@@ -20,7 +20,9 @@ import {
   Card,
 } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   NumberField, NumberFieldDecrement, NumberFieldGroup, NumberFieldIncrement,
   NumberFieldInput,
@@ -351,11 +353,13 @@ export function BatchActionsBar({
 
   return (
     <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-2xl">
+      {/* 「更多设置」的开合交给 Collapsible：触发器在上面那行，面板在下面，根节点得把两者都包住。 */}
+      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
         {/* 「清空选择」跟着「已选 N」待在左边，而不是挂在最右端：手机上一行放不下时，最右那枚
             总是第一个被挤到第二行，孤零零一个 ×。「更多设置」在手机上只留图标，同一个理由。 */}
         <div className="flex min-h-14 flex-wrap items-center gap-2 px-4 py-3 sm:gap-3 sm:px-5">
           <div className="mr-auto flex items-center gap-1">
-          <label className="flex cursor-pointer items-center gap-2 text-xs">
+          <Label className="cursor-pointer font-normal text-xs">
             <Checkbox
               checked={allSelected}
               indeterminate={n > 0 && !allSelected}
@@ -366,7 +370,7 @@ export function BatchActionsBar({
               <span className="tnum font-semibold text-foreground">{formattedCount}</span>
               <span className="text-muted-foreground"> / {formattedTotal}</span>
             </span>
-          </label>
+          </Label>
           <Hint label={t('清空选择', 'Clear selection')}>
             <Button size="icon-sm" variant="ghost" onClick={onClear} aria-label={t('清空选择', 'Clear selection')}>
               <XIcon />
@@ -390,254 +394,246 @@ export function BatchActionsBar({
           </Toolbar>
 
           <Hint label={t('更多设置', 'More settings')}>
-            <Button
-              size="sm"
-              variant="outline"
-              aria-expanded={advancedOpen}
-              aria-controls="batch-advanced-settings"
-              onClick={() => setAdvancedOpen((open) => !open)}
-              aria-label={t('更多设置', 'More settings')}
-            >
+            <CollapsibleTrigger render={<Button size="sm" variant="outline" aria-label={t('更多设置', 'More settings')} />}>
               <SlidersHorizontalIcon className="sm:hidden" />
               <span className="max-sm:sr-only">{t('更多设置', 'More settings')}</span>
               <ChevronDownIcon className={cn('size-4 transition-transform max-sm:hidden', advancedOpen && 'rotate-180')} />
-            </Button>
+            </CollapsibleTrigger>
           </Hint>
         </div>
 
-        {advancedOpen && (
-          <div id="batch-advanced-settings" className="divide-y border-t">
-            <SettingRow
-              title={t('调度优先级', 'Scheduling priority')}
-              hint={priorityRange === null
-                ? t('同档分摊，跨档按先后顺序用尽', 'Same tier shares load; tiers are used up in order')
-                : t(`同档分摊，跨档按先后顺序用尽；选中账号当前 ${priorityRange}`, `Same tier shares load; tiers are used up in order. Selected are ${priorityRange}`)}
-              action={
-                <Button
-                  size="sm"
-                  loading={applyPriority.isPending}
-                  disabled={busy}
-                  onClick={() => applyPriority.mutate({ mode: priorityMode, value: priorityValue })}
-                >
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-            >
-              <Select
-                items={priorityModeItems}
-                value={priorityMode}
-                onValueChange={(value) => value && setPriorityMode(value as PriorityMode)}
+        <CollapsiblePanel className="divide-y border-t">
+          <SettingRow
+            title={t('调度优先级', 'Scheduling priority')}
+            hint={priorityRange === null
+              ? t('同档分摊，跨档按先后顺序用尽', 'Same tier shares load; tiers are used up in order')
+              : t(`同档分摊，跨档按先后顺序用尽；选中账号当前 ${priorityRange}`, `Same tier shares load; tiers are used up in order. Selected are ${priorityRange}`)}
+            action={
+              <Button
+                size="sm"
+                loading={applyPriority.isPending}
+                disabled={busy}
+                onClick={() => applyPriority.mutate({ mode: priorityMode, value: priorityValue })}
               >
-                <SelectTrigger aria-label={t('批量调整优先级方式', 'How to change priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                <SelectPopup>
-                  {priorityModeItems.map((item) => (
+                {t('应用', 'Apply')}
+              </Button>
+            }
+          >
+            <Select
+              items={priorityModeItems}
+              value={priorityMode}
+              onValueChange={(value) => value && setPriorityMode(value as PriorityMode)}
+            >
+              <SelectTrigger aria-label={t('批量调整优先级方式', 'How to change priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {priorityModeItems.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {priorityMode === 'set' && (
+              <Select
+                items={priorityTierItems}
+                value={String(priorityValue)}
+                onValueChange={(value) => value && setPriorityValue(Number(value))}
+              >
+                <SelectTrigger aria-label={t('批量设置优先级', 'Set priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                <SelectPopup alignItemWithTrigger={false}>
+                  {priorityTierItems.map((item) => (
                     <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
                   ))}
                 </SelectPopup>
               </Select>
-              {priorityMode === 'set' && (
-                <Select
-                  items={priorityTierItems}
-                  value={String(priorityValue)}
-                  onValueChange={(value) => value && setPriorityValue(Number(value))}
-                >
-                  <SelectTrigger aria-label={t('批量设置优先级', 'Set priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                  <SelectPopup>
-                    {priorityTierItems.map((item) => (
+            )}
+          </SettingRow>
+
+          {!devicesBySession && (
+          <SettingRow
+            title={t('设备上限', 'Device limit')}
+            hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
+            action={
+              <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
+                {t('应用', 'Apply')}
+              </Button>
+            }
+          >
+            <Select items={limitModeItems} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
+              <SelectTrigger aria-label={t('批量设置设备上限策略', 'Set device limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {limitModeItems.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {limitMode === 'custom' && (
+              <NumberField value={customLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
+                <NumberFieldGroup>
+                  <NumberFieldDecrement />
+                  <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
+                  <NumberFieldIncrement />
+                </NumberFieldGroup>
+              </NumberField>
+            )}
+          </SettingRow>
+          )}
+
+          <SettingRow
+            title={t('会话上限', 'Session limit')}
+            hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
+            action={
+              <Button size="sm" loading={applySessionLimit.isPending} disabled={busy} onClick={() => applySessionLimit.mutate(sessionLimit)}>
+                {t('应用', 'Apply')}
+              </Button>
+            }
+          >
+            <Select items={sessionLimitModeItems} value={sessionLimitMode} onValueChange={(value) => value && setSessionLimitMode(value as typeof sessionLimitMode)}>
+              <SelectTrigger aria-label={t('批量设置会话上限策略', 'Set session limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {sessionLimitModeItems.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {sessionLimitMode === 'custom' && (
+              <NumberField value={customSessionLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
+                <NumberFieldGroup>
+                  <NumberFieldDecrement />
+                  <NumberFieldInput aria-label={t('批量设置独立会话上限', 'Set a custom session limit for selected accounts')} />
+                  <NumberFieldIncrement />
+                </NumberFieldGroup>
+              </NumberField>
+            )}
+          </SettingRow>
+
+          <SettingRow
+            title={t('RPM 上限', 'RPM limit')}
+            hint={t('每分钟最多转发的请求数', 'Max requests forwarded per minute')}
+            action={
+              <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
+                {t('应用', 'Apply')}
+              </Button>
+            }
+          >
+            <Select items={rpmModeItems} value={rpmMode} onValueChange={(value) => value && setRpmMode(value as typeof rpmMode)}>
+              <SelectTrigger aria-label={t('批量设置 RPM 上限策略', 'Set RPM limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {rpmModeItems.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {rpmMode === 'custom' && (
+              <NumberField value={customRpm} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
+                <NumberFieldGroup>
+                  <NumberFieldDecrement />
+                  <NumberFieldInput aria-label={t('批量设置独立 RPM 上限', 'Set a custom RPM limit for selected accounts')} />
+                  <NumberFieldIncrement />
+                </NumberFieldGroup>
+              </NumberField>
+            )}
+          </SettingRow>
+
+          {/* 提前停调度阈值：5h / 7d 两档各自三态，一次整份覆盖所选账号（覆盖设置页的全局值）。 */}
+          <SettingRow
+            title={t('提前暂停调度阈值', 'Early pause threshold')}
+            hint={t('使用率达到阈值时移出调度池；两个窗口的设置将一并覆盖全局值', 'Removed from the scheduling pool at this utilization; both windows override the global setting')}
+            action={
+              <Button size="sm" loading={applyQuotaPause.isPending} disabled={busy} onClick={() => applyQuotaPause.mutate({ pct: quotaPct, pct7d: quotaPct7d })}>
+                {t('应用', 'Apply')}
+              </Button>
+            }
+            stacked
+          >
+            {([
+              ['short', t('5 小时', '5h'), quotaShortMode, setQuotaShortMode, quotaShortCustom, setQuotaShortCustom,
+                t('批量设置 5 小时窗口阈值策略', 'Set the 5h window threshold policy for selected accounts'),
+                t('批量设置 5 小时窗口阈值（%）', 'Set a custom 5h window threshold (%) for selected accounts')],
+              ['long', t('7 天', '7d'), quotaLongMode, setQuotaLongMode, quotaLongCustom, setQuotaLongCustom,
+                t('批量设置 7 天窗口阈值策略', 'Set the 7d window threshold policy for selected accounts'),
+                t('批量设置 7 天窗口阈值（%）', 'Set a custom 7d window threshold (%) for selected accounts')],
+            ] as const).map(([key, label, mode, setMode, custom, setCustom, modeAria, customAria]) => (
+              <div key={key} className="flex flex-wrap items-center gap-2">
+                <span className="w-12 shrink-0 text-xs text-muted-foreground">{label}</span>
+                <Select items={quotaModeItems} value={mode} onValueChange={(value) => value && setMode(value as QuotaMode)}>
+                  <SelectTrigger aria-label={modeAria} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+                  <SelectPopup alignItemWithTrigger={false}>
+                    {quotaModeItems.map((item) => (
                       <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
                     ))}
                   </SelectPopup>
                 </Select>
-              )}
-            </SettingRow>
+                {mode === 'custom' && (
+                  <>
+                    <NumberField value={custom} min={1} max={100} step={1} size="sm" className="w-32" onValueChange={(value) => setCustom(Math.min(100, Math.max(1, Math.floor(value ?? 1))))}>
+                      <NumberFieldGroup>
+                        <NumberFieldDecrement />
+                        <NumberFieldInput aria-label={customAria} />
+                        <NumberFieldIncrement />
+                      </NumberFieldGroup>
+                    </NumberField>
+                    <span className="text-xs text-muted-foreground">%</span>
+                  </>
+                )}
+              </div>
+            ))}
+          </SettingRow>
 
-            {!devicesBySession && (
-            <SettingRow
-              title={t('设备上限', 'Device limit')}
-              hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
-              action={
-                <Button size="sm" loading={applyLimit.isPending} disabled={busy} onClick={() => applyLimit.mutate(deviceLimit)}>
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-            >
-              <Select items={limitModeItems} value={limitMode} onValueChange={(value) => value && setLimitMode(value as typeof limitMode)}>
-                <SelectTrigger aria-label={t('批量设置设备上限策略', 'Set device limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                <SelectPopup>
-                  {limitModeItems.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-              {limitMode === 'custom' && (
-                <NumberField value={customLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
-                  <NumberFieldGroup>
-                    <NumberFieldDecrement />
-                    <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
-                    <NumberFieldIncrement />
-                  </NumberFieldGroup>
-                </NumberField>
-              )}
-            </SettingRow>
+          <SettingRow
+            title={(
+              <span className="inline-flex items-center gap-1.5">
+                <GlobeIcon className="size-3.5" />
+                {t('出站代理', 'Outbound proxy')}
+              </span>
             )}
-
-            <SettingRow
-              title={t('会话上限', 'Session limit')}
-              hint={t('跟随默认、不限或独立上限', 'Default, unlimited, or custom')}
-              action={
-                <Button size="sm" loading={applySessionLimit.isPending} disabled={busy} onClick={() => applySessionLimit.mutate(sessionLimit)}>
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-            >
-              <Select items={sessionLimitModeItems} value={sessionLimitMode} onValueChange={(value) => value && setSessionLimitMode(value as typeof sessionLimitMode)}>
-                <SelectTrigger aria-label={t('批量设置会话上限策略', 'Set session limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                <SelectPopup>
-                  {sessionLimitModeItems.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+            hint={t('统一设置出站代理或改回直连', 'Set an outbound proxy or switch back to direct connection')}
+            action={
+              <Button
+                size="sm"
+                loading={applyProxy.isPending}
+                disabled={busy || (proxyMode === 'custom' && !customProxyUrl.trim()) || (proxyMode === 'pool' && !selectedProxyUrl)}
+                onClick={() => applyProxy.mutate(proxyUrl || null)}
+              >
+                {t('应用', 'Apply')}
+              </Button>
+            }
+          >
+            <Select items={proxyModeItems} value={proxyMode} onValueChange={(value) => value && setProxyMode(value as typeof proxyMode)}>
+              <SelectTrigger aria-label={t('批量设置出站代理策略', 'Set outbound proxy policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {proxyModeItems.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+            {proxyMode === 'pool' && savedProxies.length > 0 && (
+              <Select
+                items={savedProxies.map((p) => ({ value: p.url, label: p.label }))}
+                value={selectedProxyUrl}
+                onValueChange={(value) => value && setSelectedProxyUrl(value)}
+              >
+                <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="w-56"><SelectValue /></SelectTrigger>
+                <SelectPopup alignItemWithTrigger={false}>
+                  {savedProxies.map((p) => (
+                    <SelectItem key={p.id} value={p.url}>{p.label}</SelectItem>
                   ))}
                 </SelectPopup>
               </Select>
-              {sessionLimitMode === 'custom' && (
-                <NumberField value={customSessionLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
-                  <NumberFieldGroup>
-                    <NumberFieldDecrement />
-                    <NumberFieldInput aria-label={t('批量设置独立会话上限', 'Set a custom session limit for selected accounts')} />
-                    <NumberFieldIncrement />
-                  </NumberFieldGroup>
-                </NumberField>
-              )}
-            </SettingRow>
-
-            <SettingRow
-              title={t('RPM 上限', 'RPM limit')}
-              hint={t('每分钟最多转发的请求数', 'Max requests forwarded per minute')}
-              action={
-                <Button size="sm" loading={applyRpmLimit.isPending} disabled={busy} onClick={() => applyRpmLimit.mutate(rpmLimit)}>
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-            >
-              <Select items={rpmModeItems} value={rpmMode} onValueChange={(value) => value && setRpmMode(value as typeof rpmMode)}>
-                <SelectTrigger aria-label={t('批量设置 RPM 上限策略', 'Set RPM limit policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                <SelectPopup>
-                  {rpmModeItems.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-              {rpmMode === 'custom' && (
-                <NumberField value={customRpm} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
-                  <NumberFieldGroup>
-                    <NumberFieldDecrement />
-                    <NumberFieldInput aria-label={t('批量设置独立 RPM 上限', 'Set a custom RPM limit for selected accounts')} />
-                    <NumberFieldIncrement />
-                  </NumberFieldGroup>
-                </NumberField>
-              )}
-            </SettingRow>
-
-            {/* 提前停调度阈值：5h / 7d 两档各自三态，一次整份覆盖所选账号（覆盖设置页的全局值）。 */}
-            <SettingRow
-              title={t('提前暂停调度阈值', 'Early pause threshold')}
-              hint={t('使用率达到阈值时移出调度池；两个窗口的设置将一并覆盖全局值', 'Removed from the scheduling pool at this utilization; both windows override the global setting')}
-              action={
-                <Button size="sm" loading={applyQuotaPause.isPending} disabled={busy} onClick={() => applyQuotaPause.mutate({ pct: quotaPct, pct7d: quotaPct7d })}>
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-              stacked
-            >
-              {([
-                ['short', t('5 小时', '5h'), quotaShortMode, setQuotaShortMode, quotaShortCustom, setQuotaShortCustom,
-                  t('批量设置 5 小时窗口阈值策略', 'Set the 5h window threshold policy for selected accounts'),
-                  t('批量设置 5 小时窗口阈值（%）', 'Set a custom 5h window threshold (%) for selected accounts')],
-                ['long', t('7 天', '7d'), quotaLongMode, setQuotaLongMode, quotaLongCustom, setQuotaLongCustom,
-                  t('批量设置 7 天窗口阈值策略', 'Set the 7d window threshold policy for selected accounts'),
-                  t('批量设置 7 天窗口阈值（%）', 'Set a custom 7d window threshold (%) for selected accounts')],
-              ] as const).map(([key, label, mode, setMode, custom, setCustom, modeAria, customAria]) => (
-                <div key={key} className="flex flex-wrap items-center gap-2">
-                  <span className="w-12 shrink-0 text-xs text-muted-foreground">{label}</span>
-                  <Select items={quotaModeItems} value={mode} onValueChange={(value) => value && setMode(value as QuotaMode)}>
-                    <SelectTrigger aria-label={modeAria} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                    <SelectPopup>
-                      {quotaModeItems.map((item) => (
-                        <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-                      ))}
-                    </SelectPopup>
-                  </Select>
-                  {mode === 'custom' && (
-                    <>
-                      <NumberField value={custom} min={1} max={100} step={1} size="sm" className="w-32" onValueChange={(value) => setCustom(Math.min(100, Math.max(1, Math.floor(value ?? 1))))}>
-                        <NumberFieldGroup>
-                          <NumberFieldDecrement />
-                          <NumberFieldInput aria-label={customAria} />
-                          <NumberFieldIncrement />
-                        </NumberFieldGroup>
-                      </NumberField>
-                      <span className="text-xs text-muted-foreground">%</span>
-                    </>
-                  )}
-                </div>
-              ))}
-            </SettingRow>
-
-            <SettingRow
-              title={(
-                <span className="inline-flex items-center gap-1.5">
-                  <GlobeIcon className="size-3.5" />
-                  {t('出站代理', 'Outbound proxy')}
-                </span>
-              )}
-              hint={t('统一设置出站代理或改回直连', 'Set an outbound proxy or switch back to direct connection')}
-              action={
-                <Button
-                  size="sm"
-                  loading={applyProxy.isPending}
-                  disabled={busy || (proxyMode === 'custom' && !customProxyUrl.trim()) || (proxyMode === 'pool' && !selectedProxyUrl)}
-                  onClick={() => applyProxy.mutate(proxyUrl || null)}
-                >
-                  {t('应用', 'Apply')}
-                </Button>
-              }
-            >
-              <Select items={proxyModeItems} value={proxyMode} onValueChange={(value) => value && setProxyMode(value as typeof proxyMode)}>
-                <SelectTrigger aria-label={t('批量设置出站代理策略', 'Set outbound proxy policy for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
-                <SelectPopup>
-                  {proxyModeItems.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-              {proxyMode === 'pool' && savedProxies.length > 0 && (
-                <Select
-                  items={savedProxies.map((p) => ({ value: p.url, label: p.label }))}
-                  value={selectedProxyUrl}
-                  onValueChange={(value) => value && setSelectedProxyUrl(value)}
-                >
-                  <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="w-56"><SelectValue /></SelectTrigger>
-                  <SelectPopup>
-                    {savedProxies.map((p) => (
-                      <SelectItem key={p.id} value={p.url}>{p.label}</SelectItem>
-                    ))}
-                  </SelectPopup>
-                </Select>
-              )}
-              {proxyMode === 'custom' && (
-                <Input
-                  value={customProxyUrl}
-                  onChange={(event) => setCustomProxyUrl(event.target.value)}
-                  placeholder="socks5://127.0.0.1:1080"
-                  spellCheck={false}
-                  autoComplete="off"
-                  size="sm"
-                  className="w-72 max-w-full"
-                  aria-label={t('自定义代理地址', 'Custom proxy URL')}
-                />
-              )}
-            </SettingRow>
-          </div>
-        )}
+            )}
+            {proxyMode === 'custom' && (
+              <Input
+                value={customProxyUrl}
+                onChange={(event) => setCustomProxyUrl(event.target.value)}
+                placeholder="socks5://127.0.0.1:1080"
+                spellCheck={false}
+                autoComplete="off"
+                size="sm"
+                className="w-72 max-w-full"
+                aria-label={t('自定义代理地址', 'Custom proxy URL')}
+              />
+            )}
+          </SettingRow>
+        </CollapsiblePanel>
+      </Collapsible>
 
         <SetGroupsDialog ids={ids} open={groupsOpen} onOpenChange={setGroupsOpen} />
         <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>

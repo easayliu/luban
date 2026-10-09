@@ -449,7 +449,7 @@ export const CredentialCard = memo(function CredentialCard({
           {!editing && (
             <CardAction>
               <CredentialActionsMenu
-                triggerClassName={buttonVariants({ size: 'icon', variant: 'ghost' })}
+                triggerClassName={buttonVariants({ size: 'icon-sm', variant: 'ghost' })}
                 triggerLabel={t(`打开 ${credentialLabel} 菜单`, `Open menu for ${credentialLabel}`)}
                   cred={cred}
                   actions={actions}

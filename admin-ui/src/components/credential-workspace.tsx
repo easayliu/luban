@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   ArrowUpDownIcon,
   DatabaseZapIcon,
@@ -50,7 +50,10 @@ import {
   useTtftSeries,
 } from '@/components/ttft-trend-dialog'
 import { getRejections, type CacheSeriesPoint, type TtftSeriesPoint } from '@/api/metrics'
-import { Button, buttonVariants } from '@/components/ui/button'
+import { PaginationBar } from '@/components/pagination-bar'
+import { ErrorState } from '@/components/state-placeholders'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
   Empty,
@@ -60,33 +63,18 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
-import {
-  Menu,
-  MenuGroup,
-  MenuPopup,
-  MenuRadioGroup,
-  MenuRadioItem,
-  MenuSeparator,
-  MenuTrigger,
-} from '@/components/ui/menu'
-import {
-  Pagination as CossPagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationNext,
-  PaginationPrevious,
-} from '@/components/ui/pagination'
-import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { ToolbarMenuSelect, ToolbarSearch } from '@/components/toolbar-controls'
+import { MenuRadioGroup, MenuRadioItem } from '@/components/ui/menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
+import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
 import { useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
-import { cacheHitRate, cn, displayCredentialLabel, extractError, formatPercent } from '@/lib/utils'
+import { cacheHitRate, cn, displayCredentialLabel, formatPercent } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -115,11 +103,6 @@ export const CREDENTIAL_PAGE_SIZES = [10, 20, 50] as const
 export type CredentialPageSize = (typeof CREDENTIAL_PAGE_SIZES)[number]
 
 export const CREDENTIAL_VIEW_MODES = ['card', 'list'] as const
-
-const PAGE_SIZE_ITEMS = CREDENTIAL_PAGE_SIZES.map((size) => ({
-  size,
-  value: String(size),
-}))
 
 type LocalizedLabel = readonly [chinese: string, english: string]
 
@@ -250,10 +233,6 @@ const SORT_GROUPS: readonly (readonly SortKey[])[] = [
   ['devices', 'sessions'],
 ]
 
-/** 状态 / 套餐触发器在筛选生效时的染色：一眼能看出哪个按钮正在缩小列表。 */
-const ACTIVE_FILTER_CLASS =
-  'border-marine/40 bg-marine/10 text-marine-foreground hover:border-marine/40 hover:bg-marine/16 data-pressed:bg-marine/16'
-
 /** 下拉里的一项：名称靠左，计数靠右、弱化，不做染色。 */
 function FacetOption({ label, count }: { label: string; count: string }) {
   return (
@@ -295,32 +274,6 @@ export function useNowSeconds(): number {
   return now
 }
 
-/**
- * `/` 与 ⌘K / Ctrl+K 聚焦搜索框——列表型控制台的通用约定。
- *
- * 已经在输入的时候不抢键（否则打不出 `/`）；弹层/对话框打开时也不抢，
- * 否则焦点会跳到被遮住的输入框上，模态里反而按不动。
- */
-function useSearchHotkey(ref: RefObject<HTMLInputElement | null>): void {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const slash = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey
-      const commandK = (event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)
-      if (!slash && !commandK) return
-      const target = event.target as HTMLElement | null
-      if (target?.isContentEditable) return
-      if (target && /^(input|textarea|select)$/i.test(target.tagName)) return
-      if (target?.closest('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return
-      const input = ref.current
-      if (!input) return
-      event.preventDefault()
-      input.focus()
-      input.select()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [ref])
-}
 
 /**
  * 搜索匹配的字段。除名称和 #id 外还收了套餐、组织类型与当前状态文案——
@@ -428,8 +381,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   } = state
   const pool = credentials ?? []
   const debouncedQuery = useDebounced(query)
-  const searchRef = useRef<HTMLInputElement>(null)
-  useSearchHotkey(searchRef)
   const now = useNowSeconds()
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
@@ -863,6 +814,16 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     if ([...selected].every((id) => visible.has(id))) return
     onSelectedChangeRef.current(new Set([...selected].filter((id) => visible.has(id))))
   }, [credentials, sorted, selected])
+  // 套餐下拉按 TIER_GROUP_STARTS 切成几组，组间画分隔线。
+  const tierGroups = useMemo(() => {
+    const groups: { value: CredentialTierFilterKey; label: ReactNode }[][] = []
+    tierItems.forEach((item, index) => {
+      const entry = { value: item.key, label: <FacetOption label={item.label} count={formatNumber(metrics.tierCounts[item.key])} /> }
+      if (index === 0 || TIER_GROUP_STARTS.has(item.key)) groups.push([entry])
+      else groups[groups.length - 1].push(entry)
+    })
+    return groups
+  }, [tierItems, metrics.tierCounts, formatNumber])
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
@@ -892,33 +853,39 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 {t('账号池', 'Account pool')}
               </h1>
               {!isLoading && (
-                <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
+                <Badge variant="secondary" size="lg">
                   {t(
                     `${formatNumber(count)} 个账号`,
                     `${formatNumber(count)} ${count === 1 ? 'account' : 'accounts'}`,
                   )}
-                </span>
+                </Badge>
               )}
               {/* 绑定设备数从概览格挪到这里：概览那一行留给「号的状态」与「流量质量」，设备数
                   是池子的容量属性，与账号数并排读更顺。点击仍是筛选（已满 > 已绑定）。 */}
               {!isLoading && count > 0 && !devicesBySession && (
                 <Tooltip>
                   <TooltipTrigger
-                    render={<button type="button" />}
+                    // 这枚是**控件**（点下去筛列表），所以用小号 outline 的 Toggle：白底 + 边框 +
+                    // hover 变底色。旁边那枚「N 个账号」是纯展示的 secondary 徽标，没有边框。
+                    // 原来两枚逐字同样式，谁点得动全靠猜——选中态那条竖条只在点过之后才出现，
+                    // 没法在点之前给提示。
+                    // 按下态与概览格同一套记号：淡底 + 一条左侧竖条。Toggle 自带的按下底色与
+                    // outline 的「按下去掉阴影」与这两条同权重，所以加 `!` 盖过去。
+                    // 点击不看 Toggle 给的新状态：已筛「有设备」而池里又有满额号时，点下去是改筛
+                    // 「已满」而不是取消，沿用 selectMetric 的切换规则。
+                    render={(
+                      <Toggle
+                        variant="outline"
+                        size="sm"
+                        pressed={filter === 'deviceFull' || filter === 'hasDevice'}
+                        onPressedChange={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
+                      />
+                    )}
                     className={cn(
-                      // 这枚是**控件**（点下去筛列表），所以长得像个小号 outline 按钮：白底 + 边框 +
-                      // hover 变底色。旁边那枚「N 个账号」是纯展示的 `bg-muted` 标签，没有边框。
-                      // 原来两枚逐字同样式，谁点得动全靠猜——选中态那条竖条只在点过之后才出现，
-                      // 没法在点之前给提示。
-                      'inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs font-medium text-muted-foreground shadow-xs/5 transition-colors',
-                      'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
-                      // 选中态与概览格同一套记号：淡底 + 一条左侧竖条。
-                      (filter === 'deviceFull' || filter === 'hasDevice')
-                        && 'bg-marine/10 text-foreground shadow-[inset_2px_0_0_0_var(--marine)]',
+                      'gap-1 px-2 text-xs text-muted-foreground hover:text-foreground',
+                      'data-pressed:bg-marine/10! data-pressed:text-foreground data-pressed:shadow-[inset_2px_0_0_0_var(--marine)]!',
                       fullDeviceCount > 0 && 'text-warning-foreground',
                     )}
-                    aria-pressed={filter === 'deviceFull' || filter === 'hasDevice'}
-                    onClick={() => selectMetric(fullDeviceCount > 0 ? 'deviceFull' : 'hasDevice')}
                   >
                     <SmartphoneIcon className="size-3" aria-hidden />
                     <span className="tnum">
@@ -944,13 +911,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               {isRefetchError ? (
                 <>
                   <TriangleAlertIcon className="size-3.5 text-destructive-foreground" aria-hidden />
-                  <button
-                    type="button"
-                    className="rounded-sm font-medium text-destructive-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                  <Button
+                    variant="link"
+                    size="xs"
+                    className="px-1 text-destructive-foreground"
                     onClick={actions.onRetry}
                   >
                     {t('刷新失败，点击重试', 'Refresh failed. Click to retry')}
-                  </button>
+                  </Button>
                 </>
               ) : (
                 // 自动刷新指示器同时是手动刷新入口：等下一轮 30 秒才能确认操作结果，
@@ -958,8 +926,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 <Tooltip>
                   <TooltipTrigger
                     // disabled 必须写在 render 的按钮上：写在 TooltipTrigger 上只会禁用提示，按钮照样能点。
-                    render={<button type="button" disabled={isLoading || isFetching} />}
-                    className="inline-flex items-center gap-1.5 rounded-sm px-1 py-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 disabled:hover:text-muted-foreground"
+                    // `disabled:opacity-100`：后台每 30 秒取一次数，按钮跟着禁用；Button 默认的禁用变淡
+                    // 会让这行字每半分钟闪一次，转圈图标已经说明「正在刷新」。
+                    render={<Button variant="link" size="xs" disabled={isLoading || isFetching} />}
+                    className="gap-1.5 px-1 font-normal text-muted-foreground hover:text-foreground disabled:opacity-100"
                     onClick={actions.onRetry}
                     aria-label={t('立即刷新账号数据', 'Refresh account data now')}
                   >
@@ -994,100 +964,39 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
             {/* sm–lg（工具条独占一行）时搜索框吃掉剩余宽度，整行没有死区；xl 起与标题同行，
                 必须用 `xl:max-w-64` 封顶——不封顶它会一路撑开，把筛选与视图切换挤出可视区。 */}
-            <InputGroup className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1 xl:max-w-64">
-              <InputGroupAddon><SearchIcon /></InputGroupAddon>
-              <InputGroupInput
-                ref={searchRef}
-                value={query}
-                onChange={(event) => changeQuery(event.target.value)}
-                onKeyDown={(event) => {
-                  // Esc 先清空、再退出输入框：清空和失焦是两个不同的意图，一次按键只做一件。
-                  if (event.key !== 'Escape') return
-                  event.preventDefault()
-                  if (query) changeQuery('')
-                  else event.currentTarget.blur()
-                }}
-                placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
-                aria-label={t('搜索账号', 'Search accounts')}
-              />
-              <InputGroupAddon align="inline-end">
-                {query ? (
-                  <Button
-                    size="icon-xs"
-                    variant="ghost"
-                    onClick={() => changeQuery('')}
-                    aria-label={t('清除搜索', 'Clear search')}
-                  >
-                    <XIcon />
-                  </Button>
-                ) : (
-                  // 只在指针设备上提示：触屏没有物理按键，画个 kbd 只是噪声。
-                  <kbd
-                    className="pointer-events-none hidden rounded border bg-muted px-1 font-sans text-2xs text-muted-foreground pointer-fine:inline-block"
-                    aria-hidden
-                  >
-                    /
-                  </kbd>
-                )}
-              </InputGroupAddon>
-            </InputGroup>
+            <ToolbarSearch
+              ariaLabel={t('搜索账号', 'Search accounts')}
+              className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1 xl:max-w-64"
+              placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
+              value={query}
+              onChange={changeQuery}
+            />
 
             {/* 搜索与两个筛选是同一组「缩小范围」的控件，中间不加分隔线；排序与视图切换属于
                 「怎么展示」，在分隔线之后。与 GitHub / Linear 列表页的工具条排布一致。 */}
             <ToolbarGroup className="grid min-w-0 grid-cols-3 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap">
-              <Menu>
-                <MenuTrigger
-                  aria-label={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
-                  className={cn(
-                    buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                    filter !== 'all' && ACTIVE_FILTER_CLASS,
-                  )}
-                >
-                  <ListFilterIcon />
-                  <span className="min-w-0 truncate">{activeFilterLabel}</span>
-                </MenuTrigger>
-                <MenuPopup align="end" className="w-48">
-                  <MenuRadioGroup value={filter}>
-                    {filterGroups.map((items, index) => (
-                      <MenuGroup key={items[0].key}>
-                        {index > 0 && <MenuSeparator />}
-                        {items.map((item) => (
-                          <MenuRadioItem key={item.key} value={item.key} onClick={() => changeFilter(item.key)}>
-                            <FacetOption label={item.label} count={formatNumber(metrics.filterCounts[item.key])} />
-                          </MenuRadioItem>
-                        ))}
-                      </MenuGroup>
-                    ))}
-                  </MenuRadioGroup>
-                </MenuPopup>
-              </Menu>
+              <ToolbarMenuSelect
+                active={filter !== 'all'}
+                ariaLabel={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
+                groups={filterGroups.map((items) => items.map((item) => ({
+                  value: item.key,
+                  label: <FacetOption label={item.label} count={formatNumber(metrics.filterCounts[item.key])} />,
+                })))}
+                icon={ListFilterIcon}
+                label={activeFilterLabel}
+                value={filter}
+                onChange={changeFilter}
+              />
 
-              <Menu>
-                <MenuTrigger
-                  aria-label={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
-                  className={cn(
-                    buttonVariants({ variant: 'outline' }),
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                    tier !== 'all' && ACTIVE_FILTER_CLASS,
-                  )}
-                >
-                  <LayersIcon />
-                  <span className="min-w-0 truncate">{activeTierLabel}</span>
-                </MenuTrigger>
-                <MenuPopup align="end" className="w-48">
-                  <MenuRadioGroup value={tier}>
-                    {tierItems.map((item, index) => (
-                      <MenuGroup key={item.key}>
-                        {TIER_GROUP_STARTS.has(item.key) && index > 0 && <MenuSeparator />}
-                        <MenuRadioItem value={item.key} onClick={() => changeTier(item.key)}>
-                          <FacetOption label={item.label} count={formatNumber(metrics.tierCounts[item.key])} />
-                        </MenuRadioItem>
-                      </MenuGroup>
-                    ))}
-                  </MenuRadioGroup>
-                </MenuPopup>
-              </Menu>
+              <ToolbarMenuSelect
+                active={tier !== 'all'}
+                ariaLabel={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
+                groups={tierGroups}
+                icon={LayersIcon}
+                label={activeTierLabel}
+                value={tier}
+                onChange={changeTier}
+              />
 
               {(filter !== 'all' || tier !== 'all') && (
                 <Button
@@ -1105,52 +1014,40 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
               <ToolbarSeparator orientation="vertical" className="mx-1 hidden sm:block" />
 
-              <Menu>
-                <MenuTrigger
-                  aria-label={t(
-                    `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
-                    `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
-                  )}
-                  className={cn(
-                    buttonVariants({ variant: 'outline' }),
-                    // 不要 `max-sm:col-span-2`：那是筛选组还是两列时给的（让排序独占一整行）。
-                    // 组改成三列后它会占掉 3 列中的 2 列、被挤到第二行，右边空一格——
-                    // 就是三枚筛选排成 2 + 1 的原因。三列下它和另外两枚一样，各占一格。
-                    'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
-                  )}
+              <ToolbarMenuSelect
+                ariaLabel={t(
+                  `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
+                  `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
+                )}
+                groups={sortGroups.map((items) => items.map((item) => ({ value: item.key, label: item.label })))}
+                icon={ArrowUpDownIcon}
+                label={(
+                  <>
+                    <span className="min-w-0 truncate max-[22rem]:hidden">
+                      {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
+                    </span>
+                    <span className="hidden shrink-0 max-[22rem]:inline">
+                      {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
+                    </span>
+                  </>
+                )}
+                value={sort}
+                onChange={changeSortKey}
+              >
+                <MenuRadioGroup
+                  value={dir}
+                  onValueChange={(next) => {
+                    if (next === 'asc' || next === 'desc') changeSortDir(next)
+                  }}
                 >
-                  <ArrowUpDownIcon />
-                  <span className="min-w-0 truncate max-[22rem]:hidden">
-                    {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
-                  </span>
-                  <span className="hidden shrink-0 max-[22rem]:inline">
-                    {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
-                  </span>
-                </MenuTrigger>
-                <MenuPopup align="end" className="w-48">
-                  <MenuRadioGroup value={sort}>
-                    {sortGroups.map((items, index) => (
-                      <MenuGroup key={items[0].key}>
-                        {index > 0 && <MenuSeparator />}
-                        {items.map((item) => (
-                          <MenuRadioItem key={item.key} value={item.key} onClick={() => changeSortKey(item.key)}>
-                            {item.label}
-                          </MenuRadioItem>
-                        ))}
-                      </MenuGroup>
-                    ))}
-                  </MenuRadioGroup>
-                  <MenuSeparator />
-                  <MenuRadioGroup value={dir}>
-                    <MenuRadioItem value="asc" onClick={() => changeSortDir('asc')}>
-                      {t('升序', 'Ascending')}
-                    </MenuRadioItem>
-                    <MenuRadioItem value="desc" onClick={() => changeSortDir('desc')}>
-                      {t('降序', 'Descending')}
-                    </MenuRadioItem>
-                  </MenuRadioGroup>
-                </MenuPopup>
-              </Menu>
+                  <MenuRadioItem value="asc">
+                    {t('升序', 'Ascending')}
+                  </MenuRadioItem>
+                  <MenuRadioItem value="desc">
+                    {t('降序', 'Descending')}
+                  </MenuRadioItem>
+                </MenuRadioGroup>
+              </ToolbarMenuSelect>
             </ToolbarGroup>
 
             {/* `sm:ml-auto` 把视图切换推到整行最右端，与下面指标卡、列表的右边界落在同一条竖线上。
@@ -1350,7 +1247,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
               <CredentialLoadingState view={view} selectable={!readOnly} count={pageSize} />
             </div>
           ) : isError && !credentials ? (
-            <Card><ErrorState error={error} onRetry={actions.onRetry} /></Card>
+            <Card><ErrorState error={error} title={t('暂时无法读取账号', 'Unable to load accounts')} onRetry={actions.onRetry} /></Card>
           ) : count === 0 ? (
             <Card><EmptyState onAdd={actions.onAdd} /></Card>
           ) : total === 0 ? (
@@ -1429,11 +1326,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             整条分页条跟着消失的话，那个「每页」选择器也没了，再想改回 10 个/页就无从下手。 */}
           {!isLoading && (pageCount > 1 || total > CREDENTIAL_PAGE_SIZES[0]) && (
             <div className="relative py-2">
-              <AccountPagination
+              <PaginationBar
                 total={total}
                 page={current}
                 pageCount={pageCount}
                 pageSize={pageSize}
+                pageSizes={CREDENTIAL_PAGE_SIZES}
+                unit="account"
+                pageSizeLabel={t('每页账号数', 'Accounts per page')}
                 onPageChange={actions.onPageChange}
                 onPageSizeChange={(size) => {
                   actions.onPageSizeChange(size)
@@ -1447,105 +1347,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
       <CacheHitTrendDialog open={cacheTrendOpen} onOpenChange={setCacheTrendOpen} />
       <TtftTrendDialog open={ttftTrendOpen} onOpenChange={setTtftTrendOpen} />
-    </div>
-  )
-}
-
-function AccountPagination({
-  total,
-  page,
-  pageCount,
-  pageSize,
-  onPageChange,
-  onPageSizeChange,
-}: {
-  total: number
-  page: number
-  pageCount: number
-  pageSize: CredentialPageSize
-  onPageChange: (page: number) => void
-  onPageSizeChange: (pageSize: CredentialPageSize) => void
-}) {
-  const { locale, t } = useI18n()
-  const numberFormatter = useMemo(() => new Intl.NumberFormat(locale), [locale])
-  const formatNumber = (value: number) => numberFormatter.format(value)
-  const pageSizeItems = useMemo(
-    () => PAGE_SIZE_ITEMS.map(({ size, value }) => ({ value, label: numberFormatter.format(size) })),
-    [numberFormatter],
-  )
-  const from = (page - 1) * pageSize + 1
-  const to = Math.min(page * pageSize, total)
-
-  // 与用量明细、封禁记录、学到的规则三处的分页条同一套写法：左计数、中翻页、右每页，任何宽度
-  // 都是一行；翻页只有上一页 / 「第 x / y 页」/ 下一页，手机上是两个方形图标按钮。窄屏时计数
-  // 缩成「1–10 / 29」、页码缩成「1 / 3」、藏掉「每页」二字，腾出宽度让三栏并排——原先翻页落到
-  // 第二行，与左右两栏对不上。
-  return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3 text-xs">
-      <p className="min-w-0 text-muted-foreground tabular-nums">
-        <span className="max-sm:hidden">
-          {t(
-            `第 ${formatNumber(from)}–${formatNumber(to)} 个，共 ${formatNumber(total)} 个`,
-            `${formatNumber(from)}–${formatNumber(to)} of ${formatNumber(total)}`,
-          )}
-        </span>
-        <span className="sm:hidden">{`${formatNumber(from)}–${formatNumber(to)} / ${formatNumber(total)}`}</span>
-      </p>
-      {/* 窄屏也排成一行：计数缩成「1–10 / 29」、翻页只写「1 / 3」、藏掉「每页」二字，
-        三栏放得下，不再把翻页挤到第二行。 */}
-      <div className="col-start-3 row-start-1 flex items-center gap-2 justify-self-end">
-        <span className="whitespace-nowrap text-muted-foreground max-sm:hidden">{t('每页', 'Per page')}</span>
-        <Select
-          items={pageSizeItems}
-          value={String(pageSize)}
-          onValueChange={(value) => {
-            const next = Number(value)
-            if (CREDENTIAL_PAGE_SIZES.includes(next as CredentialPageSize)) {
-              onPageSizeChange(next as CredentialPageSize)
-            }
-          }}
-        >
-          <SelectTrigger size="sm" className="w-auto min-w-16 sm:min-w-20" aria-label={t('每页账号数', 'Accounts per page')}>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectPopup>
-            {pageSizeItems.map((item) => (
-              <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
-            ))}
-          </SelectPopup>
-        </Select>
-      </div>
-      {pageCount > 1 && (
-        <CossPagination className="col-start-2 row-start-1 justify-center">
-          <PaginationContent>
-            <PaginationItem>
-              <PaginationPrevious
-                render={<Button variant="ghost" disabled={page <= 1} />}
-                aria-disabled={page <= 1}
-                onClick={() => onPageChange(Math.max(1, page - 1))}
-              />
-            </PaginationItem>
-            <PaginationItem>
-              <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
-                <span className="max-sm:hidden">
-                  {t(
-                    `第 ${formatNumber(page)} / ${formatNumber(pageCount)} 页`,
-                    `Page ${formatNumber(page)} of ${formatNumber(pageCount)}`,
-                  )}
-                </span>
-                <span className="sm:hidden">{`${formatNumber(page)} / ${formatNumber(pageCount)}`}</span>
-              </span>
-            </PaginationItem>
-            <PaginationItem>
-              <PaginationNext
-                render={<Button variant="ghost" disabled={page >= pageCount} />}
-                aria-disabled={page >= pageCount}
-                onClick={() => onPageChange(Math.min(pageCount, page + 1))}
-              />
-            </PaginationItem>
-          </PaginationContent>
-        </CossPagination>
-      )}
     </div>
   )
 }
@@ -1573,25 +1374,6 @@ function EmptyState({ onAdd }: { onAdd: () => void }) {
           </Button>
         </EmptyContent>
       )}
-    </Empty>
-  )
-}
-
-function ErrorState({ error, onRetry }: { error: unknown; onRetry: () => void }) {
-  const { language, t } = useI18n()
-  return (
-    <Empty role="alert">
-      <EmptyHeader>
-        <EmptyMedia variant="icon"><TriangleAlertIcon /></EmptyMedia>
-        <EmptyTitle>{t('暂时无法读取账号', 'Unable to load accounts')}</EmptyTitle>
-        <EmptyDescription className="break-words">{extractError(error, language)}</EmptyDescription>
-      </EmptyHeader>
-      <EmptyContent>
-        <Button variant="outline" onClick={onRetry}>
-          <RefreshCwIcon />
-          {t('重新加载', 'Reload')}
-        </Button>
-      </EmptyContent>
     </Empty>
   )
 }

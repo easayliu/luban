@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { KeyRoundIcon, PlusIcon, SearchIcon, SettingsIcon, ShieldAlertIcon } from 'lucide-react'
+import { PlusIcon, SearchIcon, ShieldAlertIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState, logout } from '@/api/auth'
 import { getSettings } from '@/api/settings'
@@ -33,9 +33,15 @@ import { LoginPage } from '@/components/login-page'
 import { SetupPage } from '@/components/setup-page'
 import { UsersPage } from '@/components/users-page'
 import { BillingPage } from '@/components/billing-page'
-import { ChangePasswordDialog } from '@/components/change-password-dialog'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, Breadcrumb, MainNav, PreferencesMenu, scrollToTop, type MainSection } from '@/components/app-header'
+import {
+  AccountMenu,
+  AppHeader,
+  HEADER_ACTION_CLASS,
+  MainNav,
+  scrollToTop,
+  type MainSection,
+} from '@/components/app-header'
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -58,19 +64,17 @@ const loadSettingsPage = () => import('@/components/settings-page')
 const SettingsPage = lazy(() => loadSettingsPage().then((m) => ({ default: m.SettingsPage })))
 
 /** 设置页 chunk 到达前的占位：保留与设置页同构的顶栏和标题骨架，切换时页面不至于整块变白。 */
-function SettingsPageFallback({ onBack }: { onBack: () => void }) {
+function SettingsPageFallback({ onNavigate }: { onNavigate: (section: MainSection) => void }) {
   const { t } = useI18n()
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <AppHeader actions={<PreferencesMenu />} onNavigateHome={onBack} />
+      <AppHeader
+        actions={<AccountMenu />}
+        nav={<MainNav current="settings" onNavigate={onNavigate} />}
+        onNavigateHome={() => onNavigate('pool')}
+      />
       <main aria-busy="true" className="page-frame flex-1 py-5 sm:py-8">
-        {/* 与真设置页同构：面包屑也在骨架里占住位置，chunk 到达时标题不上下跳。 */}
-        <Breadcrumb
-          current={t('系统设置', 'System settings')}
-          parent={t('账号池', 'Account pool')}
-          onNavigateParent={onBack}
-        />
-        <div className="mt-5 max-w-2xl">
+        <div className="max-w-2xl">
           <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
             {t('系统设置', 'System settings')}
           </h1>
@@ -158,7 +162,6 @@ function App() {
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
   const [bansOpen, setBansOpen] = useState(false)
-  const [passwordOpen, setPasswordOpen] = useState(false)
   const [mainRoute, setMainRoute] = useState<MainPage | null>(readMainRoute)
   // 同设置页：从账号页点进来的，返回时消费 history；深链接直接打开的原地替换回账号页。
   const enteredMainFromAccounts = useRef(false)
@@ -169,7 +172,7 @@ function App() {
   const [page, setPage] = useState(1)
   // 只有从账号页主动进入设置时，关闭设置才应该消费这条 history 记录。
   // 直接打开 #/settings/* 的深链接则在原地替换回账号页，避免把用户带离当前站点。
-  const enteredSettingsFromAccounts = useRef(false)
+
   const [accountRoute, setAccountRoute] = useState<number | null>(readAccountRoute)
   // 同设置页：从账号列表点进详情才消费 history（返回＝后退），深链接直接打开的原地替换回列表。
   // 详情入口是 `<a href>`，由浏览器自己压栈，所以「是不是从列表进来的」在 hashchange 里判断。
@@ -256,8 +259,8 @@ function App() {
       setAccountRoute(nextAccount)
       const nextMain = readMainRoute()
       setMainRoute(nextMain)
-      if (!nextMain) enteredMainFromAccounts.current = false
-      if (!next) enteredSettingsFromAccounts.current = false
+      if (!nextMain && !next) enteredMainFromAccounts.current = false
+
       if (nextAccount == null) enteredAccountFromList.current = false
     }
     window.addEventListener('popstate', syncRoute)
@@ -268,32 +271,15 @@ function App() {
     }
   }, [])
 
+  // 设置页里切分区：同一页内的 Tab，不新增浏览器历史。
   const openSettings = (section: SettingsSection) => {
-    // 预取可能还没轮到（页面刚打开就点），这里再触发一次：import() 命中缓存则是空操作。
-    void loadSettingsPage()
-    const url = `#/settings/${section}`
-    if (settingsRoute) {
-      // Tab 切换属于同一设置页，不应为每次切换新增浏览器历史。
-      window.history.replaceState(null, '', url)
-    } else {
-      window.history.pushState(null, '', url)
-      enteredSettingsFromAccounts.current = true
-    }
+    window.history.replaceState(null, '', `#/settings/${section}`)
     setSettingsRoute(section)
-    window.scrollTo({ top: 0, behavior: 'instant' })
-  }
-  const closeSettings = () => {
-    setSettingsRoute(null)
-    if (enteredSettingsFromAccounts.current) {
-      enteredSettingsFromAccounts.current = false
-      window.history.back()
-    } else {
-      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
-    }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
   const closeMain = () => {
     setMainRoute(null)
+    setSettingsRoute(null)
     if (enteredMainFromAccounts.current) {
       enteredMainFromAccounts.current = false
       window.history.back()
@@ -302,20 +288,29 @@ function App() {
     }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
-  // 主导航：账号池、费用、用户管理三者平级。从账号池进去压一层历史（后退回账号池），
-  // 一级页面之间互切原地替换，不在历史里越积越深。
+  // 主导航：账号池、费用、用户管理、系统设置四者平级。从账号池进去压一层历史（后退回
+  // 账号池），一级页面之间互切原地替换，不在历史里越积越深。
   const navigateMain = (section: MainSection) => {
     if (section === 'pool') {
       closeMain()
       return
     }
-    if (mainRoute) {
-      window.history.replaceState(null, '', `#/${section}`)
+    const url = section === 'settings' ? `#/settings/${settingsRoute ?? 'access'}` : `#/${section}`
+    if (mainRoute || settingsRoute) {
+      window.history.replaceState(null, '', url)
     } else {
-      window.history.pushState(null, '', `#/${section}`)
+      window.history.pushState(null, '', url)
       enteredMainFromAccounts.current = true
     }
-    setMainRoute(section)
+    if (section === 'settings') {
+      // 预取可能还没轮到（页面刚打开就点），这里再触发一次：import() 命中缓存则是空操作。
+      void loadSettingsPage()
+      setMainRoute(null)
+      setSettingsRoute((current) => current ?? 'access')
+    } else {
+      setSettingsRoute(null)
+      setMainRoute(section)
+    }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
   const closeAccount = useCallback(() => {
@@ -447,11 +442,12 @@ function App() {
 
   if (!isBootstrapping && settingsRoute && isAdmin) {
     return (
-      <Suspense fallback={<SettingsPageFallback onBack={closeSettings} />}>
+      <Suspense fallback={<SettingsPageFallback onNavigate={navigateMain} />}>
         <SettingsPage
           section={settingsRoute}
           onSectionChange={openSettings}
-          onBack={closeSettings}
+          onNavigate={navigateMain}
+          onSignOut={signOut}
         />
       </Suspense>
     )
@@ -467,6 +463,12 @@ function App() {
         error={isBootstrapping ? null : credentialsError}
         onRetry={retry}
         onBack={closeAccount}
+        onNavigate={(section) => {
+          // 从详情页去别的一级页面压一层历史：在那边点「账号池」或浏览器后退，都回到这个号的详情。
+          setAccountRoute(null)
+          navigateMain(section)
+        }}
+        onSignOut={authState?.configured && session ? signOut : undefined}
       />
     )
   }
@@ -485,7 +487,7 @@ function App() {
               <Hint label={t('添加账号', 'Add account')}>
                 <Button
                   aria-label={t('添加账号', 'Add account')}
-                  className="max-sm:size-10 max-sm:px-0"
+                  className={HEADER_ACTION_CLASS}
                   disabled={isBootstrapping}
                   size="sm"
                   onClick={() => setAdding(true)}
@@ -500,7 +502,7 @@ function App() {
               <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
                 <Button
                   aria-label={t('请求查询', 'Request lookup')}
-                  className="max-sm:size-10 max-sm:px-0"
+                  className={HEADER_ACTION_CLASS}
                   disabled={isBootstrapping}
                   size="sm"
                   variant="outline"
@@ -511,26 +513,14 @@ function App() {
                 </Button>
               </Hint>
             )}
-            <PreferencesMenu
-              onSignOut={authState?.configured && session ? signOut : undefined}
-            >
+            {/* 系统设置已在主导航里；这里只留账号池自己的工具（封号记录看全池，只给管理员与访客）。 */}
+            <AccountMenu onSignOut={authState?.configured && session ? signOut : undefined}>
               {seesWholePool && (
                 <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
                   <ShieldAlertIcon />{t('封号记录', 'Ban events')}
                 </MenuItem>
               )}
-              {isAdmin && (
-                <MenuItem disabled={isBootstrapping} onClick={() => openSettings('access')}>
-                  <SettingsIcon />{t('系统设置', 'System settings')}
-                </MenuItem>
-              )}
-              {/* 管理员的密码在系统设置里改（那里还能清除）；访客的密码由管理员设。 */}
-              {!readOnly && !isAdmin && (
-                <MenuItem disabled={isBootstrapping} onClick={() => setPasswordOpen(true)}>
-                  <KeyRoundIcon />{t('修改密码', 'Change password')}
-                </MenuItem>
-              )}
-            </PreferencesMenu>
+            </AccountMenu>
           </>
         }
       />
@@ -540,7 +530,6 @@ function App() {
         <AddAccount open={adding} onOpenChange={setAdding} />
         <RequestLookupDialog open={lookupOpen} onOpenChange={setLookupOpen} />
         {seesWholePool && <BanEventsDialog open={bansOpen} onOpenChange={setBansOpen} />}
-        <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
 
         <CredentialWorkspace
           data={{

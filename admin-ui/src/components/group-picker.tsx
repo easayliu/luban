@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownIcon, ArrowUpIcon, FolderIcon, PlusIcon, XIcon } from 'lucide-react'
 import { setCredentialGroups, setCredentialsGroups, type Credential } from '@/api/credentials'
@@ -8,6 +8,7 @@ import { cn, extractError } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CheckboxGroup } from '@/components/ui/checkbox-group'
 import {
   Dialog,
   DialogClose,
@@ -18,6 +19,8 @@ import {
   DialogPopup,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import { toastManager } from '@/components/ui/toast'
 import { Hint } from '@/components/ui/tooltip'
 
@@ -46,36 +49,42 @@ export function GroupPicker({
   disabled?: boolean
 }) {
   const { t } = useI18n()
-  const toggle = (id: number, on: boolean) =>
-    onChange(on ? [...value, id] : value.filter((v) => v !== id))
+  // CheckboxGroup 的值是字符串，分组 id 在这里进出时转换；新勾的追加在末尾，与原先一致。
   return (
-    <div className="max-h-64 divide-y overflow-y-auto rounded-lg border">
-      {groups.map((g) => {
-        const checked = value.includes(g.id)
-        return (
-          <label
-            className={cn(
-              'flex cursor-pointer items-start gap-3 px-3 py-2.5 text-sm transition-colors hover:bg-accent/48',
-              disabled && 'pointer-events-none opacity-64',
-            )}
-            key={g.id}
-          >
-            <Checkbox
-              checked={checked}
-              className="mt-0.5"
-              disabled={disabled}
-              onCheckedChange={(next) => toggle(g.id, next === true)}
-            />
-            <span className="min-w-0 flex-1">
-              <span className="flex items-center gap-1.5 font-medium">
-                <span className="truncate">{g.name}</span>
-                {g.is_default && <Badge size="xs" variant="secondary">{t('默认', 'Default')}</Badge>}
-              </span>
-              {g.note && <span className="mt-0.5 block text-xs text-muted-foreground">{g.note}</span>}
+    <CheckboxGroup
+      className="max-h-64 items-stretch gap-0 divide-y overflow-y-auto rounded-lg border"
+      disabled={disabled}
+      value={value.map(String)}
+      onValueChange={(next) => onChange(next.map(Number))}
+    >
+      {groups.map((g) => (
+        <Label
+          className={cn(
+            'cursor-pointer items-start gap-3 px-3 py-2.5 font-normal transition-colors hover:bg-accent/48',
+            disabled && 'pointer-events-none opacity-64',
+          )}
+          key={g.id}
+        >
+          <Checkbox className="mt-0.5" value={String(g.id)} />
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-1.5 font-medium">
+              <span className="truncate">{g.name}</span>
+              {g.is_default && <Badge size="xs" variant="secondary">{t('默认', 'Default')}</Badge>}
             </span>
-          </label>
-        )
-      })}
+            {g.note && <span className="mt-0.5 block text-xs text-muted-foreground">{g.note}</span>}
+          </span>
+        </Label>
+      ))}
+    </CheckboxGroup>
+  )
+}
+
+/** 分组列表还没拉回来时的占位：几行灰条，高度与上面的复选列表相近，弹框不会跳。 */
+export function GroupPickerSkeleton({ rows = 3 }: { rows?: number }) {
+  const { t } = useI18n()
+  return (
+    <div aria-label={t('正在加载分组', 'Loading groups')} className="space-y-2" role="status">
+      {Array.from({ length: rows }, (_, i) => <Skeleton className="h-9 w-full rounded-lg" key={i} />)}
     </div>
   )
 }
@@ -88,10 +97,13 @@ export function OrderedGroupPicker({
   groups,
   value,
   onChange,
+  emptyHint,
 }: {
   groups: PoolGroup[]
   value: number[]
   onChange: (value: number[]) => void
+  /** 一个都没选时的占位提示；传 null 不显示（由外层给说明）。 */
+  emptyHint?: ReactNode
 }) {
   const { t } = useI18n()
   const byId = new Map(groups.map((g) => [g.id, g]))
@@ -106,9 +118,11 @@ export function OrderedGroupPicker({
   return (
     <div className="space-y-2">
       {value.length === 0 ? (
-        <p className="rounded-lg border border-dashed px-3 py-2.5 text-xs text-muted-foreground">
-          {t('未绑定分组：这把 Key 可用全部号。', 'No groups bound: this key can use every account.')}
-        </p>
+        emptyHint === null ? null : (
+          <p className="rounded-lg border border-dashed px-3 py-2.5 text-xs text-muted-foreground">
+            {emptyHint ?? t('还没有选择分组。', 'No group selected yet.')}
+          </p>
+        )
       ) : (
         <ol className="divide-y rounded-lg border">
           {value.map((id, index) => (
@@ -227,7 +241,7 @@ export function SetGroupsDialog({
         </DialogHeader>
         <DialogPanel>
           {isPending || !groups ? (
-            <p className="text-sm text-muted-foreground">{t('正在加载分组', 'Loading groups')}</p>
+            <GroupPickerSkeleton />
           ) : (
             <GroupPicker groups={groups} value={value} onChange={setValue} />
           )}

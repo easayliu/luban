@@ -14,7 +14,7 @@ import {
   type Credential, type ModelsResp, type ProbeQuota, type ProbeResult,
 } from '@/api/credentials'
 import {
-  cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime, localizeBackendMessage,
+  cn, displayCredentialLabel, extractError, formatClockTime, formatFullTime, formatMs, localizeBackendMessage,
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
@@ -1487,11 +1487,6 @@ interface ProbeRequest {
   session: number
 }
 
-/** 耗时展示：1 秒以内用毫秒，超过用秒（保留一位小数）。 */
-function formatLatency(ms: number): string {
-  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
-}
-
 /**
  * 连通性测试弹窗：用**这一个**账号向上游发一条最小请求，测它能不能用某个模型。
  *
@@ -1716,7 +1711,7 @@ function ProbeEntryRow({ entry }: { entry: ProbeEntry }) {
           <Badge variant={result.ok ? 'success' : 'error'} size="sm">
             {result.status > 0 ? `HTTP ${result.status}` : t('未送达上游', 'Not sent upstream')}
           </Badge>
-          <span className="font-normal text-muted-foreground">{formatLatency(result.latency_ms)}</span>
+          <span className="font-normal text-muted-foreground">{formatMs(result.latency_ms)}</span>
           {result.model && result.model !== model && (
             <Hint label={t(`上游实际使用的模型：${result.model}`, `Model actually used upstream: ${result.model}`)}>
               <span className="min-w-0 font-normal text-muted-foreground [overflow-wrap:anywhere]">

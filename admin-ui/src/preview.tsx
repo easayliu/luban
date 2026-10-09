@@ -736,7 +736,8 @@ function PreviewSettingsRoute({ initialSection }: { initialSection: SettingsSect
     <SettingsPage
       section={section}
       onSectionChange={changeSection}
-      onBack={() => navigatePreview()}
+      onNavigate={() => navigatePreview()}
+      onSignOut={() => {}}
     />
   )
 }

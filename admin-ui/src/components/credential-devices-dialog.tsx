@@ -2,7 +2,6 @@ import { useEffect, useState, type MouseEvent } from 'react'
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import {
   ChevronDownIcon,
-  CopyIcon,
   MessagesSquareIcon,
   PencilIcon,
   RefreshCwIcon,
@@ -28,7 +27,6 @@ import { useI18n, type Language } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
 import {
   cn,
-  copyText,
   displayCredentialLabel,
   extractError,
   formatDuration,
@@ -37,6 +35,7 @@ import {
   parseSessionKey,
   relativeTime,
 } from '@/lib/utils'
+import { CopyButton } from '@/components/copy-button'
 import { ClampedDescription } from '@/components/settings-group'
 import { deviceUsageMeta, METER_FILL, type CredentialActions } from '@/components/credential-shared'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
@@ -602,31 +601,12 @@ export function DeviceList({
                   {device.simulated && (
                     <Badge variant="secondary" size="sm">{t('模拟', 'Simulated')}</Badge>
                   )}
-                  <Tooltip>
-                    <TooltipTrigger
-                      className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                      aria-label={t(
-                        `复制设备 ID ${device.device_id}`,
-                        `Copy device ID ${device.device_id}`,
-                      )}
-                      onClick={async () => {
-                        const copied = await copyText(device.device_id)
-                        toastManager.add(copied
-                          ? {
-                              title: t('已复制设备 ID', 'Device ID copied'),
-                              type: 'success',
-                            }
-                          : {
-                              title: t('复制失败', 'Copy failed'),
-                              description: device.device_id,
-                              type: 'error',
-                            })
-                      }}
-                    >
-                      <CopyIcon />
-                    </TooltipTrigger>
-                    <TooltipPopup>{t('复制设备 ID', 'Copy device ID')}</TooltipPopup>
-                  </Tooltip>
+                  <CopyButton
+                    text={device.device_id}
+                    label={t('复制设备 ID', 'Copy device ID')}
+                    copiedLabel={t('已复制设备 ID', 'Device ID copied')}
+                    className="shrink-0"
+                  />
                   {/* 模拟伪设备没有绑定行可删，故不给解绑按钮——点了也只会是一次空操作。 */}
                   {!device.simulated && !readOnly && (
                     <Button
@@ -756,28 +736,33 @@ function SessionDetails({
           </div>
         ))}
       </dl>
-      <div className="space-y-1 border-t pt-2">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-muted-foreground">{t('历史事件', 'History')}</span>
-          {!passthrough && (
-            <Button size="xs" variant="ghost" onClick={() => setShowSlot((v) => !v)} aria-expanded={showSlot}>
-              {showSlot ? t('收起槽位历史', 'Hide slot history') : t(`槽位 #${session.slot} 历史`, `Slot #${session.slot} history`)}
-            </Button>
-          )}
-        </div>
-        <EventList query={events} language={language} />
-      </div>
-      {showSlot && !passthrough && (
+      {/* 槽位历史的开关在「历史事件」那一行，面板在它下面，Collapsible 的根节点把两块都包住。 */}
+      <Collapsible open={showSlot && !passthrough} onOpenChange={setShowSlot} className="space-y-2">
         <div className="space-y-1 border-t pt-2">
-          <span className="text-muted-foreground">
-            {t(
-              `槽位 #${session.slot}（上游会话 ID ${session.session_id.slice(0, 8)}）先后被哪些会话使用`,
-              `Sessions that used slot #${session.slot} (upstream session ID ${session.session_id.slice(0, 8)})`,
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-muted-foreground">{t('历史事件', 'History')}</span>
+            {!passthrough && (
+              <CollapsibleTrigger render={<Button size="xs" variant="ghost" />}>
+                {showSlot ? t('收起槽位历史', 'Hide slot history') : t(`槽位 #${session.slot} 历史`, `Slot #${session.slot} history`)}
+              </CollapsibleTrigger>
             )}
-          </span>
-          <EventList query={slotEvents} language={language} showKey />
+          </div>
+          <EventList query={events} language={language} />
         </div>
-      )}
+        {!passthrough && (
+          <CollapsiblePanel>
+            <div className="space-y-1 border-t pt-2">
+              <span className="text-muted-foreground">
+                {t(
+                  `槽位 #${session.slot}（上游会话 ID ${session.session_id.slice(0, 8)}）先后被哪些会话使用`,
+                  `Sessions that used slot #${session.slot} (upstream session ID ${session.session_id.slice(0, 8)})`,
+                )}
+              </span>
+              <EventList query={slotEvents} language={language} showKey />
+            </div>
+          </CollapsiblePanel>
+        )}
+      </Collapsible>
     </div>
   )
 }
@@ -1305,21 +1290,12 @@ export function SessionList({
                       {derived ? t('按前缀', 'By prefix') : t('自带 ID', 'Client ID')}
                     </Badge>
                     {session.session_id && (
-                    <Tooltip>
-                      <TooltipTrigger
-                        className={cn(buttonVariants({ size: 'icon-xs', variant: 'ghost' }), 'shrink-0')}
-                        aria-label={t(`复制会话 ID ${session.session_id}`, `Copy session ID ${session.session_id}`)}
-                        onClick={async () => {
-                          const copied = await copyText(session.session_id)
-                          toastManager.add(copied
-                            ? { title: t('已复制会话 ID', 'Session ID copied'), type: 'success' }
-                            : { title: t('复制失败', 'Copy failed'), description: session.session_id, type: 'error' })
-                        }}
-                      >
-                        <CopyIcon />
-                      </TooltipTrigger>
-                      <TooltipPopup>{t('复制会话 ID', 'Copy session ID')}</TooltipPopup>
-                    </Tooltip>
+                      <CopyButton
+                        text={session.session_id}
+                        label={t('复制会话 ID', 'Copy session ID')}
+                        copiedLabel={t('已复制会话 ID', 'Session ID copied')}
+                        className="shrink-0"
+                      />
                     )}
                     <Tooltip>
                       <TooltipTrigger

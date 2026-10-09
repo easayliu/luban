@@ -557,8 +557,42 @@ export function formatPercent(rate: number | null): string {
   return `${rounded}%`
 }
 
+/**
+ * 毫秒 → `842ms` / `4.0s`；`null` 给 `—`。首字时延、上游耗时等毫秒量全站共用这一种写法，
+ * 别处不再各写一份（曾有 `842 ms` 带空格的变体）。
+ */
+export function formatMs(ms: number | null): string {
+  if (ms == null) return '—'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(1)}s`
+}
+
+/** 吞吐 → `42 tok/s`；没有可算的请求时 `—`。 */
+export function formatTokensPerSec(tps: number | null | undefined): string {
+  if (tps == null) return '—'
+  return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`
+}
+
 /** 趋势图的分桶粒度。 */
 export type CacheGranularity = 'hour' | 'day'
+
+/**
+ * 趋势图一格的时间标签：`when` 给悬浮读数与表格（逐小时带日期，`3/14 09:00`），
+ * `axis` 给横轴刻度（逐小时只留钟点，省地方）。按浏览器本地时区。
+ */
+export function slotLabel(ts: number, granularity: CacheGranularity): { when: string; axis: string } {
+  const d = new Date(ts * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  const day = `${d.getMonth() + 1}/${d.getDate()}`
+  return granularity === 'hour'
+    ? { when: `${day} ${p(d.getHours())}:00`, axis: `${p(d.getHours())}:00` }
+    : { when: day, axis: day }
+}
+
+/** 横轴每隔几格标一个刻度：不论 7 格还是 24 格，都只标七个上下，标签不至于挤成一团。 */
+export function tickStep(slots: number): number {
+  return Math.max(1, Math.ceil(slots / 7))
+}
 
 /** 趋势图里的一格。`hasTraffic` 为 false 时这一格没有请求，命中率**不存在**（不是 0）。 */
 export interface CacheSlot {

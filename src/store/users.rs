@@ -710,6 +710,12 @@ impl CredentialStore {
         Ok(())
     }
 
+    /// 上次空闲页清理没清完就再清一次（见 `secret::scrub_if_pending`），挂在后台每小时的任务上。
+    pub fn retry_pending_scrub(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        scrub_if_pending(&conn)
+    }
+
     /// 清掉过期会话，挂在后台定时任务上。
     pub fn prune_sessions(&self) -> Result<usize> {
         let conn = self.conn.lock();

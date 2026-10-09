@@ -860,3 +860,21 @@ async fn api_key_groups_route_to_their_accounts() {
     assert_ne!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(mock.seen().len(), 1, "分组里没有号，不该再打上游");
 }
+
+/// 唯一一把接入 Key 删掉之后，不带 Key、带旧 Key 都被拒（不退回「没配 Key 就放行」）。
+#[tokio::test]
+async fn deleting_the_last_key_does_not_open_the_proxy() {
+    let mock = MockUpstream::start(vec![]).await;
+    let (store, state, _) = setup(1, &mock.base);
+    let id = store.create_api_key("k", "old-key", &[]).unwrap().unwrap();
+    store.delete_api_key(id).unwrap();
+    for key in [None, Some("old-key")] {
+        let mut req = cc_request(serde_json::json!({}));
+        if let Some(k) = key {
+            req.0.insert("x-api-key", HeaderValue::from_static(k));
+        }
+        let (status, _, _) = send(&state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert!(mock.seen().is_empty());
+}

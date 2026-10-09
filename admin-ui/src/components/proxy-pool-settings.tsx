@@ -38,12 +38,14 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Field, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
+import { Toggle } from '@/components/ui/toggle'
 import { Hint } from '@/components/ui/tooltip'
 import { SettingsGroup } from '@/components/settings-group'
+import { ErrorState, LoadingState } from '@/components/state-placeholders'
 import { ProxyAccountsDialog } from '@/components/proxy-accounts-dialog'
 import { locationLabel, ProxyBatchImportDialog, runConcurrently } from '@/components/proxy-batch-import-dialog'
 
@@ -162,35 +164,17 @@ export function ProxyPoolSettingsContent() {
   }
 
   if (proxiesQuery.isPending) {
-    return (
-      <div
-        className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground"
-        role="status"
-      >
-        <Spinner className="size-4" />
-        {t('正在加载', 'Loading')}
-      </div>
-    )
+    return <LoadingState label={t('正在加载代理池', 'Loading the proxy pool')} />
   }
 
   if (proxiesQuery.isError) {
     return (
-      <div
-        className="flex min-h-40 flex-col items-center justify-center gap-3 text-center"
-        role="alert"
-      >
-        <p className="text-sm font-medium">
-          {t('无法读取代理池', 'Unable to load the proxy pool')}
-        </p>
-        <Button
-          size="sm"
-          variant="outline"
-          loading={proxiesQuery.isFetching}
-          onClick={() => proxiesQuery.refetch()}
-        >
-          {t('重试', 'Retry')}
-        </Button>
-      </div>
+      <ErrorState
+        error={proxiesQuery.error}
+        title={t('无法读取代理池', 'Unable to load the proxy pool')}
+        onRetry={() => proxiesQuery.refetch()}
+        retrying={proxiesQuery.isFetching}
+      />
     )
   }
 
@@ -224,24 +208,22 @@ export function ProxyPoolSettingsContent() {
             if (trimmedAddUrl && !create.isPending) create.mutate()
           }}
         >
-          <div className="min-w-0 flex-1 space-y-1 max-sm:basis-full">
-            <label className="text-xs font-medium" htmlFor="proxy-pool-add-label">
+          <Field className="min-w-0 flex-1 items-stretch gap-1 max-sm:basis-full">
+            <FieldLabel className="text-xs">
               {t('名称', 'Name')}
-            </label>
+            </FieldLabel>
             <Input
-              id="proxy-pool-add-label"
               value={addLabel}
               onChange={(event) => setAddLabel(event.target.value)}
               placeholder={t('留空则自动命名', 'Auto-named if empty')}
               size="sm"
             />
-          </div>
-          <div className="min-w-0 flex-[2] space-y-1">
-            <label className="text-xs font-medium" htmlFor="proxy-pool-add-url">
+          </Field>
+          <Field className="min-w-0 flex-[2] items-stretch gap-1">
+            <FieldLabel className="text-xs">
               {t('代理地址', 'Proxy URL')}
-            </label>
+            </FieldLabel>
             <Input
-              id="proxy-pool-add-url"
               value={addUrl}
               onChange={(event) => setAddUrl(event.target.value)}
               placeholder="socks5://127.0.0.1:1080"
@@ -249,7 +231,7 @@ export function ProxyPoolSettingsContent() {
               autoComplete="off"
               size="sm"
             />
-          </div>
+          </Field>
           <Button
             type="button"
             size="sm"
@@ -313,15 +295,15 @@ export function ProxyPoolSettingsContent() {
               {t(`${failedProxies.length} 条测试失败`, `${failedProxies.length} failed`)}
             </p>
             <div className="flex flex-wrap items-center gap-2">
-              <Button
+              <Toggle
                 size="sm"
-                variant={filtering ? 'secondary' : 'ghost'}
-                aria-pressed={filtering}
-                onClick={() => setOnlyFailed((v) => !v)}
+                variant="outline"
+                pressed={filtering}
+                onPressedChange={setOnlyFailed}
               >
                 <FilterIcon />
                 {filtering ? t('显示全部', 'Show all') : t('仅显示失败项', 'Only failed')}
-              </Button>
+              </Toggle>
               <Button
                 size="sm"
                 variant="outline"
@@ -479,31 +461,29 @@ function ProxyRow({
   if (editing) {
     return (
       <li className="flex flex-wrap items-end gap-2 px-4 py-4 sm:px-5">
-        <div className="min-w-0 flex-1 space-y-1 max-sm:basis-full">
-          <label className="text-xs font-medium" htmlFor={`proxy-edit-label-${proxy.id}`}>
+        <Field className="min-w-0 flex-1 items-stretch gap-1 max-sm:basis-full">
+          <FieldLabel className="text-xs">
             {t('名称', 'Name')}
-          </label>
+          </FieldLabel>
           <Input
-            id={`proxy-edit-label-${proxy.id}`}
             value={label}
             onChange={(event) => setLabel(event.target.value)}
             size="sm"
             autoFocus
           />
-        </div>
-        <div className="min-w-0 flex-[2] space-y-1">
-          <label className="text-xs font-medium" htmlFor={`proxy-edit-url-${proxy.id}`}>
+        </Field>
+        <Field className="min-w-0 flex-[2] items-stretch gap-1">
+          <FieldLabel className="text-xs">
             {t('代理地址', 'Proxy URL')}
-          </label>
+          </FieldLabel>
           <Input
-            id={`proxy-edit-url-${proxy.id}`}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             spellCheck={false}
             autoComplete="off"
             size="sm"
           />
-        </div>
+        </Field>
         <Button
           size="icon-sm"
           variant="outline"

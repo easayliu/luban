@@ -4,7 +4,7 @@ import { SearchIcon } from 'lucide-react'
 import { listUsage, type UsageLog } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
 import {
-  cn, displayCredentialLabel, extractError, formatFullTime, formatUsd, parseSessionKey, sideClassLabel,
+  cn, displayCredentialLabel, extractError, formatFullTime, formatMs, formatUsd, parseSessionKey, sideClassLabel,
 } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -16,6 +16,7 @@ import {
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
+import { Group } from '@/components/ui/group'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { Hint } from '@/components/ui/tooltip'
@@ -130,22 +131,22 @@ export function RequestLookupDialog({
               <FieldLabel htmlFor="request-lookup-id">
                 {t('请求 ID 或会话 ID', 'Request ID or session ID')}
               </FieldLabel>
-              <div className="flex gap-2">
+              <Group className="w-full">
                 <Input
                   id="request-lookup-id"
                   autoFocus
                   autoComplete="off"
                   spellCheck={false}
-                  className="font-mono"
+                  className="flex-1 font-mono"
                   placeholder="req_Q3k9ZpL2mNv7Xb1c"
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                 />
-                <Button type="submit" disabled={!draft.trim() || query.isFetching}>
-                  {query.isFetching ? <Spinner /> : <SearchIcon />}
+                <Button type="submit" disabled={!draft.trim()} loading={query.isFetching}>
+                  <SearchIcon />
                   {t('查询', 'Search')}
                 </Button>
-              </div>
+              </Group>
               <FieldDescription>
                 {looksLikeUuid(draft.trim())
                   ? t(
@@ -206,7 +207,6 @@ function sessionTitle(log: UsageLog): string | undefined {
 function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
   const { t, language } = useI18n()
   const num = (v: number | null) => (v == null ? '—' : v.toLocaleString(locale))
-  const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
   const deviceShort = log.device_id
     ? log.device_id.startsWith('sim:') ? `sim:${log.device_id.slice(4, 12)}` : log.device_id.slice(0, 8)
     : '—'
@@ -232,7 +232,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         <Fact label={t('模型', 'Model')}><Hint label={log.model}><span>{log.model ?? '—'}</span></Hint></Fact>
         <Fact label={t('输入 / 输出', 'In / out')}>{num(log.input_tokens)} / {num(log.output_tokens)}</Fact>
         <Fact label={t('缓存写 / 读', 'Cache w/r')}>{num(log.cache_creation_tokens)} / {num(log.cache_read_tokens)}</Fact>
-        <Fact label={t('首字 / 总耗时', 'TTFT / total')}>{ms(log.ttft_ms)} / {ms(log.total_ms)}</Fact>
+        <Fact label={t('首字 / 总耗时', 'TTFT / total')}>{formatMs(log.ttft_ms)} / {formatMs(log.total_ms)}</Fact>
         <Fact label={t('花费', 'Cost')}>
           <span className={cn(log.cost_usd == null && 'text-muted-foreground')}>
             {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}

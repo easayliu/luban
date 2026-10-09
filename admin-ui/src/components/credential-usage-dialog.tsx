@@ -13,6 +13,7 @@ import {
   parseSessionKey,
   sideClassLabel,
 } from '@/lib/utils'
+import { PaginationBar } from '@/components/pagination-bar'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { RequestIdChip, statusVariant } from '@/components/usage-shared'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -36,20 +37,6 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
-import {
-  Pagination,
-  PaginationContent,
-  PaginationItem,
-  PaginationNext,
-  PaginationPrevious,
-} from '@/components/ui/pagination'
-import {
-  Select,
-  SelectItem,
-  SelectPopup,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { Hint } from '@/components/ui/tooltip'
@@ -96,7 +83,7 @@ export function CredentialUsageDialog({
   const qc = useQueryClient()
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const titleRef = useRef<HTMLHeadingElement>(null)
-  const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
+  const [pageSize, setPageSize] = useState<(typeof PAGE_SIZES)[number]>(PAGE_SIZES[0])
   const [page, setPage] = useState(0)
   /**
    * 本轮翻页的锚点（首次响应给出，之后每页原样带回）。
@@ -136,8 +123,6 @@ export function CredentialUsageDialog({
   // 页码越界（改了每页条数、或刷新后记录变少）时退回最后一页，而不是显示一页空白。
   const currentPage = Math.min(page, totalPages - 1)
   if (currentPage !== page) setPage(currentPage)
-  const firstIndex = currentPage * pageSize + 1
-  const lastIndex = currentPage * pageSize + rows.length
   const retentionNoteId = `credential-usage-retention-${cred.id}`
 
   /** 重新取一轮：丢掉锚点回到第一页，于是能看到刚发生的请求。 */
@@ -271,77 +256,23 @@ export function CredentialUsageDialog({
                 />
               )}
 
-              <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3 border-t pt-3 text-xs">
-                <p className="min-w-0 text-muted-foreground tabular-nums">
-                  <span className="max-sm:hidden">
-                    {t(
-                      `第 ${firstIndex}–${lastIndex} 条，共 ${total.toLocaleString(locale)} 条`,
-                      `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
-                    )}
-                  </span>
-                  <span className="sm:hidden">{`${firstIndex}–${lastIndex} / ${total.toLocaleString(locale)}`}</span>
-                </p>
-                {/* 窄屏也排成一行：计数缩成「1–10 / 29」、翻页只写「1 / 3」、藏掉「每页」二字，
-                  三栏放得下，不再把翻页挤到第二行。 */}
-                <div className="col-start-3 row-start-1 flex items-center gap-2 justify-self-end">
-                  <span className="whitespace-nowrap text-muted-foreground max-sm:hidden">{t('每页', 'Per page')}</span>
-                  <Select
-                    items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
-                    value={pageSize}
-                    onValueChange={(value) => {
-                      if (value == null) return
-                      // 每页条数一变，原来的页码就没有意义了，回到第一页。
-                      setPageSize(Number(value))
-                      setPage(0)
-                    }}
-                  >
-                    <SelectTrigger size="sm" className="w-auto min-w-16 sm:min-w-20" aria-label={t('每页条数', 'Rows per page')}>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectPopup>
-                      {PAGE_SIZES.map((size) => (
-                        <SelectItem key={size} value={size}>{size}</SelectItem>
-                      ))}
-                    </SelectPopup>
-                  </Select>
-                </div>
-
-              {totalPages > 1 && (
-                <Pagination className="col-start-2 row-start-1 justify-center">
-                  <PaginationContent>
-                    <PaginationItem>
-                      <PaginationPrevious
-                        render={<Button variant="ghost" disabled={usage.isFetching || currentPage === 0} />}
-                        aria-disabled={usage.isFetching || currentPage === 0}
-                        onClick={() => {
-                          setPage((current) => Math.max(0, current - 1))
-                        }}
-                      />
-                    </PaginationItem>
-                    <PaginationItem>
-                      <span className="whitespace-nowrap px-2 text-foreground text-xs tabular-nums" aria-live="polite">
-                        <span className="max-sm:hidden">
-                          {t(
-                            `第 ${currentPage + 1} / ${totalPages} 页`,
-                            `Page ${currentPage + 1} of ${totalPages}`,
-                          )}
-                        </span>
-                        <span className="sm:hidden">{`${currentPage + 1} / ${totalPages}`}</span>
-                      </span>
-                    </PaginationItem>
-                    <PaginationItem>
-                      <PaginationNext
-                        render={<Button variant="ghost" disabled={usage.isFetching || currentPage >= totalPages - 1} />}
-                        aria-disabled={usage.isFetching || currentPage >= totalPages - 1}
-                        onClick={() => {
-                          setPage((current) => Math.min(totalPages - 1, current + 1))
-                        }}
-                      />
-                    </PaginationItem>
-                  </PaginationContent>
-                </Pagination>
-              )}
-              </div>
+              <PaginationBar
+                className="border-t pt-3"
+                total={total}
+                page={currentPage + 1}
+                pageCount={totalPages}
+                pageSize={pageSize}
+                pageSizes={PAGE_SIZES}
+                pageRowCount={rows.length}
+                pageSizeLabel={t('每页条数', 'Rows per page')}
+                disabled={usage.isFetching}
+                onPageChange={(next) => setPage(next - 1)}
+                onPageSizeChange={(size) => {
+                  // 每页条数一变，原来的页码就没有意义了，回到第一页。
+                  setPageSize(size)
+                  setPage(0)
+                }}
+              />
             </>
           )}
         </DialogPanel>

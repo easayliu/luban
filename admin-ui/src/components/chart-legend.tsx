@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { InfoIcon } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
-import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Popover, PopoverPopup, PopoverTrigger } from '@/components/ui/popover'
 
 export type ChartLegendItem = {
   /** 色块的 className，必须与图里那一段的填充完全一致（如 `bg-chart-1/40`）。 */
@@ -22,7 +22,8 @@ export type ChartLegendItem = {
  * 文字一律用文本色，颜色只由旁边那枚色块承担——浅色系列当文字是读不清的。
  *
  * `hint` 是可选的诊断性说明（「写入多命中少说明什么」这类），挂在末尾一枚 info 上：
- * 它对会看的人有用、对其他人是噪声，适合收进悬浮层而不是平铺在图下。
+ * 它对会看的人有用、对其他人是噪声，适合收进悬浮层而不是平铺在图下。用 Popover 而不是
+ * Tooltip：看到 ⓘ 的人习惯去点，Tooltip 点了反而收起；Popover 点击与悬停都能打开。
  */
 export function ChartLegend({
   items,
@@ -52,18 +53,18 @@ export function ChartLegend({
       ))}
       {hint && (
         <li className="flex items-center">
-          <Tooltip>
-            <TooltipTrigger
+          <Popover>
+            <PopoverTrigger
               aria-label={t('图表说明', 'About this chart')}
               className="rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
-              render={<button type="button" />}
+              openOnHover
             >
               <InfoIcon className="size-3.5" />
-            </TooltipTrigger>
-            <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+            </PopoverTrigger>
+            <PopoverPopup className="max-w-72 text-left leading-5" side="top" tooltipStyle>
               {hint}
-            </TooltipPopup>
-          </Tooltip>
+            </PopoverPopup>
+          </Popover>
         </li>
       )}
     </ul>

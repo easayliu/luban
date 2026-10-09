@@ -3,7 +3,17 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { BarChart3Icon, TableIcon, TimerIcon } from 'lucide-react'
 import { getTtftSeries } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
-import { bucketTtftSeries, cn, extractError, type CacheGranularity, type TtftSlot } from '@/lib/utils'
+import {
+  bucketTtftSeries,
+  cn,
+  extractError,
+  formatMs,
+  formatTokensPerSec,
+  slotLabel,
+  tickStep,
+  type CacheGranularity,
+  type TtftSlot,
+} from '@/lib/utils'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
@@ -20,6 +30,9 @@ import { Spinner } from '@/components/ui/spinner'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Hint } from '@/components/ui/tooltip'
 import { ChartLegend } from '@/components/chart-legend'
+import { ChartReadout } from '@/components/chart-readout'
+import { ChartTable } from '@/components/chart-table'
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { UsageBreakdown } from '@/components/usage-breakdown'
 import type { TtftSeriesPoint } from '@/api/metrics'
 
@@ -88,18 +101,8 @@ export function useTtftSeries(range: TtftRangeKey, enabled = true) {
   }
 }
 
-/** 毫秒 → `842ms` / `4.0s`。 */
-export function formatMs(ms: number | null): string {
-  if (ms == null) return '—'
-  if (ms < 1000) return `${ms}ms`
-  return `${(ms / 1000).toFixed(1)}s`
-}
-
-/** 吞吐 → `42 tok/s`；没有可算的请求时 `—`。 */
-export function formatTokensPerSec(tps: number | null | undefined): string {
-  if (tps == null) return '—'
-  return `${tps >= 100 ? Math.round(tps) : tps.toFixed(1)} tok/s`
-}
+// 两个格式化函数已挪到 lib/utils；这里转出一份，从本文件引入它们的旧调用点不必跟着改。
+export { formatMs, formatTokensPerSec }
 
 function slotReadout(
   slot: TtftSlot,
@@ -107,11 +110,7 @@ function slotReadout(
   t: (zh: string, en: string) => string,
   locale: string,
 ): { when: string; axis: string; value: string; detail: string } {
-  const d = new Date(slot.ts * 1000)
-  const p = (n: number) => String(n).padStart(2, '0')
-  const day = `${d.getMonth() + 1}/${d.getDate()}`
-  const when = granularity === 'hour' ? `${day} ${p(d.getHours())}:00` : day
-  const axis = granularity === 'hour' ? `${p(d.getHours())}:00` : day
+  const { when, axis } = slotLabel(slot.ts, granularity)
   if (!slot.hasTraffic) {
     return { when, axis, value: '—', detail: t('该时段没有请求', 'No requests in this period') }
   }
@@ -124,10 +123,6 @@ function slotReadout(
       `p95 ${formatMs(slot.p95Ms)} · avg ${formatMs(slot.avgMs)} · ${slot.count.toLocaleString(locale)} requests · ${formatTokensPerSec(slot.tokensPerSec)}`,
     ),
   }
-}
-
-function tickStep(slots: number): number {
-  return Math.max(1, Math.ceil(slots / 7))
 }
 
 function TtftColumns({
@@ -221,35 +216,15 @@ function TtftColumns({
               })}
             </div>
 
-            {active != null && (() => {
-              const pos = (active + 0.5) / slots.length
-              const anchor = pos < 0.2 ? 'start' : pos > 0.8 ? 'end' : 'center'
-              return (
-                <div
-                  role="status"
-                  aria-live="off"
-                  className={cn(
-                    'pointer-events-none absolute top-1 z-10 rounded-lg border bg-popover px-2 py-1',
-                    'text-2xs leading-4 text-popover-foreground shadow-md',
-                    'w-max max-w-[min(16rem,100%)]',
-                    anchor === 'center' && '-translate-x-1/2',
-                  )}
-                  style={
-                    anchor === 'start'
-                      ? { left: 0 }
-                      : anchor === 'end'
-                        ? { right: 0 }
-                        : { left: `${pos * 100}%` }
-                  }
-                >
-                  <p className="flex items-baseline gap-1.5 tabular-nums">
-                    <span className="font-semibold">{readouts[active].value}</span>
-                    <span className="text-muted-foreground">{readouts[active].when}</span>
-                  </p>
-                  <p className="text-muted-foreground tabular-nums">{readouts[active].detail}</p>
-                </div>
-              )
-            })()}
+            {active != null && (
+              <ChartReadout
+                index={active}
+                count={slots.length}
+                value={readouts[active].value}
+                when={readouts[active].when}
+                detail={readouts[active].detail}
+              />
+            )}
           </div>
 
           <div className="relative mt-1.5 h-4" aria-hidden>
@@ -282,39 +257,33 @@ function TtftTable({
   const rows = slots.filter((s) => s.hasTraffic)
 
   return (
-    <div className="max-h-64 overflow-auto rounded-xl border">
-      <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-surface-subtle">
-          <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-            <th scope="col" className="text-start">
-              {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}
-            </th>
-            <th scope="col" className="text-end">p50</th>
-            <th scope="col" className="text-end">p95</th>
-            <th scope="col" className="text-end">{t('平均', 'Avg')}</th>
-            <th scope="col" className="text-end">{t('请求数', 'Requests')}</th>
-            <th scope="col" className="text-end">{t('吞吐', 'Throughput')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((slot) => {
-            const r = slotReadout(slot, granularity, t, locale)
-            return (
-              <tr key={slot.ts} className="[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0">
-                <td className="whitespace-nowrap tabular-nums">{r.when}</td>
-                <td className="whitespace-nowrap text-end font-medium tabular-nums">{formatMs(slot.p50Ms)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">{formatMs(slot.p95Ms)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums text-muted-foreground">{formatMs(slot.avgMs)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">
-                  {slot.count.toLocaleString(locale)}
-                </td>
-                <td className="whitespace-nowrap text-end tabular-nums">{formatTokensPerSec(slot.tokensPerSec)}</td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </div>
+    <ChartTable caption={t('首字时延按时段明细', 'TTFT by period')}>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</TableHead>
+          <TableHead className="text-end">p50</TableHead>
+          <TableHead className="text-end">p95</TableHead>
+          <TableHead className="text-end">{t('平均', 'Avg')}</TableHead>
+          <TableHead className="text-end">{t('请求数', 'Requests')}</TableHead>
+          <TableHead className="text-end">{t('吞吐', 'Throughput')}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((slot) => {
+          const r = slotReadout(slot, granularity, t, locale)
+          return (
+            <TableRow key={slot.ts}>
+              <TableCell>{r.when}</TableCell>
+              <TableCell className="text-end font-medium">{formatMs(slot.p50Ms)}</TableCell>
+              <TableCell className="text-end">{formatMs(slot.p95Ms)}</TableCell>
+              <TableCell className="text-end text-muted-foreground">{formatMs(slot.avgMs)}</TableCell>
+              <TableCell className="text-end">{slot.count.toLocaleString(locale)}</TableCell>
+              <TableCell className="text-end">{formatTokensPerSec(slot.tokensPerSec)}</TableCell>
+            </TableRow>
+          )
+        })}
+      </TableBody>
+    </ChartTable>
   )
 }
 

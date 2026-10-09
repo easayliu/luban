@@ -1,19 +1,26 @@
 import { useState, type ReactNode } from 'react'
 import {
-  ChevronRightIcon,
   EllipsisVerticalIcon,
-  LanguagesIcon,
+  KeyRoundIcon,
   LayersIcon,
   ReceiptIcon,
+  SettingsIcon,
   LogOutIcon,
-  MonitorIcon,
-  MoonIcon,
-  SunIcon,
   UsersIcon,
 } from 'lucide-react'
 import { LogoMark } from '@/components/logo-mark'
+import { LanguageMenuItem } from '@/components/language-switcher'
+import { ThemeMenuItem } from '@/components/theme-switcher'
 import { Badge } from '@/components/ui/badge'
-import { buttonVariants } from '@/components/ui/button'
+import {
+  Breadcrumb as BreadcrumbRoot,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from '@/components/ui/breadcrumb'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import {
   Menu,
@@ -23,9 +30,14 @@ import {
   MenuTrigger,
 } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
-import { useCanManageUsers, useMe, useReadOnly } from '@/lib/role'
-import { cn } from '@/lib/utils'
-import { readThemeMode, writeThemeMode, THEME_MODES, type ThemeMode } from '@/lib/theme'
+import { useCanManageUsers, useIsAdmin, useMe, useReadOnly } from '@/lib/role'
+import { ChangePasswordDialog } from '@/components/change-password-dialog'
+
+/**
+ * 顶栏动作按钮的窄屏形态：手机上只留图标，撑成 40px 见方的点按目标；文字由按钮里的
+ * `max-sm:sr-only` 留给读屏。各页顶栏的主动作和「更多操作」都用这一份，别再各抄一遍。
+ */
+export const HEADER_ACTION_CLASS = 'max-sm:size-10 max-sm:px-0'
 
 /**
  * 全站顶栏：左边品牌、右边动作，两个页面共用同一个壳。
@@ -61,7 +73,8 @@ export function AppHeader({
   const brand = (
     <>
       <span className="brand-mark flex size-8 shrink-0 items-center justify-center rounded-lg text-white">
-        <LogoMark className="size-[1.125rem]" />
+        {/* `opacity-100` 躲开 Button 给图标统一加的 80% 透明度：logo 是品牌色块里的白字，不该发灰。 */}
+        <LogoMark className="size-[1.125rem] opacity-100" />
       </span>
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight">Luban</span>
     </>
@@ -92,14 +105,16 @@ export function AppHeader({
         <div className="flex min-w-0 items-center gap-2">
         {onNavigateHome ? (
           <Hint label={label}>
-            <button
+            {/* 高度随内容（32px 色块 + 上下留白），不吃 Button 的固定尺寸；内边距扣掉 Button 那 1px
+                透明边框，留白仍是横 8px、纵 6px。`shrink` 覆盖 Button 的 `shrink-0`，窄屏上品牌名才能截断。 */}
+            <Button
               aria-label={label}
-              className="-mx-2 flex min-w-0 cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background sm:gap-3"
-              type="button"
+              className="-mx-2 h-auto min-w-0 shrink justify-start gap-2.5 px-[calc(--spacing(2)-1px)] py-[calc(--spacing(1.5)-1px)] sm:h-auto sm:gap-3"
+              variant="ghost"
               onClick={onNavigateHome}
             >
               {brand}
-            </button>
+            </Button>
           </Hint>
         ) : (
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">{brand}</div>
@@ -115,11 +130,12 @@ export function AppHeader({
 }
 
 /** 顶栏主导航的一级页面。 */
-export type MainSection = 'pool' | 'billing' | 'users'
+export type MainSection = 'pool' | 'billing' | 'users' | 'settings'
 
 /**
- * 顶栏主导航：账号池、费用、用户管理是平级的一级页面，不是谁挂在谁下面。用户管理只给管理员
- * 与代理。窄屏只留图标，文字留给读屏与悬浮提示。
+ * 顶栏主导航：账号池、费用、用户管理、系统设置是平级的一级页面，不是谁挂在谁下面——每一页
+ * 都能直接去别的页，不必先回账号池。用户管理只给管理员与代理，系统设置只给管理员。窄屏只留
+ * 图标，文字留给读屏与悬浮提示。
  */
 export function MainNav({
   current,
@@ -130,10 +146,12 @@ export function MainNav({
 }) {
   const { t } = useI18n()
   const canManageUsers = useCanManageUsers()
+  const isAdmin = useIsAdmin()
   const items = [
     { key: 'pool' as const, label: t('账号池', 'Accounts'), icon: LayersIcon },
     { key: 'billing' as const, label: t('费用', 'Billing'), icon: ReceiptIcon },
     ...(canManageUsers ? [{ key: 'users' as const, label: t('用户管理', 'Users'), icon: UsersIcon }] : []),
+    ...(isAdmin ? [{ key: 'settings' as const, label: t('系统设置', 'Settings'), icon: SettingsIcon }] : []),
   ]
   return (
     <nav aria-label={t('主导航', 'Main navigation')} className="flex shrink-0 items-center gap-0.5">
@@ -141,21 +159,20 @@ export function MainNav({
         const active = current === key
         return (
           <Hint key={key} label={label}>
-            <button
+            {/* 当前页靠 `aria-current` 着色：它是导航里的「所在位置」，不是按下的开关，所以不用
+                `data-pressed`。悬浮只给半档底色，与当前页的整档区分开。`sm:h-8` 让桌面也保持 32px
+                高（size="sm" 在桌面是 28px），导航项在 64px 的顶栏里不显得局促。 */}
+            <Button
               aria-current={active ? 'page' : undefined}
               aria-label={label}
-              className={cn(
-                'inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                active
-                  ? 'bg-accent text-foreground'
-                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-              )}
-              type="button"
+              className="text-muted-foreground hover:bg-accent/60 hover:text-foreground sm:h-8 aria-[current=page]:bg-accent aria-[current=page]:text-foreground"
+              size="sm"
+              variant="ghost"
               onClick={() => { if (!active) onNavigate(key) }}
             >
               <Icon aria-hidden="true" className="size-4" />
               <span className="max-sm:sr-only">{label}</span>
-            </button>
+            </Button>
           </Hint>
         )
       })}
@@ -195,7 +212,7 @@ export function PreferencesMenu({
       <Hint label={t('更多操作', 'More actions')}>
         <MenuTrigger
           aria-label={t('更多操作', 'More actions')}
-          className={buttonVariants({ size: 'sm', variant: 'outline', className: 'max-sm:size-10 max-sm:px-0' })}
+          className={buttonVariants({ size: 'sm', variant: 'outline', className: HEADER_ACTION_CLASS })}
         >
           <EllipsisVerticalIcon />
         </MenuTrigger>
@@ -219,55 +236,34 @@ export function PreferencesMenu({
   )
 }
 
-/** 中 / 英切换。与顶栏上那枚独立按钮同一份逻辑，只是换了个壳。 */
-function LanguageMenuItem() {
-  const { language, toggleLanguage } = useI18n()
-  const toEnglish = language === 'zh-CN'
-
-  return (
-    <MenuItem closeOnClick={false} onClick={toggleLanguage}>
-      <LanguagesIcon />
-      <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-        <span>{toEnglish ? '语言' : 'Language'}</span>
-        <span className="text-xs text-muted-foreground">{toEnglish ? '中文' : 'English'}</span>
-      </span>
-    </MenuItem>
-  )
-}
-
-const THEME_ICONS: Record<ThemeMode, typeof MonitorIcon> = {
-  system: MonitorIcon,
-  light: SunIcon,
-  dark: MoonIcon,
-}
-
-/** 系统 → 浅色 → 深色 循环。三态本来就少，点一下换一档，不必再套一层子菜单。 */
-function ThemeMenuItem() {
+/**
+ * 所有一级页面共用的账号菜单：页面自己的工具（`children`）在上，修改密码、语言、外观、退出
+ * 在下。修改密码给代理和用户（管理员的密码在系统设置的「控制台安全」里改，那里还能清除；
+ * 访客的密码由管理员设）。每页都用它，菜单里有什么不再随所在页面变。
+ */
+export function AccountMenu({
+  children,
+  onSignOut,
+}: {
+  children?: ReactNode
+  onSignOut?: () => void
+}) {
   const { t } = useI18n()
-  const [mode, setMode] = useState<ThemeMode>(readThemeMode)
-  const next = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length]
-  const Icon = THEME_ICONS[mode]
-  const name = (value: ThemeMode) => ({
-    system: t('跟随系统', 'System'),
-    light: t('浅色', 'Light'),
-    dark: t('深色', 'Dark'),
-  })[value]
-
+  const role = useMe().data?.role
+  const [passwordOpen, setPasswordOpen] = useState(false)
+  const canChangePassword = role === 'agent' || role === 'user'
   return (
-    <MenuItem
-      aria-label={t(`外观：${name(mode)}，点击切换为${name(next)}`, `Appearance: ${name(mode)}. Switch to ${name(next)}`)}
-      closeOnClick={false}
-      onClick={() => {
-        setMode(next)
-        writeThemeMode(next)
-      }}
-    >
-      <Icon />
-      <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
-        <span>{t('外观', 'Appearance')}</span>
-        <span className="text-xs text-muted-foreground">{name(mode)}</span>
-      </span>
-    </MenuItem>
+    <>
+      <PreferencesMenu onSignOut={onSignOut}>
+        {children}
+        {canChangePassword && (
+          <MenuItem onClick={() => setPasswordOpen(true)}>
+            <KeyRoundIcon />{t('修改密码', 'Change password')}
+          </MenuItem>
+        )}
+      </PreferencesMenu>
+      {canChangePassword && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
+    </>
   )
 }
 
@@ -289,24 +285,23 @@ export function Breadcrumb({
   const { t } = useI18n()
 
   return (
-    <nav aria-label={t('层级导航', 'Breadcrumb')}>
-      <ol className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
-        <li className="min-w-0">
-          <button
-            className="truncate rounded-sm underline-offset-4 transition-colors hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-            type="button"
+    <BreadcrumbRoot aria-label={t('层级导航', 'Breadcrumb')}>
+      {/* coss 的列表默认可换行、间距更宽；这里收成单行、两段各自截断，与顶栏下这条窄带的高度相称。 */}
+      <BreadcrumbList className="min-w-0 flex-nowrap gap-1 sm:gap-1">
+        <BreadcrumbItem className="min-w-0">
+          <BreadcrumbLink
+            className="truncate rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            render={<button type="button" />}
             onClick={onNavigateParent}
           >
             {parent}
-          </button>
-        </li>
-        <li aria-hidden="true" className="flex shrink-0 items-center">
-          <ChevronRightIcon className="size-3.5" />
-        </li>
-        <li aria-current="page" className="min-w-0 truncate font-medium text-foreground">
-          {current}
-        </li>
-      </ol>
-    </nav>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        <BreadcrumbSeparator className="flex shrink-0 items-center [&>svg]:size-3.5" />
+        <BreadcrumbItem className="min-w-0">
+          <BreadcrumbPage className="truncate font-medium">{current}</BreadcrumbPage>
+        </BreadcrumbItem>
+      </BreadcrumbList>
+    </BreadcrumbRoot>
   )
 }

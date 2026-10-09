@@ -59,7 +59,11 @@ impl std::error::Error for ModelUnsupported {}
 impl CredentialStore {
     /// 限流暂停中、且**不在** `denied` 里的号里最早的 `resume_at`；没有这样的号则 `None`。
     /// 选号时用，调用方已持锁。
-    fn soonest_paused_resume(conn: &Connection, denied: &HashSet<i64>) -> Result<Option<i64>> {
+    fn soonest_paused_resume(
+        conn: &Connection,
+        denied: &HashSet<i64>,
+        allowed: Option<&HashMap<i64, usize>>,
+    ) -> Result<Option<i64>> {
         let mut stmt = conn.prepare(
             "SELECT id, resume_at FROM credentials WHERE disabled = 1 AND resume_at IS NOT NULL",
         )?;
@@ -67,7 +71,7 @@ impl CredentialStore {
         let mut soonest: Option<i64> = None;
         for row in rows {
             let (id, at) = row?;
-            if !denied.contains(&id) {
+            if !denied.contains(&id) && allowed.is_none_or(|m| m.contains_key(&id)) {
                 soonest = Some(soonest.map_or(at, |s| s.min(at)));
             }
         }
@@ -199,7 +203,8 @@ impl<'a> Binding<'a> {
 /// 位置传参写反了照样编译得过，而那是一个「设备粘性按模型名走」的静默错误。
 #[derive(Default, Clone, Copy)]
 pub struct Select<'a> {
-    /// 接入 Key 绑定的分组，按优先顺序；`None` 或空 = 全部号。只在这些分组的号里选，号在越
+    /// 接入 Key 能用的分组，按优先顺序；`None` = 全部号，`Some(空)` = 一个号都不能用（绑定的
+    /// 分组被删光了，不放开成全部号）。只在这些分组的号里选，号在越
     /// 靠前的分组里越优先（排序第一键，排在优先级之前）；前面分组的号都用不了才溢出到后面的。
     /// 粘住的号不在这些分组里时，按「原号不可用」改选。
     pub groups: Option<&'a [i64]>,
@@ -414,15 +419,13 @@ impl CredentialStore {
             stmt.query_map([], row_to_cred)?.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         // 接入 Key 绑定了分组：只留这些分组里的号，并记下每个号所在的最靠前的分组名次。
+        // 绑了分组但一个都不剩（分组被删光）时是空表：一个号都选不到，而不是放开成全部号。
         let group_rank: Option<HashMap<i64, usize>> = match groups {
-            Some(gs) if !gs.is_empty() => Some(Self::group_ranks(&conn, gs)?),
-            _ => None,
+            Some(gs) => Some(Self::group_ranks(&conn, gs)?),
+            None => None,
         };
         if let Some(rank) = &group_rank {
             all.retain(|c| rank.contains_key(&c.id));
-            if all.is_empty() {
-                anyhow::bail!("no available credentials in the groups bound to this API key");
-            }
         }
         let rank_of =
             |c: &Credential| group_rank.as_ref().and_then(|m| m.get(&c.id).copied()).unwrap_or(0);
@@ -430,15 +433,25 @@ impl CredentialStore {
             // 一个能用的都没有。若其中有「限流暂停、还没到点」的，这不是配置问题而是限流：
             // 回 429 + 最早那个的恢复时刻，比一句「没有可用凭证，请先登录」诚实得多
             // （后者会把运维引去查登录，而实际上号都在、只是在等额度回血）。
-            let soonest: Option<(i64, String, Option<String>, i64)> = conn
-                .query_row(
+            // 只看这把 Key 能用的号：别的分组里暂停的号不该让这里回 429。
+            let soonest: Option<(i64, String, Option<String>, i64)> = {
+                let mut stmt = conn.prepare(
                     "SELECT id, label, ban_reason, resume_at FROM credentials \
                       WHERE disabled = 1 AND resume_at IS NOT NULL \
-                      ORDER BY resume_at ASC, id ASC LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .optional()?;
+                      ORDER BY resume_at ASC, id ASC",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                let mut hit = None;
+                for row in rows {
+                    let row: (i64, String, Option<String>, i64) = row?;
+                    if group_rank.as_ref().is_none_or(|m| m.contains_key(&row.0)) {
+                        hit = Some(row);
+                        break;
+                    }
+                }
+                hit
+            };
             if let Some((id, label, reason, at)) = soonest {
                 let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
                 let refresh_failed = reason
@@ -446,6 +459,9 @@ impl CredentialStore {
                     .and_then(refresh_pause_detail)
                     .map(|detail| RefreshFailed::paused(id, label, detail));
                 return Err(AllRateLimited { retry_after_secs, refresh_failed }.into());
+            }
+            if group_rank.is_some() {
+                anyhow::bail!("no available credentials in the groups bound to this API key");
             }
             anyhow::bail!("no available credentials; add an account first");
         }
@@ -465,7 +481,7 @@ impl CredentialStore {
         if let Some(m) = model
             && all.iter().all(|c| denied.contains(&c.id))
         {
-            if let Some(at) = Self::soonest_paused_resume(&conn, &denied)? {
+            if let Some(at) = Self::soonest_paused_resume(&conn, &denied, group_rank.as_ref())? {
                 let retry_after_secs = (at - crate::credentials::now_secs() as i64).max(1);
                 return Err(AllRateLimited { retry_after_secs, refresh_failed: None }.into());
             }

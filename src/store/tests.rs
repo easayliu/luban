@@ -2323,7 +2323,7 @@ fn admin_password_never_travels_with_settings() {
     // 旧版文件里的全局接入 Key 导进来变成一把不绑定分组的接入 Key，设置项本身不再落库。
     assert_eq!(target.get_setting(CLIENT_API_KEY).unwrap(), None);
     let access = target.api_key_access("key-from-source").unwrap().expect("转成了接入 Key");
-    assert!(access.groups.is_empty(), "不绑定分组，用全部号");
+    assert!(access.groups.is_none(), "不绑定分组，用全部号");
 }
 
 /// 导出的每一项都要能原样导回来：迁移文件就是「导出的响应原样喂给导入」，
@@ -5728,7 +5728,7 @@ fn groups_and_keys_migrate_from_a_legacy_database() {
     assert_eq!(store.credential_groups(cred).unwrap(), vec![default]);
     assert_eq!(store.get_setting(CLIENT_API_KEY).unwrap(), None);
     let access = store.api_key_access("legacy-key").unwrap().unwrap();
-    assert!(access.groups.is_empty());
+    assert!(access.groups.is_none());
     assert!(store.api_key_access("wrong").unwrap().is_none());
 }
 
@@ -5780,7 +5780,7 @@ fn deleting_a_group_rehomes_its_only_members() {
     store.delete_group(g1).unwrap().unwrap();
     assert_eq!(store.credential_groups(a).unwrap(), vec![default]);
     assert_eq!(store.credential_groups(b).unwrap(), vec![g2]);
-    assert_eq!(store.api_key_access("key-1").unwrap().unwrap().groups, vec![g2]);
+    assert_eq!(store.api_key_access("key-1").unwrap().unwrap().groups, Some(vec![g2]));
     assert_eq!(store.list_api_keys().unwrap()[0].id, key);
 }
 
@@ -5815,19 +5815,21 @@ fn selection_honours_key_groups_and_their_order() {
     store.set_disabled(b, true).unwrap();
     assert_eq!(pick(&[g2, g1], None).unwrap(), a, "前面分组的号用不了就溢出到后面的");
     assert!(pick(&[empty], None).is_err());
-    assert_eq!(pick(&[], None).unwrap(), a, "不绑分组用全部号");
+    assert!(pick(&[], None).is_err(), "绑定的分组被删光：一个号都不能用，不放开成全部号");
+    let all = store.select_for_device(Select { groups: None, ..Default::default() }).unwrap();
+    assert_eq!(all.id, a, "不限分组（None）用全部号");
 }
 
 /// 停用的 Key 认不出来；库里有 Key 时 `has_api_keys` 为真（停用的也算，不会因此变成放行）。
 #[test]
 fn disabled_api_keys_are_rejected() {
     let store = CredentialStore::open_in_memory().unwrap();
-    assert!(!store.has_api_keys().unwrap());
+    assert!(!store.api_keys_required().unwrap());
     let id = store.create_api_key("k", "key-x", &[]).unwrap().unwrap();
     assert!(store.api_key_access("key-x").unwrap().is_some());
-    store.update_api_key(id, "k", true, &[]).unwrap().unwrap();
+    store.update_api_key(id, "k", true, &[], None).unwrap().unwrap();
     assert!(store.api_key_access("key-x").unwrap().is_none());
-    assert!(store.has_api_keys().unwrap());
+    assert!(store.api_keys_required().unwrap());
     assert_eq!(store.reveal_api_key(id).unwrap().as_deref(), Some("key-x"));
     let sealed: String = store
         .conn
@@ -5947,4 +5949,248 @@ fn billing_backfills_existing_usage_logs_once() {
     let rows = store.billing_breakdown(&f, BillingDim::Cred).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].requests, rows[0].cost_usd, rows[0].input_tokens), (2, 1.0, 10));
+}
+
+/// 配过接入 Key 之后把 Key 全删了，转发仍要求带 Key（不退回「不校验」）。
+#[test]
+fn deleting_every_key_keeps_auth_required() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    assert!(!store.api_keys_required().unwrap(), "从没配过：不校验");
+    let id = store.create_api_key("k", "key-only", &[]).unwrap().unwrap();
+    store.delete_api_key(id).unwrap();
+    assert!(store.api_keys_required().unwrap(), "删光了也仍要求带 Key");
+    assert!(store.api_key_access("key-only").unwrap().is_none());
+}
+
+/// Key 唯一绑定的分组被删掉：这把 Key 变成一个号都不能用，而不是全部号；显式不绑分组的
+/// Key 才是全部号。
+#[test]
+fn deleting_a_keys_only_group_fails_closed() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let g = store.create_group("g", "").unwrap().unwrap();
+    store.insert("a", None, "t", "r", u64::MAX, None, None, admin).unwrap();
+    store.create_api_key("bound", "key-bound", &[g]).unwrap().unwrap();
+    store.create_api_key("all", "key-all", &[]).unwrap().unwrap();
+    store.delete_group(g).unwrap().unwrap();
+    let bound = store.api_key_access("key-bound").unwrap().unwrap();
+    assert_eq!(bound.groups, Some(vec![]));
+    assert!(
+        store
+            .select_for_device(Select { groups: bound.groups.as_deref(), ..Default::default() })
+            .is_err()
+    );
+    assert_eq!(store.api_key_access("key-all").unwrap().unwrap().groups, None);
+    let keys = store.list_api_keys().unwrap();
+    assert!(!keys.iter().find(|k| k.label == "bound").unwrap().all_groups);
+}
+
+/// 加密迁移之后库文件里捞不到旧明文：改写过的页清零、VACUUM 重写整库、WAL 截断。
+#[test]
+fn encrypting_tokens_leaves_no_plaintext_in_the_file() {
+    let dir = std::env::temp_dir().join(format!("luban-scrub-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("luban.db");
+    let _ = std::fs::remove_file(&path);
+    let marker = |i: usize| format!("PLAINTEXT-REFRESH-TOKEN-MARKER-{i:04}-{}", "x".repeat(60));
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+             CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL DEFAULT '',
+                 tier TEXT, org_type TEXT, access_token TEXT NOT NULL, refresh_token TEXT NOT NULL,
+                 expires_at INTEGER NOT NULL, priority INTEGER NOT NULL DEFAULT 2,
+                 disabled INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 updated_at INTEGER NOT NULL DEFAULT (unixepoch())) STRICT;",
+        )
+        .unwrap();
+        for i in 0..100 {
+            conn.execute(
+                "INSERT INTO credentials (access_token, refresh_token, expires_at) VALUES (?1, ?2, 0)",
+                params![format!("at-{i}"), marker(i)],
+            )
+            .unwrap();
+        }
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    if let Ok(wal) = std::fs::read(dir.join("luban.db-wal")) {
+        bytes.extend(wal);
+    }
+    let needle = b"PLAINTEXT-REFRESH-TOKEN-MARKER";
+    assert!(!bytes.windows(needle.len()).any(|w| w == needle), "库文件里还能找到明文 token");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 密钥校验值或接入 Key 的密文解不开（换了密钥）：拒绝启动，哪怕库里一个号都没有。
+#[test]
+fn a_wrong_secret_key_is_caught_without_any_credentials() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "UPDATE settings SET value = 'enc1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE key = 'secret_key_check'",
+        [],
+    )
+    .unwrap();
+    assert!(format!("{:#}", init_schema(&conn).unwrap_err()).contains("secret key does not match"));
+
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO api_keys (label, key_hash, key_sealed) VALUES ('k', 'h', 'enc1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')",
+        [],
+    )
+    .unwrap();
+    let err = init_schema(&conn).unwrap_err();
+    assert!(format!("{err:#}").contains("access key"), "{err:#}");
+}
+
+/// 分组内的暂停与模型判断只看这把 Key 能用的号：本组全部暂停回 429；别的组里暂停的号
+/// 不让本组「模型不支持」变成 429。
+#[test]
+fn paused_and_denied_checks_stay_inside_the_key_groups() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let admin = store.admin_user().unwrap().id;
+    let g1 = store.create_group("g1", "").unwrap().unwrap();
+    let g2 = store.create_group("g2", "").unwrap().unwrap();
+    let a = store.insert("a", None, "ta", "ra", u64::MAX, None, None, admin).unwrap().id;
+    let b = store.insert("b", None, "tb", "rb", u64::MAX, None, None, admin).unwrap().id;
+    store.set_credential_groups(&[a], &[g1]).unwrap().unwrap();
+    store.set_credential_groups(&[b], &[g2]).unwrap().unwrap();
+    let later = crate::credentials::now_secs() + 600;
+    store.pause_for_rate_limit(a, "rate limited", later).unwrap();
+    let only_g1 = [g1];
+    let err = store
+        .select_for_device(Select { groups: Some(&only_g1), ..Default::default() })
+        .unwrap_err();
+    assert!(err.downcast_ref::<AllRateLimited>().is_some(), "本组全部暂停：429，{err:#}");
+
+    store.deny_model(b, "claude-fable-5", "plan", None).unwrap();
+    let only_g2 = [g2];
+    let err = store
+        .select_for_device(Select {
+            groups: Some(&only_g2),
+            model: Some("claude-fable-5"),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<ModelUnsupported>().is_some(),
+        "别组暂停的号不该让这里回 429，{err:#}"
+    );
+}
+
+/// 绑定的分组删光后，只改名字、停用再启用都不会把这把 Key 变成全部号；显式选「全部号」才是。
+#[test]
+fn editing_an_orphaned_key_never_widens_it() {
+    let store = CredentialStore::open_in_memory().unwrap();
+    let g = store.create_group("g", "").unwrap().unwrap();
+    let id = store.create_api_key("bound", "key-orphan", &[g]).unwrap().unwrap();
+    store.delete_group(g).unwrap().unwrap();
+    let scope = |s: &CredentialStore| s.api_key_access("key-orphan").unwrap().map(|a| a.groups);
+    store.update_api_key(id, "renamed", false, &[], None).unwrap().unwrap();
+    assert_eq!(scope(&store), Some(Some(vec![])), "改名不放开");
+    store.update_api_key(id, "renamed", true, &[], None).unwrap().unwrap();
+    store.update_api_key(id, "renamed", false, &[], None).unwrap().unwrap();
+    assert_eq!(scope(&store), Some(Some(vec![])), "停用再启用不放开");
+    store.update_api_key(id, "renamed", false, &[], Some(false)).unwrap().unwrap();
+    assert_eq!(scope(&store), Some(Some(vec![])), "显式只限分组、列表为空：仍是一个号都不能用");
+    store.update_api_key(id, "renamed", false, &[], Some(true)).unwrap().unwrap();
+    assert_eq!(scope(&store), Some(None), "显式选全部号才是全部号");
+}
+
+/// 清理被别的连接的读快照挡住时如实回「没清完」并留下标记；快照放掉后重试清干净、删标记。
+#[test]
+fn scrub_reports_busy_and_retries_until_clean() {
+    let dir = std::env::temp_dir().join(format!("luban-scrub-busy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("luban.db");
+    for f in ["luban.db", "luban.db-wal", "luban.db-shm"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let a = Connection::open(&path).unwrap();
+    a.pragma_update(None, "journal_mode", "WAL").unwrap();
+    init_schema(&a).unwrap();
+    let needle = "PLAINTEXT-LEFTOVER-MARKER-0123456789";
+    a.pragma_update(None, "secure_delete", "OFF").unwrap();
+    a.execute("INSERT INTO settings (key, value) VALUES ('tmp', ?1)", [needle]).unwrap();
+    a.execute("UPDATE settings SET value = 'sealed' WHERE key = 'tmp'", []).unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN; SELECT COUNT(*) FROM settings;").unwrap();
+    let _: i64 = reader.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap();
+    assert!(!secret::scrub_freed_pages(&a).unwrap(), "读快照挡着时不能报成功");
+    let pending: bool = a
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM settings WHERE key = 'secret_scrub_pending')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(pending, "没清完要留标记等重试");
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reader);
+    secret::scrub_if_pending(&a).unwrap();
+    let pending: bool = a
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM settings WHERE key = 'secret_scrub_pending')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!pending, "清干净后删标记");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend(std::fs::read(dir.join("luban.db-wal")).unwrap_or_default());
+    assert!(
+        !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+        "库文件或 WAL 里还有旧明文"
+    );
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 留下明文残留的那几步各自在同一个事务里落下清理标记：之后的迁移失败、进程退出，下次启动
+/// 照样按标记清理，不会因为「token 已是密文、校验值已写」而跳过。
+#[test]
+fn scrub_marker_survives_a_failed_startup() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let pending = |c: &Connection| -> bool {
+        c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM settings WHERE key = 'secret_scrub_pending')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let clear = |c: &Connection| {
+        c.execute("DELETE FROM settings WHERE key = 'secret_scrub_pending'", []).unwrap();
+    };
+    assert!(!pending(&conn), "正常启动清完不留标记");
+
+    conn.execute(
+        "INSERT INTO credentials (access_token, refresh_token, expires_at) VALUES ('at-plain', 'rt-plain', 0)",
+        [],
+    )
+    .unwrap();
+    secret::encrypt_plaintext_tokens(&conn).unwrap();
+    assert!(pending(&conn), "加密明文 token 时就要落标记");
+    clear(&conn);
+
+    conn.execute("INSERT INTO settings (key, value) VALUES ('client_api_key', 'legacy-key')", [])
+        .unwrap();
+    migrate_groups(&conn).unwrap();
+    assert!(pending(&conn), "搬旧版全局 Key 时就要落标记");
+    clear(&conn);
+
+    conn.execute("DELETE FROM settings WHERE key = 'secret_key_check'", []).unwrap();
+    secret::ensure_secret_check(&conn).unwrap();
+    assert!(pending(&conn), "首次写校验值时就要落标记");
+
+    // 模拟上一轮在清理前失败：再启动一次要把欠着的清理补上。
+    init_schema(&conn).unwrap();
+    assert!(!pending(&conn), "下次启动补清理并删标记");
 }

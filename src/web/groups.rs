@@ -22,7 +22,10 @@ pub(super) struct GrantsReq {
 pub(super) struct CreateKeyReq {
     #[serde(default)]
     label: String,
-    /// 绑定的分组，按优先顺序；空 = 用全部号。
+    /// 可用全部号。缺省按「没选分组 = 全部号」（老版本前端只传 `group_ids`）。
+    #[serde(default)]
+    all_groups: Option<bool>,
+    /// 绑定的分组，按优先顺序。
     #[serde(default)]
     group_ids: Vec<i64>,
 }
@@ -33,6 +36,10 @@ pub(super) struct UpdateKeyReq {
     label: String,
     #[serde(default)]
     disabled: bool,
+    /// 范围：`true` 全部号、`false` 只限 `group_ids`，不传则范围不动（见
+    /// `store::CredentialStore::update_api_key`）。
+    #[serde(default)]
+    all_groups: Option<bool>,
     #[serde(default)]
     group_ids: Vec<i64>,
 }
@@ -178,13 +185,16 @@ pub(super) async fn create_api_key(
     State(state): State<AppState>,
     Json(req): Json<CreateKeyReq>,
 ) -> Result<Json<KeySecret>, ApiError> {
+    let all = req.all_groups.unwrap_or(req.group_ids.is_empty());
+    // 新建时不许建出「只限分组却一个分组都没有」的 Key：那是一把谁也用不了的 Key。
+    if !all && req.group_ids.is_empty() {
+        return Err(group_error(store::GroupError::Empty));
+    }
+    let groups: &[i64] = if all { &[] } else { &req.group_ids };
     let key = store::generate_api_key();
     let label = req.label.trim();
-    let id = state
-        .store
-        .create_api_key(label, &key, &req.group_ids)
-        .map_err(internal)?
-        .map_err(group_error)?;
+    let id =
+        state.store.create_api_key(label, &key, groups).map_err(internal)?.map_err(group_error)?;
     tracing::info!(key_id = id, label, groups = ?req.group_ids, "API key created");
     Ok(Json(KeySecret { id, key }))
 }
@@ -197,7 +207,7 @@ pub(super) async fn update_api_key(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .store
-        .update_api_key(id, req.label.trim(), req.disabled, &req.group_ids)
+        .update_api_key(id, req.label.trim(), req.disabled, &req.group_ids, req.all_groups)
         .map_err(internal)?
         .map_err(group_error)?;
     tracing::info!(key_id = id, disabled = req.disabled, groups = ?req.group_ids, "API key updated");

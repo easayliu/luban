@@ -1,4 +1,3 @@
-import { useEffect } from 'react'
 import {
   ArrowRightLeftIcon,
   CableIcon,
@@ -18,7 +17,7 @@ import { ForwardingSettingsContent } from '@/components/forwarding-settings'
 import { GroupSettingsContent } from '@/components/group-settings'
 import { MigrationSettingsContent } from '@/components/migration-settings'
 import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
-import { AppHeader, Breadcrumb, PreferencesMenu } from '@/components/app-header'
+import { AccountMenu, AppHeader, MainNav, type MainSection } from '@/components/app-header'
 import {
   Select,
   SelectItem,
@@ -28,6 +27,7 @@ import {
 } from '@/components/ui/select'
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@/components/ui/tabs'
 import { useI18n } from '@/lib/i18n'
+import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 
 export type SettingsSection = 'access' | 'groups' | 'devices' | 'proxies' | 'forwarding' | 'security' | 'migration'
@@ -35,11 +35,13 @@ export type SettingsSection = 'access' | 'groups' | 'devices' | 'proxies' | 'for
 export function SettingsPage({
   section,
   onSectionChange,
-  onBack,
+  onNavigate,
+  onSignOut,
 }: {
   section: SettingsSection
   onSectionChange: (section: SettingsSection) => void
-  onBack: () => void
+  onNavigate: (section: MainSection) => void
+  onSignOut: () => void
 }) {
   const { t } = useI18n()
   const sections = [
@@ -97,28 +99,18 @@ export function SettingsPage({
     }
   }
 
-  useEffect(() => {
-    const previousTitle = document.title
-    document.title = `${active.label} · Luban`
-    return () => {
-      document.title = previousTitle
-    }
-  }, [active.label])
+  useDocumentTitle(`${active.label} · Luban`)
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <AppHeader actions={<PreferencesMenu />} onNavigateHome={onBack} />
+      <AppHeader
+        actions={<AccountMenu onSignOut={onSignOut} />}
+        nav={<MainNav current="settings" onNavigate={onNavigate} />}
+        onNavigateHome={() => onNavigate('pool')}
+      />
 
       <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
         <div className="space-y-5 sm:space-y-7">
-          {/* 层级线：既交代「我在哪儿」，也是回账号页的入口之一（顶栏那枚 logo 是另一个，
-              两者都是标准做法；撤掉的是右上角那枚与 logo 完全重复的「返回账号」按钮）。 */}
-          <Breadcrumb
-            current={t('系统设置', 'System settings')}
-            parent={t('账号池', 'Account pool')}
-            onNavigateParent={onBack}
-          />
-
           <section aria-labelledby="settings-page-title" className="max-w-2xl">
             <h1
               className="min-w-0 text-xl font-semibold tracking-tight sm:text-2xl"
@@ -147,15 +139,12 @@ export function SettingsPage({
                   既不好点也读不出它是导航。窄屏改 `self-stretch` 铺满。 */}
             <div className="settings-tabs-bar sticky z-10 min-w-0 self-stretch bg-surface-page py-2 lg:top-24 lg:w-60 lg:shrink-0 lg:self-start lg:bg-transparent lg:py-0">
               <div className="lg:hidden">
-                <label className="sr-only" htmlFor="settings-section-select">
-                  {t('设置分类', 'Settings category')}
-                </label>
                 <Select items={selectItems} value={section} onValueChange={changeSection}>
-                  <SelectTrigger id="settings-section-select" aria-label={t('设置分类', 'Settings category')}>
+                  <SelectTrigger aria-label={t('设置分类', 'Settings category')}>
                     <ActiveIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectPopup>
+                  <SelectPopup alignItemWithTrigger={false}>
                     {sections.map((item) => {
                       const Icon = item.icon
                       return (

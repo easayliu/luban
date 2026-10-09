@@ -5,10 +5,17 @@ import { useI18n } from '@/lib/i18n'
 import { cacheHitRate, cn, extractError, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
 import { formatMs, formatTokensPerSec } from '@/components/ttft-trend-dialog'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
+import {
+  COMPACT_TABLE_BODY_CLASS,
+  COMPACT_TABLE_HEADER_CLASS,
+  COMPACT_TABLE_LINK_CLASS,
+} from '@/components/usage-shared'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { Table, TableBody, TableCell, TableFooter, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 
@@ -83,76 +90,78 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
           {t('所选时间范围内没有请求', 'No requests in this period')}
         </p>
       ) : (
-        <div className={cn('max-h-64 overflow-auto rounded-xl border transition-opacity', query.isFetching && !query.isPending && 'opacity-60')}>
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-surface-subtle">
-              <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-                <th scope="col" className="text-start">{rowsBy === 'model' ? t('模型', 'Model') : t('账号', 'Account')}</th>
-                <th scope="col" className="text-end">{t('请求', 'Requests')}</th>
-                {kind === 'latency' ? (
-                  <>
-                    <th scope="col" className="text-end">p50</th>
-                    <th scope="col" className="text-end">p95</th>
-                    <th scope="col" className="text-end">{t('吞吐', 'Throughput')}</th>
-                    <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-                  </>
-                ) : (
-                  <>
-                    <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-                    <th scope="col" className="text-end">{t('缓存读', 'Cache read')}</th>
-                    <th scope="col" className="text-end">{t('缓存写', 'Cache write')}</th>
-                    <th scope="col" className="text-end">{t('输入', 'Input')}</th>
-                    <th scope="col" className="text-end">{t('节省', 'Saved')}</th>
-                  </>
-                )}
+        // 滚动容器当 Table 的外壳传进 `render`，sticky 表头才粘得住，见 COMPACT_TABLE_HEADER_CLASS。
+        <Table
+          className="text-xs"
+          render={<div className={cn('max-h-64 overflow-auto rounded-xl border transition-opacity', query.isFetching && !query.isPending && 'opacity-60')} />}
+        >
+          <TableHeader className={COMPACT_TABLE_HEADER_CLASS}>
+            <TableRow>
+              <TableHead>{rowsBy === 'model' ? t('模型', 'Model') : t('账号', 'Account')}</TableHead>
+              <TableHead className="text-end">{t('请求', 'Requests')}</TableHead>
+              {kind === 'latency' ? (
+                <>
+                  <TableHead className="text-end">p50</TableHead>
+                  <TableHead className="text-end">p95</TableHead>
+                  <TableHead className="text-end">{t('吞吐', 'Throughput')}</TableHead>
+                  <TableHead className="text-end">{t('命中率', 'Hit rate')}</TableHead>
+                </>
+              ) : (
+                <>
+                  <TableHead className="text-end">{t('命中率', 'Hit rate')}</TableHead>
+                  <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
+                  <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
+                  <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
+                  <TableHead className="text-end">{t('节省', 'Saved')}</TableHead>
+                </>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody className={COMPACT_TABLE_BODY_CLASS}>
+            {rows.map((row) => (
+              <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={() => openRow(row)} />
+            ))}
+          </TableBody>
+          {/* 合计是表格的一部分，落在 tfoot 里、和「省下」那一列对齐。
+              原来它是表格下面的一句话——数字离它的列有半个表格远，还要在句子里重读一遍列名。
+              怎么算出来的那句话收进悬浮层：它解释的是口径，不是这一格的值。 */}
+          {kind === 'cache' && query.data && (
+            <TableFooter className="[&>tr>*]:border-t [&>tr>*]:bg-surface-subtle [&>tr>*]:px-3 [&>tr>*]:py-1.5 [&>tr>*]:font-medium">
+              <tr>
+                <th className="text-start" scope="row">{t('合计', 'Total')}</th>
+                {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 缓存读 / 缓存写 / 输入 / 节省。
+                    合计只有「省下」这一列有值，中间 5 列留空。 */}
+                <td colSpan={5} />
+                <td className="text-end">
+                  <Tooltip>
+                    <TooltipTrigger
+                      className={cn(
+                        'cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4',
+                        query.data.cache_saved_usd_total < 0 && 'text-warning-foreground',
+                      )}
+                      render={<span />}
+                    >
+                      {query.data.cache_saved_usd_total >= 0
+                        ? formatUsd(query.data.cache_saved_usd_total)
+                        : `-${formatUsd(-query.data.cache_saved_usd_total)}`}
+                    </TooltipTrigger>
+                    <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
+                      {query.data.cache_saved_usd_total >= 0
+                        ? t(
+                            '缓存读按 0.1 倍计价节省的金额，减去缓存写按 1.25 倍计价多付的金额。',
+                            'Savings from cache reads billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
+                          )
+                        : t(
+                            '缓存写多付的金额超过了缓存读节省的金额，通常是因为前缀每轮都在变化。',
+                            'The extra paid for cache writes exceeded the savings from cache reads; the prefix is usually changing every turn.',
+                          )}
+                    </TooltipPopup>
+                  </Tooltip>
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={() => openRow(row)} />
-              ))}
-            </tbody>
-            {/* 合计是表格的一部分，落在 tfoot 里、和「省下」那一列对齐。
-                原来它是表格下面的一句话——数字离它的列有半个表格远，还要在句子里重读一遍列名。
-                怎么算出来的那句话收进悬浮层：它解释的是口径，不是这一格的值。 */}
-            {kind === 'cache' && query.data && (
-              <tfoot>
-                <tr className="[&>*]:border-t [&>*]:bg-surface-subtle [&>*]:px-3 [&>*]:py-1.5 [&>*]:font-medium">
-                  <th className="text-start" scope="row">{t('合计', 'Total')}</th>
-                  {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 缓存读 / 缓存写 / 输入 / 节省。
-                      合计只有「省下」这一列有值，中间 5 列留空。 */}
-                  <td colSpan={5} />
-                  <td className="text-end">
-                    <Tooltip>
-                      <TooltipTrigger
-                        className={cn(
-                          'cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4',
-                          query.data.cache_saved_usd_total < 0 && 'text-warning-foreground',
-                        )}
-                        render={<span />}
-                      >
-                        {query.data.cache_saved_usd_total >= 0
-                          ? formatUsd(query.data.cache_saved_usd_total)
-                          : `-${formatUsd(-query.data.cache_saved_usd_total)}`}
-                      </TooltipTrigger>
-                      <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                        {query.data.cache_saved_usd_total >= 0
-                          ? t(
-                              '缓存读按 0.1 倍计价节省的金额，减去缓存写按 1.25 倍计价多付的金额。',
-                              'Savings from cache reads billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
-                            )
-                          : t(
-                              '缓存写多付的金额超过了缓存读节省的金额，通常是因为前缀每轮都在变化。',
-                              'The extra paid for cache writes exceeded the savings from cache reads; the prefix is usually changing every turn.',
-                            )}
-                      </TooltipPopup>
-                    </Tooltip>
-                  </td>
-                </tr>
-              </tfoot>
-            )}
-          </table>
-        </div>
+            </TableFooter>
+          )}
+        </Table>
       )}
       <RequestLookupDialog
         open={drill != null}
@@ -179,11 +188,8 @@ function BreakdownTr({
   const uncached = Math.max(0, row.cache.input_tokens - row.cache.cached_tokens - row.cache.written_tokens)
   const noLatency = row.latency.count === 0
   return (
-    <tr
-      className="cursor-pointer hover:bg-muted/40 [&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0"
-      onClick={onOpen}
-    >
-      <td className="max-w-56">
+    <TableRow className="cursor-pointer hover:bg-muted/40" onClick={onOpen}>
+      <TableCell className="max-w-56">
         <span className="flex min-w-0 items-center gap-1.5">
           {/* 「点击查看该组最近的请求」原先挂在整行上；行里不再套提示，并到这枚名称按钮上，顺带补上被截断的全名。 */}
           <Hint
@@ -191,37 +197,37 @@ function BreakdownTr({
               ? `${row.label}\n${t('点击查看该组最近的请求', 'Click to view recent requests in this group')}`
               : t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
           >
-            <button type="button" className="min-w-0 truncate text-start hover:underline" onClick={onOpen}>
+            <Button variant="link" className={COMPACT_TABLE_LINK_CLASS} onClick={onOpen}>
               {row.label || '—'}
-            </button>
+            </Button>
           </Hint>
           {/* 按账号拆时带套餐：Max 号和 Pro 号上游的排队本来就不同，混着比延迟没有意义。 */}
           {row.tier && <Badge variant="outline" size="sm" className="shrink-0">{row.tier}</Badge>}
         </span>
-      </td>
-      <td className="whitespace-nowrap text-end tabular-nums">{row.requests.toLocaleString(locale)}</td>
+      </TableCell>
+      <TableCell className="whitespace-nowrap text-end tabular-nums">{row.requests.toLocaleString(locale)}</TableCell>
       {kind === 'latency' ? (
         <>
-          <td className={cn('whitespace-nowrap text-end font-medium tabular-nums', noLatency && 'text-muted-foreground')}>
+          <TableCell className={cn('whitespace-nowrap text-end font-medium tabular-nums', noLatency && 'text-muted-foreground')}>
             {noLatency ? '—' : formatMs(row.latency.p50_ms)}
-          </td>
-          <td className={cn('whitespace-nowrap text-end tabular-nums', noLatency && 'text-muted-foreground')}>
+          </TableCell>
+          <TableCell className={cn('whitespace-nowrap text-end tabular-nums', noLatency && 'text-muted-foreground')}>
             {noLatency ? '—' : formatMs(row.latency.p95_ms)}
-          </td>
-          <td className="whitespace-nowrap text-end tabular-nums">{formatTokensPerSec(row.latency.tokens_per_sec)}</td>
-          <td className="whitespace-nowrap text-end tabular-nums">{formatPercent(rate)}</td>
+          </TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokensPerSec(row.latency.tokens_per_sec)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatPercent(rate)}</TableCell>
         </>
       ) : (
         <>
-          <td className="whitespace-nowrap text-end font-medium tabular-nums">{formatPercent(rate)}</td>
-          <td className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.cached_tokens)}</td>
-          <td className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.written_tokens)}</td>
-          <td className="whitespace-nowrap text-end tabular-nums">{formatTokens(uncached)}</td>
-          <td className={cn('whitespace-nowrap text-end tabular-nums', row.cache_saved_usd < 0 && 'text-warning')}>
+          <TableCell className="whitespace-nowrap text-end font-medium tabular-nums">{formatPercent(rate)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.cached_tokens)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.written_tokens)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(uncached)}</TableCell>
+          <TableCell className={cn('whitespace-nowrap text-end tabular-nums', row.cache_saved_usd < 0 && 'text-warning')}>
             {row.cache_saved_usd < 0 ? `-${formatUsd(-row.cache_saved_usd)}` : formatUsd(row.cache_saved_usd)}
-          </td>
+          </TableCell>
         </>
       )}
-    </tr>
+    </TableRow>
   )
 }

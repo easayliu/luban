@@ -5,7 +5,7 @@ import { type Credential } from '@/api/credentials'
 import { listProxies, testProxy, type ProxyTestResult, type SavedProxy } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
-import { displayCredentialLabel, extractError } from '@/lib/utils'
+import { displayCredentialLabel, extractError, formatMs } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { proxyMaskedUrl, type CredentialActions } from '@/components/credential-shared'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -27,8 +27,8 @@ import {
   DialogPopup,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Hint } from '@/components/ui/tooltip'
 
 export function CredentialProxyDialog({
@@ -82,15 +82,19 @@ export function CredentialProxyDialog({
 
         <DialogPanel className="space-y-4">
           {!readOnly && savedProxies.length > 0 && (
-            <div className="space-y-2">
-              <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
-              <ProxyPickerCombobox proxies={savedProxies} value={trimmed} onPick={setValue} />
-            </div>
+            <Field>
+              <FieldLabel>{t('从代理池选择', 'Pick from proxy pool')}</FieldLabel>
+              <ProxyPickerCombobox
+                ariaLabel={t('从代理池选择', 'Pick from proxy pool')}
+                proxies={savedProxies}
+                value={trimmed}
+                onPick={setValue}
+              />
+            </Field>
           )}
 
-
-          <div className="space-y-2">
-            <Label htmlFor="cred-proxy">{t('代理地址', 'Proxy URL')}</Label>
+          <Field>
+            <FieldLabel htmlFor="cred-proxy">{t('代理地址', 'Proxy URL')}</FieldLabel>
             <Input
               id="cred-proxy"
               value={value}
@@ -106,14 +110,14 @@ export function CredentialProxyDialog({
             {/* 两段格式说明合成一段、默认收两行：开头那两行（支持哪些协议、可带账号密码、留空直连）
                 是填写时要看的，socks5h 与 socks4 的来龙去脉按需展开。原来两段全摊开，手机上九行，
                 把下面那条「不会回退直连」的警示挤到了屏幕外。 */}
-            <p className="text-muted-foreground text-xs leading-relaxed">
+            <FieldDescription className="leading-relaxed">
               {/* 长说明默认收两行、末尾「了解更多」，同设置页的 ClampedDescription：超过 140 字各宽度都收，60–140 字只在手机上收。 */}
               <ClampedDescription text={t(
                 '支持 socks5://、socks5h://、http://、https://，可带 user:pass@（密码中的特殊字符需进行 percent-encode，如 # 写作 %23）。留空表示直连。填写 socks5:// 时，保存时会自动改为 socks5h://，由代理端而非本机解析域名。本机解析会将上游域名泄露给本地 DNS，解析结果也是距离本机最近的 IP；此外，不少住宅代理只接受域名形式的请求，收到 IP 形式的请求会直接断开连接。不再支持 socks4/socks4a：SOCKS4 协议无法携带用户名和密码，填写的认证信息会被静默丢弃。',
                 'Supports socks5://, socks5h://, http://, https://, optionally with user:pass@ (percent-encode special characters in the password, e.g. # as %23). Leave empty for a direct connection. socks5:// is rewritten to socks5h:// on save, so DNS is resolved at the proxy rather than locally. Local resolution leaks the upstream hostname to your DNS, yields an IP close to you rather than the proxy, and many residential proxies reject address-form requests outright. socks4/socks4a are no longer supported: the SOCKS4 protocol cannot carry a username and password, so credentials would be silently dropped.',
               )} />
-            </p>
-          </div>
+            </FieldDescription>
+          </Field>
 
           {/* 测试会经这条代理出网，访客不给。 */}
           {!readOnly && <ProxyTestBlock url={trimmed} />}
@@ -161,10 +165,13 @@ export function ProxyPickerCombobox({
   proxies,
   value,
   onPick,
+  ariaLabel,
 }: {
   proxies: SavedProxy[]
   value: string
   onPick: (url: string) => void
+  /** 触发按钮的读屏名称：外面的 FieldLabel 关联不到这个按钮，得单独给。 */
+  ariaLabel?: string
 }) {
   const { t } = useI18n()
   const byId = (id: number) => proxies.find((p) => p.id === id)
@@ -191,7 +198,7 @@ export function ProxyPickerCombobox({
         return `${p.label} ${p.url} ${p.credential_labels.join(' ')}`.toLowerCase().includes(q)
       }}
     >
-      <ComboboxTrigger className="w-full min-w-0 flex-1">
+      <ComboboxTrigger aria-label={ariaLabel} className="w-full min-w-0 flex-1">
         <ComboboxValue placeholder={t('选择代理…', 'Select a proxy…')} />
       </ComboboxTrigger>
       <ComboboxPopup
@@ -256,12 +263,12 @@ export function ProxyTestResultView({
           <p className="text-muted-foreground">
             {[result.city, result.region, result.country].filter(Boolean).join(', ')}
             {result.org && ` · ${result.org}`}
-            {` · ${result.latency_ms}ms`}
+            {` · ${formatMs(result.latency_ms)}`}
           </p>
         </div>
       ) : (
         <p className="min-w-0 break-all text-destructive-foreground">
-          {result.error}{result.latency_ms > 0 && ` · ${result.latency_ms}ms`}
+          {result.error}{result.latency_ms > 0 && ` · ${formatMs(result.latency_ms)}`}
         </p>
       )}
       <Button size="icon-sm" variant="ghost" className="-my-0.5 ml-auto shrink-0" onClick={onDismiss}>

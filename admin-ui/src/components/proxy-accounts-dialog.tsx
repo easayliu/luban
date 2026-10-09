@@ -9,6 +9,7 @@ import { proxyMaskedUrl } from '@/components/credential-shared'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CheckboxGroup } from '@/components/ui/checkbox-group'
 import {
   Dialog,
   DialogClose,
@@ -20,6 +21,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 import { Hint } from '@/components/ui/tooltip'
@@ -54,6 +56,20 @@ export function ProxyAccountsDialog({
 
   const usesThis = (proxyUrl: string | null) => proxyUrl === proxy.url
   const isChecked = (id: number, proxyUrl: string | null) => overrides.get(id) ?? usesThis(proxyUrl)
+  // CheckboxGroup 只认字符串数组：勾选状态由上面的覆盖表推出，变化时只把真正翻转的账号记进覆盖表
+  //（被搜索藏起来的账号不会变）。
+  const checkedValues = creds.filter((c) => isChecked(c.id, c.proxy)).map((c) => String(c.id))
+  const onCheckedValuesChange = (next: string[]) => {
+    const nextSet = new Set(next)
+    setOverrides((prev) => {
+      const map = new Map(prev)
+      for (const c of creds) {
+        const on = nextSet.has(String(c.id))
+        if (on !== isChecked(c.id, c.proxy)) map.set(c.id, on)
+      }
+      return map
+    })
+  }
 
   // 正在用这条代理的排在前面，其余按原顺序；排序只看当前配置，勾选时行不跳动。
   const sorted = useMemo(
@@ -149,41 +165,36 @@ export function ProxyAccountsDialog({
                   />
                 </div>
               )}
-              <ul className="max-h-80 divide-y overflow-y-auto rounded-md border" role="list">
-                {visible.map((c) => {
-                  const checked = isChecked(c.id, c.proxy)
-                  return (
-                    <li key={c.id}>
-                      <label className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-accent/50">
-                        <Checkbox
-                          checked={checked}
-                          onCheckedChange={(next) =>
-                            setOverrides((prev) => new Map(prev).set(c.id, next === true))
-                          }
-                        />
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm">{displayCredentialLabel(c.label, language)}</p>
-                          {!usesThis(c.proxy) && (
-                            <p className="truncate text-xs text-muted-foreground">
-                              {currentProxyText(c.proxy)}
-                            </p>
-                          )}
-                        </div>
-                        {c.disabled && (
-                          <span className="shrink-0 text-xs text-muted-foreground">
-                            {t('已停用', 'Disabled')}
-                          </span>
-                        )}
-                      </label>
-                    </li>
-                  )
-                })}
+              <CheckboxGroup
+                aria-label={t('使用账号', 'Accounts using this proxy')}
+                className="max-h-80 items-stretch gap-0 divide-y overflow-y-auto rounded-md border"
+                value={checkedValues}
+                onValueChange={onCheckedValuesChange}
+              >
+                {visible.map((c) => (
+                  <Label className="cursor-pointer gap-3 px-3 py-2 font-normal transition-colors hover:bg-accent/50" key={c.id}>
+                    <Checkbox value={String(c.id)} />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm">{displayCredentialLabel(c.label, language)}</p>
+                      {!usesThis(c.proxy) && (
+                        <p className="truncate text-xs text-muted-foreground">
+                          {currentProxyText(c.proxy)}
+                        </p>
+                      )}
+                    </div>
+                    {c.disabled && (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {t('已停用', 'Disabled')}
+                      </span>
+                    )}
+                  </Label>
+                ))}
                 {visible.length === 0 && (
-                  <li className="px-3 py-4 text-center text-sm text-muted-foreground">
+                  <p className="px-3 py-4 text-center text-sm text-muted-foreground">
                     {t('无匹配结果', 'No matches')}
-                  </li>
+                  </p>
                 )}
-              </ul>
+              </CheckboxGroup>
               {toRemove.length > 0 && (
                 <Alert>
                   <AlertDescription>

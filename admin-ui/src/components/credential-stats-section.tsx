@@ -20,11 +20,19 @@ import {
 import { ChartLegend, type ChartLegendItem } from '@/components/chart-legend'
 import { DetailSection } from '@/components/detail-section'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
-import { statusVariant } from '@/components/usage-shared'
+import {
+  COMPACT_TABLE_BODY_CLASS,
+  COMPACT_TABLE_HEADER_CLASS,
+  COMPACT_TABLE_LINK_CLASS,
+  statusVariant,
+} from '@/components/usage-shared'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Meter, MeterIndicator, MeterTrack } from '@/components/ui/meter'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
+import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Hint } from '@/components/ui/tooltip'
 
@@ -530,37 +538,40 @@ function StatsTable({ slots, granularity }: { slots: StatsSlot[]; granularity: C
   const rows = slots.filter((s) => s.hasTraffic).reverse()
   const n = (v: number) => v.toLocaleString(locale)
   return (
-    <div className="max-h-72 overflow-auto rounded-xl border">
-      <table className="w-full text-xs" aria-describedby={captionId}>
-        <caption id={captionId} className="sr-only">{t('按时段的用量明细', 'Usage by period')}</caption>
-        <thead className="sticky top-0 bg-surface-subtle">
-          <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-            <th scope="col" className="text-start">{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</th>
-            <th scope="col" className="text-end">{t('请求', 'Requests')}</th>
-            <th scope="col" className="text-end">{t('失败', 'Failed')}</th>
-            <th scope="col" className="text-end">{t('输入', 'Input')}</th>
-            <th scope="col" className="text-end">{t('输出', 'Output')}</th>
-            <th scope="col" className="text-end">{t('缓存写', 'Cache write')}</th>
-            <th scope="col" className="text-end">{t('缓存读', 'Cache read')}</th>
-            <th scope="col" className="text-end">{t('费用', 'Cost')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((s) => (
-            <tr key={s.ts} className="[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 [&>td]:whitespace-nowrap [&>td]:tabular-nums last:[&>td]:border-b-0">
-              <td>{slotLabel(s.ts, granularity).when}</td>
-              <td className="text-end font-medium">{n(s.requests)}</td>
-              <td className={cn('text-end', s.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>{n(s.errors)}</td>
-              <td className="text-end">{n(s.input_tokens)}</td>
-              <td className="text-end">{n(s.output_tokens)}</td>
-              <td className="text-end">{n(s.cache_write_tokens)}</td>
-              <td className="text-end text-muted-foreground">{n(s.cache_read_tokens)}</td>
-              <td className="text-end">{formatUsd(s.cost_usd)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    // 滚动容器当 Table 的外壳传进 `render`，sticky 表头才粘得住，见 COMPACT_TABLE_HEADER_CLASS。
+    <Table
+      className="text-xs"
+      aria-describedby={captionId}
+      render={<div className="max-h-72 overflow-auto rounded-xl border" />}
+    >
+      <TableCaption id={captionId} className="sr-only">{t('按时段的用量明细', 'Usage by period')}</TableCaption>
+      <TableHeader className={COMPACT_TABLE_HEADER_CLASS}>
+        <TableRow>
+          <TableHead>{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</TableHead>
+          <TableHead className="text-end">{t('请求', 'Requests')}</TableHead>
+          <TableHead className="text-end">{t('失败', 'Failed')}</TableHead>
+          <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
+          <TableHead className="text-end">{t('输出', 'Output')}</TableHead>
+          <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
+          <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
+          <TableHead className="text-end">{t('费用', 'Cost')}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody className={cn(COMPACT_TABLE_BODY_CLASS, '[&_td]:tabular-nums')}>
+        {rows.map((s) => (
+          <TableRow key={s.ts}>
+            <TableCell>{slotLabel(s.ts, granularity).when}</TableCell>
+            <TableCell className="text-end font-medium">{n(s.requests)}</TableCell>
+            <TableCell className={cn('text-end', s.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>{n(s.errors)}</TableCell>
+            <TableCell className="text-end">{n(s.input_tokens)}</TableCell>
+            <TableCell className="text-end">{n(s.output_tokens)}</TableCell>
+            <TableCell className="text-end">{n(s.cache_write_tokens)}</TableCell>
+            <TableCell className="text-end text-muted-foreground">{n(s.cache_read_tokens)}</TableCell>
+            <TableCell className="text-end">{formatUsd(s.cost_usd)}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -632,84 +643,82 @@ function StatsBreakdown({
           {t('所选时间范围内没有请求', 'No requests in this period')}
         </p>
       ) : (
-        <div className={cn('max-h-80 overflow-auto rounded-xl border transition-opacity', refetching && 'opacity-60')}>
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-surface-subtle">
-              <tr className="[&>th]:h-7 [&>th]:whitespace-nowrap [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-                <th scope="col" className="text-start">{keyHeader[by]}</th>
-                {/* 手机上七列放不下：占比条、Token（上面的图切到 Token 能看）与「最近」藏掉，留名称、占比、请求、失败、费用五列。 */}
-                <th scope="col" className="w-40 text-start max-sm:w-auto max-sm:text-end">{t('占比', 'Share')}</th>
-                <th scope="col" className="text-end">{t('请求', 'Requests')}</th>
-                <th scope="col" className="text-end">{t('失败', 'Failed')}</th>
-                <th scope="col" className="text-end max-sm:hidden">Token</th>
-                <th scope="col" className="text-end">{t('费用', 'Cost')}</th>
-                <th scope="col" className="text-end max-sm:hidden">{t('最近', 'Last')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => {
-                const share = total > 0 ? row.requests / total : 0
-                const drillable = by === 'model' && row.key !== ''
-                const drill = () => setDrill({ credId, model: row.key, label: row.key, hours })
-                return (
-                  <tr
-                    key={row.key}
-                    className={cn(
-                      '[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0',
-                      drillable && 'cursor-pointer hover:bg-muted/40',
+        // 滚动容器当 Table 的外壳传进 `render`，sticky 表头才粘得住，见 COMPACT_TABLE_HEADER_CLASS。
+        <Table
+          className="text-xs"
+          render={<div className={cn('max-h-80 overflow-auto rounded-xl border transition-opacity', refetching && 'opacity-60')} />}
+        >
+          <TableHeader className={COMPACT_TABLE_HEADER_CLASS}>
+            <TableRow>
+              <TableHead>{keyHeader[by]}</TableHead>
+              {/* 手机上七列放不下：占比条、Token（上面的图切到 Token 能看）与「最近」藏掉，留名称、占比、请求、失败、费用五列。 */}
+              <TableHead className="w-40 max-sm:w-auto max-sm:text-end">{t('占比', 'Share')}</TableHead>
+              <TableHead className="text-end">{t('请求', 'Requests')}</TableHead>
+              <TableHead className="text-end">{t('失败', 'Failed')}</TableHead>
+              <TableHead className="text-end max-sm:hidden">Token</TableHead>
+              <TableHead className="text-end">{t('费用', 'Cost')}</TableHead>
+              <TableHead className="text-end max-sm:hidden">{t('最近', 'Last')}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody className={COMPACT_TABLE_BODY_CLASS}>
+            {rows.map((row) => {
+              const share = total > 0 ? row.requests / total : 0
+              const drillable = by === 'model' && row.key !== ''
+              const drill = () => setDrill({ credId, model: row.key, label: row.key, hours })
+              return (
+                <TableRow
+                  key={row.key}
+                  className={cn(drillable && 'cursor-pointer hover:bg-muted/40')}
+                  onClick={drillable ? drill : undefined}
+                >
+                  <TableCell className="max-w-80 max-sm:max-w-36">
+                    {by === 'status' ? (
+                      <Badge size="sm" variant={statusVariant(Number(row.key))}>{row.key}</Badge>
+                    ) : drillable ? (
+                      // 与 UsageBreakdown 同一个做法：名称做成按钮，键盘用户也能钻进去看请求。
+                      // 「查看该模型的请求」原先挂在整行上，并进这枚按钮的提示，不再在行里套一层提示。
+                      <Hint label={`${row.key}\n${t('查看该模型的请求', 'View requests for this model')}`}>
+                        <Button variant="link" className={cn(COMPACT_TABLE_LINK_CLASS, 'font-mono')} onClick={drill}>
+                          {row.key}
+                        </Button>
+                      </Hint>
+                    ) : (
+                      <Hint label={row.key}>
+                        <span
+                          className={cn('block truncate', by !== 'client' && 'font-mono', !row.key && 'font-sans text-muted-foreground')}
+                        >
+                          {row.key || emptyKey[by]}
+                        </span>
+                      </Hint>
                     )}
-                    onClick={drillable ? drill : undefined}
-                  >
-                    <td className="max-w-80 max-sm:max-w-36">
-                      {by === 'status' ? (
-                        <Badge size="sm" variant={statusVariant(Number(row.key))}>{row.key}</Badge>
-                      ) : drillable ? (
-                        // 与 UsageBreakdown 同一个做法：名称做成按钮，键盘用户也能钻进去看请求。
-                        // 「查看该模型的请求」原先挂在整行上，并进这枚按钮的提示，不再在行里套一层提示。
-                        <Hint label={`${row.key}\n${t('查看该模型的请求', 'View requests for this model')}`}>
-                          <button
-                            type="button"
-                            className="block max-w-full truncate text-start font-mono hover:underline"
-                            onClick={drill}
-                          >
-                            {row.key}
-                          </button>
-                        </Hint>
-                      ) : (
-                        <Hint label={row.key}>
-                          <span
-                            className={cn('block truncate', by !== 'client' && 'font-mono', !row.key && 'font-sans text-muted-foreground')}
-                          >
-                            {row.key || emptyKey[by]}
-                          </span>
-                        </Hint>
-                      )}
-                    </td>
-                    <td>
-                      <span className="flex items-center gap-2">
-                        <span className="h-1.5 min-w-10 flex-1 overflow-hidden rounded-full bg-muted max-sm:hidden">
-                          <span className="block h-full rounded-full bg-chart-1" style={{ width: `${share * 100}%` }} />
-                        </span>
-                        <span className="w-10 shrink-0 text-end text-muted-foreground tabular-nums max-sm:ml-auto">
-                          {`${Number((share * 100).toFixed(1))}%`}
-                        </span>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-2">
+                      {/* 条只给眼睛看（右边那格百分比读屏会念），手机上随占比列一起收成纯数字。 */}
+                      <Meter aria-hidden className="min-w-10 flex-1 max-sm:hidden" max={100} value={share * 100}>
+                        <MeterTrack className="h-1.5 rounded-full bg-muted">
+                          <MeterIndicator className="rounded-full bg-chart-1" />
+                        </MeterTrack>
+                      </Meter>
+                      <span className="w-10 shrink-0 text-end text-muted-foreground tabular-nums max-sm:ml-auto">
+                        {`${Number((share * 100).toFixed(1))}%`}
                       </span>
-                    </td>
-                    <td className="whitespace-nowrap text-end font-medium tabular-nums">{row.requests.toLocaleString(locale)}</td>
-                    <td className={cn('whitespace-nowrap text-end tabular-nums', row.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>
-                      {row.errors.toLocaleString(locale)}
-                    </td>
-                    <Hint label={row.tokens.toLocaleString(locale)}>
-                      <td className="whitespace-nowrap text-end tabular-nums max-sm:hidden">{formatTokens(row.tokens)}</td>
-                    </Hint>
-                    <td className="whitespace-nowrap text-end tabular-nums">{formatUsd(row.cost_usd)}</td>
-                    <td className="whitespace-nowrap text-end text-muted-foreground max-sm:hidden">{relativeTime(row.last_ts, now, language)}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-end font-medium tabular-nums">{row.requests.toLocaleString(locale)}</TableCell>
+                  <TableCell className={cn('text-end tabular-nums', row.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>
+                    {row.errors.toLocaleString(locale)}
+                  </TableCell>
+                  <Hint label={row.tokens.toLocaleString(locale)}>
+                    <TableCell className="text-end tabular-nums max-sm:hidden">{formatTokens(row.tokens)}</TableCell>
+                  </Hint>
+                  <TableCell className="text-end tabular-nums">{formatUsd(row.cost_usd)}</TableCell>
+                  <TableCell className="text-end text-muted-foreground max-sm:hidden">{relativeTime(row.last_ts, now, language)}</TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
       )}
       {drill && (
         <RequestLookupDialog open onOpenChange={(open) => { if (!open) setDrill(null) }} filter={drill} />

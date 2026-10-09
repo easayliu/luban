@@ -17,6 +17,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CheckboxGroup } from '@/components/ui/checkbox-group'
 import {
   Dialog,
   DialogClose,
@@ -30,10 +31,11 @@ import {
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Spinner } from '@/components/ui/spinner'
+import { Label } from '@/components/ui/label'
 import { toastManager } from '@/components/ui/toast'
 import { SettingsGroup } from '@/components/settings-group'
 import { useGroups } from '@/components/group-picker'
+import { ErrorState, LoadingState } from '@/components/state-placeholders'
 
 /** 能被开放分组的人：代理（名下用户自动继承），以及管理员直属的用户。 */
 function grantable(users: ConsoleUser[]): ConsoleUser[] {
@@ -75,14 +77,20 @@ export function GroupSettingsContent() {
   })
 
   if (groupsQuery.isPending) {
+    return <LoadingState label={t('正在加载分组', 'Loading groups')} />
+  }
+  // 读失败时原先落到空列表，看着像「还没有分组」；明确报错并给重试。
+  if (groupsQuery.isError) {
     return (
-      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-        <Spinner className="size-4" />
-        {t('正在加载分组', 'Loading groups')}
-      </div>
+      <ErrorState
+        error={groupsQuery.error}
+        retrying={groupsQuery.isFetching}
+        title={t('无法读取号池分组', 'Unable to load pool groups')}
+        onRetry={() => void groupsQuery.refetch()}
+      />
     )
   }
-  const groups = groupsQuery.data ?? []
+  const groups = groupsQuery.data
 
   return (
     <div className="space-y-4">
@@ -284,20 +292,23 @@ function GrantsDialog({
               {t('还没有代理或管理员直属的用户，先到「用户管理」开设账号。', 'No agents or users directly under the admin yet; create them under Users first.')}
             </p>
           ) : (
-            <div className="max-h-72 divide-y overflow-y-auto rounded-lg border">
+            // CheckboxGroup 的值是字符串：用户 id 在这里进出时转换。
+            <CheckboxGroup
+              aria-label={t('开放名单', 'Access')}
+              className="max-h-72 items-stretch gap-0 divide-y overflow-y-auto rounded-lg border"
+              value={value.map(String)}
+              onValueChange={(next) => setValue(next.map(Number))}
+            >
               {users.map((u) => (
-                <label className="flex cursor-pointer items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/48" key={u.id}>
-                  <Checkbox
-                    checked={value.includes(u.id)}
-                    onCheckedChange={(on) => setValue((v) => (on === true ? [...v, u.id] : v.filter((x) => x !== u.id)))}
-                  />
-                  <span className="min-w-0 flex-1 truncate font-medium">{u.username}</span>
+                <Label className="cursor-pointer gap-3 px-3 py-2.5 transition-colors hover:bg-accent/48" key={u.id}>
+                  <Checkbox value={String(u.id)} />
+                  <span className="min-w-0 flex-1 truncate">{u.username}</span>
                   <Badge size="xs" variant={u.role === 'agent' ? 'info' : 'secondary'}>
                     {u.role === 'agent' ? t('代理', 'Agent') : t('用户', 'User')}
                   </Badge>
-                </label>
+                </Label>
               ))}
-            </div>
+            </CheckboxGroup>
           )}
         </DialogPanel>
         <DialogFooter>

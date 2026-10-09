@@ -1,6 +1,18 @@
-import { useId, useState } from 'react'
+import { useState } from 'react'
 import { useI18n } from '@/lib/i18n'
-import { cacheHitRate, cn, formatPercent, formatTokens, type CacheGranularity, type CacheSlot } from '@/lib/utils'
+import {
+  cacheHitRate,
+  cn,
+  formatPercent,
+  formatTokens,
+  slotLabel,
+  tickStep,
+  type CacheGranularity,
+  type CacheSlot,
+} from '@/lib/utils'
+import { ChartReadout } from '@/components/chart-readout'
+import { ChartTable } from '@/components/chart-table'
+import { TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 
 function slotReadout(
   slot: CacheSlot,
@@ -8,11 +20,7 @@ function slotReadout(
   t: (zh: string, en: string) => string,
   locale: string,
 ): { when: string; axis: string; rate: string; detail: string } {
-  const d = new Date(slot.ts * 1000)
-  const p = (n: number) => String(n).padStart(2, '0')
-  const day = `${d.getMonth() + 1}/${d.getDate()}`
-  const when = granularity === 'hour' ? `${day} ${p(d.getHours())}:00` : day
-  const axis = granularity === 'hour' ? `${p(d.getHours())}:00` : day
+  const { when, axis } = slotLabel(slot.ts, granularity)
   if (!slot.hasTraffic) {
     return { when, axis, rate: '—', detail: t('该时段没有请求', 'No requests in this period') }
   }
@@ -31,10 +39,6 @@ function slotReadout(
 /** 三段之外的那部分：既没命中也没写入、按原价算的输入。 */
 function uncachedTokens(slot: { inputTokens: number; cachedTokens: number; writtenTokens: number }): number {
   return Math.max(0, slot.inputTokens - slot.cachedTokens - slot.writtenTokens)
-}
-
-function tickStep(slots: number): number {
-  return Math.max(1, Math.ceil(slots / 7))
 }
 
 function volumeWeight(inputTokens: number, maxInputTokens: number): number {
@@ -178,35 +182,15 @@ export function CacheHitColumns({
               })}
             </div>
 
-            {active != null && (() => {
-              const pos = (active + 0.5) / slots.length
-              const anchor = pos < 0.2 ? 'start' : pos > 0.8 ? 'end' : 'center'
-              return (
-                <div
-                  role="status"
-                  aria-live="off"
-                  className={cn(
-                    'pointer-events-none absolute top-1 z-10 rounded-lg border bg-popover px-2 py-1',
-                    'text-2xs leading-4 text-popover-foreground shadow-md',
-                    'w-max max-w-[min(16rem,100%)]',
-                    anchor === 'center' && '-translate-x-1/2',
-                  )}
-                  style={
-                    anchor === 'start'
-                      ? { left: 0 }
-                      : anchor === 'end'
-                        ? { right: 0 }
-                        : { left: `${pos * 100}%` }
-                  }
-                >
-                  <p className="flex items-baseline gap-1.5 tabular-nums">
-                    <span className="font-semibold">{readouts[active].rate}</span>
-                    <span className="text-muted-foreground">{readouts[active].when}</span>
-                  </p>
-                  <p className="text-muted-foreground tabular-nums">{readouts[active].detail}</p>
-                </div>
-              )
-            })()}
+            {active != null && (
+              <ChartReadout
+                index={active}
+                count={slots.length}
+                value={readouts[active].rate}
+                when={readouts[active].when}
+                detail={readouts[active].detail}
+              />
+            )}
           </div>
 
           <div className="relative mt-1.5 h-4" aria-hidden>
@@ -236,45 +220,36 @@ export function CacheHitTable({
   granularity: CacheGranularity
 }) {
   const { t, locale } = useI18n()
-  const captionId = useId()
   const rows = slots.filter((s) => s.hasTraffic)
 
   return (
-    // 六列在手机宽度上放不下，横向滚动而不是把表撑出对话框。
-    <div className="max-h-64 overflow-auto rounded-xl border">
-      <table className="w-full text-xs" aria-describedby={captionId}>
-        <caption id={captionId} className="sr-only">
-          {t('缓存命中率按时段明细', 'Cache hit rate by period')}
-        </caption>
-        <thead className="sticky top-0 bg-surface-subtle">
-          <tr className="[&>th]:h-7 [&>th]:border-b [&>th]:px-3 [&>th]:text-2xs [&>th]:font-medium [&>th]:text-muted-foreground">
-            <th scope="col" className="text-start">
-              {granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}
-            </th>
-            <th scope="col" className="text-end">{t('命中率', 'Hit rate')}</th>
-            <th scope="col" className="text-end">{t('缓存读', 'Cache read')}</th>
-            <th scope="col" className="text-end">{t('缓存写', 'Cache write')}</th>
-            <th scope="col" className="text-end">{t('输入', 'Input')}</th>
-            <th scope="col" className="text-end">{t('输入合计', 'Input total')}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((slot) => {
-            const r = slotReadout(slot, granularity, t, locale)
-            return (
-              <tr key={slot.ts} className="[&>td]:border-b [&>td]:px-3 [&>td]:py-1.5 last:[&>td]:border-b-0">
-                <td className="whitespace-nowrap tabular-nums">{r.when}</td>
-                <td className="whitespace-nowrap text-end font-medium tabular-nums">{r.rate}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">{slot.cachedTokens.toLocaleString(locale)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">{slot.writtenTokens.toLocaleString(locale)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums">{uncachedTokens(slot).toLocaleString(locale)}</td>
-                <td className="whitespace-nowrap text-end tabular-nums text-muted-foreground">{slot.inputTokens.toLocaleString(locale)}</td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </div>
+    <ChartTable caption={t('缓存命中率按时段明细', 'Cache hit rate by period')}>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</TableHead>
+          <TableHead className="text-end">{t('命中率', 'Hit rate')}</TableHead>
+          <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
+          <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
+          <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
+          <TableHead className="text-end">{t('输入合计', 'Input total')}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((slot) => {
+          const r = slotReadout(slot, granularity, t, locale)
+          return (
+            <TableRow key={slot.ts}>
+              <TableCell>{r.when}</TableCell>
+              <TableCell className="text-end font-medium">{r.rate}</TableCell>
+              <TableCell className="text-end">{slot.cachedTokens.toLocaleString(locale)}</TableCell>
+              <TableCell className="text-end">{slot.writtenTokens.toLocaleString(locale)}</TableCell>
+              <TableCell className="text-end">{uncachedTokens(slot).toLocaleString(locale)}</TableCell>
+              <TableCell className="text-end text-muted-foreground">{slot.inputTokens.toLocaleString(locale)}</TableCell>
+            </TableRow>
+          )
+        })}
+      </TableBody>
+    </ChartTable>
   )
 }
 

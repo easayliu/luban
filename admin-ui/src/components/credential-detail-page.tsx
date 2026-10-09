@@ -31,6 +31,7 @@ import {
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
 import { useReadOnly } from '@/lib/role'
+import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
@@ -47,7 +48,7 @@ import {
   relativeTime,
 } from '@/lib/utils'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, Breadcrumb, PreferencesMenu } from '@/components/app-header'
+import { AccountMenu, AppHeader, Breadcrumb, MainNav, type MainSection } from '@/components/app-header'
 import { BanEventDetail, sourceLabel } from '@/components/ban-events-dialog'
 import { ExtraWindows, verdictShownByMeter, visibleExtraWindows } from '@/components/credential-card'
 import { CredentialDevicesDialog, DeviceList, SessionList } from '@/components/credential-devices-dialog'
@@ -87,6 +88,7 @@ import { DetailSection as Section } from '@/components/detail-section'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { GroupBadges, SetGroupsDialog, useGroups } from '@/components/group-picker'
 import { statusVariant } from '@/components/usage-shared'
+import { Fact } from '@/components/fact'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -98,6 +100,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Meter, MeterIndicator, MeterTrack } from '@/components/ui/meter'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
@@ -169,6 +172,8 @@ export function CredentialDetailPage({
   error,
   onRetry,
   onBack,
+  onNavigate,
+  onSignOut,
 }: {
   id: number
   credentials: Credential[] | undefined
@@ -176,6 +181,9 @@ export function CredentialDetailPage({
   error: unknown
   onRetry: () => void
   onBack: () => void
+  /** 顶栏主导航与账号菜单：详情页挂在账号池下，但从这里也能直接去别的一级页面。 */
+  onNavigate?: (section: MainSection) => void
+  onSignOut?: () => void
 }) {
   const { t, language } = useI18n()
   // 详情页不另开接口：账号列表接口本来就带全了单个账号的字段，且已按 30 秒轮询，
@@ -224,7 +232,11 @@ export function CredentialDetailPage({
 
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
-      <AppHeader actions={<PreferencesMenu />} onNavigateHome={onBack} />
+      <AppHeader
+        actions={<AccountMenu onSignOut={onSignOut} />}
+        nav={onNavigate && <MainNav current="pool" onNavigate={onNavigate} />}
+        onNavigateHome={onBack}
+      />
       <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
         <div className="space-y-5 sm:space-y-7">
           <Breadcrumb
@@ -457,13 +469,7 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
   const { status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
 
-  useEffect(() => {
-    const previousTitle = document.title
-    document.title = `${credentialLabel} · Luban`
-    return () => {
-      document.title = previousTitle
-    }
-  }, [credentialLabel])
+  useDocumentTitle(`${credentialLabel} · Luban`)
 
   const openRename = () => {
     setName(cred.label)
@@ -1077,15 +1083,6 @@ function ExpandableText({ text, label }: { text: string; label: string }) {
   )
 }
 
-function Fact({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="min-w-0">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 min-w-0 break-words tabular-nums">{children}</dd>
-    </div>
-  )
-}
-
 /** 最近几条流水；要翻页、看全量走请求明细对话框（它有锚点翻页，这里只看最新一页）。 */
 function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: () => void }) {
   const { t, language, locale } = useI18n()
@@ -1119,16 +1116,18 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
         : undefined}
       action={(
         <>
-          <Button
-            type="button"
-            size="icon-sm"
-            variant="ghost"
-            disabled={usage.isFetching}
-            aria-label={t('刷新', 'Refresh')}
-            onClick={() => { void usage.refetch() }}
-          >
-            <RefreshCwIcon className={usage.isFetching ? 'animate-spin' : undefined} />
-          </Button>
+          <Hint label={t('刷新', 'Refresh')}>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              disabled={usage.isFetching}
+              aria-label={t('刷新', 'Refresh')}
+              onClick={() => { void usage.refetch() }}
+            >
+              <RefreshCwIcon className={usage.isFetching ? 'animate-spin' : undefined} />
+            </Button>
+          </Hint>
           <Button type="button" size="sm" variant="outline" onClick={onViewAll}>
             {t('查看全部', 'View all')}
             <ChevronRightIcon />
@@ -1262,13 +1261,16 @@ function BanEventsSection({ cred }: { cred: Credential }) {
         <ul className="divide-y">
           {rows.map((ev) => {
             const isOpen = expanded === ev.id
+            // 一次只展开一条（展开别的会收起这条），所以开合状态仍记在外面，Collapsible 受控。
             return (
-              <li key={ev.id}>
-                <button
-                  type="button"
-                  aria-expanded={isOpen}
+              <Collapsible
+                key={ev.id}
+                open={isOpen}
+                onOpenChange={(open) => setExpanded(open ? ev.id : null)}
+                render={<li />}
+              >
+                <CollapsibleTrigger
                   className="flex w-full min-w-0 items-start gap-2 px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
-                  onClick={() => setExpanded(isOpen ? null : ev.id)}
                 >
                   <span className="mt-0.5 shrink-0 text-muted-foreground" aria-hidden>
                     {isOpen ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
@@ -1288,9 +1290,11 @@ function BanEventsSection({ cred }: { cred: Credential }) {
                     </span>
                     <span className="line-clamp-2 block break-all font-mono text-xs text-muted-foreground">{ev.reason}</span>
                   </span>
-                </button>
-                {isOpen && <BanEventDetail ev={ev} />}
-              </li>
+                </CollapsibleTrigger>
+                <CollapsiblePanel>
+                  <BanEventDetail ev={ev} />
+                </CollapsiblePanel>
+              </Collapsible>
             )
           })}
         </ul>
@@ -1420,7 +1424,8 @@ function ScheduleSection({
       disabled={prio.isPending}
     >
       <SelectTrigger aria-label={t('调度优先级', 'Priority')} size="sm" className="w-36"><SelectValue /></SelectTrigger>
-      <SelectPopup>
+      {/* 行内控件：弹层在下方展开，不盖住触发器与同一行的说明。 */}
+      <SelectPopup alignItemWithTrigger={false}>
         {priorityItems.map((item) => (
           <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
         ))}
@@ -1431,16 +1436,17 @@ function ScheduleSection({
     // 手机上 SettingsRow 会把「修改」按钮换到说明下面单独一行，三项配置占掉大半屏。改成与 ⋯ 底部
     // 面板「设置」组同一副面孔：名称在左、当前值在右、末尾一枚 ›，整行可点。
     const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('停用', 'off'))
+    // ghost 按钮铺满整行：去掉圆角、边框与按钮自身的高度，行高由 min-h-12 定，与面板里的行一致。
     const row = (label: string, value: string, onClick: () => void) => (
-      <button
-        type="button"
-        className="flex min-h-12 w-full items-center gap-3 px-4 text-left text-sm outline-none transition-colors active:bg-accent focus-visible:bg-accent"
+      <Button
+        variant="ghost"
+        className="h-auto min-h-12 w-full justify-start gap-3 rounded-none border-0 px-4 text-left font-normal before:rounded-none active:bg-accent focus-visible:bg-accent focus-visible:ring-inset focus-visible:ring-offset-0 sm:h-auto [&_svg]:mx-0"
         onClick={onClick}
       >
         <span className="shrink-0 font-medium">{label}</span>
         <span className="min-w-0 flex-1 truncate text-right text-xs text-muted-foreground tabular-nums">{value}</span>
         <ChevronRightIcon aria-hidden className="size-4 shrink-0 text-muted-foreground/64" />
-      </button>
+      </Button>
     )
     return (
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>

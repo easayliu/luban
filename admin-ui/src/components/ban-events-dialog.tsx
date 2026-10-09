@@ -12,6 +12,8 @@ import {
   cn, copyText, displayCredentialLabel, downloadJson, extractError, fileStamp, formatFullTime,
   formatUsd,
 } from '@/lib/utils'
+import { Fact } from '@/components/fact'
+import { PaginationBar } from '@/components/pagination-bar'
 import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -20,12 +22,6 @@ import {
   Dialog, DialogDescription, DialogHeader, DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
-import {
-  Pagination, PaginationContent, PaginationItem, PaginationNext, PaginationPrevious,
-} from '@/components/ui/pagination'
-import {
-  Select, SelectItem, SelectPopup, SelectTrigger, SelectValue,
-} from '@/components/ui/select'
 import { Spinner } from '@/components/ui/spinner'
 import { toastManager } from '@/components/ui/toast'
 import {
@@ -66,19 +62,10 @@ function Distribution({ items, empty }: { items: ValueCount[]; empty: string }) 
   )
 }
 
-function Fact({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="min-w-0">
-      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="mt-0.5 break-words text-sm">{children}</div>
-    </div>
-  )
-}
-
 /** 一条事件的详情：账号侧快照 + 冻结流水时间线。 */
 export function BanEventDetail({ ev }: { ev: BanEvent }) {
-  const { t, language, locale } = useI18n()
-  const [pageSize, setPageSize] = useState<number>(PAGE_SIZES[0])
+  const { t, language } = useI18n()
+  const [pageSize, setPageSize] = useState<(typeof PAGE_SIZES)[number]>(PAGE_SIZES[0])
   const [page, setPage] = useState(0)
   /** 导出（复制/下载）正在连着翻页拉整份：期间两个按钮都锁上，免得拉出半份。 */
   const [exporting, setExporting] = useState(false)
@@ -95,8 +82,6 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
   // 页码越界（改了每页条数）时退回最后一页，而不是显示一页空白。
   const currentPage = Math.min(page, totalPages - 1)
   if (currentPage !== page) setPage(currentPage)
-  const firstIndex = currentPage * pageSize + 1
-  const lastIndex = currentPage * pageSize + rows.length
   const dash = '—'
 
   /**
@@ -149,7 +134,7 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
   return (
     // whitespace-normal：详情挂在表格单元格里，表格默认不折行，长的上游原文会直接压到右边那一格上。
     <div className="space-y-4 whitespace-normal border-t bg-muted/30 px-4 py-4">
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
         <Fact label={t('上游原文', 'Upstream message')}>
           <div className="font-mono text-xs [overflow-wrap:anywhere]">
             {/* `size="xs"`：这枚是内联嵌在一行 `text-xs` 正文里的，默认档带视口 ramp
@@ -185,27 +170,19 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
           )}
         </Fact>
         <Fact label={t('冻结流水', 'Frozen rows')}>{ev.frozen_rows}</Fact>
-        <div className="sm:col-span-2">
-          <Fact label={t('模型分布（7 天）', 'Models (7d)')}>
-            <Distribution items={ev.models_7d} empty={dash} />
-          </Fact>
-        </div>
-        <div className="sm:col-span-2">
-          <Fact label={t('客户端 UA 分布（7 天）', 'Client UAs (7d)')}>
-            <Distribution items={ev.uas_7d} empty={dash} />
-          </Fact>
-        </div>
-        <div className="sm:col-span-2 lg:col-span-4">
-          <Fact label={t('发给 Anthropic 的设备 ID 分布（7 天）', 'Device IDs sent to Anthropic (7d)')}>
-            <Distribution items={ev.device_ids_out_7d} empty={t('旧记录不含此项', 'not recorded in older rows')} />
-          </Fact>
-        </div>
-        <div className="sm:col-span-2 lg:col-span-4">
-          <Fact label={t('出口代理分布（7 天）', 'Proxies (7d)')}>
-            <Distribution items={ev.proxies_7d} empty={t('全部直连，或旧记录不含此项', 'all direct, or not recorded in older rows')} />
-          </Fact>
-        </div>
-      </div>
+        <Fact className="sm:col-span-2" label={t('模型分布（7 天）', 'Models (7d)')}>
+          <Distribution items={ev.models_7d} empty={dash} />
+        </Fact>
+        <Fact className="sm:col-span-2" label={t('客户端 UA 分布（7 天）', 'Client UAs (7d)')}>
+          <Distribution items={ev.uas_7d} empty={dash} />
+        </Fact>
+        <Fact className="sm:col-span-2 lg:col-span-4" label={t('发给 Anthropic 的设备 ID 分布（7 天）', 'Device IDs sent to Anthropic (7d)')}>
+          <Distribution items={ev.device_ids_out_7d} empty={t('旧记录不含此项', 'not recorded in older rows')} />
+        </Fact>
+        <Fact className="sm:col-span-2 lg:col-span-4" label={t('出口代理分布（7 天）', 'Proxies (7d)')}>
+          <Distribution items={ev.proxies_7d} empty={t('全部直连，或旧记录不含此项', 'all direct, or not recorded in older rows')} />
+        </Fact>
+      </dl>
 
       <div className="flex items-center justify-between gap-2">
         <div className="text-sm font-medium">
@@ -218,8 +195,8 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
           <Button size="sm" variant="outline" onClick={copyAll} disabled={exporting || total === 0}>
             <CopyIcon />{t('复制 JSON', 'Copy JSON')}
           </Button>
-          <Button size="sm" variant="outline" onClick={downloadAll} disabled={exporting || total === 0}>
-            {exporting ? <Spinner className="size-4" /> : <DownloadIcon />}
+          <Button size="sm" variant="outline" onClick={downloadAll} loading={exporting} disabled={total === 0}>
+            <DownloadIcon />
             {t('下载 JSON', 'Download JSON')}
           </Button>
         </div>
@@ -261,67 +238,23 @@ export function BanEventDetail({ ev }: { ev: BanEvent }) {
             </Table>
           </div>
 
-          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 sm:gap-3 border-t pt-3 text-xs">
-            <p className="min-w-0 text-muted-foreground tabular-nums">
-              <span className="max-sm:hidden">
-                {t(
-                  `第 ${firstIndex}–${lastIndex} 条，共 ${total.toLocaleString(locale)} 条`,
-                  `${firstIndex}–${lastIndex} of ${total.toLocaleString(locale)}`,
-                )}
-              </span>
-              <span className="sm:hidden">{`${firstIndex}–${lastIndex} / ${total.toLocaleString(locale)}`}</span>
-            </p>
-            {/* 窄屏也排成一行：计数缩成「1–10 / 29」、翻页只写「1 / 3」、藏掉「每页」二字，
-              三栏放得下，不再把翻页挤到第二行。 */}
-            <div className="col-start-3 row-start-1 flex items-center gap-2 justify-self-end">
-              <span className="whitespace-nowrap text-muted-foreground max-sm:hidden">{t('每页', 'Per page')}</span>
-              <Select
-                items={PAGE_SIZES.map((size) => ({ value: size, label: String(size) }))}
-                value={pageSize}
-                onValueChange={(value) => {
-                  if (value == null) return
-                  // 每页条数一变，原来的页码就没有意义了，回到第一页。
-                  setPageSize(Number(value))
-                  setPage(0)
-                }}
-              >
-                <SelectTrigger size="sm" className="w-auto min-w-16 sm:min-w-20" aria-label={t('每页条数', 'Rows per page')}>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectPopup>
-                  {PAGE_SIZES.map((size) => (
-                    <SelectItem key={size} value={size}>{size}</SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-            </div>
-            {totalPages > 1 && (
-              <Pagination className="col-start-2 row-start-1 justify-center">
-                <PaginationContent>
-                  <PaginationItem>
-                    <PaginationPrevious
-                      render={<Button variant="ghost" disabled={logs.isFetching || currentPage === 0} />}
-                      aria-disabled={logs.isFetching || currentPage === 0}
-                      onClick={() => setPage((current) => Math.max(0, current - 1))}
-                    />
-                  </PaginationItem>
-                  <PaginationItem>
-                    <span className="whitespace-nowrap px-2 text-xs text-foreground tabular-nums" aria-live="polite">
-                      <span className="max-sm:hidden">{t(`第 ${currentPage + 1} / ${totalPages} 页`, `Page ${currentPage + 1} of ${totalPages}`)}</span>
-                      <span className="sm:hidden">{`${currentPage + 1} / ${totalPages}`}</span>
-                    </span>
-                  </PaginationItem>
-                  <PaginationItem>
-                    <PaginationNext
-                      render={<Button variant="ghost" disabled={logs.isFetching || currentPage >= totalPages - 1} />}
-                      aria-disabled={logs.isFetching || currentPage >= totalPages - 1}
-                      onClick={() => setPage((current) => Math.min(totalPages - 1, current + 1))}
-                    />
-                  </PaginationItem>
-                </PaginationContent>
-              </Pagination>
-            )}
-          </div>
+          <PaginationBar
+            className="border-t pt-3"
+            total={total}
+            page={currentPage + 1}
+            pageCount={totalPages}
+            pageSize={pageSize}
+            pageSizes={PAGE_SIZES}
+            pageRowCount={rows.length}
+            pageSizeLabel={t('每页条数', 'Rows per page')}
+            disabled={logs.isFetching}
+            onPageChange={(next) => setPage(next - 1)}
+            onPageSizeChange={(size) => {
+              // 每页条数一变，原来的页码就没有意义了，回到第一页。
+              setPageSize(size)
+              setPage(0)
+            }}
+          />
         </>
       )}
     </div>
@@ -383,7 +316,7 @@ function FrozenRow({ log, trigger }: { log: UsageLog; trigger: boolean }) {
         </TableCell>
         <TableCell>
           {shape ? (
-            <Button size="sm" variant="ghost" className="h-6 px-1 font-mono" onClick={() => setShapeOpen((v) => !v)}>
+            <Button size="sm" variant="ghost" className="h-6 px-1 font-mono" aria-expanded={shapeOpen} onClick={() => setShapeOpen((v) => !v)}>
               {shapeOpen ? <ChevronDownIcon /> : <ChevronRightIcon />}
               {shapeBrief(shape)}
             </Button>
@@ -462,9 +395,17 @@ export function BanEventsDialog({
         </DialogHeader>
         <DialogPanel className="max-h-[70vh] overflow-y-auto">
           <div className="mb-2 flex justify-end">
-            <Button size="sm" variant="ghost" onClick={() => query.refetch()} disabled={query.isFetching}>
-              <RefreshCwIcon className={cn(query.isFetching && 'animate-spin')} />{t('刷新', 'Refresh')}
-            </Button>
+            <Hint label={t('刷新', 'Refresh')}>
+              <Button
+                size="icon-sm"
+                variant="ghost"
+                aria-label={t('刷新', 'Refresh')}
+                onClick={() => { void query.refetch() }}
+                disabled={query.isFetching}
+              >
+                <RefreshCwIcon className={cn(query.isFetching && 'animate-spin')} />
+              </Button>
+            </Hint>
           </div>
           {query.isPending ? (
             <div className="flex justify-center py-10"><Spinner /></div>

@@ -1,9 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CableIcon,
-  CheckIcon,
-  ClipboardIcon,
   EyeIcon,
   GaugeIcon,
   KeyRoundIcon,
@@ -37,8 +35,11 @@ import { changePassword, getAuthState, setViewerPassword } from '@/api/auth'
 import { clearToken } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
 import { useMe } from '@/lib/role'
-import { ApiKeysSettings } from '@/components/api-keys-settings'
-import { copyText, extractError, formatDuration } from '@/lib/utils'
+import { ApiKeysSettings, setupSnippet, SnippetBlock } from '@/components/api-keys-settings'
+import { CopyButton } from '@/components/copy-button'
+import { MIN_PASSWORD_LENGTH, PasswordInput } from '@/components/password-input'
+import { ErrorState, LoadingState } from '@/components/state-placeholders'
+import { extractError, formatDuration } from '@/lib/utils'
 import {
   AlertDialog,
   AlertDialogClose,
@@ -49,7 +50,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
-import { Button, type ButtonProps } from '@/components/ui/button'
+import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogDescription,
@@ -75,7 +76,6 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
-import { Hint } from '@/components/ui/tooltip'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 import {
   DurationSetting,
@@ -125,32 +125,19 @@ export function AccessSettingsContent() {
   // `api_key` 只在 `LUBAN_API_KEY` 接管时有值：那把 Key 只读列在接入 Key 列表最上面。
   const envKey = data?.env_managed ? (data.api_key ?? null) : null
   const keyPlaceholder = t('<接入 Key>', '<access key>')
-  const snippet = `export ANTHROPIC_BASE_URL=${baseUrl}\nexport ANTHROPIC_AUTH_TOKEN=${keyPlaceholder}`
 
   if (settingsQuery.isPending) {
-    return (
-      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-        <Spinner className="size-4" />
-        {t('正在加载设置', 'Loading settings')}
-      </div>
-    )
+    return <LoadingState label={t('正在加载设置', 'Loading settings')} />
   }
 
   if (settingsQuery.isError) {
     return (
-      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
-        <p className="text-sm font-medium">
-          {t('无法读取当前设置', 'Unable to load the current settings')}
-        </p>
-        <Button
-          size="sm"
-          variant="outline"
-          loading={settingsQuery.isFetching}
-          onClick={() => settingsQuery.refetch()}
-        >
-          {t('重试', 'Retry')}
-        </Button>
-      </div>
+      <ErrorState
+        error={settingsQuery.error}
+        retrying={settingsQuery.isFetching}
+        title={t('无法读取当前设置', 'Unable to load the current settings')}
+        onRetry={() => void settingsQuery.refetch()}
+      />
     )
   }
 
@@ -185,13 +172,11 @@ export function AccessSettingsContent() {
           </InputGroup>
         </Field>
 
-        <ApiKeysSettings envKey={envKey} />
+        <ApiKeysSettings envKey={envKey} required={data?.api_keys_required ?? true} />
 
         <Field className="p-4 sm:p-5">
           <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>
-          <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5">
-            {snippet}
-          </pre>
+          <SnippetBlock text={setupSnippet(keyPlaceholder)} />
           <FieldDescription>
             {t(
               '把占位符换成上面任意一把接入 Key；在 Key 的「查看与复制」里可以直接复制带 Key 的完整片段。',
@@ -209,29 +194,17 @@ export function DeviceSettingsContent() {
   const settingsQuery = useSettingsQuery()
 
   if (settingsQuery.isPending) {
-    return (
-      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-        <Spinner className="size-4" />
-        {t('正在加载设备策略', 'Loading device policies')}
-      </div>
-    )
+    return <LoadingState label={t('正在加载设备策略', 'Loading device policies')} />
   }
 
   if (settingsQuery.isError) {
     return (
-      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
-        <p className="text-sm font-medium">
-          {t('无法读取设备策略', 'Unable to load device policies')}
-        </p>
-        <Button
-          size="sm"
-          variant="outline"
-          loading={settingsQuery.isFetching}
-          onClick={() => settingsQuery.refetch()}
-        >
-          {t('重试', 'Retry')}
-        </Button>
-      </div>
+      <ErrorState
+        error={settingsQuery.error}
+        retrying={settingsQuery.isFetching}
+        title={t('无法读取设备策略', 'Unable to load device policies')}
+        onRetry={() => void settingsQuery.refetch()}
+      />
     )
   }
 
@@ -1219,24 +1192,21 @@ function AdminPassword() {
         ) : (
           <>
             <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-              <Input
-                aria-label={t('新管理密码', 'New admin password')}
-                onChange={(event) => setPassword(event.target.value)}
+              <PasswordInput
+                ariaLabel={t('新管理密码', 'New admin password')}
+                onChange={setPassword}
                 placeholder={t('输入新密码', 'Enter a new password')}
-                type="password"
                 value={password}
               />
               <Button
-                size="sm"
                 loading={save.isPending}
-                disabled={password.trim().length < 4}
+                disabled={password.trim().length < MIN_PASSWORD_LENGTH}
                 onClick={() => save.mutate(password.trim())}
               >
                 <KeyRoundIcon />
                 {t('修改', 'Change')}
               </Button>
               <Button
-                size="sm"
                 variant="destructive-outline"
                 disabled={save.isPending}
                 onClick={() => setClearOpen(true)}
@@ -1344,17 +1314,15 @@ function ViewerPassword() {
         ) : (
           <>
             <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-              <Input
-                aria-label={t('新访客密码', 'New viewer password')}
-                onChange={(event) => setPassword(event.target.value)}
+              <PasswordInput
+                ariaLabel={t('新访客密码', 'New viewer password')}
+                onChange={setPassword}
                 placeholder={configured ? t('输入新密码', 'Enter a new password') : t('设置访客密码', 'Set a viewer password')}
-                type="password"
                 value={password}
               />
               <Button
-                size="sm"
                 loading={save.isPending}
-                disabled={password.trim().length < 4}
+                disabled={password.trim().length < MIN_PASSWORD_LENGTH}
                 onClick={() => save.mutate(password.trim())}
               >
                 <KeyRoundIcon />
@@ -1362,7 +1330,6 @@ function ViewerPassword() {
               </Button>
               {configured && (
                 <Button
-                  size="sm"
                   variant="destructive-outline"
                   disabled={save.isPending}
                   onClick={() => setClearOpen(true)}
@@ -1374,8 +1341,14 @@ function ViewerPassword() {
             </div>
             <FieldDescription>
               {configured
-                ? t('访客访问已启用，访客以用户名 viewer 登录。密码至少 4 个字符。', 'Viewer access is on; viewers sign in with the username viewer. At least 4 characters.')
-                : t('尚未设置，访客访问处于停用状态。设置后访客以用户名 viewer 登录，密码至少 4 个字符。', 'Not set; viewer access is off. Once set, viewers sign in with the username viewer. At least 4 characters.')}
+                ? t(
+                    `访客访问已启用，访客以用户名 viewer 登录。密码至少 ${MIN_PASSWORD_LENGTH} 个字符。`,
+                    `Viewer access is on; viewers sign in with the username viewer. At least ${MIN_PASSWORD_LENGTH} characters.`,
+                  )
+                : t(
+                    `尚未设置，访客访问处于停用状态。设置后访客以用户名 viewer 登录，密码至少 ${MIN_PASSWORD_LENGTH} 个字符。`,
+                    `Not set; viewer access is off. Once set, viewers sign in with the username viewer. At least ${MIN_PASSWORD_LENGTH} characters.`,
+                  )}
             </FieldDescription>
           </>
         )}
@@ -1411,94 +1384,6 @@ function ViewerPassword() {
           </AlertDialogFooter>
         </AlertDialogPopup>
       </AlertDialog>
-    </>
-  )
-}
-
-function CopyButton({
-  text,
-  label,
-  copiedLabel,
-  copyErrorDescription,
-  disabledReason,
-  size = 'icon-xs',
-}: {
-  text: string
-  /** 给了就禁用按钮，并把原因放进提示。 */
-  disabledReason?: string
-  label?: string
-  copiedLabel?: string
-  copyErrorDescription?: string
-  size?: ButtonProps['size']
-}) {
-  const { t } = useI18n()
-  const [copied, setCopied] = useState(false)
-  const copyAttemptRef = useRef(0)
-  const resetTimerRef = useRef<number | null>(null)
-  const idleLabel = label ?? t('复制', 'Copy')
-  const successLabel = copiedLabel ?? t('已复制', 'Copied')
-
-  useEffect(() => {
-    copyAttemptRef.current += 1
-    if (resetTimerRef.current !== null) {
-      window.clearTimeout(resetTimerRef.current)
-      resetTimerRef.current = null
-    }
-    setCopied(false)
-
-    return () => {
-      copyAttemptRef.current += 1
-      if (resetTimerRef.current !== null) {
-        window.clearTimeout(resetTimerRef.current)
-      }
-    }
-  }, [text])
-
-  return (
-    <>
-      {/* 提示挂在外层 span 上：禁用的 Button 带 pointer-events-none，挂在它自己身上时
-          「为什么不能复制」那句永远悬停不出来。 */}
-      <Hint label={copied ? successLabel : disabledReason ?? idleLabel}>
-        <span className="inline-flex">
-          <Button
-            type="button"
-            aria-label={copied ? successLabel : disabledReason ?? idleLabel}
-            className={copied ? 'text-success-foreground' : undefined}
-            disabled={disabledReason !== undefined}
-            size={size}
-            variant="ghost"
-            onClick={async () => {
-              if (!text) return
-              const attempt = ++copyAttemptRef.current
-              const copiedSuccessfully = await copyText(text)
-              if (attempt !== copyAttemptRef.current) return
-    
-              if (copiedSuccessfully) {
-                if (resetTimerRef.current !== null) {
-                  window.clearTimeout(resetTimerRef.current)
-                }
-                setCopied(true)
-                resetTimerRef.current = window.setTimeout(() => {
-                  setCopied(false)
-                  resetTimerRef.current = null
-                }, 1200)
-                return
-              }
-              toastManager.add({
-                title: t('复制失败', 'Copy failed'),
-                description: copyErrorDescription
-                  ?? t('请手动选择并复制内容。', 'Select the content and copy it manually.'),
-                type: 'error',
-              })
-            }}
-          >
-            {copied ? <CheckIcon /> : <ClipboardIcon />}
-          </Button>
-        </span>
-      </Hint>
-      <span className="sr-only" role="status" aria-live="polite">
-        {copied ? successLabel : ''}
-      </span>
     </>
   )
 }

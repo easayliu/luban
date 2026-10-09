@@ -145,8 +145,137 @@ pub(super) fn open_column(stored: String, col: usize) -> rusqlite::Result<String
     })
 }
 
+/// 密钥校验值：库里存一份用当前密钥加密的它，启动时解开比对——跟库里有没有号、有没有接入
+/// Key 无关，换了密钥都当场发现，不会混进第二把密钥加密的数据。
+const SECRET_CHECK_KEY: &str = "secret_key_check";
+const SECRET_CHECK_PLAINTEXT: &str = "luban-secret-key-check";
+
+fn mismatch(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the secret key does not match the one used to encrypt the stored secrets ({what}); \
+         restore the original secret.key or LUBAN_SECRET_KEY"
+    )
+}
+
+/// 建表之后、任何迁移之前：核对密钥校验值，并试解接入 Key 的密文。解不开就拒绝启动。
+pub(super) fn verify_secret_key(conn: &Connection) -> Result<()> {
+    let check: Option<String> = conn
+        .query_row("SELECT value FROM settings WHERE key = ?1", [SECRET_CHECK_KEY], |r| r.get(0))
+        .optional()?;
+    if let Some(check) = check
+        && open(&check).ok().as_deref() != Some(SECRET_CHECK_PLAINTEXT)
+    {
+        return Err(mismatch("key check"));
+    }
+    let has_keys_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_keys_table {
+        let mut stmt = conn.prepare("SELECT id, key_sealed FROM api_keys")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, sealed) = row?;
+            if open(&sealed).is_err() {
+                return Err(mismatch(&format!("access key #{id}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 全部迁移跑完之后：还没有校验值就用当前密钥写一份。
+///
+/// 「这次才写」也意味着这个库第一次被带清理的版本打开：更早的开发版加密 token 时没清空闲页，
+/// 那次留下的明文残留要借这一次清掉。校验值与清理标记同一个事务落盘：只写了校验值、后面的
+/// 迁移失败的话，下次启动看到校验值已在就再也不会补这次清理。
+pub(super) fn ensure_secret_check(conn: &Connection) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let n = tx.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![SECRET_CHECK_KEY, seal(SECRET_CHECK_PLAINTEXT)],
+    )?;
+    if n > 0 {
+        mark_scrub_pending(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 还欠着一次空闲页清理的标记：与留下明文残留的那次写入同一个事务落下，确认 WAL 截断干净、
+/// 整库重写完才删。没清完（另一个连接拿着读快照挡住了 checkpoint，或中途有迁移失败、进程
+/// 退出）就留着，下次启动与后台每小时的任务都会重试。
+pub(super) const SCRUB_PENDING_KEY: &str = "secret_scrub_pending";
+
+/// 落下 [`SCRUB_PENDING_KEY`]。调用方要把它放进改写机密的同一个事务里。
+pub(super) fn mark_scrub_pending(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+        [SCRUB_PENDING_KEY],
+    )?;
+    Ok(())
+}
+
+/// 截断 WAL，回是否**真的**截断干净了：checkpoint 被别的连接的读快照挡住时 SQLite 回 busy
+/// （第一列非 0），或只搬了一部分帧（第二、三列不等），旧帧还留在 WAL 里。非 WAL 库回
+/// `(0, -1, -1)`，按干净算。
+fn truncate_wal(conn: &Connection) -> Result<bool> {
+    let (busy, log, done): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+    Ok(busy == 0 && log == done)
+}
+
+/// 机密从明文改成密文之后清掉旧明文的残留：UPDATE / DELETE 只是让旧内容所在的页变成空闲页，
+/// 字节还在库文件里（WAL 里也可能还有旧帧），直接读文件就能捞出来。截断 WAL、VACUUM 整库
+/// 重写一遍，再截断一次 WAL；每一步都核对结果，几次都没成就留下 [`SCRUB_PENDING_KEY`] 等重试。
+///
+/// 回是否清干净了。清不干净不让启动失败（号照样要能用），只记警告、留标记。
+pub(super) fn scrub_freed_pages(conn: &Connection) -> Result<bool> {
+    mark_scrub_pending(conn)?;
+    let started = std::time::Instant::now();
+    for attempt in 1..=3 {
+        let done =
+            truncate_wal(conn)? && conn.execute_batch("VACUUM;").is_ok() && truncate_wal(conn)?;
+        if done {
+            conn.execute("DELETE FROM settings WHERE key = ?1", [SCRUB_PENDING_KEY])?;
+            // 删标记本身也是一次写：再截断一次，WAL 里只剩这一帧也不留。
+            let _ = truncate_wal(conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "rewrote the database to drop plaintext leftovers"
+            );
+            return Ok(true);
+        }
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    tracing::warn!(
+        "could not fully rewrite the database (another connection is holding a read snapshot); \
+         plaintext leftovers may remain in luban.db-wal until the next retry"
+    );
+    Ok(false)
+}
+
+/// 上次没清完（[`SCRUB_PENDING_KEY`] 还在）就再清一次。
+pub(super) fn scrub_if_pending(conn: &Connection) -> Result<()> {
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM settings WHERE key = ?1)",
+        [SCRUB_PENDING_KEY],
+        |r| r.get(0),
+    )?;
+    if pending {
+        scrub_freed_pages(conn)?;
+    }
+    Ok(())
+}
+
 /// 启动迁移：先拿密钥试解所有已加密的 token（解不开就拒绝启动），再把明文的补加密、补上
 /// refresh_token 指纹。幂等，每次启动都跑。
+///
+/// 加密过明文就在同一个事务里落下 [`SCRUB_PENDING_KEY`]，迁移跑完由调用方清空闲页。
 pub(super) fn encrypt_plaintext_tokens(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE credentials ADD COLUMN refresh_token_hash TEXT", []);
     // 唯一约束从 refresh_token 本身挪到它的指纹上：密文随机，对它做唯一约束形同虚设。
@@ -163,10 +292,7 @@ pub(super) fn encrypt_plaintext_tokens(conn: &Connection) -> Result<()> {
     for (id, access, refresh, hash) in rows {
         let (a, r) = match (open(&access), open(&refresh)) {
             (Ok(a), Ok(r)) => (a, r),
-            _ => anyhow::bail!(
-                "the secret key does not match the one used to encrypt the stored tokens \
-                 (credential #{id}); restore the original secret.key or LUBAN_SECRET_KEY"
-            ),
+            _ => return Err(mismatch(&format!("credential #{id}"))),
         };
         let sealed = access.starts_with(SEALED_PREFIX) && refresh.starts_with(SEALED_PREFIX);
         if !sealed || hash.is_none() {
@@ -186,6 +312,7 @@ pub(super) fn encrypt_plaintext_tokens(conn: &Connection) -> Result<()> {
             stmt.execute(params![id, seal(access), seal(refresh), token_fingerprint(refresh)])?;
         }
     }
+    mark_scrub_pending(&tx)?;
     tx.commit()?;
     tracing::info!(count = pending.len(), "encrypted stored credential tokens");
     Ok(())

@@ -2,9 +2,7 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   BanIcon,
-  CheckIcon,
   CircleCheckIcon,
-  CopyIcon,
   EllipsisIcon,
   EyeIcon,
   KeyRoundIcon,
@@ -22,7 +20,9 @@ import {
   type ApiKey,
 } from '@/api/groups'
 import { useI18n } from '@/lib/i18n'
-import { cn, copyText, extractError, formatFullTime } from '@/lib/utils'
+import { cn, extractError, formatFullTime } from '@/lib/utils'
+import { CopyButton } from '@/components/copy-button'
+import { ErrorState, LoadingState } from '@/components/state-placeholders'
 import {
   AlertDialog,
   AlertDialogClose,
@@ -48,36 +48,31 @@ import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
+import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
-import { Hint } from '@/components/ui/tooltip'
-import { OrderedGroupPicker, useGroups } from '@/components/group-picker'
+import { GroupPickerSkeleton, OrderedGroupPicker, useGroups } from '@/components/group-picker'
 
 /** Claude Code 的接入片段。 */
 export function setupSnippet(key: string): string {
   return `export ANTHROPIC_BASE_URL=${window.location.origin}\nexport ANTHROPIC_AUTH_TOKEN=${key}`
 }
 
-function CopyInline({ text, label }: { text: string; label: string }) {
-  const { t } = useI18n()
-  const [copied, setCopied] = useState(false)
+/**
+ * 接入片段的代码块：这里的「查看与复制」和客户端接入页底部的占位片段共用一副样子。
+ * 给了 `copyLabel` 就在右上角挂一枚复制按钮。
+ */
+export function SnippetBlock({ text, copyLabel }: { text: string; copyLabel?: string }) {
   return (
-    <Hint label={copied ? t('已复制', 'Copied') : label}>
-      <Button
-        aria-label={label}
-        size="icon-xs"
-        type="button"
-        variant="ghost"
-        onClick={() => {
-          void copyText(text).then((ok) => {
-            if (!ok) return
-            setCopied(true)
-            setTimeout(() => setCopied(false), 2000)
-          })
-        }}
-      >
-        {copied ? <CheckIcon /> : <CopyIcon />}
-      </Button>
-    </Hint>
+    <div className="relative">
+      <pre className={cn('max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 font-mono text-xs leading-5', copyLabel && 'pe-10')}>
+        {text}
+      </pre>
+      {copyLabel && (
+        <span className="absolute end-1.5 top-1.5">
+          <CopyButton label={copyLabel} text={text} />
+        </span>
+      )}
+    </div>
   )
 }
 
@@ -88,16 +83,9 @@ function KeyReveal({ secret }: { secret: string }) {
     <div className="space-y-3">
       <div className="flex items-center gap-2 rounded-lg border px-3 py-2">
         <code className="min-w-0 flex-1 truncate font-mono text-sm">{secret}</code>
-        <CopyInline label={t('复制 Key', 'Copy key')} text={secret} />
+        <CopyButton label={t('复制 Key', 'Copy key')} text={secret} />
       </div>
-      <div className="relative">
-        <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 pe-10 font-mono text-xs leading-5">
-          {setupSnippet(secret)}
-        </pre>
-        <span className="absolute end-1.5 top-1.5">
-          <CopyInline label={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(secret)} />
-        </span>
-      </div>
+      <SnippetBlock copyLabel={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(secret)} />
     </div>
   )
 }
@@ -108,7 +96,7 @@ function KeyReveal({ secret }: { secret: string }) {
  *
  * `envKey`：`LUBAN_API_KEY` 设的那把（可用全部号），只读列在最上面。
  */
-export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
+export function ApiKeysSettings({ envKey, required }: { envKey: string | null; required: boolean }) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const keysQuery = useQuery({ queryKey: ['api-keys'], queryFn: listApiKeys })
@@ -122,14 +110,20 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
   const failed = (error: unknown) => {
     toastManager.add({ title: t('操作失败', 'Operation failed'), description: extractError(error, language), type: 'error' })
   }
-  const refresh = () => void qc.invalidateQueries({ queryKey: ['api-keys'] })
+  // 「是否要求接入 Key」（settings 的 api_keys_required）在首次建 Key 时由服务端翻转，Key 有增删改
+  // 都一并刷新 settings，否则删光 Key 后页面还停在建 Key 之前的状态，提示「任何人都能使用」。
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: ['api-keys'] })
+    void qc.invalidateQueries({ queryKey: ['settings'] })
+  }
   const reveal = useMutation({
     mutationFn: (k: ApiKey) => revealApiKey(k.id).then((secret) => ({ k, secret })),
     onSuccess: ({ k, secret }) => setRevealed({ title: k.label || k.prefix, secret }),
     onError: failed,
   })
   const toggle = useMutation({
-    mutationFn: (k: ApiKey) => updateApiKey(k.id, { label: k.label, disabled: !k.disabled, group_ids: k.groups }),
+    // 只改启停，不碰范围（不传 all_groups）：绑定的分组被删光的 Key 停用再启用也不会变成全部号。
+    mutationFn: (k: ApiKey) => updateApiKey(k.id, { label: k.label, disabled: !k.disabled }),
     onSuccess: (_r, k) => {
       refresh()
       toastManager.add({ title: k.disabled ? t('Key 已启用', 'Key enabled') : t('Key 已停用', 'Key disabled'), type: 'success' })
@@ -176,10 +170,20 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
               </div>
               <div className="text-xs text-muted-foreground">{t('可用全部号，此处只读。', 'Uses every account; read-only here.')}</div>
             </div>
-            <CopyInline label={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(envKey)} />
+            <CopyButton label={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(envKey)} />
           </div>
         )}
-        {keys.map((k) => (
+        {/* 列表没拉到之前别落到下面「尚未配置接入 Key」的提示：那句话在加载中与读取失败时都是错的。 */}
+        {keysQuery.isPending ? (
+          <LoadingState className="min-h-24" label={t('正在加载接入 Key', 'Loading access keys')} />
+        ) : keysQuery.isError ? (
+          <ErrorState
+            error={keysQuery.error}
+            title={t('无法读取接入 Key', 'Unable to load access keys')}
+            onRetry={() => keysQuery.refetch()}
+            retrying={keysQuery.isFetching}
+          />
+        ) : keys.map((k) => (
           <div className={cn('flex items-center gap-3 px-3 py-2.5 text-sm', k.disabled && 'opacity-64')} key={k.id}>
             <KeyRoundIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             <div className="min-w-0 flex-1">
@@ -189,11 +193,17 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
                 {k.disabled && <Badge size="xs" variant="error">{t('已停用', 'Disabled')}</Badge>}
               </div>
               <div className="mt-0.5 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
-                {k.groups.length === 0
+                {k.all_groups
                   ? t('全部号', 'All accounts')
-                  : k.groups.map((id, i) => (
-                      <Badge key={id} size="xs" variant="outline">{i + 1}. {groupName(id)}</Badge>
-                    ))}
+                  : k.groups.length === 0
+                    ? (
+                        <Badge size="xs" variant="warning">
+                          {t('绑定的分组已删除，暂不可用', 'Bound groups were deleted; unusable')}
+                        </Badge>
+                      )
+                    : k.groups.map((id, i) => (
+                        <Badge key={id} size="xs" variant="outline">{i + 1}. {groupName(id)}</Badge>
+                      ))}
                 <span>· {formatFullTime(k.created_at, language)}</span>
               </div>
             </div>
@@ -223,12 +233,17 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
             </Menu>
           </div>
         ))}
-        {!envKey && keys.length === 0 && (
+        {keysQuery.isSuccess && !envKey && keys.length === 0 && (
           <div className="px-3 py-3 text-xs text-warning-foreground">
-            {t(
-              '尚未配置接入 Key：转发不校验来访身份，任何人都能使用全部号。',
-              'No access key is configured: forwarding does not authenticate callers, and anyone can use every account.',
-            )}
+            {required
+              ? t(
+                  '当前没有可用的接入 Key：所有转发请求都会被拒绝。新建一把 Key 后恢复。',
+                  'There is no access key: every forwarded request is rejected until you create one.',
+                )
+              : t(
+                  '尚未配置接入 Key：转发不校验来访身份，任何人都能使用全部号。',
+                  'No access key is configured: forwarding does not authenticate callers, and anyone can use every account.',
+                )}
           </div>
         )}
       </div>
@@ -296,19 +311,27 @@ function KeyEditDialog({
   const { data: groups } = useGroups(!!apiKey)
   const [label, setLabel] = useState('')
   const [groupIds, setGroupIds] = useState<number[]>([])
+  // 范围是显式的：「不限分组」开着才是全部号；关着就只限所选分组，一个都不选就谁也用不了。
+  const [allGroups, setAllGroups] = useState(true)
   useEffect(() => {
     if (!apiKey) return
     setLabel(apiKey === 'new' ? '' : apiKey.label)
     setGroupIds(apiKey === 'new' ? [] : apiKey.groups)
+    setAllGroups(apiKey === 'new' ? true : apiKey.all_groups)
   }, [apiKey])
   const save = useMutation({
-    mutationFn: async (input: { label: string; groupIds: number[] }) => {
+    mutationFn: async (input: { label: string; groupIds: number[]; allGroups: boolean }) => {
       if (apiKey === 'new') {
-        const created = await createApiKey(input.label, input.groupIds)
+        const created = await createApiKey(input.label, input.groupIds, input.allGroups)
         return { secret: created.key, label: input.label }
       }
       if (apiKey) {
-        await updateApiKey(apiKey.id, { label: input.label, disabled: apiKey.disabled, group_ids: input.groupIds })
+        await updateApiKey(apiKey.id, {
+          label: input.label,
+          disabled: apiKey.disabled,
+          all_groups: input.allGroups,
+          group_ids: input.allGroups ? [] : input.groupIds,
+        })
       }
       return null
     },
@@ -323,6 +346,9 @@ function KeyEditDialog({
       toastManager.add({ title: t('操作失败', 'Operation failed'), description: extractError(error, language), type: 'error' })
     },
   })
+
+  // 新建时不许建出谁也用不了的 Key；编辑时允许保存（比如只改名字），上面已给出警告。
+  const canSubmit = apiKey !== 'new' || allGroups || groupIds.length > 0
 
   return (
     <Dialog open={!!apiKey} onOpenChange={(next) => { if (!next && !save.isPending) onClose() }}>
@@ -339,7 +365,7 @@ function KeyEditDialog({
           className="contents"
           onSubmit={(event) => {
             event.preventDefault()
-            if (!save.isPending) save.mutate({ label: label.trim(), groupIds })
+            if (!save.isPending && canSubmit) save.mutate({ label: label.trim(), groupIds, allGroups })
           }}
         >
           <DialogPanel className="space-y-4">
@@ -353,20 +379,39 @@ function KeyEditDialog({
               />
             </Field>
             <Field>
-              <FieldLabel>{t('绑定的号池分组', 'Bound pool groups')}</FieldLabel>
-              {groups ? (
-                <OrderedGroupPicker groups={groups} value={groupIds} onChange={setGroupIds} />
-              ) : (
-                <p className="text-sm text-muted-foreground">{t('正在加载分组', 'Loading groups')}</p>
-              )}
+              <FieldLabel className="flex w-full items-center justify-between gap-3">
+                <span>{t('不限分组（可用全部号）', 'Any group (all accounts)')}</span>
+                <Switch checked={allGroups} onCheckedChange={setAllGroups} />
+              </FieldLabel>
               <FieldDescription>
-                {t('顺序即优先级：前面分组的号都不可用时，才会用到后面分组的号。', 'Order is priority: later groups are used only when every account in earlier groups is unavailable.')}
+                {allGroups
+                  ? t('这把 Key 可以用号池里的全部号。', 'This key can use every account in the pool.')
+                  : t('只在下面所选的分组里选号。', 'Only accounts in the groups below are used.')}
               </FieldDescription>
             </Field>
+            {!allGroups && (
+              <Field>
+                <FieldLabel>{t('绑定的号池分组', 'Bound pool groups')}</FieldLabel>
+                {groups ? (
+                  <OrderedGroupPicker groups={groups} value={groupIds} onChange={setGroupIds} emptyHint={null} />
+                ) : (
+                  <GroupPickerSkeleton rows={2} />
+                )}
+                <FieldDescription>
+                  {groupIds.length === 0
+                    ? (
+                        <span className="text-warning-foreground">
+                          {t('还没有选择分组：这把 Key 暂时用不了任何号。', 'No group selected: this key cannot use any account yet.')}
+                        </span>
+                      )
+                    : t('顺序即优先级：前面分组的号都不可用时，才会用到后面分组的号。', 'Order is priority: later groups are used only when every account in earlier groups is unavailable.')}
+                </FieldDescription>
+              </Field>
+            )}
           </DialogPanel>
           <DialogFooter>
             <DialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</DialogClose>
-            <Button loading={save.isPending} type="submit">
+            <Button disabled={!canSubmit} loading={save.isPending} type="submit">
               {apiKey === 'new' ? t('新建', 'Create') : t('保存', 'Save')}
             </Button>
           </DialogFooter>

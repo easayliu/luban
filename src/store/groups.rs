@@ -33,18 +33,26 @@ pub struct ApiKey {
     pub prefix: String,
     pub disabled: bool,
     pub created_at: u64,
-    /// 绑定的分组，按优先顺序。空 = 用全部号。
+    /// 可用全部号（建 / 改时没选任何分组）。为假时只能用 `groups` 里的分组——绑定的分组被
+    /// 删光了也不会因此变成全部号，而是一个号都选不到。
+    pub all_groups: bool,
+    /// 绑定的分组，按优先顺序。
     pub groups: Vec<i64>,
 }
 
-/// 校验通过的接入 Key：它是哪一把、只能用哪些分组（按优先顺序；空 = 全部号）。
+/// 校验通过的接入 Key：它是哪一把、能用哪些号。
 #[derive(Debug, Clone)]
 pub struct KeyAccess {
     /// 哪一把（环境变量那把与「没配任何 Key 时放行」为 None）。流水按 Key 记账时用。
     #[allow(dead_code)]
     pub key_id: Option<i64>,
-    pub groups: Vec<i64>,
+    /// `None` = 全部号；`Some` = 只能用这些分组（按优先顺序），空列表即一个号都不能用。
+    pub groups: Option<Vec<i64>>,
 }
+
+/// 配过接入 Key 的标记：有了它，转发就恒要求带 Key——哪怕后来把 Key 全删了，也只是谁都
+/// 进不来，而不是退回「没配 Key 就不校验」。
+pub const API_KEYS_CONFIGURED: &str = "api_keys_configured";
 
 /// 默认分组的名称（建库时）。
 const DEFAULT_GROUP_NAME: &str = "默认分组";
@@ -57,6 +65,9 @@ const KEY_PREFIX_LEN: usize = 10;
 /// - 默认分组恒存在；不在任何分组里的号（存量号、直接写库的号）补进默认分组；
 /// - 旧版的全局接入 Key（settings 的 `client_api_key`）迁成一把不绑定分组的 Key，再删掉
 ///   那个设置项。
+///
+/// 搬过旧版全局 Key（明文从 settings 里删掉了）就在同一个事务里落下清理标记，迁移跑完由
+/// 调用方清空闲页。
 pub(super) fn migrate_groups(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pool_groups (
@@ -86,6 +97,7 @@ pub(super) fn migrate_groups(conn: &Connection) -> Result<()> {
              key_hash   TEXT    NOT NULL UNIQUE,
              key_sealed TEXT    NOT NULL,
              key_prefix TEXT    NOT NULL DEFAULT '',
+             all_groups INTEGER NOT NULL DEFAULT 1 CHECK (all_groups IN (0,1)),
              disabled   INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
              created_at INTEGER NOT NULL DEFAULT (unixepoch())
          ) STRICT;
@@ -125,18 +137,41 @@ pub(super) fn migrate_groups(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // 早先建的表没有 all_groups：补列时把已绑了分组的 Key 标成「只限分组」。
+    if conn
+        .execute("ALTER TABLE api_keys ADD COLUMN all_groups INTEGER NOT NULL DEFAULT 1", [])
+        .is_ok()
+    {
+        conn.execute(
+            "UPDATE api_keys SET all_groups = 0 WHERE id IN (SELECT key_id FROM api_key_groups)",
+            [],
+        )?;
+    }
+    // 库里有 Key 就一定配过：补上标记（升级前建的库）。
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) SELECT ?1, '1' WHERE EXISTS (SELECT 1 FROM api_keys)",
+        [API_KEYS_CONFIGURED],
+    )?;
+
     let legacy: Option<String> = conn
         .query_row("SELECT value FROM settings WHERE key = ?1", [CLIENT_API_KEY], |r| r.get(0))
         .optional()?
         .map(|v: String| v.trim().to_owned())
         .filter(|v| !v.is_empty());
     if let Some(key) = legacy {
-        conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT OR IGNORE INTO api_keys (label, key_hash, key_sealed, key_prefix) \
              VALUES (?1, ?2, ?3, ?4)",
             params!["默认 Key", key_hash(&key), seal(&key), key_prefix(&key)],
         )?;
-        conn.execute("DELETE FROM settings WHERE key = ?1", [CLIENT_API_KEY])?;
+        tx.execute("DELETE FROM settings WHERE key = ?1", [CLIENT_API_KEY])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            [API_KEYS_CONFIGURED],
+        )?;
+        mark_scrub_pending(&tx)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -460,7 +495,7 @@ impl CredentialStore {
             }
         }
         let mut stmt = conn.prepare(
-            "SELECT id, label, key_prefix, disabled, created_at FROM api_keys ORDER BY id",
+            "SELECT id, label, key_prefix, disabled, created_at, all_groups FROM api_keys ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             let id: i64 = r.get(0)?;
@@ -470,6 +505,7 @@ impl CredentialStore {
                 prefix: r.get(2)?,
                 disabled: r.get::<_, i64>(3)? != 0,
                 created_at: r.get::<_, i64>(4)? as u64,
+                all_groups: r.get::<_, i64>(5)? != 0,
                 groups: groups.get(&id).cloned().unwrap_or_default(),
             })
         })?;
@@ -486,7 +522,8 @@ impl CredentialStore {
         Ok(())
     }
 
-    /// 新建一把接入 Key，回它的 id。`group_ids` 按优先顺序，空 = 用全部号。
+    /// 新建一把接入 Key，回它的 id。`group_ids` 按优先顺序，空 = 用全部号。建过一把之后
+    /// 转发就恒要求带 Key（[`API_KEYS_CONFIGURED`]）。
     pub fn create_api_key(
         &self,
         label: &str,
@@ -494,33 +531,54 @@ impl CredentialStore {
         group_ids: &[i64],
     ) -> Result<std::result::Result<i64, GroupError>> {
         let group_ids = dedup_ordered(group_ids);
-        let conn = self.conn.lock();
-        if !groups_exist(&conn, &group_ids)? {
-            return Ok(Err(GroupError::UnknownGroup));
-        }
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix) VALUES (?1, ?2, ?3, ?4)",
-            params![label, key_hash(key), seal(key), key_prefix(key)],
-        )
-        .context("this API key already exists")?;
-        let id = tx.last_insert_rowid();
-        Self::write_key_groups(&tx, id, &group_ids)?;
-        tx.commit()?;
+        let id = {
+            let conn = self.conn.lock();
+            if !groups_exist(&conn, &group_ids)? {
+                return Ok(Err(GroupError::UnknownGroup));
+            }
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix, all_groups) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    label,
+                    key_hash(key),
+                    seal(key),
+                    key_prefix(key),
+                    group_ids.is_empty() as i64
+                ],
+            )
+            .context("this API key already exists")?;
+            let id = tx.last_insert_rowid();
+            Self::write_key_groups(&tx, id, &group_ids)?;
+            tx.commit()?;
+            id
+        };
+        // 走 set_setting 而不是直接写表：设置在内存里有一份镜像。
+        self.set_setting(API_KEYS_CONFIGURED, "1")?;
         Ok(Ok(id))
     }
 
-    /// 改一把 Key 的名称、停用状态与绑定的分组（按优先顺序）。
+    /// 改一把 Key 的名称、停用状态与能用的号。
+    ///
+    /// `all_groups` 必须显式给才会改范围，**绝不从「分组列表为空」推断成全部号**：
+    /// - `Some(true)`：可用全部号，清掉分组绑定；
+    /// - `Some(false)`：只限 `group_ids`（按优先顺序）。空列表就是一个号都不能用；
+    /// - `None`：范围原样不动（`group_ids` 被忽略），只改名称与启停。
+    ///
+    /// 绑定的分组被删光的 Key 是「只限分组、列表为空」：只改个名字、停用再启用，不能因此
+    /// 变成全部号。
     pub fn update_api_key(
         &self,
         id: i64,
         label: &str,
         disabled: bool,
         group_ids: &[i64],
+        all_groups: Option<bool>,
     ) -> Result<std::result::Result<(), GroupError>> {
         let group_ids = dedup_ordered(group_ids);
         let conn = self.conn.lock();
-        if !groups_exist(&conn, &group_ids)? {
+        if all_groups == Some(false) && !groups_exist(&conn, &group_ids)? {
             return Ok(Err(GroupError::UnknownGroup));
         }
         let tx = conn.unchecked_transaction()?;
@@ -531,7 +589,17 @@ impl CredentialStore {
         if n == 0 {
             return Ok(Err(GroupError::NotFound));
         }
-        Self::write_key_groups(&tx, id, &group_ids)?;
+        match all_groups {
+            Some(true) => {
+                tx.execute("UPDATE api_keys SET all_groups = 1 WHERE id = ?1", [id])?;
+                Self::write_key_groups(&tx, id, &[])?;
+            }
+            Some(false) => {
+                tx.execute("UPDATE api_keys SET all_groups = 0 WHERE id = ?1", [id])?;
+                Self::write_key_groups(&tx, id, &group_ids)?;
+            }
+            None => {}
+        }
         tx.commit()?;
         Ok(Ok(()))
     }
@@ -555,9 +623,13 @@ impl CredentialStore {
         sealed.map(|s| secret::open(&s)).transpose()
     }
 
-    /// 库里有没有接入 Key（不论启用与否）。一把都没有、环境变量也没设时，转发不校验来访身份
-    /// （与老版本「没配接入 Key 就不校验」一致）。
-    pub fn has_api_keys(&self) -> Result<bool> {
+    /// 转发要不要求带接入 Key：库里有 Key，或者配过（[`API_KEYS_CONFIGURED`]）。从没配过、
+    /// 环境变量也没设时才不校验来访身份（与老版本「没配接入 Key 就不校验」一致）；配过之后
+    /// 把 Key 全删了也不会因此敞开。
+    pub fn api_keys_required(&self) -> Result<bool> {
+        if self.get_setting(API_KEYS_CONFIGURED)?.is_some() {
+            return Ok(true);
+        }
         let conn = self.conn.lock();
         Ok(conn.query_row("SELECT EXISTS (SELECT 1 FROM api_keys)", [], |r| r.get(0))?)
     }
@@ -565,17 +637,20 @@ impl CredentialStore {
     /// 按来访带的 Key 明文认身份：启用中的 Key 才算，回它能用的分组（按优先顺序）。
     pub fn api_key_access(&self, key: &str) -> Result<Option<KeyAccess>> {
         let conn = self.conn.lock();
-        let id: Option<i64> = conn
+        let hit: Option<(i64, bool)> = conn
             .query_row(
-                "SELECT id FROM api_keys WHERE key_hash = ?1 AND disabled = 0",
+                "SELECT id, all_groups FROM api_keys WHERE key_hash = ?1 AND disabled = 0",
                 [key_hash(key)],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
             )
             .optional()?;
-        let Some(id) = id else { return Ok(None) };
+        let Some((id, all)) = hit else { return Ok(None) };
+        if all {
+            return Ok(Some(KeyAccess { key_id: Some(id), groups: None }));
+        }
         let mut stmt = conn
             .prepare_cached("SELECT group_id FROM api_key_groups WHERE key_id = ?1 ORDER BY ord")?;
         let groups = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(Some(KeyAccess { key_id: Some(id), groups }))
+        Ok(Some(KeyAccess { key_id: Some(id), groups: Some(groups) }))
     }
 }

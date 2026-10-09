@@ -8,8 +8,6 @@ import {
   ChevronDownIcon,
   DatabaseIcon,
   FingerprintIcon,
-  SearchIcon,
-  XIcon,
   InfoIcon,
   KeyRoundIcon,
   RefreshCwIcon,
@@ -52,7 +50,6 @@ import {
 } from '@/components/ui/dialog'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
 import {
   NumberField,
   NumberFieldDecrement,
@@ -66,13 +63,14 @@ import {
 import {
   Select, SelectItem, SelectPopup, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import { Spinner } from '@/components/ui/spinner'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { toastManager } from '@/components/ui/toast'
 import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { useSettingsQuery, useSettingsSave } from '@/components/setting-controls'
+import { ErrorState, LoadingState } from '@/components/state-placeholders'
+import { ToolbarSearch } from '@/components/toolbar-controls'
 
 /**
  * 转发策略。
@@ -120,29 +118,17 @@ export function ForwardingSettingsContent() {
   const settingsQuery = useSettingsQuery()
 
   if (settingsQuery.isPending) {
-    return (
-      <div className="flex min-h-40 items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-        <Spinner className="size-4" />
-        {t('正在加载设置', 'Loading settings')}
-      </div>
-    )
+    return <LoadingState label={t('正在加载设置', 'Loading settings')} />
   }
 
   if (settingsQuery.isError) {
     return (
-      <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-center" role="alert">
-        <p className="text-sm font-medium">
-          {t('无法读取当前设置', 'Unable to load current settings')}
-        </p>
-        <Button
-          size="sm"
-          variant="outline"
-          loading={settingsQuery.isFetching}
-          onClick={() => settingsQuery.refetch()}
-        >
-          {t('重试', 'Retry')}
-        </Button>
-      </div>
+      <ErrorState
+        error={settingsQuery.error}
+        title={t('无法读取当前设置', 'Unable to load current settings')}
+        onRetry={() => settingsQuery.refetch()}
+        retrying={settingsQuery.isFetching}
+      />
     )
   }
 
@@ -1788,17 +1774,14 @@ function LearnedRejections() {
       )}
     >
       {query.isPending ? (
-        <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground sm:p-5">
-          <Spinner />
-          {t('正在加载', 'Loading')}
-        </div>
+        <LoadingState className="min-h-24" label={t('正在加载规则', 'Loading rules')} />
       ) : query.isError ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 p-4 text-sm sm:p-5">
-          <span className="text-destructive-foreground">{extractError(query.error, language)}</span>
-          <Button size="xs" variant="outline" onClick={() => query.refetch()}>
-            {t('重试', 'Retry')}
-          </Button>
-        </div>
+        <ErrorState
+          error={query.error}
+          title={t('无法读取已学习的规则', 'Unable to load learned rules')}
+          onRetry={() => query.refetch()}
+          retrying={query.isFetching}
+        />
       ) : rows.length === 0 ? (
         <Empty className="py-10 md:py-12">
           <EmptyHeader>
@@ -1839,26 +1822,14 @@ function LearnedRejections() {
               ))}
             </div>
             <div className="ms-auto flex flex-wrap items-center gap-1.5">
-              <div className="relative">
-                <SearchIcon aria-hidden="true" className="pointer-events-none absolute start-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  aria-label={t('搜索规则', 'Search rules')}
-                  className="h-7 w-52 ps-7 pe-7 text-xs"
-                  placeholder={t('模型 / 哈希 / 原文', 'Model / hash / text')}
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                />
-                {search && (
-                  <button
-                    aria-label={t('清除搜索', 'Clear search')}
-                    className="absolute end-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
-                    type="button"
-                    onClick={() => setSearch('')}
-                  >
-                    <XIcon className="size-3.5" />
-                  </button>
-                )}
-              </div>
+              <ToolbarSearch
+                ariaLabel={t('搜索规则', 'Search rules')}
+                className="w-52"
+                placeholder={t('模型 / 哈希 / 原文', 'Model / hash / text')}
+                size="sm"
+                value={search}
+                onChange={setSearch}
+              />
               {kindFilter !== 'all' && (counts[kindFilter] ?? 0) > 0 && (
                 <Button size="xs" variant="outline" onClick={() => setConfirmClear({ type: 'kind', kind: kindFilter })}>
                   <Trash2Icon />

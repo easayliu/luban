@@ -1,26 +1,19 @@
 import { useEffect, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import { EyeIcon, EyeOffIcon, KeyRoundIcon, ShieldCheckIcon } from 'lucide-react'
+import { KeyRoundIcon, ShieldCheckIcon } from 'lucide-react'
 import { setup, type LoginResult } from '@/api/auth'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { Hint } from '@/components/ui/tooltip'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import {
-  InputGroup,
-  InputGroupAddon,
-  InputGroupInput,
-} from '@/components/ui/input-group'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
+import { MIN_PASSWORD_LENGTH, PasswordInput } from '@/components/password-input'
 import { useI18n } from '@/lib/i18n'
-
-/** 与后端 `auth::setup` 的下限一致。 */
-const MIN_PASSWORD_LENGTH = 4
+import { useDocumentTitle } from '@/lib/use-document-title'
 
 /** 地址栏里 `#setup_token=` 带来的初始化口令（`luban --open` 打开浏览器时附上的）。 */
 function tokenFromHash(): string {
@@ -44,15 +37,8 @@ export function SetupPage({ onSuccess }: { onSuccess: (result: LoginResult) => v
     }
   }, [])
   const [password, setPassword] = useState('')
-  const [show, setShow] = useState(false)
 
-  useEffect(() => {
-    const previousTitle = document.title
-    document.title = t('初始化管理密码 · Luban', 'Set up admin password · Luban')
-    return () => {
-      document.title = previousTitle
-    }
-  }, [t])
+  useDocumentTitle(t('初始化管理密码 · Luban', 'Set up admin password · Luban'))
 
   const tooShort = password.trim().length > 0 && password.trim().length < MIN_PASSWORD_LENGTH
   const doSetup = useMutation({
@@ -119,30 +105,13 @@ export function SetupPage({ onSuccess }: { onSuccess: (result: LoginResult) => v
               </Field>
               <Field invalid={tooShort || doSetup.isError}>
                 <FieldLabel htmlFor="setup-password">{t('管理密码', 'Admin password')}</FieldLabel>
-                <InputGroup>
-                  <InputGroupInput
-                    id="setup-password"
-                    autoComplete="new-password"
-                    autoFocus={!!token}
-                    aria-invalid={tooShort || doSetup.isError || undefined}
-                    onChange={(event) => setPassword(event.target.value)}
-                    type={show ? 'text' : 'password'}
-                    value={password}
-                  />
-                  <InputGroupAddon align="inline-end">
-                    <Hint label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}>
-                      <Button
-                        aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                        size="icon-xs"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => setShow((visible) => !visible)}
-                      >
-                        {show ? <EyeOffIcon /> : <EyeIcon />}
-                      </Button>
-                    </Hint>
-                  </InputGroupAddon>
-                </InputGroup>
+                <PasswordInput
+                  id="setup-password"
+                  autoFocus={!!token}
+                  invalid={tooShort || doSetup.isError}
+                  onChange={setPassword}
+                  value={password}
+                />
                 {/* `match`：错误来自前端校验或接口，不是原生表单校验，得显式打开才显示。 */}
                 {tooShort && (
                   <FieldError match>

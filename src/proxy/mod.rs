@@ -588,7 +588,7 @@ fn client_access(
     state: &AppState,
     headers: &HeaderMap,
 ) -> anyhow::Result<Option<store::KeyAccess>> {
-    let all = || store::KeyAccess { key_id: None, groups: Vec::new() };
+    let all = || store::KeyAccess { key_id: None, groups: None };
     let key = presented_key(headers);
     if let (Some(env), Some(k)) = (&state.client_key, key)
         && crate::auth::secrets_equal(env.as_bytes(), k.as_bytes())
@@ -600,7 +600,7 @@ fn client_access(
     {
         return Ok(Some(access));
     }
-    if state.client_key.is_none() && !state.store.has_api_keys()? {
+    if state.client_key.is_none() && !state.store.api_keys_required()? {
         return Ok(Some(all()));
     }
     Ok(None)

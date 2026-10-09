@@ -45,7 +45,9 @@ export interface ApiKey {
   prefix: string
   disabled: boolean
   created_at: number
-  /** 绑定的分组，按优先顺序；空 = 用全部号。 */
+  /** 可用全部号（没绑定分组）。为假时只能用 `groups`；绑定的分组被删光时一个号都不能用。 */
+  all_groups: boolean
+  /** 绑定的分组，按优先顺序。 */
   groups: number[]
 }
 
@@ -54,15 +56,27 @@ export async function listApiKeys(): Promise<ApiKey[]> {
   return data
 }
 
-/** 新建一把 Key，回明文。 */
-export async function createApiKey(label: string, groupIds: number[]): Promise<{ id: number; key: string }> {
-  const { data } = await api.post<{ id: number; key: string }>('/api-keys', { label, group_ids: groupIds })
+/** 新建一把 Key，回明文。`allGroups` 为真时可用全部号（`groupIds` 被忽略）。 */
+export async function createApiKey(
+  label: string,
+  groupIds: number[],
+  allGroups: boolean,
+): Promise<{ id: number; key: string }> {
+  const { data } = await api.post<{ id: number; key: string }>('/api-keys', {
+    label,
+    group_ids: groupIds,
+    all_groups: allGroups,
+  })
   return data
 }
 
+/**
+ * 改一把 Key。`all_groups` 不传则范围原样不动（只改名称与启停）；传了才按它与 `group_ids`
+ * 改范围——绝不会因为分组列表为空就变成全部号。
+ */
 export async function updateApiKey(
   id: number,
-  input: { label: string; disabled: boolean; group_ids: number[] },
+  input: { label: string; disabled: boolean; all_groups?: boolean; group_ids?: number[] },
 ): Promise<void> {
   await api.post(`/api-keys/${id}`, input)
 }

@@ -12,8 +12,8 @@ pub(super) struct SessionSel<'a> {
     pub(super) per_session: bool,
     pub(super) passthrough: bool,
     pub(super) follow_only: bool,
-    /// 接入 Key 绑定的分组（按优先顺序；空 = 全部号），见 `store::Select::groups`。
-    pub(super) groups: &'a [i64],
+    /// 接入 Key 能用的分组（按优先顺序；`None` = 全部号），见 `store::Select::groups`。
+    pub(super) groups: Option<&'a [i64]>,
 }
 
 impl Inbound {
@@ -23,7 +23,7 @@ impl Inbound {
             per_session: self.plan.per_session,
             passthrough: self.plan.passthrough,
             follow_only: self.plan.follow_only,
-            groups: &self.key_access.groups,
+            groups: self.key_access.groups.as_deref(),
         }
     }
 }
@@ -44,7 +44,7 @@ pub(super) fn select<'a>(
         per_session: session.per_session,
         passthrough_session: session.passthrough,
         follow_only: session.follow_only,
-        groups: Some(session.groups),
+        groups: session.groups,
         rate_limited: billable,
         exclude,
         model,

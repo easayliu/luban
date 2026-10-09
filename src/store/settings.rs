@@ -424,6 +424,9 @@ pub const DEPLOYMENT_ONLY_KEYS: &[&str] = &[
     VIEWER_ENV_PASSWORD_HASH,
     VIEWER_ENV_PASSWORD_VERSION,
     "billing_backfilled",
+    "api_keys_configured",
+    "secret_key_check",
+    "secret_scrub_pending",
 ];
 
 /// 控制台登录相关的 settings 键：属于部署本身，导出不带、导入不认。

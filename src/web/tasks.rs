@@ -94,10 +94,14 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
             loop {
                 tick.tick().await;
                 let store = store.clone();
-                if let Ok(Err(e)) =
-                    tokio::task::spawn_blocking(move || store.prune_sessions()).await
-                {
-                    tracing::warn!(error = %e, "failed to prune expired console sessions");
+                let result = tokio::task::spawn_blocking(move || {
+                    store.prune_sessions()?;
+                    // 启动时没清完的明文残留（被别的连接的读快照挡住了），在这里重试。
+                    store.retry_pending_scrub()
+                })
+                .await;
+                if let Ok(Err(e)) = result {
+                    tracing::warn!(error = %e, "hourly console maintenance failed");
                 }
             }
         });

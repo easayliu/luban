@@ -3,13 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRightLeftIcon,
   BanIcon,
-  CheckIcon,
   CircleCheckIcon,
-  CopyIcon,
-  DicesIcon,
   EllipsisIcon,
-  EyeIcon,
-  EyeOffIcon,
   KeyRoundIcon,
   PlusIcon,
   Trash2Icon,
@@ -27,10 +22,13 @@ import {
 } from '@/api/users'
 import { useI18n } from '@/lib/i18n'
 import { useMe } from '@/lib/role'
-import { cn, copyText, extractError, formatFullTime } from '@/lib/utils'
+import { cn, extractError, formatFullTime } from '@/lib/utils'
+import { useDocumentTitle } from '@/lib/use-document-title'
 import { AppFooter } from '@/components/app-footer'
-import { AppHeader, MainNav, PreferencesMenu, type MainSection } from '@/components/app-header'
-import { ChangePasswordDialog } from '@/components/change-password-dialog'
+import { AccountMenu, AppHeader, MainNav, type MainSection } from '@/components/app-header'
+import { CopyButton } from '@/components/copy-button'
+import { MIN_PASSWORD_LENGTH, PasswordInput } from '@/components/password-input'
+import { ErrorState } from '@/components/state-placeholders'
 import {
   AlertDialog,
   AlertDialogClose,
@@ -41,6 +39,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { Card } from '@/components/ui/card'
 import { Button, buttonVariants } from '@/components/ui/button'
 import {
   Dialog,
@@ -56,15 +55,14 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
+import { Label } from '@/components/ui/label'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
+import { Radio, RadioGroup } from '@/components/ui/radio-group'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { toastManager } from '@/components/ui/toast'
 import { Hint } from '@/components/ui/tooltip'
-
-const MIN_PASSWORD_LENGTH = 4
 
 /** 弹框里正在处理哪一个账号、做什么。 */
 type Pending =
@@ -91,19 +89,12 @@ export function UsersPage({
   const me = useMe().data
   const isAdmin = me?.role === 'admin'
   const [creating, setCreating] = useState(false)
-  const [passwordOpen, setPasswordOpen] = useState(false)
   const [pending, setPending] = useState<Pending | null>(null)
   const usersQuery = useQuery({ queryKey: ['users'], queryFn: listUsers })
   const users = useMemo(() => usersQuery.data ?? [], [usersQuery.data])
   const agents = useMemo(() => users.filter((u) => u.role === 'agent'), [users])
 
-  useEffect(() => {
-    const previousTitle = document.title
-    document.title = `${t('用户管理', 'Users')} · Luban`
-    return () => {
-      document.title = previousTitle
-    }
-  }, [t])
+  useDocumentTitle(`${t('用户管理', 'Users')} · Luban`)
 
   const done = (title: string) => {
     void qc.invalidateQueries({ queryKey: ['users'] })
@@ -141,67 +132,72 @@ export function UsersPage({
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        actions={
-          <PreferencesMenu onSignOut={onSignOut}>
-            {/* 管理员的密码在系统设置里改；代理在这里改自己的。 */}
-            {me?.role === 'agent' && (
-              <MenuItem onClick={() => setPasswordOpen(true)}>
-                <KeyRoundIcon />{t('修改密码', 'Change password')}
-              </MenuItem>
-            )}
-          </PreferencesMenu>
-        }
+        actions={<AccountMenu onSignOut={onSignOut} />}
         nav={<MainNav current="users" onNavigate={onNavigate} />}
         onNavigateHome={() => onNavigate('pool')}
       />
-      <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
 
-      <main className="page-frame relative flex-1 py-5 pb-8 sm:py-8 sm:pb-12">
-        <div className="space-y-5 sm:space-y-7">
-          <section aria-labelledby="users-page-title" className="flex flex-wrap items-end justify-between gap-3">
-            <div className="max-w-2xl">
-              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl" id="users-page-title">
-                {t('用户管理', 'Users')}
-              </h1>
-              <p className="mt-1.5 text-sm leading-6 text-muted-foreground max-sm:sr-only">
-                {isAdmin
-                  ? t(
-                      '开设代理与用户的登录账号。每个人上的号挂在自己名下，代理看不到下属用户的号。',
-                      'Create sign-ins for agents and users. Accounts belong to whoever added them; agents cannot see their users’ accounts.',
-                    )
-                  : t(
-                      '开设挂在你名下的用户。你看不到他们上的号。',
-                      'Create users under you. You cannot see the accounts they add.',
-                    )}
-              </p>
+      <main className="page-frame relative flex-1 py-4 pb-8 sm:py-5 sm:pb-10">
+        <div className="space-y-3 sm:space-y-4">
+          {/* 页头卡片：与账号池、费用同构——标题与计数在左，主动作在右。 */}
+          <section aria-labelledby="users-page-title" className="overflow-hidden rounded-2xl border bg-card shadow-xs/5">
+            <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4 sm:px-5">
+              <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+                <h1 className="min-w-0 text-lg font-semibold tracking-tight" id="users-page-title">
+                  {t('用户管理', 'Users')}
+                </h1>
+                {!usersQuery.isPending && (
+                  <Hint
+                    label={isAdmin
+                      ? t(
+                          '开设代理与用户的登录账号。每个人上的号挂在自己名下，代理看不到下属用户的号。',
+                          'Create sign-ins for agents and users. Accounts belong to whoever added them; agents cannot see their users’ accounts.',
+                        )
+                      : t('开设挂在你名下的用户。你看不到他们上的号。', 'Create users under you. You cannot see the accounts they add.')}
+                  >
+                    <Badge variant="secondary">
+                      {isAdmin
+                        ? t(`${agents.length} 个代理 · ${users.length - agents.length} 个用户`, `${agents.length} agents · ${users.length - agents.length} users`)
+                        : t(`${users.length} 个用户`, `${users.length} users`)}
+                    </Badge>
+                  </Hint>
+                )}
+              </div>
+              <Button size="sm" onClick={() => setCreating(true)}>
+                <PlusIcon />
+                {isAdmin ? t('新建账号', 'New account') : t('新建用户', 'New user')}
+              </Button>
             </div>
-            <Button size="sm" onClick={() => setCreating(true)}>
-              <PlusIcon />
-              {isAdmin ? t('新建账号', 'New account') : t('新建用户', 'New user')}
-            </Button>
           </section>
 
           {usersQuery.isPending ? (
-            <div className="space-y-2">
-              {Array.from({ length: 4 }, (_, i) => <Skeleton className="h-10 w-full" key={i} />)}
-            </div>
+            <Card className="space-y-2 p-4">
+              {Array.from({ length: 4 }, (_, i) => <Skeleton className="h-9 w-full" key={i} />)}
+            </Card>
           ) : usersQuery.isError ? (
-            <p className="text-sm text-destructive-foreground">{extractError(usersQuery.error, language)}</p>
+            <Card>
+              <ErrorState
+                error={usersQuery.error}
+                retrying={usersQuery.isFetching}
+                onRetry={() => void usersQuery.refetch()}
+              />
+            </Card>
           ) : users.length === 0 ? (
-            <Empty>
-              <EmptyHeader>
-                <EmptyMedia variant="icon"><UsersIcon /></EmptyMedia>
-                <EmptyTitle>{t('还没有账号', 'No accounts yet')}</EmptyTitle>
-                <EmptyDescription>
-                  {isAdmin
-                    ? t('新建代理或用户后，他们即可登录控制台上号。', 'Once created, agents and users can sign in and add accounts.')
-                    : t('新建用户后，他们即可登录控制台上号。', 'Once created, users can sign in and add accounts.')}
-                </EmptyDescription>
-              </EmptyHeader>
-            </Empty>
+            <Card>
+              <Empty>
+                <EmptyHeader>
+                  <EmptyMedia variant="icon"><UsersIcon /></EmptyMedia>
+                  <EmptyTitle>{t('还没有账号', 'No accounts yet')}</EmptyTitle>
+                  <EmptyDescription>
+                    {isAdmin
+                      ? t('新建代理或用户后，他们即可登录控制台上号。', 'Once created, agents and users can sign in and add accounts.')
+                      : t('新建用户后，他们即可登录控制台上号。', 'Once created, users can sign in and add accounts.')}
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            </Card>
           ) : (
-            <div className="overflow-x-auto rounded-xl border">
-              <Table>
+              <Table variant="card">
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t('用户名', 'Username')}</TableHead>
@@ -271,7 +267,6 @@ export function UsersPage({
                   ))}
                 </TableBody>
               </Table>
-            </div>
           )}
         </div>
       </main>
@@ -362,39 +357,6 @@ export function UsersPage({
         </AlertDialogPopup>
       </AlertDialog>
     </div>
-  )
-}
-
-/** 生成一个好读好抄的初始密码：12 位，去掉 0/O、1/l/I 这类容易看错的字符。 */
-function generatePassword(): string {
-  const alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  const bytes = new Uint32Array(12)
-  crypto.getRandomValues(bytes)
-  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('')
-}
-
-/** 一枚复制按钮：点了换成对勾，两秒后复原。 */
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const { t } = useI18n()
-  const [copied, setCopied] = useState(false)
-  return (
-    <Hint label={copied ? t('已复制', 'Copied') : label}>
-      <Button
-        aria-label={label}
-        size="icon-xs"
-        type="button"
-        variant="ghost"
-        onClick={() => {
-          void copyText(text).then((ok) => {
-            if (!ok) return
-            setCopied(true)
-            setTimeout(() => setCopied(false), 2000)
-          })
-        }}
-      >
-        {copied ? <CheckIcon /> : <CopyIcon />}
-      </Button>
-    </Hint>
   )
 }
 
@@ -490,7 +452,7 @@ function CreateUserDialog({
               <SignInDetails password={created.password} username={created.user.username} />
             </DialogPanel>
             <DialogFooter>
-              <CopyButtonWide text={signInText(created.user.username, created.password, t)} />
+              <CopyButton text={signInText(created.user.username, created.password, t)}>{t('复制全部', 'Copy all')}</CopyButton>
               <DialogClose render={<Button />}>{t('完成', 'Done')}</DialogClose>
             </DialogFooter>
           </>
@@ -512,30 +474,26 @@ function CreateUserDialog({
                 {isAdmin && (
                   <Field>
                     <FieldLabel>{t('角色', 'Role')}</FieldLabel>
-                    <div aria-label={t('角色', 'Role')} className="grid w-full gap-2 sm:grid-cols-2" role="radiogroup">
-                      {roleOptions.map((option) => {
-                        const selected = role === option.value
-                        return (
-                          <button
-                            aria-checked={selected}
-                            className={cn(
-                              'flex cursor-pointer flex-col items-start gap-1 rounded-lg border px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                              selected ? 'border-primary bg-primary/6' : 'hover:bg-accent/60',
-                            )}
-                            key={option.value}
-                            role="radio"
-                            type="button"
-                            onClick={() => setRole(option.value)}
-                          >
-                            <span className="flex w-full items-center justify-between text-sm font-medium">
-                              {option.title}
-                              {selected && <CheckIcon aria-hidden="true" className="size-4 text-primary" />}
-                            </span>
-                            <span className="text-xs text-muted-foreground">{option.description}</span>
-                          </button>
-                        )
-                      })}
-                    </div>
+                    {/* 选中态挂在整张卡片上（has-data-checked），点卡片任意处都能选，方向键切换由 RadioGroup 负责。 */}
+                    <RadioGroup
+                      aria-label={t('角色', 'Role')}
+                      className="grid w-full gap-2 sm:grid-cols-2"
+                      value={role}
+                      onValueChange={(value) => setRole(value as 'agent' | 'user')}
+                    >
+                      {roleOptions.map((option) => (
+                        <Label
+                          className="cursor-pointer items-start gap-2.5 rounded-lg border px-3 py-2.5 transition-colors hover:bg-accent/60 has-data-checked:border-primary has-data-checked:bg-primary/6"
+                          key={option.value}
+                        >
+                          <Radio className="mt-px" value={option.value} />
+                          <span className="flex flex-col gap-1">
+                            <span className="text-sm font-medium">{option.title}</span>
+                            <span className="text-xs font-normal text-muted-foreground">{option.description}</span>
+                          </span>
+                        </Label>
+                      ))}
+                    </RadioGroup>
                   </Field>
                 )}
                 {isAdmin && role === 'user' && (
@@ -569,7 +527,7 @@ function CreateUserDialog({
                 </Field>
                 <Field invalid={passwordTooShort || create.isError}>
                   <FieldLabel>{t('初始密码', 'Initial password')}</FieldLabel>
-                  <PasswordInput invalid={passwordTooShort} value={password} onChange={setPassword} />
+                  <PasswordInput generate invalid={passwordTooShort} value={password} onChange={setPassword} />
                   <FieldDescription>
                     {t(
                       `至少 ${MIN_PASSWORD_LENGTH} 个字符，对方登录后可自行修改。`,
@@ -591,58 +549,6 @@ function CreateUserDialog({
         )}
       </DialogPopup>
     </Dialog>
-  )
-}
-
-/** 初始 / 新密码的输入框：可显示明文，可一键随机生成（生成后自动显示，方便核对）。 */
-function PasswordInput({
-  value,
-  onChange,
-  autoFocus,
-  invalid,
-}: {
-  value: string
-  onChange: (value: string) => void
-  autoFocus?: boolean
-  invalid?: boolean
-}) {
-  const { t } = useI18n()
-  const [show, setShow] = useState(false)
-  return (
-    <InputGroup>
-      <InputGroupInput
-        aria-invalid={invalid || undefined}
-        autoComplete="new-password"
-        autoFocus={autoFocus}
-        onChange={(event) => onChange(event.target.value)}
-        type={show ? 'text' : 'password'}
-        value={value}
-      />
-      <InputGroupAddon align="inline-end">
-        <Hint label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}>
-          <Button
-            aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-            onClick={() => setShow((v) => !v)}
-          >
-            {show ? <EyeOffIcon /> : <EyeIcon />}
-          </Button>
-        </Hint>
-        <Hint label={t('随机生成', 'Generate')}>
-          <Button
-            aria-label={t('随机生成密码', 'Generate a password')}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-            onClick={() => { onChange(generatePassword()); setShow(true) }}
-          >
-            <DicesIcon />
-          </Button>
-        </Hint>
-      </InputGroupAddon>
-    </InputGroup>
   )
 }
 
@@ -672,28 +578,6 @@ function SignInDetails({ username, password }: { username: string; password: str
         </div>
       ))}
     </dl>
-  )
-}
-
-/** 一次复制整份登录信息的按钮。 */
-function CopyButtonWide({ text }: { text: string }) {
-  const { t } = useI18n()
-  const [copied, setCopied] = useState(false)
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      onClick={() => {
-        void copyText(text).then((ok) => {
-          if (!ok) return
-          setCopied(true)
-          setTimeout(() => setCopied(false), 2000)
-        })
-      }}
-    >
-      {copied ? <CheckIcon /> : <CopyIcon />}
-      {copied ? t('已复制', 'Copied') : t('复制全部', 'Copy all')}
-    </Button>
   )
 }
 
@@ -742,7 +626,7 @@ function ResetPasswordDialog({
               <SignInDetails password={reset} username={user.username} />
             </DialogPanel>
             <DialogFooter>
-              <CopyButtonWide text={signInText(user.username, reset, t)} />
+              <CopyButton text={signInText(user.username, reset, t)}>{t('复制全部', 'Copy all')}</CopyButton>
               <DialogClose render={<Button />}>{t('完成', 'Done')}</DialogClose>
             </DialogFooter>
           </>
@@ -762,7 +646,7 @@ function ResetPasswordDialog({
               <DialogPanel>
                 <Field invalid={tooShort || save.isError}>
                   <FieldLabel>{t('新密码', 'New password')}</FieldLabel>
-                  <PasswordInput autoFocus invalid={tooShort} value={password} onChange={setPassword} />
+                  <PasswordInput autoFocus generate invalid={tooShort} value={password} onChange={setPassword} />
                   <FieldDescription>
                     {t(
                       `至少 ${MIN_PASSWORD_LENGTH} 个字符。重置后，该账号已有的登录全部退出。`,

@@ -1,43 +1,32 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { ArrowRightIcon, EyeIcon, EyeOffIcon, LockKeyholeIcon } from 'lucide-react'
+import { ArrowRightIcon, LockKeyholeIcon } from 'lucide-react'
 import { getAuthState, login } from '@/api/auth'
 import { setToken } from '@/api/client'
 import { rememberRole } from '@/lib/role'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { Hint } from '@/components/ui/tooltip'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
 import { Field, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import {
-  InputGroup,
-  InputGroupAddon,
-  InputGroupInput,
-} from '@/components/ui/input-group'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { ThemeSwitcher } from '@/components/theme-switcher'
 import { LogoMark } from '@/components/logo-mark'
+import { PasswordInput } from '@/components/password-input'
 import { useI18n } from '@/lib/i18n'
+import { useDocumentTitle } from '@/lib/use-document-title'
 
 /** 控制台登录页（已设置管理密码时展示）：用户名 + 密码。登录成功回调 onSuccess(会话 token)。 */
 export function LoginPage({ onSuccess }: { onSuccess: (token: string) => void }) {
   const { t, language } = useI18n()
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
-  const [show, setShow] = useState(false)
   // App 已拉过这份鉴权状态，这里直接命中缓存。
   const { data: authState } = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const viewerEnabled = authState?.viewer_enabled ?? false
 
-  useEffect(() => {
-    const previousTitle = document.title
-    document.title = t('控制台登录 · Luban', 'Console sign-in · Luban')
-    return () => {
-      document.title = previousTitle
-    }
-  }, [t])
+  useDocumentTitle(t('控制台登录 · Luban', 'Console sign-in · Luban'))
 
   const doLogin = useMutation({
     mutationFn: () => login(username.trim(), password),
@@ -99,29 +88,13 @@ export function LoginPage({ onSuccess }: { onSuccess: (token: string) => void })
               </Field>
               <Field invalid={doLogin.isError}>
                 <FieldLabel htmlFor="console-password">{t('密码', 'Password')}</FieldLabel>
-                <InputGroup>
-                  <InputGroupInput
-                    id="console-password"
-                    autoComplete="current-password"
-                    aria-invalid={doLogin.isError || undefined}
-                    onChange={(event) => setPassword(event.target.value)}
-                    type={show ? 'text' : 'password'}
-                    value={password}
-                  />
-                  <InputGroupAddon align="inline-end">
-                    <Hint label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}>
-                      <Button
-                        aria-label={show ? t('隐藏密码', 'Hide password') : t('显示密码', 'Show password')}
-                        size="icon-xs"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => setShow((visible) => !visible)}
-                      >
-                        {show ? <EyeOffIcon /> : <EyeIcon />}
-                      </Button>
-                    </Hint>
-                  </InputGroupAddon>
-                </InputGroup>
+                <PasswordInput
+                  id="console-password"
+                  autoComplete="current-password"
+                  invalid={doLogin.isError}
+                  onChange={setPassword}
+                  value={password}
+                />
                 {/* `match`：Base UI 的 Field.Error 默认只跟着原生表单校验显示，这里的错误来自接口，得显式
                     打开，否则登录失败时框变红了却看不到原因。 */}
                 {doLogin.isError && <FieldError match>{extractError(doLogin.error, language)}</FieldError>}

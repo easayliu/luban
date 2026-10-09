@@ -1,25 +1,24 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, KeyRoundIcon, RefreshCwIcon } from 'lucide-react'
+import { ArrowRightIcon, ExternalLinkIcon, KeyRoundIcon, RefreshCwIcon } from 'lucide-react'
 import { getAuthorizeUrl, exchangeCode, reauthorizeCredential, type Credential } from '@/api/credentials'
-import { GroupPicker, defaultGroupId, useGroups } from '@/components/group-picker'
+import { GroupPicker, GroupPickerSkeleton, defaultGroupId, useGroups } from '@/components/group-picker'
 import { listProxies } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
 import { ReauthorizeContext } from '@/lib/reauthorize'
-import { copyText, displayCredentialLabel, extractError } from '@/lib/utils'
+import { displayCredentialLabel, extractError } from '@/lib/utils'
 import { ProxyPickerCombobox, ProxyTestBlock } from '@/components/credential-proxy-dialog'
+import { CopyButton } from '@/components/copy-button'
 import { Button } from '@/components/ui/button'
 import {
   Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader,
   DialogPanel, DialogPopup, DialogTitle,
 } from '@/components/ui/dialog'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
-import { Label } from '@/components/ui/label'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { toastManager } from '@/components/ui/toast'
-import { Hint } from '@/components/ui/tooltip'
 
 interface AuthorizeRequest {
   session: number
@@ -173,36 +172,22 @@ export function AddAccount({
                   说明、按钮（「打开授权页面」与本步标题一字不差）说的都是同一件事。 */}
               {authUrl ? (
                 <div className="flex flex-wrap items-center gap-2">
-                  <a href={authUrl} target="_blank" rel="noopener">
-                    <Button type="button" variant="outline">
-                      <ExternalLinkIcon />
-                      {t('打开授权页面', 'Open authorization page')}
-                    </Button>
-                  </a>
-                  <Hint label={t('复制后可在其他浏览器或设备上完成授权', 'Copy it to authorize in another browser or on another device')}>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={async () => {
-                        const copied = await copyText(authUrl)
-                        toastManager.add(copied
-                          ? { title: t('已复制授权链接', 'Authorization link copied'), type: 'success' }
-                          : {
-                              title: t('复制失败，请手动复制', 'Copy failed; copy the link manually'),
-                              description: authUrl,
-                              type: 'error',
-                            })
-                      }}
-                    >
-                      <CopyIcon />
-                      {t('复制链接', 'Copy link')}
-                    </Button>
-                  </Hint>
+                  <Button render={<a href={authUrl} rel="noreferrer" target="_blank" />} variant="outline">
+                    <ExternalLinkIcon />
+                    {t('打开授权页面', 'Open authorization page')}
+                  </Button>
+                  {/* 复制失败时把链接原文放进报错，方便手动复制。 */}
+                  <CopyButton
+                    errorDescription={authUrl}
+                    label={t('复制后可在其他浏览器或设备上完成授权', 'Copy it to authorize in another browser or on another device')}
+                    text={authUrl}
+                  >
+                    {t('复制链接', 'Copy link')}
+                  </CopyButton>
                   {/* 链接有时效，授权页开久了会过期；关掉弹窗再开也行，这里给个就近的出口。 */}
                   <Button
                     type="button"
                     variant="ghost"
-                    size="sm"
                     loading={authorize.isPending}
                     onClick={() => authorize.mutate({ session: authorizeSession.current })}
                   >
@@ -247,7 +232,7 @@ export function AddAccount({
                 {groupsQuery.data ? (
                   <GroupPicker groups={groupsQuery.data} value={groupIds} onChange={setGroupIds} />
                 ) : (
-                  <p className="text-sm text-muted-foreground">{t('正在加载分组', 'Loading groups')}</p>
+                  <GroupPickerSkeleton />
                 )}
                 <FieldDescription>
                   {t(
@@ -274,9 +259,11 @@ export function AddAccount({
                 </FieldLabel>
                 {savedProxies.length > 0 && (
                   <div className="w-full space-y-2">
-                    <Label>{t('从代理池选择', 'Pick from proxy pool')}</Label>
+                    {/* 字段标签已是「出站代理」，这里两种填法只是小字提示，不再各挂一个 Label。 */}
+                    <p className="text-xs text-muted-foreground">{t('从代理池选择', 'Pick from proxy pool')}</p>
                     <div className="flex w-full items-center gap-2">
                       <ProxyPickerCombobox
+                        ariaLabel={t('从代理池选择', 'Pick from proxy pool')}
                         proxies={savedProxies}
                         value={proxy.trim()}
                         onPick={setProxy}
@@ -284,7 +271,6 @@ export function AddAccount({
                       {proxy.trim() && (
                         <Button
                           type="button"
-                          size="sm"
                           variant="ghost"
                           className="shrink-0"
                           onClick={() => setProxy('')}
@@ -298,9 +284,7 @@ export function AddAccount({
                 {!pickedFromPool && (
                   <>
                     {savedProxies.length > 0 && (
-                      <Label htmlFor="account-proxy" className="mt-1">
-                        {t('或手动填写地址', 'Or enter an address')}
-                      </Label>
+                      <p className="mt-1 text-xs text-muted-foreground">{t('或手动填写地址', 'Or enter an address')}</p>
                     )}
                     <Input
                       id="account-proxy"

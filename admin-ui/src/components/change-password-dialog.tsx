@@ -16,10 +16,8 @@ import {
 } from '@/components/ui/dialog'
 import { Field, FieldDescription, FieldError, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
 import { toastManager } from '@/components/ui/toast'
-
-const MIN_PASSWORD_LENGTH = 4
+import { MIN_PASSWORD_LENGTH, PasswordInput } from '@/components/password-input'
 
 /**
  * 代理和用户改自己的密码。改成功后其它设备上的登录全部下线，当前这个保留。
@@ -79,25 +77,14 @@ export function ChangePasswordDialog({
           <DialogPanel className="space-y-4">
             <Field invalid={tooShort}>
               <FieldLabel>{t('新密码', 'New password')}</FieldLabel>
-              <Input
-                autoComplete="new-password"
-                autoFocus
-                onChange={(event) => setPassword(event.target.value)}
-                type="password"
-                value={password}
-              />
+              <PasswordInput autoFocus invalid={tooShort} onChange={setPassword} value={password} />
               <FieldDescription>
                 {t(`至少 ${MIN_PASSWORD_LENGTH} 个字符。`, `At least ${MIN_PASSWORD_LENGTH} characters.`)}
               </FieldDescription>
             </Field>
             <Field invalid={mismatch || save.isError}>
               <FieldLabel>{t('确认新密码', 'Confirm new password')}</FieldLabel>
-              <Input
-                autoComplete="new-password"
-                onChange={(event) => setConfirm(event.target.value)}
-                type="password"
-                value={confirm}
-              />
+              <PasswordInput invalid={mismatch || save.isError} onChange={setConfirm} value={confirm} />
               {mismatch && <FieldError match>{t('两次输入的密码不一致', 'The passwords do not match')}</FieldError>}
               {save.isError && !mismatch && <FieldError match>{extractError(save.error, language)}</FieldError>}
             </Field>

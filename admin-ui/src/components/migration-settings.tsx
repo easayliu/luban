@@ -29,6 +29,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectItem,
@@ -320,7 +321,7 @@ function ImportPanel() {
               </FieldDescription>
             </Field>
 
-            <label className="flex cursor-pointer items-start gap-2.5">
+            <Label className="flex cursor-pointer items-start gap-2.5 font-normal">
               <Checkbox
                 checked={withSettings}
                 className="mt-0.5"
@@ -337,7 +338,7 @@ function ImportPanel() {
                   )}
                 </span>
               </span>
-            </label>
+            </Label>
           </DialogPanel>
 
           <DialogFooter>

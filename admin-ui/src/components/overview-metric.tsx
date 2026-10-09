@@ -85,7 +85,8 @@ export function OverviewMetric({
               带迷你趋势线的两格本来就不传 status，三样挤一行的问题不存在。 */}
           {status && (
             <Tooltip>
-              <TooltipTrigger className="min-w-0 shrink truncate text-xs text-muted-foreground">
+              {/* 触发器默认渲染成 <button>，而整格本身常是按钮：按钮套按钮是非法 HTML，改用 span。 */}
+              <TooltipTrigger className="min-w-0 shrink truncate text-xs text-muted-foreground" render={<span />}>
                 {status}
               </TooltipTrigger>
               <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">{statusDetail ?? status}</TooltipPopup>

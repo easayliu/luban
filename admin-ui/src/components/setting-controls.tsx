@@ -5,6 +5,7 @@ import { getSettings, type Settings } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { extractError } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Group } from '@/components/ui/group'
 import {
   NumberField,
   NumberFieldDecrement,
@@ -234,8 +235,11 @@ function DurationField({
     { value: 'day', label: t('天', 'Days') },
   ]
 
+  // 数值框与单位下拉拼成一个整体（Group 收掉相接处的圆角与重复边框）：两者说的是同一个量，
+  // 分开摆读起来像两项设置。Group 只认直接子元素，而数值框的边框画在里层的 NumberFieldGroup
+  // 上，所以右侧圆角得在那一层自己收。
   return (
-    <>
+    <Group className="min-w-0 flex-1 sm:flex-none">
       <NumberField
         className="min-w-0 flex-1 sm:w-32 sm:flex-none"
         min={0}
@@ -244,10 +248,10 @@ function DurationField({
         value={value}
         onValueChange={onValueChange}
       >
-        <NumberFieldGroup>
+        <NumberFieldGroup className="rounded-e-none before:rounded-e-none">
           <NumberFieldDecrement aria-label={t(`减少${label}`, `Decrease ${label}`)} />
           <NumberFieldInput aria-label={label} />
-          <NumberFieldIncrement aria-label={t(`增加${label}`, `Increase ${label}`)} />
+          <NumberFieldIncrement className="rounded-e-none" aria-label={t(`增加${label}`, `Increase ${label}`)} />
         </NumberFieldGroup>
       </NumberField>
       <Select
@@ -267,7 +271,7 @@ function DurationField({
           ))}
         </SelectPopup>
       </Select>
-    </>
+    </Group>
   )
 }
 

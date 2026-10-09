@@ -423,7 +423,7 @@ impl CredentialStore {
             .create_api_key(k.label.trim(), k.key.trim(), &[])?
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if k.disabled {
-            self.update_api_key(id, k.label.trim(), true, &[])?
+            self.update_api_key(id, k.label.trim(), true, &[], None)?
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(ImportOutcome::Added)

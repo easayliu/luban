@@ -3,6 +3,9 @@
 use super::*;
 
 pub(super) fn init_schema(conn: &Connection) -> Result<()> {
+    // 删改的内容立刻清零，不留在空闲页里：库里有 token、接入 Key 这类机密，旧值不该能从库文件
+    // 里捞回来（见 `secret::scrub_freed_pages`）。
+    conn.pragma_update(None, "secure_delete", "ON")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS credentials (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -592,9 +595,11 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     // 清理旧库遗留的无主历史数据（此前删号只清 device_bindings，用量日志留了下来）。
     // 必须在回填账本之前跑：先扫掉无主日志，回填才不会给已删账号立账。
     migrate_users(conn)?;
+    verify_secret_key(conn)?;
     encrypt_plaintext_tokens(conn)?;
     migrate_groups(conn)?;
     migrate_billing(conn)?;
+    ensure_secret_check(conn)?;
     purge_orphan_rows(conn)?;
     backfill_ledger(conn)?;
     migrate_priority_tiers(conn)?;
@@ -621,6 +626,10 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     )
     .context("failed to create the usage rollup table")?;
     backfill_rollup(conn)?;
+    // 有机密从明文改成密文、或这个库第一次被带清理的版本打开时，上面那几步已在各自的事务里
+    // 落下清理标记；这里按标记清掉空闲页里的旧明文。标记先于后续迁移持久化，中途哪一步失败、
+    // 下次启动照样会清。全新的空库也会走一次，空库 VACUUM 不花时间。
+    scrub_if_pending(conn)?;
     Ok(())
 }
 

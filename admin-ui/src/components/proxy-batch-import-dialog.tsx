@@ -2,11 +2,12 @@ import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { addProxies, type BatchProxyItem, type ProxyTestResult } from '@/api/proxies'
 import { useI18n } from '@/lib/i18n'
-import { extractError } from '@/lib/utils'
+import { extractError, formatMs } from '@/lib/utils'
 import { proxyMaskedUrl } from '@/components/credential-shared'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Label } from '@/components/ui/label'
 import {
   Dialog,
   DialogClose,
@@ -210,7 +211,7 @@ export function ProxyBatchImportDialog({
     const r = item.url ? results[item.url] : undefined
     if (!preview?.testFirst || !r) return null
     return r.ok
-      ? [[r.city, r.region, r.country].filter(Boolean).join(', '), `${r.latency_ms}ms`].filter(Boolean).join(' · ')
+      ? [[r.city, r.region, r.country].filter(Boolean).join(', '), formatMs(r.latency_ms)].filter(Boolean).join(' · ')
       : r.error
   }
 
@@ -282,10 +283,10 @@ export function ProxyBatchImportDialog({
                 className="font-mono text-xs"
                 aria-label={t('代理地址，每行一条', 'Proxy URLs, one per line')}
               />
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <Label className="flex cursor-pointer font-normal">
                 <Checkbox checked={testFirst} onCheckedChange={(next) => setTestFirst(next === true)} />
                 {t('导入前先测试，仅导入可用代理', 'Test before importing and only import working proxies')}
-              </label>
+              </Label>
             </>
           )}
         </DialogPanel>

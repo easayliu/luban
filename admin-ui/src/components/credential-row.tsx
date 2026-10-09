@@ -730,7 +730,7 @@ function CredentialRowActionsMenu({
   const credentialLabel = displayCredentialLabel(cred.label, language)
   return (
     <CredentialActionsMenu
-      triggerClassName={buttonVariants({ size: 'icon-xs', variant: 'ghost' })}
+      triggerClassName={buttonVariants({ size: 'icon-sm', variant: 'ghost' })}
       triggerLabel={t(`打开 ${credentialLabel} 操作菜单`, `Open actions for ${credentialLabel}`)}
       triggerTitle={t('账号操作', 'Account actions')}
         cred={cred}
@@ -1196,11 +1196,12 @@ function MiniQuotaLine({
         <span className="min-w-0 flex-1 truncate text-2xs text-muted-foreground">{t('无此窗口', 'N/A')}</span>
       ) : (
         <>
-          <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-input" aria-hidden>
-            {percentage != null && (
-              <span className={cn('block h-full rounded-full', METER_FILL[level])} style={{ width: `${percentage}%` }} />
-            )}
-          </span>
+          {/* 条只给眼睛看，读屏念右边那格百分比；配色与卡片视图的 QuotaBar 同一套 [METER_FILL]。 */}
+          <Meter aria-hidden className="min-w-0 flex-1" max={100} value={percentage ?? 0}>
+            <MeterTrack className="h-1.5 rounded-full">
+              {percentage != null && <MeterIndicator className={cn(METER_FILL[level], 'rounded-full')} />}
+            </MeterTrack>
+          </Meter>
           <span
             className={cn(
               'w-9 shrink-0 text-left font-medium text-xs tabular-nums',
@@ -1437,8 +1438,8 @@ function ListQuotaDetails({
 /**
  * 名额列的一行：图标、`当前/上限`、内联细条。数字按占用配色（0 灰、有量默认色、快满黄、
  * 满红，见 [deviceUsageMeta]），条同色；不限上限时分母是 ∞、不画条。整行是一颗按钮，
- * 条只是装饰（aria-hidden），读屏靠 aria-label。条用两个 span 画而不是 Meter 组件：按钮里
- * 只能放行内内容，Meter 渲染的是带 role 的块级元素。
+ * 条只是装饰（aria-hidden），读屏靠 aria-label。条是 Meter，但三层都 `render` 成 span：
+ * 按钮里只能放行内内容，Meter 默认渲染的是 div。
  * 行本身是外层网格的 `grid-cols-subgrid`（图标、数字、条三列，数字列有 2.75rem 的下限），
  * 三行的三条边界因此对齐；没画条的那行也会空出第三列，条位靠 `col-start-3` 钉住。
  */
@@ -1471,23 +1472,28 @@ function SlotMeterRow({
         : 'text-foreground'
   return (
     <Hint label={title}>
-      <button
-        type="button"
+      {/* ghost 按钮压成一行 16px 的网格：高度、圆角、内边距、边框都收回原来的尺寸，
+          显示方式换成 subgrid，三行的图标 / 数字 / 条才对得齐。 */}
+      <Button
+        variant="ghost"
+        size="xs"
         onClick={onClick}
         aria-label={ariaLabel}
         aria-haspopup="dialog"
-        className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center gap-x-1.5 rounded px-1 text-xs leading-none hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+        className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center justify-start gap-x-1.5 rounded border-0 px-1 font-normal text-xs leading-none sm:h-4 sm:text-xs [&_svg]:mx-0"
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
         <span className={cn('text-left tabular-nums', numberClass)}>
           {count}/{limit > 0 ? limit : '∞'}
         </span>
         {limit > 0 && (
-          <span className="col-start-3 block h-1 w-full min-w-0 overflow-hidden rounded-full bg-muted" aria-hidden>
-            <span className={cn('block h-full rounded-full', METER_FILL[usage.level])} style={{ width: `${pct}%` }} />
-          </span>
+          <Meter aria-hidden className="col-start-3 block w-full min-w-0" max={100} render={<span />} value={pct}>
+            <MeterTrack className="h-1 rounded-full bg-muted" render={<span />}>
+              <MeterIndicator className={cn('block h-full rounded-full', METER_FILL[usage.level])} render={<span />} />
+            </MeterTrack>
+          </Meter>
         )}
-      </button>
+      </Button>
     </Hint>
   )
 }
