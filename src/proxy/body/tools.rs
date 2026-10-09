@@ -203,8 +203,8 @@ pub(in crate::proxy) fn cc_tools_core(
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
 ///
-/// 只给注入那一步用（[`inject_cc_tools`]，此时 `tool_choice` 已归一）。流水**不**拿它预判：
-/// 那边读的是来访原文，`tool_choice: "required"` 这类方言还没归一，会算错——流水改按实际出站
+/// 只给注入那一步用（[`inject_cc_tools`]）。流水**不**拿它预判：
+/// 那边读的是来访原文，会算错——流水改按实际出站
 /// 体对来访算（[`injected_tools_of`]）。
 ///
 /// **不带工具的来访**（[`declares_no_tools`]：没有 `tools` 键、`tools: null`、`tools: []` 三种
@@ -259,9 +259,7 @@ pub(in crate::proxy) fn cc_tools_to_inject(
 /// 官方资产（[`cc_tools_core`]）的名字，减去来访 `tools` 里已有的名字。
 ///
 /// 流水按它记 `injected_tool_called` / `tools_filled`，不再拿来访体预判
-/// （[`cc_tools_to_inject`]）：来访的 `tool_choice: "required"` / `"any"` / OpenAI 的
-/// `{"type":"function"}` 要先被 [`normalize_tool_choice`] 归一成 `any` / `tool`，注入那一步才
-/// 据此不补；读来访原文会把这类请求误记成「补了」。官方工具名不参与假名混淆，出站里认得出。
+/// （[`cc_tools_to_inject`]）：注入那一步按 `tool_choice` 与开关决定补不补，读来访原文会误记。官方工具名不参与假名混淆，出站里认得出。
 pub(in crate::proxy) fn injected_tools_of(
     inbound: &serde_json::Value,
     outbound: &serde_json::Value,
@@ -468,98 +466,4 @@ pub(super) fn inject_cc_tools(
         "aligned CC main-thread tool stubs for simulation"
     );
     true
-}
-
-/// `tools` 数组按 `name` 去重：保留每个名字的首次出现，丢弃后续重复声明。
-/// 上游对重复名直接 400（`Tool names must be unique`），而客户端侧不一定能改。
-/// 上游不支持 `input_schema` 顶层的 `allOf` / `oneOf` / `anyOf`（直接 400），
-/// 这里把它们展平为一个普通 `object` schema。
-///
-/// - **`allOf`**：按序合并——`properties` 取并集（后覆前），`required` 取并集，其余键后覆前。
-///   顶层如果还有 `type`/`properties` 等，先当第 0 块参与合并。
-/// - **`oneOf` / `anyOf`**：单元素直接解包；多元素按 `allOf` 策略合并（properties 取并集，
-///   required 取并集——比「丢掉所有分支」保留了更多信息）。
-/// - 嵌套不管：只修顶层，深层的 `allOf` 等留给上游——它只对顶层报错。
-pub(in crate::proxy) fn flatten_tool_schemas(v: &mut serde_json::Value) -> bool {
-    let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
-        return false;
-    };
-    let mut changed = false;
-    for tool in tools.iter_mut() {
-        let Some(schema) = tool.get_mut("input_schema").and_then(|s| s.as_object_mut()) else {
-            continue;
-        };
-        // 取出 compound 关键字（只看顶层）。
-        let compound = ["allOf", "oneOf", "anyOf"].iter().find_map(|k| schema.remove(*k));
-        let Some(serde_json::Value::Array(parts)) = compound else {
-            continue;
-        };
-        // 把当前顶层属性也算进去作为「第 0 块」。
-        let mut merged = serde_json::Value::Object(std::mem::take(schema));
-        for part in &parts {
-            merge_schema_into(&mut merged, part);
-        }
-        if let Some(obj) = merged.as_object_mut() {
-            obj.entry("type").or_insert_with(|| serde_json::Value::String("object".into()));
-        }
-        let serde_json::Value::Object(m) = merged else { continue };
-        *schema = m;
-        changed = true;
-    }
-    if changed {
-        tracing::info!("flattened top-level allOf/oneOf/anyOf in tool input_schema");
-    }
-    changed
-}
-
-/// 把 `src` 的字段合并进 `dst`：`properties` 取并集，`required` 取并集，其余后覆前。
-fn merge_schema_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
-    let (Some(dst_obj), Some(src_obj)) = (dst.as_object_mut(), src.as_object()) else {
-        return;
-    };
-    for (k, v) in src_obj {
-        match k.as_str() {
-            "properties" => {
-                let props = dst_obj
-                    .entry("properties")
-                    .or_insert_with(|| serde_json::Value::Object(Default::default()));
-                if let (Some(existing), Some(new)) = (props.as_object_mut(), v.as_object()) {
-                    for (pk, pv) in new {
-                        existing.insert(pk.clone(), pv.clone());
-                    }
-                }
-            }
-            "required" => {
-                let req =
-                    dst_obj.entry("required").or_insert_with(|| serde_json::Value::Array(vec![]));
-                if let (Some(existing), Some(new)) = (req.as_array_mut(), v.as_array()) {
-                    for item in new {
-                        if !existing.contains(item) {
-                            existing.push(item.clone());
-                        }
-                    }
-                }
-            }
-            _ => {
-                dst_obj.insert(k.clone(), v.clone());
-            }
-        }
-    }
-}
-
-pub(in crate::proxy) fn dedup_tools(v: &mut serde_json::Value) -> bool {
-    let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
-        return false;
-    };
-    let before = tools.len();
-    let mut seen = std::collections::HashSet::new();
-    tools.retain(|t| {
-        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-        seen.insert(name.to_string())
-    });
-    let removed = before - tools.len();
-    if removed > 0 {
-        tracing::info!(removed, "deduped tools array (duplicate tool names)");
-    }
-    removed > 0
 }

@@ -499,8 +499,7 @@ impl ReqLog {
     /// `sent` 不能省。响应侧（状态码、用量、model、stop_reason、限流）调用方已经换成重试
     /// 那一发了，请求侧却还挂着首发那份 body——于是遥测里 `messageCount` /
     /// `inputTextCharLength` / `toolsCount` / 「是不是新输入」全都算的是**一条被上游拒了的
-    /// 请求**，而同一条事件里的 requestId 与 token 来自另一条。prefill 那条尤其明显：
-    /// [`strip_assistant_prefill`] 直接弹掉末尾的 assistant 轮，`messageCount` 是真的变了。
+    /// 请求**，而同一条事件里的 requestId 与 token 来自另一条。
     /// 取证的 `shape` 列同理——它要回答的是「发出去的到底长什么样」。
     ///
     /// `thread` 同理，是重试那次改写交出的 message thread 那份（`Simulation::take_thread`）：
@@ -853,8 +852,8 @@ pub(super) struct ShapeBits {
     pub(super) session_id: Option<String>,
     pub(super) device_id_out: Option<String>,
     /// 出站比来访多出来的官方工具名（模拟路径注入的），见 [`crate::proxy::injected_tools_of`]。
-    /// 按**实际改写结果**算，不按来访体预判：`tool_choice: "required"` 之类的方言要先经
-    /// [`crate::proxy::normalize_tool_choice`] 归一才知道补不补，读来访原文会算错。
+    /// 按**实际改写结果**算，不按来访体预判：注入那一步会按 `tool_choice` 与开关决定补不补，
+    /// 读来访原文会算错。
     /// 只有 [`crate::proxy::Upstream::shape_outbound`] 填它，其余路径为空。
     pub(super) injected_tools: Vec<&'static str>,
     /// 来访一个工具都没声明、出站却带上了注入的官方工具（开关 `fill_absent_tools`）。

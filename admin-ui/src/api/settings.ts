@@ -69,8 +69,6 @@ export interface Settings {
   orig_header_case: boolean
   /** 上游拒绝 thinking 块签名时，把历史 thinking 降级成 text 后重试一次。 */
   thinking_signature_retry: boolean
-  /** 上游拒绝被修改的 thinking 块时，降级历史 thinking 后重试一次。 */
-  thinking_modified_retry: boolean
   /** 上游拒绝 redacted_thinking 块的密文（Invalid `data`）时，降级历史 thinking 后重试一次。 */
   redacted_thinking_retry: boolean
   /** 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 + 整套官方头）；官方桌面端预热与 WebSearch 子调用原样放行。 */
@@ -107,13 +105,7 @@ export interface Settings {
   tool_name_mimic: boolean
   /** 模拟路径下是否注入 thinking（及配套的 context_management）。 */
   inject_thinking: boolean
-  /** 展平 tool input_schema 顶层的 allOf/oneOf/anyOf。 */
-  flatten_tool_schemas: boolean
-  /** 剥除 messages 里的空 text 内容块。 */
-  strip_empty_text: boolean
-  /** 将 messages 里的 role:"system" 消息提升到顶层 system 字段（CC 形态的请求跳过；content 为空壳的那种无论开关与形态一律丢掉，上游恒 400）。 */
-  hoist_system_role: boolean
-  /** 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。 */
+  /** 本地拒绝带 OpenAI 格式转换残留的请求，不转发。 */
   reject_openai_shape: boolean
   /** 会话 id 在请求头与 metadata 两处不一致时本地拒绝，不替客户端选一个。 */
   reject_session_conflict: boolean
@@ -135,10 +127,6 @@ export interface Settings {
   fable_refusal_fallback: boolean
   /** opus-5 族主线程请求补 luban 自定的 refusal fallback 链（4.8→4.6）。官方不发这个字段，实验开关，默认关。 */
   opus_refusal_fallback: boolean
-  /** 4.6+ 模型收到 assistant prefill 时的策略：strip（默认）、reject、off。 */
-  prefill_policy: string
-  /** 4.7+ 模型收到 sampling 参数时的策略：strip（默认）、reject、off。 */
-  sampling_policy: string
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -154,7 +142,6 @@ export type ForwardingKey =
   | 'system_shape'
   | 'orig_header_case'
   | 'thinking_signature_retry'
-  | 'thinking_modified_retry'
   | 'redacted_thinking_retry'
   | 'simulate_cc'
   | 'simulate_full_system'
@@ -171,9 +158,6 @@ export type ForwardingKey =
   | 'strip_extra_fields'
   | 'tool_name_mimic'
   | 'inject_thinking'
-  | 'flatten_tool_schemas'
-  | 'strip_empty_text'
-  | 'hoist_system_role'
   | 'reject_openai_shape'
   | 'reject_session_conflict'
   | 'reject_probes'
@@ -363,25 +347,6 @@ export async function setOauthScopes(scopes: string): Promise<Settings> {
   return data
 }
 
-/** 策略类型：strip = 剥离后转发（默认），reject = 本地 400 拒绝，off = 不处理。 */
-export type PolicyValue = 'strip' | 'reject' | 'off'
-
-/** 设置 prefill 处理策略。 */
-export async function setPrefillPolicy(policy: PolicyValue): Promise<Settings> {
-  const { data } = await api.post<Settings>('/settings/prefill-policy', {
-    prefill_policy: policy,
-  })
-  return data
-}
-
-/** 设置 sampling 参数处理策略。 */
-export async function setSamplingPolicy(policy: PolicyValue): Promise<Settings> {
-  const { data } = await api.post<Settings>('/settings/sampling-policy', {
-    sampling_policy: policy,
-  })
-  return data
-}
-
 /**
  * 改一个转发形态开关。只发生变化的那一项，后端不会动其余开关。
  */
@@ -453,7 +418,7 @@ export async function importAll(
 /**
  * 从上游响应学到的一条规则（`GET /api/learned-rejections`）。
  * `shape`：某模型不收某字段的某取值（如 effort 'xhigh'），命中本地直接拒；
- * `deprecated`：某模型已废弃某字段（如 temperature），命中转发前剥掉；
+ * `deprecated`：luban 补的 `fallbacks` 被某模型以 400 拒绝（`field` 恒为 fallbacks），此后不再为该模型补；
  * `empty_reply`：某模型对「无 tools 的单条消息 + 这个 max_tokens」回过 200 却零输出，
  * 同类命中本地直接拒（`field` 恒为 max_tokens，`value` 是那个数，`message` 是上游当时的回复开头）；
  * `refusal`：某模型拒答过这条提示词（stop_reason refusal），逐字相同的重发本地直接拒
@@ -465,7 +430,7 @@ export interface LearnedRejection {
   kind: 'shape' | 'deprecated' | 'empty_reply' | 'refusal' | (string & {})
   model: string
   field: string
-  /** 形态规则被拒的取值 / 零输出规则的 max_tokens / 拒答规则的提示词哈希；废弃字段规则为空串。 */
+  /** 形态规则被拒的取值 / 零输出规则的 max_tokens / 拒答规则的提示词哈希；fallbacks 规则为空串。 */
   value: string
   /** 上游原话（零输出规则是当时截下的回复开头）。 */
   message: string

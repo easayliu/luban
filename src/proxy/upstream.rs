@@ -7,7 +7,6 @@ use crate::config;
 use crate::store;
 use crate::web::AppState;
 
-use super::ban::parse_upstream_error;
 use super::body::{
     CcClient, ToolNameMap, cc_ua_entrypoint, declares_no_tools, injected_tools_of,
     restore_tool_names_stream, rewrite_body_out, trusted_cc_version,
@@ -16,7 +15,6 @@ use super::headers::{is_resp_forwardable, orig_header_case};
 use super::logging::{ReqLog, ShapeBits, UsageSniffer, shape_summary_of};
 use super::rate_limit::RateLimitInfo;
 use super::session_link::{CcRequestKind, CcSessionLink};
-use super::thinking::preserve_thinking_encoding;
 use super::{Simulation, error_response, header_opt};
 
 /// 一次转发要发往上游的全部固定入参（方法/URL/已装好的转发头/开关），只有请求体每次不同。
@@ -779,61 +777,6 @@ pub(super) async fn retry_thread_as_create(
         upstream.sim.as_ref().and_then(|s| s.take_thread()),
     );
     Some(up)
-}
-
-/// `messages` 末尾是不是 `assistant` 轮——用已解析的 `body_json` 判，零开销。
-pub(super) fn has_trailing_assistant(body: Option<&serde_json::Value>) -> bool {
-    body.and_then(|v| v.get("messages"))
-        .and_then(|m| m.as_array())
-        .and_then(|a| a.last())
-        .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
-        == Some("assistant")
-}
-
-/// 模型是否不支持 assistant message prefill（4.6+ 全系列均不支持）。
-///
-/// 用于在转发前主动剥掉末尾 assistant 轮，省去被上游 400 后再重试的往返。
-/// 客户端可能带日期后缀（如 `claude-opus-4-6-20251114`），故用前缀匹配。
-pub(super) fn model_rejects_prefill(model: &str) -> bool {
-    [
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-        "claude-sonnet-5",
-        "claude-opus-5",
-        "claude-fable-5",
-        "claude-mythos-5",
-    ]
-    .iter()
-    .any(|p| model.starts_with(p))
-}
-
-/// 上游那条 400 是不是「该模型不支持 assistant message prefill」，形如
-/// `This model does not support assistant message prefill.`
-///
-/// 只按 message 文本判、不卡 `error.type`：同样归在 `invalid_request_error` 名下。
-pub(super) fn is_prefill_not_supported_error(body: &[u8]) -> bool {
-    let (_, message) = parse_upstream_error(body);
-    let hay = message.to_lowercase();
-    hay.contains("does not support") && hay.contains("prefill")
-}
-
-/// 剥掉 `messages` 末尾连续的 `assistant` 轮——也就是客户端发的 prefill。
-///
-/// 返回 `None` 表示末轮不是 assistant（不该走到这）或者剥完之后一条消息都不剩。
-pub(super) fn strip_assistant_prefill(body: &Bytes) -> Option<Bytes> {
-    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let msgs = v.get_mut("messages")?.as_array_mut()?;
-    let before = msgs.len();
-    while msgs.last().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
-        msgs.pop();
-    }
-    if msgs.is_empty() || msgs.len() == before {
-        return None;
-    }
-    serde_json::to_vec(&v).ok().map(|bytes| Bytes::from(preserve_thinking_encoding(body, bytes)))
 }
 
 /// 展开 error 的 source 链，拼成「顶层 -> 次层 -> …」，暴露底层真实原因。

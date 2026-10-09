@@ -100,9 +100,7 @@ pub(super) fn admit(
     // 限额，见 [`UpstreamLoad`]。算在这里是因为 `body_json` 只解析一次（见上面 2 那段），
     // 而这个值逐轮不变。
     let req_max_tokens = request_max_tokens(facts.body_json.as_ref());
-    let body = prefill_gate(state, &client_ua, &facts, body)?;
     shape_gates(state, &method, &path_and_query, &client_ua, &headers, &facts, log_state)?;
-    let body = sampling_gate(state, &client_ua, &facts, body)?;
     device_rpm_gate(state, &method, &path_and_query, &client_ua, &facts, log_state)?;
 
     let Facts {
@@ -547,55 +545,6 @@ fn identity_gates(
     Ok(())
 }
 
-/// 2.3a：末尾 assistant 轮（prefill）按 `prefill_policy` 剥掉、拒掉或放过。
-fn prefill_gate(
-    state: &AppState,
-    client_ua: &str,
-    facts: &Facts,
-    body: Bytes,
-) -> Result<Bytes, Response> {
-    let Facts { ref body_json, ref req_model, .. } = *facts;
-    // 2.3a) 4.6+ 全系列不支持 assistant message prefill（末尾 role=assistant 的轮次），
-    //       上游会返回 400。策略由 `prefill_policy` 控制：
-    //       - strip（默认）：主动剥掉末尾 assistant 轮后转发，省去白跑一趟。
-    //       - reject：本地直接 400 拒绝，不往上游送。
-    //       - off：不做任何处理，原样转发，上游的 400 也原样回给客户端。
-    //       strip / reject 下后面那条被动重试（[`is_prefill_not_supported_error`] →
-    //       [`retry_without_prefill`]）仍作兜底：万一新模型不在列表里、或者上游的拒绝消息换了措辞。
-    let body = if req_model.as_deref().is_some_and(model_rejects_prefill)
-        && has_trailing_assistant(body_json.as_ref())
-    {
-        match state.store.prefill_policy() {
-            store::PrefillPolicy::Strip => match strip_assistant_prefill(&body) {
-                Some(stripped) => {
-                    tracing::info!(
-                        model = %req_model.as_deref().unwrap_or("-"),
-                        "proactively stripped trailing assistant prefill for a model that does not support it"
-                    );
-                    stripped
-                }
-                None => body,
-            },
-            store::PrefillPolicy::Reject => {
-                tracing::info!(
-                    model = %req_model.as_deref().unwrap_or("-"),
-                    ua = %client_ua,
-                    "rejected: assistant message prefill is not supported by this model (prefill_policy=reject)"
-                );
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    "This model does not support assistant message prefill. The conversation must end with a user message.",
-                ));
-            }
-            store::PrefillPolicy::Off => body,
-        }
-    } else {
-        body
-    };
-    Ok(body)
-}
-
 /// 2.3～2.3a5：本地就能判的形态错误与学到的拒答，命中即拒或回放，不往上游送。
 fn shape_gates(
     state: &AppState,
@@ -626,13 +575,12 @@ fn shape_gates(
     // 「出站带不带 fallback」的例外要跟实际出站计划一致。
     let billing_only = flags.sim_billing_only
         && simulates_cc(body_json.as_ref(), headers, facts.from_cc_client, flags);
-    let system_hoisted = billable && hoists_system_role(&flags, cc_shaped);
     if flags.reject_learned_shapes
         && let Some((field, value, message)) = known_shape_rejection(
             &state.shape_rejections,
             req_model.as_deref(),
             body_json.as_ref(),
-            system_hoisted,
+            false,
         )
     {
         tracing::warn!(
@@ -646,12 +594,8 @@ fn shape_gates(
     // 2.3') 对话中途的 `role:"system"` 摆错位置（一段 system 之后紧跟 user）→ 本地直接拒，
     //       回上游那句原话，见 [`misplaced_system_role`]。规则是上游报错里写明的，不靠学：
     //       0.3.188 之前它被形态记忆学成「这个模型不收 system」，之后同模型带中途 system 的
-    //       请求不论位置对错全被本地拒掉。出站会被整条提升的不判（上游看不到这个位置）；
-    //       只判计费路径，`count_tokens` 等原样交给上游。
-    if billable
-        && !system_hoisted
-        && let Some(message) = misplaced_system_role(body_json.as_ref())
-    {
+    //       请求不论位置对错全被本地拒掉。只判计费路径，`count_tokens` 等原样交给上游。
+    if billable && let Some(message) = misplaced_system_role(body_json.as_ref()) {
         tracing::warn!(
             %method, path = %path_and_query, ua = %client_ua,
             model = %req_model.as_deref().unwrap_or("-"), cc_shaped,
@@ -661,9 +605,7 @@ fn shape_gates(
     }
 
     // 2.3a) OpenAI 格式转换残留 → 本地直接拒，不修补，见 [`find_openai_marker`]。
-    //       全部由 `reject_openai_shape` 拨（`image_url` 也是：上游对它恒 400，关着照样原样
-    //       送上去）：开着一律拒，关着退回旧的修补路径
-    //       （`hoist_system_role` 挪 system、[`normalize_tool_choice`] 翻译 tool_choice）。
+    //       全部由 `reject_openai_shape` 拨：开着一律拒，关着原样送上去，由上游回官方的 400。
     //       模拟路径不受影响：它只接管**本来就是 Anthropic 形态**的非 CC 请求。
     let reject_openai_shape = state.store.forward_flags().reject_openai_shape;
     if let Some(marker) = find_openai_marker(body_json.as_ref(), cc_shaped, reject_openai_shape) {
@@ -848,52 +790,6 @@ fn shape_gates(
         ));
     }
     Ok(())
-}
-
-/// 2.3b：已废弃的采样参数按 `sampling_policy` 剥掉或拒掉。
-fn sampling_gate(
-    state: &AppState,
-    client_ua: &str,
-    facts: &Facts,
-    body: Bytes,
-) -> Result<Bytes, Response> {
-    let Facts { ref body_json, ref req_model, .. } = *facts;
-    // 2.3b) 上游曾以 `deprecated` 拒过的字段（`temperature`、`top_p` 之类）。
-    //       策略由 `sampling_policy` 控制：strip（默认）= 剥掉后转发，reject = 本地 400，
-    //       off = 原样转发——静态名单和学到的都不用，上游 400 也不学（见 respond 里的学习入口）。
-    //       与 2.3 共享「从上游 400 里学」的范式，但行为相反：那条路是拒绝，这条路是修补。
-    let sampling_policy = state.store.sampling_policy();
-    if sampling_policy == store::PrefillPolicy::Off {
-        return Ok(body);
-    }
-    // reject 策略下静态名单与学到的组合一视同仁：都是「这个模型不收这个参数」的既定事实。
-    let body = if sampling_policy == store::PrefillPolicy::Reject
-        && ((req_model.as_deref().is_some_and(model_rejects_sampling)
-            && has_deprecated_sampling_field(body_json.as_ref()))
-            || has_learned_deprecated_field(
-                &state.deprecated_fields,
-                req_model.as_deref(),
-                body_json.as_ref(),
-            )) {
-        tracing::info!(
-            model = %req_model.as_deref().unwrap_or("-"),
-            ua = %client_ua,
-            "rejected: sampling parameters (temperature/top_p/top_k) are deprecated for this model (sampling_policy=reject)"
-        );
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "Sampling parameters (temperature, top_p, top_k) are deprecated for this model.",
-        ));
-    } else {
-        maybe_strip_deprecated(
-            &state.deprecated_fields,
-            req_model.as_deref(),
-            body_json.as_ref(),
-            body,
-        )
-    };
-    Ok(body)
 }
 
 /// 2.4：每设备 RPM 上限。

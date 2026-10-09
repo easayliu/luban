@@ -637,48 +637,6 @@ async fn gate_openai_residue() {
     assert!(mock.seen().is_empty());
 }
 
-#[tokio::test]
-async fn gate_prefill_rejected_by_policy() {
-    let mock = MockUpstream::start(vec![]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::PREFILL_POLICY, "reject").unwrap();
-    let req = cc_request(serde_json::json!({"messages": [
-        {"role": "user", "content": "write a haiku"},
-        {"role": "assistant", "content": "Waves"}]}));
-    assert_local_reject(
-        &mock,
-        &state,
-        req,
-        StatusCode::BAD_REQUEST,
-        "invalid_request_error",
-        "prefill",
-    )
-    .await;
-}
-
-/// `prefill_policy=off`：prefill 原样送到上游，上游的 400 原样回给客户端，不剥掉重试。
-#[tokio::test]
-async fn prefill_off_forwards_and_does_not_retry() {
-    let mock = MockUpstream::start(vec![
-        Reply::json_error(
-            400,
-            "invalid_request_error",
-            "This model does not support assistant message prefill. The conversation must end with a user message.",
-        ),
-        sse_ok("should not be reached"),
-    ])
-    .await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::PREFILL_POLICY, "off").unwrap();
-
-    let req = cc_request(serde_json::json!({"messages": [
-        {"role": "user", "content": "write a haiku"},
-        {"role": "assistant", "content": "Waves"}]}));
-    let (status, _, _) = send(&state, req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(mock.seen().len(), 1, "off 不该重试");
-}
-
 /// `reject_learned_shapes` 关掉：上游的形态 400 不学；表里已有的规则也不拦，照常送上游。
 #[tokio::test]
 async fn learned_shapes_off_neither_learns_nor_blocks() {
@@ -699,17 +657,85 @@ async fn learned_shapes_off_neither_learns_nor_blocks() {
 
     // 开着时学到的规则，关掉后不再拦。
     let body: serde_json::Value = serde_json::from_slice(&req().1).unwrap();
-    crate::proxy::remember_shape_rejection(
-        &state.shape_rejections,
-        Some("claude-sonnet-5"),
-        Some(&body),
-        format!(r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{EFFORT_400}"}}}}"#)
-            .as_bytes(),
-    );
+    crate::proxy::remember_shape_rejection(&state.shape_rejections, Some("claude-sonnet-5"), Some(&body), Some(&body), format!(r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{EFFORT_400}"}}}}"#)
+            .as_bytes());
     assert!(!state.shape_rejections.read().is_empty());
     let (status, _, _) = send(&state, req()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(mock.seen().len(), 2, "关着不该本地拦");
+}
+
+/// 采样参数被废弃的 400 原样回给客户端，并学成规则；同样的请求再来时本地回同一句原话，
+/// 不再发往上游。
+#[tokio::test]
+async fn deprecated_sampling_400_passes_through_then_is_rejected_locally() {
+    const TEMP_400: &str = "`temperature` is deprecated for this model.";
+    let mock =
+        MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TEMP_400)]).await;
+    let (store, state, _) = setup(1, &mock.base);
+    // 不注入 thinking：temperature 原样出站，上游才会点它的名。
+    store.set_setting(store::INJECT_THINKING, "0").unwrap();
+    let req = || cc_request(serde_json::json!({"temperature": 0.7}));
+
+    let (status, _, body) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains(TEMP_400));
+
+    let (status, _, body) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains(TEMP_400), "本地回上游原话");
+    assert_eq!(mock.seen().len(), 1, "第二条不该再发往上游");
+}
+
+/// 规则按**出站体**判：已学到「该模型不收 temperature」，但这条请求走模拟路径、注入 thinking
+/// 时会剥掉冲突的 `temperature: 0.7` 与 `top_p: 0.5`，出站里没有它们，不该在本地拦下。
+#[tokio::test]
+async fn sampling_rule_does_not_block_when_the_outbound_body_drops_the_param() {
+    const TEMP_400: &str = "`temperature` is deprecated for this model.";
+    const TOP_P_400: &str = "`top_p` is deprecated for this model.";
+    let mock = MockUpstream::start(vec![sse_ok("ok")]).await;
+    let (_, state, _) = setup(1, &mock.base);
+    let learned_from = serde_json::json!({"model": "claude-sonnet-5", "temperature": 0.7, "top_p": 0.5,
+        "messages": [{"role": "user", "content": "hi"}]});
+    for msg in [TEMP_400, TOP_P_400] {
+        crate::proxy::remember_shape_rejection(
+            &state.shape_rejections,
+            Some("claude-sonnet-5"),
+            Some(&learned_from),
+            Some(&learned_from),
+            format!(
+                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"{msg}"}}}}"#
+            )
+            .as_bytes(),
+        );
+    }
+    assert_eq!(state.shape_rejections.read().len(), 2);
+    let (status, _, _) =
+        send(&state, cc_request(serde_json::json!({"temperature": 0.7, "top_p": 0.5}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 1, "出站不带这两个参数，照常发往上游");
+}
+
+/// prefill 不支持的 400 同理：原样回给客户端并学成规则，第二条本地拒。
+#[tokio::test]
+async fn unsupported_prefill_400_passes_through_then_is_rejected_locally() {
+    const PREFILL_400: &str = "This model does not support assistant message prefill. \
+                               The conversation must end with a user message.";
+    let mock =
+        MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", PREFILL_400)])
+            .await;
+    let (_, state, _) = setup(1, &mock.base);
+    let req = || {
+        cc_request(serde_json::json!({"messages": [
+            {"role": "user", "content": "write a haiku about the sea"},
+            {"role": "assistant", "content": "Waves"}]}))
+    };
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, body) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("does not support assistant message prefill"));
+    assert_eq!(mock.seen().len(), 1, "第二条不该再发往上游");
 }
 
 /// 零输出拦截开关决定学不学：开着学到这一类，关着什么也不记。
@@ -768,24 +794,6 @@ async fn plan_denial_with_rate_limit_retry_off_passes_through() {
     for id in ids {
         assert!(store.denied_models(id).unwrap().is_empty(), "关着不该记准入");
     }
-}
-
-/// `sampling_policy=off`：temperature 原样送到上游，上游的 deprecated 400 原样回给客户端，不学。
-#[tokio::test]
-async fn sampling_off_forwards_and_learns_nothing() {
-    let mock = MockUpstream::start(vec![Reply::json_error(
-        400,
-        "invalid_request_error",
-        "`temperature` is deprecated for this model.",
-    )])
-    .await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::SAMPLING_POLICY, "off").unwrap();
-
-    let (status, _, _) = send(&state, cc_request(serde_json::json!({"temperature": 0.5}))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(mock.seen().len(), 1);
-    assert!(state.deprecated_fields.read().is_empty(), "off 不该学");
 }
 
 /// 会话 RPM 上限 1：第一条放行，第二条本地 429 + `retry-after`，上游只收到一发。

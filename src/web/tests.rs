@@ -477,34 +477,6 @@ async fn nonneg_int_settings_clamp_negatives_to_zero() {
     assert_eq!(store.get_setting(store::SESSION_BINDING_TTL).unwrap().as_deref(), Some("0"));
 }
 
-/// prefill / sampling 策略：`strip` 与空串删键回默认，`reject` / `off` 规整成小写存下，其余 400。
-#[tokio::test]
-async fn strip_policies_store_reset_and_reject_the_same_way() {
-    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
-    let state = AppState::for_test(store.clone());
-    let prefill =
-        |v: &str| Json(serde_json::from_value(serde_json::json!({ "prefill_policy": v })).unwrap());
-    let sampling = |v: &str| {
-        Json(serde_json::from_value(serde_json::json!({ "sampling_policy": v })).unwrap())
-    };
-
-    let _ = set_prefill_policy(State(state.clone()), prefill(" Reject ")).await.unwrap();
-    assert_eq!(store.get_setting(store::PREFILL_POLICY).unwrap().as_deref(), Some("reject"));
-    let _ = set_prefill_policy(State(state.clone()), prefill("")).await.unwrap();
-    assert_eq!(store.get_setting(store::PREFILL_POLICY).unwrap(), None);
-
-    let _ = set_sampling_policy(State(state.clone()), sampling("off")).await.unwrap();
-    assert_eq!(store.get_setting(store::SAMPLING_POLICY).unwrap().as_deref(), Some("off"));
-    let _ = set_sampling_policy(State(state.clone()), sampling("strip")).await.unwrap();
-    assert_eq!(store.get_setting(store::SAMPLING_POLICY).unwrap(), None);
-
-    let Err((status, msg)) = set_sampling_policy(State(state), sampling("drop")).await else {
-        panic!("未知取值必须拒");
-    };
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(msg, r#"sampling_policy must be "strip", "reject", or "off""#);
-}
-
 /// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
 #[tokio::test]
 async fn series_endpoints_report_the_bucket_width_actually_used() {

@@ -118,10 +118,9 @@ const OPENAI_CONTENT_TYPES: &[&str] = &[
 /// - 上游的 messages 认 `user` / `assistant` / `system` 三种 role。`system` 只在**首条
 ///   user/assistant 之前**被拒（`messages.0: use the top-level 'system' parameter for the
 ///   initial system prompt`）；跟在 user 之后的在新模型上是 200，那是地道的 Anthropic 请求，
-///   不能拿来当 OpenAI 残留。「开头」怎么算见 [`first_turn_index`]，与修补那侧共用。
+///   不能拿来当 OpenAI 残留。「开头」怎么算见 [`first_turn_index`]。
 /// - `cc_shaped`（`system` 里有 CC 身份声明）的请求**不查** `system_role`：CC 自己在
-///   messages 里合法使用 `role:"system"`（deferred tools），见 [`hoist_system_role_messages`]
-///   调用处的同一取舍。
+///   messages 里合法使用 `role:"system"`（deferred tools）。
 /// - `tool_call_id` 只认 `call_` 前缀，且是**唯一一条上游会放行的**：实测 `call_` id 上游
 ///   回 200。所以这一条不是「省一次 400」，是纯粹的转换指纹：Anthropic 侧签发的 id 恒为
 ///   `toolu_` 开头，`call_` 只可能来自 OpenAI 的 `tool_calls[].id` 被原样回填。其余各条上游

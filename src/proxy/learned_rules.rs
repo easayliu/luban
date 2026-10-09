@@ -1,28 +1,27 @@
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 
 use crate::store;
 
 use super::ban::parse_upstream_error;
-use super::body::{
-    FALLBACKS_FIELD, first_turn_index, is_empty_system_shell, system_survives_hoisting,
-};
+use super::body::{FALLBACKS_FIELD, first_turn_index, is_empty_system_shell};
 use super::probe_detect::message_to_sse;
 use super::rate_limit::MAX_TRANSIENT_COOLDOWN_SECS;
 use super::request_max_tokens;
 use super::simulation::field_is_empty;
-use super::thinking::preserve_thinking_encoding;
 use super::upstream::{Aggregated, SseAggregator};
 
 /// 请求里那些「上游一旦不认，就会在报错里逐字点名」的取值。
 ///
-/// 三条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
+/// 五条实测样本（都是 `invalid_request_error`，都换哪个号发都一样）：
 /// ```text
 /// This model does not support effort level 'xhigh'. Supported levels: high, low, max, medium.
 /// role 'system' is not supported on this model
 /// 'claude-fable-5' does not support tool types: computer_20250124. Did you mean one of
 /// advisor_20260301, bash_20250124, browser_toolset_20260801, …
+/// `temperature` is deprecated for this model.
+/// This model does not support assistant message prefill. The conversation must end with a user message.
 /// ```
 /// 判据一律是「字段名 + 这次的取值被点名」的**共现**：报错里既出现该字段的名字
 /// （[`ShapeProbe::keyword`]），又确实点了这次请求里的那个取值（[`ShapeProbe::cite`]）——
@@ -31,7 +30,8 @@ use super::upstream::{Aggregated, SseAggregator};
 ///
 /// 「被点名」怎么算按样本分两种：前两条点名的形态是 `'取值'`（[`cited_as_quoted`]）；第三条
 /// 不带引号，且后半句还列着一串**合法**类型，裸子串判会把它们一并学成「不支持」，故另有
-/// [`cited_in_tool_type_list`] 只认冒号后那一段。
+/// [`cited_in_tool_type_list`] 只认冒号后那一段；采样参数点名的形态是 `` `取值` ``
+/// （[`cited_in_backticks`]）；prefill 那句不点取值，整句认（[`cited_prefill`]）。
 pub(super) struct ShapeProbe {
     /// 记忆表里的字段标签，同时用于日志。
     pub(super) field: &'static str,
@@ -41,6 +41,12 @@ pub(super) struct ShapeProbe {
     values: fn(&serde_json::Value) -> Vec<String>,
     /// 这句报错有没有**点这个取值的名**：`(报错原文, 请求里的取值)`。
     cite: fn(&str, &str) -> bool,
+    /// 按**实际出站体**学与拦，而不是来访原件：luban 的改写会动到它看的东西（模拟路径注入
+    /// thinking 时剥掉冲突的 `temperature` / `top_p`，模拟线程会在历史末尾补消息），拿来访原件
+    /// 去拦，会拦下一条出站本来不会触犯规则的请求。这类规则只在计费的 `/v1/messages` 上学与拦
+    /// （改写后、发送前，见 `handler::attempt::prepare`）；`count_tokens` 那条路上游收不收同一个
+    /// 东西没有实测，不碰。
+    pub(super) on_outbound: bool,
 }
 
 /// 「条件句」的引子。命中其一即**不学**这条 400——见 [`remember_shape_rejection`]。
@@ -78,15 +84,78 @@ fn is_qualified_rejection(message: &str) -> bool {
 /// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取、怎么算被点名」，学习与
 /// 拦截两侧都不必改——它们只跟这张表打交道。
 pub(super) const SHAPE_PROBES: &[ShapeProbe] = &[
-    ShapeProbe { field: "effort", keyword: "effort", values: effort_values, cite: cited_as_quoted },
-    ShapeProbe { field: "role", keyword: "role", values: role_values, cite: cited_as_quoted },
+    ShapeProbe {
+        field: "effort",
+        keyword: "effort",
+        values: effort_values,
+        cite: cited_as_quoted,
+        on_outbound: false,
+    },
+    ShapeProbe {
+        field: "role",
+        keyword: "role",
+        values: role_values,
+        cite: cited_as_quoted,
+        on_outbound: false,
+    },
     ShapeProbe {
         field: "tool_type",
         keyword: "tool types",
         values: tool_type_values,
         cite: cited_in_tool_type_list,
+        on_outbound: false,
+    },
+    ShapeProbe {
+        field: "sampling",
+        keyword: "deprecated",
+        values: sampling_values,
+        cite: cited_in_backticks,
+        on_outbound: true,
+    },
+    ShapeProbe {
+        field: "prefill",
+        keyword: "prefill",
+        values: prefill_values,
+        cite: cited_prefill,
+        on_outbound: true,
     },
 ];
+
+/// 顶层出现的采样参数（`temperature` / `top_p` / `top_k`）名。部分新模型把它们整个废弃，
+/// 上游回 `` `temperature` is deprecated for this model. ``。与 thinking 冲突的那几句
+/// （`… when thinking is enabled`）是条件句，[`is_qualified_rejection`] 已挡在外面。
+fn sampling_values(body: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = body.as_object() else { return Vec::new() };
+    ["temperature", "top_p", "top_k"]
+        .into_iter()
+        .filter(|f| obj.contains_key(*f))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `messages` 末尾是 `assistant` 轮（prefill）时取 `"assistant"`，否则为空。
+fn prefill_values(body: &serde_json::Value) -> Vec<String> {
+    let last_role = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| a.last())
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str());
+    match last_role {
+        Some("assistant") => vec!["assistant".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// 上游用反引号点名字段：`` `temperature` ``。
+fn cited_in_backticks(message: &str, value: &str) -> bool {
+    message.contains(&format!("`{value}`"))
+}
+
+/// prefill 那句不点取值，认整句：`does not support assistant message prefill`。
+fn cited_prefill(message: &str, _value: &str) -> bool {
+    message.to_lowercase().contains("does not support assistant message prefill")
+}
 
 /// `output_config.effort`（`"high"`/`"xhigh"` 等），没有则为空。
 fn effort_values(body: &serde_json::Value) -> Vec<String> {
@@ -153,8 +222,7 @@ fn role_values(body: &serde_json::Value) -> Vec<String> {
     let first_turn = first_turn_index(msgs);
     for (i, msg) in msgs.iter().enumerate() {
         let Some(role) = msg.get("role").and_then(|r| r.as_str()) else { continue };
-        // 开头那段不算（见上）；空壳也不算：出站前不论开关一律丢掉（`drop_empty_system_messages`），
-        // 上游根本看不到它。
+        // 开头那段不算（见上）；空壳也不算：上游对它回的是另一句（`is_empty_system_shell`）。
         if role == "system" && (i < first_turn || is_empty_system_shell(msg)) {
             continue;
         }
@@ -339,9 +407,13 @@ fn seed_tables(
                 out.shape += 1;
             }
             LEARNED_KIND_DEPRECATED => {
-                if !(DEPRECATABLE_FIELDS.contains(&r.field.as_str()) || r.field == FALLBACKS_FIELD)
-                    || dep_table.len() >= SHAPE_MEMORY_CAP
-                {
+                // 旧版本学进库里的采样参数（`temperature` / `top_p` / `top_k`）：那套剥离已经
+                // 拿掉，这些行不回填、从库里删掉。
+                if r.field != FALLBACKS_FIELD {
+                    out.stale.push(r);
+                    continue;
+                }
+                if dep_table.len() >= SHAPE_MEMORY_CAP {
                     continue;
                 }
                 dep_table.entry((r.model, r.field)).or_insert(r.message);
@@ -801,24 +873,14 @@ pub(super) fn remember_empty_reply(
     })
 }
 
-// ── 已废弃字段的自动剥离 ──────────────────────────────────────────────
+// ── 「这个模型不收 luban 补的 `fallbacks`」 ─────────────────────────────
 //
-// 与 ShapeProbe 共享「从上游 400 里学」的范式，但行为正好相反：
-// - ShapeProbe 学到的是「模型 + 取值」组合，命中即**拒绝**（回放上游原话）。
-// - 这里学到的是「模型 + 字段」组合，命中即**剥掉该字段后正常转发**。
-//
-// 典型案例：`temperature` / `top_p` / `top_k` 在部分新模型上被标为 deprecated——
-// 客户端的意图（发一条消息）是合法的，只是多带了一个上游不再接受的参数。剥掉它、
-// 请求照常成功，比拒掉再让客户端去改 SDK 参数好得多。
+// 与 ShapeProbe 共享「从上游 400 里学」的范式：上游以 400 拒了 luban 补的 `fallbacks`
+// 之后，同模型不再补（见 `remember_fallback_rejection`）。落库沿用 `kind = "deprecated"`。
+// 客户端自己发的、上游不收的字段（`temperature` 之类）不在这里学，也不替它剥：
+// 上游的 400 原样回给客户端。
 
-/// 可能被上游按模型废弃的**顶层**字段。来访请求里有这个字段、且上游那条 400 含
-/// `` `字段名` `` + `deprecated` → 记下来，之后同模型自动剥掉。
-///
-/// 只放确实是**可选**的采样/生成参数——缺了它们请求也完全合法。`model`、`messages`
-/// 之类缺了上游直接 400，剥掉只是换一种死法。
-pub(super) const DEPRECATABLE_FIELDS: &[&str] = &["temperature", "top_p", "top_k"];
-
-/// 上游拒过的「模型 + 已废弃字段」→ 上游那句原话（只做日志，不回放）。
+/// 上游拒过的「模型 + 字段」→ 上游那句原话（只做日志，不回放）。目前字段只有 [`FALLBACKS_FIELD`]。
 type DeprecatedFieldRejections = std::collections::HashMap<(String, String), String>;
 
 /// [`DeprecatedFieldRejections`] 的共享句柄。与 [`ShapeMemory`] 同一套持久化：写穿到
@@ -1018,12 +1080,13 @@ pub(super) const SHAPE_MEMORY_CAP: usize = 512;
 pub(super) fn remember_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
-    body: Option<&serde_json::Value>,
+    inbound: Option<&serde_json::Value>,
+    outbound: Option<&serde_json::Value>,
     err: &[u8],
 ) -> Vec<store::LearnedRejection> {
     let mut learned = Vec::new();
-    // 认不出模型名、或请求体不是 JSON：这条 400 照常透传给客户端，只是学不到东西。
-    let (Some(model), Some(body)) = (model, body) else { return learned };
+    // 认不出模型名：这条 400 照常透传给客户端，只是学不到东西。
+    let Some(model) = model else { return learned };
     let (_, message) = parse_upstream_error(err);
     // 条件句、位置约束一律不学：这条 400 说的是「在某某前提下不行」，不是「这个取值不行」。
     if is_qualified_rejection(&message) {
@@ -1031,6 +1094,9 @@ pub(super) fn remember_shape_rejection(
     }
     let hay = message.to_lowercase();
     for probe in SHAPE_PROBES {
+        // 每条探针看它该看的那份体（[`ShapeProbe::on_outbound`]）；那份不是 JSON、或非计费
+        // 路径没给出站体，就学不到。
+        let Some(body) = (if probe.on_outbound { outbound } else { inbound }) else { continue };
         if !hay.contains(probe.keyword) {
             continue;
         }
@@ -1064,182 +1130,41 @@ pub(super) fn remember_shape_rejection(
     learned
 }
 
-/// 上游的 400 里出现 `` `字段名` `` + `deprecated` → 记进 [`DeprecatedFieldMemory`]，
-/// 之后同模型转发前自动剥掉该字段。与 [`remember_shape_rejection`] 并行调用。
-///
-/// 典型上游原文：`` `temperature` is deprecated for this model. ``
-/// 判据是「`deprecated` 出现 + 反引号包裹的字段名与请求里确实存在的顶层键匹配」，
-/// 两项**共现**才认——单看 `deprecated` 会误伤，单看反引号里的串可能碰巧。
-///
-/// 返回**这次新学到**的条目，调用方拿去落库（同 [`remember_shape_rejection`]）。
-pub(super) fn remember_deprecated_field(
-    mem: &DeprecatedFieldMemory,
-    model: Option<&str>,
-    body: Option<&serde_json::Value>,
-    err: &[u8],
-) -> Vec<store::LearnedRejection> {
-    let mut learned = Vec::new();
-    let (Some(model), Some(body)) = (model, body) else { return learned };
-    let (_, message) = parse_upstream_error(err);
-    let hay = message.to_lowercase();
-    if !hay.contains("deprecated") {
-        return learned;
-    }
-    let Some(obj) = body.as_object() else { return learned };
-    for &field in DEPRECATABLE_FIELDS {
-        if !obj.contains_key(field) {
-            continue;
-        }
-        if !message.contains(&format!("`{field}`")) {
-            continue;
-        }
-        let mut table = mem.write();
-        let key = (model.to_string(), field.to_string());
-        if table.contains_key(&key) || table.len() >= SHAPE_MEMORY_CAP {
-            continue;
-        }
-        table.insert(key, message.clone());
-        learned.push(store::LearnedRejection {
-            kind: LEARNED_KIND_DEPRECATED.into(),
-            model: model.to_string(),
-            field: field.to_string(),
-            value: String::new(),
-            message: message.clone(),
-            reply: None,
-        });
-        tracing::info!(
-            model = %model,
-            field = %field,
-            "learned a deprecated-field rejection; the field will be stripped for this model from now on"
-        );
-    }
-    learned
-}
-
-/// 请求体里是否带了**这个模型已学到**的废弃字段（不看静态名单）。`sampling_policy=reject`
-/// 时用：学到的组合也该本地拒，否则设置项名不副实——只拒名单里的、放过学到的。
-pub(super) fn has_learned_deprecated_field(
-    mem: &DeprecatedFieldMemory,
-    model: Option<&str>,
-    body: Option<&serde_json::Value>,
-) -> bool {
-    let (Some(model), Some(obj)) = (model, body.and_then(|v| v.as_object())) else { return false };
-    let table = mem.read();
-    if table.is_empty() {
-        return false;
-    }
-    DEPRECATABLE_FIELDS
-        .iter()
-        .any(|&f| obj.contains_key(f) && table.contains_key(&(model.to_string(), f.to_string())))
-}
-
-/// 请求体里是否带了 [`DEPRECATABLE_FIELDS`] 中的任何一项——用已解析的 `body_json` 判，零开销。
-pub(super) fn has_deprecated_sampling_field(body: Option<&serde_json::Value>) -> bool {
-    let Some(obj) = body.and_then(|v| v.as_object()) else { return false };
-    DEPRECATABLE_FIELDS.iter().any(|&f| obj.contains_key(f))
-}
-
-/// 模型是否不支持 sampling 参数（`temperature`/`top_p`/`top_k`）。
-///
-/// 4.7+ 及 Sonnet 5 / Fable 5 / Mythos 5 全系列已移除这些参数，传了会 400。
-/// 注意 **4.6 仍然允许**——与 prefill 的 4.6+ 全系列不同。
-pub(super) fn model_rejects_sampling(model: &str) -> bool {
-    [
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-opus-5",
-        "claude-fable-5",
-        "claude-mythos-5",
-    ]
-    .iter()
-    .any(|p| model.starts_with(p))
-}
-
-/// 请求体里有没有该模型已经被标记为 deprecated 的字段；有则从 `body` 里剥掉后返回
-/// 新的 `Bytes`，没有则原样返回（零拷贝）。
-///
-/// **先用已经解析好的 `body_json` 做只读检查**，命中了才重新解析 `body` 做改写——
-/// 绝大多数请求根本不带 `temperature` 或者模型没有废弃它，走的是零开销的快速路径。
-///
-/// 除了运行时学到的 [`DeprecatedFieldMemory`]，还按官方文档预置了已知模型的 deprecated
-/// 字段（[`model_rejects_sampling`]），避免冷启动第一条请求白撞一次 400。
-///
-/// `sampling_policy=off` 时调用方根本不进这里：不处理就是原样转发，学到的也不用。
-pub(super) fn maybe_strip_deprecated(
-    mem: &DeprecatedFieldMemory,
-    model: Option<&str>,
-    body_json: Option<&serde_json::Value>,
-    body: Bytes,
-) -> Bytes {
-    let Some(model) = model else { return body };
-    let Some(bj) = body_json else { return body };
-    let Some(obj) = bj.as_object() else { return body };
-    let static_reject = model_rejects_sampling(model);
-    let table = mem.read();
-    let to_strip: Vec<&str> = DEPRECATABLE_FIELDS
-        .iter()
-        .filter(|&&f| {
-            obj.contains_key(f)
-                && (static_reject || table.contains_key(&(model.to_string(), f.to_string())))
-        })
-        .copied()
-        .collect();
-    drop(table);
-    if to_strip.is_empty() {
-        return body;
-    }
-    let mut v: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return body,
-    };
-    if let Some(obj) = v.as_object_mut() {
-        for f in &to_strip {
-            obj.remove(*f);
-        }
-    }
-    tracing::debug!(model, fields = ?to_strip, "stripped deprecated fields from request");
-    match serde_json::to_vec(&v) {
-        Ok(bytes) => Bytes::from(preserve_thinking_encoding(&body, bytes)),
-        Err(_) => body,
-    }
-}
-
 /// 这条请求里有没有**已知**会被该模型拒掉的取值；有则给出上游当初那句原话。
 ///
 /// 只有「同一个模型、同一个字段、同一个取值确实被上游拒过一次」才返回 `Some`。没学过的
 /// 组合一律照常往上游发——这张表只用来挡住确定无疑的重复失败，绝不替上游做没有依据的判断。
 ///
-/// `system_hoisted`：这条请求出站前 `role:"system"` 会被 [`hoist_system_role_messages`] 整条
-/// 挪到顶层（billable 且 [`hoists_system_role`]）。这里查的是入站原件，而上游根本看不到
-/// 这个 role，学到的 `role 'system'` 就管不着它——拿它去拦，拦下的是一条修补后本来能过的请求。
-/// 提升之后仍留着 system 的除外（[`system_survives_hoisting`]，与提升共用判据）：那条照样送到
-/// 上游，豁免不成立。
+/// `on_outbound` 选查哪一组探针（[`ShapeProbe::on_outbound`]）：入口传 `false` 与来访原件，
+/// 改写之后、发送之前传 `true` 与出站体。
 pub(super) fn known_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
-    system_hoisted: bool,
+    on_outbound: bool,
 ) -> Option<(&'static str, String, String)> {
     let (model, body) = (model?, body?);
     let table = mem.read();
     if table.is_empty() {
         return None;
     }
-    let all_hoisted = system_hoisted
-        && !body
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|m| system_survives_hoisting(m));
-    SHAPE_PROBES.iter().find_map(|probe| {
+    SHAPE_PROBES.iter().filter(|p| p.on_outbound == on_outbound).find_map(|probe| {
         (probe.values)(body).into_iter().find_map(|value| {
-            if all_hoisted && probe.field == "role" && value == "system" {
-                return None;
-            }
             let message = table.get(&(model.to_string(), probe.field, value.clone()))?;
             Some((probe.field, value, message.clone()))
         })
     })
+}
+
+/// 这个模型有没有学到过按出站体判的规则（[`ShapeProbe::on_outbound`]）。没有就不必为查规则
+/// 再解析一遍出站体。
+pub(super) fn has_outbound_shape_rules(mem: &ShapeMemory, model: Option<&str>) -> bool {
+    let Some(model) = model else { return false };
+    let table = mem.read();
+    !table.is_empty()
+        && table.keys().any(|(m, field, _)| {
+            m == model && SHAPE_PROBES.iter().any(|p| p.on_outbound && p.field == *field)
+        })
 }
 
 #[cfg(test)]

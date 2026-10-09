@@ -112,10 +112,8 @@ pub(in crate::proxy) fn valid_fallback_array(f: &serde_json::Value) -> bool {
     })
 }
 
-/// 记忆表里「这个模型不收 `fallbacks`」那条的字段名。与已废弃字段同一张表、同一套落库
-/// （`kind = "deprecated"`），但**不在** [`DEPRECATABLE_FIELDS`] 里：那张名单还管
-/// `sampling_policy` 的静态拒绝与剥离，把 `fallbacks` 混进去会让 4.7+ 模型上客户端自带的
-/// `fallbacks` 被当成采样参数剥掉或拒掉。
+/// 记忆表里「这个模型不收 `fallbacks`」那条的字段名（[`DeprecatedFieldMemory`]，落库
+/// `kind = "deprecated"`）。
 pub(in crate::proxy) const FALLBACKS_FIELD: &str = "fallbacks";
 
 /// 上游那条 400 是不是冲着 `fallbacks` 来的（目标模型不在 `allowed_fallback_models`、
@@ -128,7 +126,7 @@ pub(in crate::proxy) fn is_fallback_rejection(err: &[u8]) -> bool {
 
 /// 上游以 400 拒了 luban 补的 `fallbacks` → 记进 [`DeprecatedFieldMemory`]（模型 +
 /// `fallbacks`），之后 [`refusal_fallbacks_for`] 对该模型不再补。返回**这次新学到**的那条，
-/// 调用方拿去落库（同 [`remember_deprecated_field`]）。
+/// 调用方拿去落库（同 [`remember_shape_rejection`]）。
 pub(in crate::proxy) fn remember_fallback_rejection(
     mem: &DeprecatedFieldMemory,
     model: &str,

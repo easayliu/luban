@@ -1,17 +1,22 @@
 import { useEffect, useId, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ActivityIcon,
   BadgeCheckIcon,
+  BracesIcon,
   BrainIcon,
   ChevronDownIcon,
   DatabaseIcon,
+  FingerprintIcon,
   SearchIcon,
   XIcon,
   InfoIcon,
   KeyRoundIcon,
   RefreshCwIcon,
+  RouteIcon,
   SaveIcon,
   ServerIcon,
+  ShieldBanIcon,
   SlidersHorizontalIcon,
   TerminalIcon,
   Trash2Icon,
@@ -23,13 +28,10 @@ import {
   listLearnedRejections,
   setForwarding,
   setOauthScopes,
-  setPrefillPolicy,
   setQuotaPausePct,
   setRateLimitRetryMax,
-  setSamplingPolicy,
   type ForwardingKey,
   type LearnedRejection,
-  type PolicyValue,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError, formatFullTime, relativeTime } from '@/lib/utils'
@@ -73,9 +75,13 @@ import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/set
 import { useSettingsQuery, useSettingsSave } from '@/components/setting-controls'
 
 /**
- * 转发形态开关。
+ * 转发策略。
  *
- * 这些改动都不是「能不能用」的必需项。每一项都可以单独关闭，用于排查上游兼容性。
+ * 按请求经过的环节分组：身份与计费标识 → 请求头 → 请求体与系统提示词 → 非官方客户端模拟 →
+ * 遥测 → 本地拦截 → 拒答换模型 → 限流与错误恢复，最后是登录授权范围。
+ *
+ * 这些改动都不是「能不能用」的必需项，每一项都可以单独停用，用于排查上游兼容性。客户端自己
+ * 写出的参数错误一律不修补，由上游原样返回官方报错。
  */
 export function ForwardingSettings({
   open,
@@ -96,8 +102,8 @@ export function ForwardingSettings({
           </DialogTitle>
           <DialogDescription>
             {t(
-              '配置兼容、缓存、限流和错误恢复策略。',
-              'Configure compatibility, caching, rate limiting, and error recovery policies.',
+              '配置身份、请求形态、本地拦截、限流与错误恢复策略。',
+              'Configure identity, request shape, local interception, rate limiting and error recovery policies.',
             )}
           </DialogDescription>
         </DialogHeader>
@@ -145,11 +151,11 @@ export function ForwardingSettingsContent() {
   const simulateRequires = [
     {
       key: 'simulate_cc' as const,
-      label: t('非官方客户端 · 模拟 Claude Code', 'Third-party clients · Emulate Claude Code'),
+      label: t('模拟 Claude Code', 'Emulate Claude Code'),
     },
     {
       key: 'merge_beta' as const,
-      label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+      label: t('请求头 · Beta 标记', 'Request headers · Beta flags'),
     },
   ]
 
@@ -167,7 +173,11 @@ export function ForwardingSettingsContent() {
         </AlertDescription>
       </Alert>
 
-      <SettingsGroup icon={BadgeCheckIcon} title={t('身份与订阅', 'Identity & subscription')}>
+      <SettingsGroup
+        icon={FingerprintIcon}
+        title={t('设备与会话身份', 'Device & session identity')}
+        description={t('请求中的账号、设备与会话 ID 如何改写，使上游看到的身份与当前账号一致。', 'How the account, device and session IDs in a request are rewritten so upstream sees an identity consistent with the current account.')}
+      >
         <ForwardingToggle
           k="spoof_identity"
           label={t('身份一致性', 'Identity consistency')}
@@ -198,38 +208,6 @@ export function ForwardingSettingsContent() {
               {t(
                 '官方客户端的每条请求都带设备身份，缺失本身即构成一处差异，常见于模仿 Claude Code 的第三方客户端。补齐的身份与「身份一致性」使用同一套取值；请求已带会话 ID 时优先沿用。',
                 'The official client includes a device identity with every request, so a missing identity is itself a discrepancy; this is common in third-party clients that imitate Claude Code. The generated identity uses the same values as “Identity consistency”, while a session ID already present in the request takes precedence.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="api_telemetry"
-          label={t('逐请求遥测', 'Per-request telemetry')}
-          summary={t(
-            '为每条转发的请求上报官方客户端会发送的整套遥测：事件链、Datadog 日志与用量指标；失败的请求上报错误事件。',
-            'Report the telemetry the official client sends for every forwarded request: the event chain, Datadog logs, and usage metrics — with an error event for the ones that fail.',
-          )}
-          description={
-            <>
-              {t(
-                '官方客户端每发一条请求，都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一组事件链（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。在此之前，luban 仅发送每 30 分钟一次的保活遥测，上游看到的是「API 用量很大，遥测中却没有任何一次 API 调用」。启用后，按 2.1.260 抓包的字段与节奏（事件每 30 秒、日志每 10 秒、指标每 5 分钟分批发送）为每个账号补发这些遥测；所用身份取自实际发往上游的请求，与请求保持一致。失败的请求同样上报：官方客户端对失败请求会发送 tengu_api_error 与 tengu_feature_bad，若只上报成功的请求，同样会留下一处可被比对出的差异。停用后只保留保活遥测。',
-                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Previously luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.260 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Failed requests are reported too — the official client sends tengu_api_error plus tengu_feature_bad for those, so reporting only the successes is itself a detectable discrepancy. Turn it off to keep only the keepalive telemetry.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="keepalive_telemetry"
-          label={t('保活遥测', 'Keepalive telemetry')}
-          summary={t(
-            '每 30 分钟为每个账号发送一组空闲版本检查事件与 Datadog 日志，每 6 小时上报一次画像。',
-            'Every 30 minutes send a set of idle version-check events and Datadog logs for each account, plus a profile report every 6 hours.',
-          )}
-          description={
-            <>
-              {t(
-                '模拟一个开着但空闲的 Claude Code 进程。账号近 3 小时内有真实会话时，事件沿用该会话的身份（相同的 session_id、设备 ID 与客户端版本），与真实客户端开着终端却无人输入时的行为一致；近期没有会话的账号才使用按账号派生的空闲身份。停用后仅停止遥测部分，token 刷新、启动握手（bootstrap / policy_limits / settings）与 401/403 探测保持不变。与「逐请求遥测」互不影响。',
-                'Simulates an open but idle Claude Code process. When the account has had a real session in the last 3 hours, the events are attached to that session (same session_id, device ID and client version), matching what a real client does when a terminal is left open with no input; only accounts with no recent session fall back to an account-derived idle identity. Turning it off stops only the telemetry part: token refresh, the startup handshake (bootstrap / policy_limits / settings) and 401/403 detection continue. Independent of “Per-request telemetry”.',
               )}
             </>
           }
@@ -269,6 +247,29 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="reject_session_conflict"
+          label={t('拒绝会话 ID 冲突', 'Reject session ID conflicts')}
+          summary={t(
+            '请求头与 metadata 里的会话 ID 不一致时，在本地直接返回 400，不代替客户端择一。',
+            'When the session ID in the header and in metadata disagree, reject locally with 400 instead of picking one.',
+          )}
+          description={
+            <>
+              {t(
+                '官方 Claude Code 在 X-Claude-Code-Session-Id 与 metadata.user_id 两处发送的是同一个值，逐字相同。两处给出两个各自合法却不同的 UUID，是官方从不产生的形态；而 luban 以会话 ID 作为会话链（cc_prompt_id / cc_prev_req / diagnostics.previous_message_id）的键，一旦选错，两条会话链会被错误地拼接在一起，且事后无从察觉。启用后，这类请求在本地返回 400，错误消息中列出两个值。停用后退回「取请求头里的值 + 记一条 warn 日志」。只有一处合法时不算冲突：这表示客户端只有一处填写正确，照常采用合法的那个值。',
+                'Official Claude Code sends the same value in X-Claude-Code-Session-Id and in metadata.user_id, byte for byte. Two different but individually valid UUIDs is a shape the official client never produces, and luban keys the session chain (cc_prompt_id / cc_prev_req / diagnostics.previous_message_id) on the session ID; picking the wrong one splices two chains together with no way to notice afterwards. When enabled such requests are rejected locally with 400, naming both values. Turn it off to fall back to using the header value and logging a warning. If only one of the two is a valid UUID it is not a conflict: the client simply got one of them right, and that one is used.',
+              )}
+            </>
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={BadgeCheckIcon}
+        title={t('计费标识', 'Billing identifier')}
+        description={t('订阅请求 system 首块中的计费标识及其校验值。', 'The billing identifier in the first system block of subscription requests, and its checksum.')}
+      >
+        <ForwardingToggle
           k="billing_cch"
           label={t('订阅计费标识', 'Subscription billing identifier')}
           summary={t(
@@ -295,17 +296,10 @@ export function ForwardingSettingsContent() {
       </SettingsGroup>
 
       <SettingsGroup
-        icon={KeyRoundIcon}
-        title={t('登录授权范围', 'Login authorization scopes')}
-        description={t(
-          '添加账号时向 Claude 申请的权限范围。仅对此后新登录的账号生效，已添加的账号不受影响。',
-          'Which permissions are requested from Claude when adding an account. Only affects accounts added from now on; existing ones are unchanged.',
-        )}
+        icon={ServerIcon}
+        title={t('请求头', 'Request headers')}
+        description={t('出站请求头的取值、拼写与顺序。', 'Values, spelling and order of outbound request headers.')}
       >
-        <OAuthScopes />
-      </SettingsGroup>
-
-      <SettingsGroup icon={ServerIcon} title={t('协议与请求头', 'Protocol & request headers')}>
         <ForwardingToggle
           k="merge_beta"
           label={t('Beta 标记', 'Beta flags')}
@@ -330,6 +324,13 @@ export function ForwardingSettingsContent() {
             'Restore the official client’s request header casing and order; disable only when troubleshooting compatibility issues.',
           )}
         />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={BracesIcon}
+        title={t('请求体形态', 'Request body shape')}
+        description={t('请求体中与官方客户端存在差异的字段与写法。', 'Request body fields and forms that differ from the official client.')}
+      >
         <ForwardingToggle
           k="nonstream_as_sse"
           label={t('非流式请求流式化', 'Upgrade non-streaming requests')}
@@ -342,6 +343,22 @@ export function ForwardingSettingsContent() {
               {t(
                 '官方客户端的对话请求一律是流式的，原样转发非流式请求会形成一处稳定特征。启用后，luban 仅修改请求中的 stream 字段，将收到的流式响应在本地拼接为完整内容，再按客户端原本期待的格式返回，请求头与返回格式都不变。上游中途报错时，错误原文按非流式请求应有的状态码返回，客户端的错误处理不受影响。代价：响应须等上游全部生成完毕后才返回（与非流式原本的行为一致），且整段内容需在内存中暂存。请求明细里这类记录会标注「非流转流」，因为其首字耗时记录的是上游首字节，与客户端的感知不同。仅作用于对话请求，token 计数接口不受影响。',
                 'The official client always sends conversation requests as streaming ones, so a non-streaming request forwarded as-is is a stable tell. When enabled, luban only flips the stream field in the request, reassembles the streamed response locally, and returns it in the format the client already expected — request headers and response format are unchanged. If the upstream errors mid-stream, the raw error is returned with the status code a non-streaming request would have received, so client error handling is unaffected. Costs: the response is sent only after the upstream finishes generating (same as non-streaming behaviour anyway) and the whole body is buffered in memory; such records are tagged “stream-upgraded” in the request log, because their TTFT is the upstream first byte rather than what the client perceived. Applies to conversation requests only; the token-counting endpoint is untouched.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="strip_extra_fields"
+          label={t('移除多余字段', 'Strip extra fields')}
+          summary={t(
+            '删除官方客户端从不发送的请求字段；参数错误不做修补，由上游原样返回。',
+            'Remove request fields the official client never sends; parameter errors are not repaired and upstream returns them as is.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端的对话请求字段是固定的一套，多出的字段会构成一处稳定特征，可能导致请求被判为第三方应用而改扣超额用量。启用后，luban 删除两项：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时保持不变）；二是第三方客户端自己写的 thinking.display 字段（官方客户端自带的照常发送）。代价：删除 display 后上游不再返回思考摘要，客户端的「思考过程」将显示为空，但功能本身不受影响。客户端自己写出的参数错误（如与 thinking 冲突的 temperature、budget_tokens 不足 1024）不做修补，原样发出，由上游返回官方的 400。真实的官方客户端本来就不发送这些，启用本项对其基本没有影响。',
+                'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes two things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), and a thinking.display field written by a third-party client (the one the official client sends is kept). Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. Parameter errors the client makes itself (such as a temperature that conflicts with thinking, or a budget_tokens below 1024) are not repaired: they go out as is and upstream answers with its own 400. The real official client never sends any of these, so enabling this is essentially a no-op for it.',
               )}
             </>
           }
@@ -363,40 +380,32 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
-          k="strip_extra_fields"
-          label={t('移除多余字段', 'Strip extra fields')}
+          k="eager_tool_streaming"
+          label={t('工具声明对齐 eager 流式', 'Match official eager tool streaming')}
           summary={t(
-            '删除官方客户端从不发送的请求字段，并修补与 thinking 冲突、上游必定拒绝的参数组合。',
-            'Remove request fields the official client never sends, and repair parameter combinations that conflict with thinking and that upstream always rejects.',
+            '为工具声明补充 eager_input_streaming:true，仅限抓包证实过的版本、模型与用途组合。',
+            'Add eager_input_streaming:true to tool declarations, only for version, model and purpose combinations confirmed by captures.',
           )}
+          requires={{
+            key: 'merge_beta',
+            label: t('请求头 · Beta 标记', 'Request headers · Beta flags'),
+          }}
           description={
             <>
               {t(
-                '官方客户端的对话请求字段是固定的一套，多出的字段会构成一处稳定特征，可能导致请求被判为第三方应用而改扣超额用量。开启后，luban 会删除三项：一是语义等于默认值的 tool_choice（客户端强制指定工具或关闭并行调用时保持不变）；二是 thinking 里的 display 字段；三是 fable 族不支持的 thinking: disabled（删除后上游按默认的 adaptive 处理）。代价：删除 display 后上游不再返回思考摘要，客户端的「思考过程」将显示为空，但功能本身不受影响。此外还会修补客户端自己写的、与 thinking 冲突的组合，这些组合原样发出必定返回 400：强制指定工具时删除手动预算的 thinking；budget_tokens 不足 1024 时抬到 1024；thinking 开启时删除不等于 1 的 temperature 和小于 0.95 的 top_p。luban 自己注入的 thinking 引起的冲突由注入那一步自行处理，不依赖本项。真实的官方客户端本来就不发送这些，开启本项对其基本没有影响。',
-                'The official client sends a fixed set of fields on conversation requests; anything extra is a stable tell and can get the request classified as a third-party app, drawing from extra usage instead of plan limits. When enabled, luban removes three things: a tool_choice whose meaning equals the default (a forced tool choice or disabled parallel calls is left alone), the display field inside thinking, and thinking: disabled on the fable family, which does not support it (upstream then falls back to its adaptive default). Cost: without display the upstream no longer returns reasoning summaries, so the client shows an empty thinking section — functionality is otherwise unaffected. It also repairs client-written combinations that conflict with thinking and always come back as a 400: with a forced tool choice, a manually budgeted thinking is removed; a budget_tokens below 1024 is raised to 1024; with thinking on, a temperature other than 1 and a top_p below 0.95 are removed. Conflicts caused by thinking that luban injects itself are cleaned up by the injection step and do not depend on this switch. The real official client never sends any of these, so enabling this is essentially a no-op for it.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="inject_thinking"
-          label={t('注入 Thinking', 'Inject thinking')}
-          summary={t(
-            '在模拟路径下自动补充 thinking 与 context_management，与官方形态一致；同时强制 temperature=1。',
-            'Inject thinking and context_management in simulation mode to match the official shape; also forces temperature=1.',
-          )}
-          description={
-            <>
-              {t(
-                '官方客户端的对话请求始终带 thinking 字段，缺少它可能被上游判为第三方应用。启用后，在模拟路径下，客户端未发送 thinking 时自动补充 {type:"enabled", budget_tokens: max_tokens-1}（max_tokens < 1024 的探测级请求不补充），并随之补充 context_management。另外，thinking 启用时上游要求 temperature 必须为 1，客户端设置的其他值会被自动移除。代价：注入 thinking 会改变模型行为（输出可能更长，thinking token 按输出计费）。如需避免这些副作用，可停用此项，代价是模拟形态少了一项与官方对齐的特征。',
-                'The official client always includes a thinking field on conversation requests; omitting it may cause the upstream to classify the request as third-party. When enabled, if the client did not send thinking, luban injects {type:"enabled", budget_tokens: max_tokens-1} in simulation mode (skipped for probe-level requests with max_tokens < 1024), and context_management is added automatically. Since upstream requires temperature=1 when thinking is on, any other value the client set is stripped. Cost: injected thinking changes model behaviour (outputs may be longer, thinking tokens are billed as output). Turn it off to avoid these side effects, at the cost of one fewer signal aligning with the official shape.',
+                '官方订阅客户端主线程请求里的每个内建工具都带 eager_input_streaming:true，API key 模式一个都不带，这是两种模式之间在每个工具上重复出现的一处固定差异。只对抓包证实过的组合补齐：2.1.258 的四个模型族、2.1.260 的 opus、2.1.270 的 sonnet 予以补齐；2.1.260 的 fable 已证实不带该字段，不予补齐；没有样本的组合不做推测。真实的 Claude Code 请求按客户端自报的版本、模型与请求用途判断；模拟请求按实际出站的模拟 profile 判断。客户端自行写入该字段时（无论 true 还是 false）不予覆盖；MCP 工具、延迟加载占位与服务端工具没有样本，保持不变。该字段与上游的 advanced-tool-use beta 同时出现，因此依赖「Beta 标记」开关。收益是缩小声明差异，对封号率的影响幅度尚未测量。',
+                'Every built-in tool in a main-thread request from the official subscription client carries eager_input_streaming:true, while API-key mode sends none: a fixed per-tool difference between the two modes. The fill only covers combinations confirmed by captures: all four model families on 2.1.258, opus on 2.1.260 and sonnet on 2.1.270 are filled; fable on 2.1.260 is confirmed absent and left alone; combinations without a sample are not guessed. Real Claude Code requests are judged by the client’s reported version, model and request purpose; emulated requests by the emulated profile actually sent upstream. A value the client wrote itself (true or false) is never overwritten; MCP tools, deferred-loading placeholders and server tools have no samples and are left untouched. The field appears together with the upstream advanced-tool-use beta, hence the dependency on “Beta flags”. The benefit is a smaller declaration gap; the effect on ban rates has not been measured.',
               )}
             </>
           }
         />
       </SettingsGroup>
 
-      <SettingsGroup icon={DatabaseIcon} title={t('系统提示词', 'System prompt')}>
+      <SettingsGroup
+        icon={DatabaseIcon}
+        title={t('系统提示词与缓存', 'System prompt & caching')}
+        description={t('系统提示词的分块方式与缓存断点。', 'How the system prompt is split into blocks, and its cache breakpoints.')}
+      >
         <ForwardingToggle
           k="system_shape"
           label={t('分块与缓存形态', 'Block shape & caching')}
@@ -422,7 +431,7 @@ export function ForwardingSettingsContent() {
           )}
           requires={{
             key: 'merge_beta',
-            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+            label: t('请求头 · Beta 标记', 'Request headers · Beta flags'),
           }}
           description={
             <>
@@ -442,7 +451,7 @@ export function ForwardingSettingsContent() {
           )}
           requires={{
             key: 'merge_beta',
-            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+            label: t('请求头 · Beta 标记', 'Request headers · Beta flags'),
           }}
           description={
             <>
@@ -453,29 +462,13 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-        <ForwardingToggle
-          k="eager_tool_streaming"
-          label={t('工具声明对齐 eager 流式', 'Match official eager tool streaming')}
-          summary={t(
-            '为工具声明补充 eager_input_streaming:true，仅限抓包证实过的版本、模型与用途组合。',
-            'Add eager_input_streaming:true to tool declarations, only for version, model and purpose combinations confirmed by captures.',
-          )}
-          requires={{
-            key: 'merge_beta',
-            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
-          }}
-          description={
-            <>
-              {t(
-                '官方订阅客户端主线程请求里的每个内建工具都带 eager_input_streaming:true，API key 模式一个都不带，这是两种模式之间在每个工具上重复出现的一处固定差异。只对抓包证实过的组合补齐：2.1.258 的四个模型族、2.1.260 的 opus、2.1.270 的 sonnet 予以补齐；2.1.260 的 fable 已证实不带该字段，不予补齐；没有样本的组合不做推测。真实的 Claude Code 请求按客户端自报的版本、模型与请求用途判断；模拟请求按实际出站的模拟 profile 判断。客户端自行写入该字段时（无论 true 还是 false）不予覆盖；MCP 工具、延迟加载占位与服务端工具没有样本，保持不变。该字段与上游的 advanced-tool-use beta 同时出现，因此依赖「Beta 标记」开关。收益是缩小声明差异，对封号率的影响幅度尚未测量。',
-                'Every built-in tool in a main-thread request from the official subscription client carries eager_input_streaming:true, while API-key mode sends none: a fixed per-tool difference between the two modes. The fill only covers combinations confirmed by captures: all four model families on 2.1.258, opus on 2.1.260 and sonnet on 2.1.270 are filled; fable on 2.1.260 is confirmed absent and left alone; combinations without a sample are not guessed. Real Claude Code requests are judged by the client’s reported version, model and request purpose; emulated requests by the emulated profile actually sent upstream. A value the client wrote itself (true or false) is never overwritten; MCP tools, deferred-loading placeholders and server tools have no samples and are left untouched. The field appears together with the upstream advanced-tool-use beta, hence the dependency on “Beta flags”. The benefit is a smaller declaration gap; the effect on ban rates has not been measured.',
-              )}
-            </>
-          }
-        />
       </SettingsGroup>
 
-      <SettingsGroup icon={TerminalIcon} title={t('非官方客户端', 'Third-party clients')}>
+      <SettingsGroup
+        icon={TerminalIcon}
+        title={t('非官方客户端模拟', 'Third-party client emulation')}
+        description={t('SDK 与第三方客户端的请求按 Claude Code 形态重建后再转发。', 'Requests from SDKs and third-party clients are rebuilt in the Claude Code shape before forwarding.')}
+      >
         <ForwardingToggle
           k="simulate_cc"
           label={t('模拟 Claude Code', 'Emulate Claude Code')}
@@ -485,13 +478,30 @@ export function ForwardingSettingsContent() {
           )}
           requires={{
             key: 'merge_beta',
-            label: t('协议与请求头 · Beta 标记', 'Protocol & request headers · Beta flags'),
+            label: t('请求头 · Beta 标记', 'Request headers · Beta flags'),
           }}
           description={
             <>
               {t(
                 '仅改写非 Claude Code 请求。启用后会增加系统提示词和客户端请求头，可能提高 token 成本并改变输出风格。此类请求通常没有设备身份，需先停用「设备身份校验」。官方客户端自己发出的两种不带基座提示词的请求原样放行：桌面端的缓存预热，以及 WebSearch 工具另外发出的搜索子调用（一条用户消息，只带 web_search 这一个服务端工具且强制调用，系统提示词只有一句搜索助手说明）。此前后者会被重建为主线程请求，导致同一台机器在几秒内以另一个版本、另一台设备、另一条会话的身份发出一条搜索请求。',
                 'Only non-Claude Code requests are rewritten. Enabling this adds a system prompt and client request headers, which may increase token costs and change the output style. These requests usually have no device identity, so disable “Device identity checks” first. Two requests the official client itself sends without the base prompt are passed through unchanged: the desktop app’s cache warm-up, and the separate search sub-call made by the WebSearch tool (one user message, a single forced web_search server tool, and a one-line search-assistant system prompt). Previously the latter was rebuilt into a main-thread request, so the same machine showed up seconds later as another version, another device and another session sending a search.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="inject_thinking"
+          label={t('注入 Thinking', 'Inject thinking')}
+          requires={simulateRequires}
+          summary={t(
+            '在模拟路径下自动补充 thinking 与 context_management，与官方形态一致；同时强制 temperature=1。',
+            'Inject thinking and context_management in simulation mode to match the official shape; also forces temperature=1.',
+          )}
+          description={
+            <>
+              {t(
+                '官方客户端的对话请求始终带 thinking 字段，缺少它可能被上游判为第三方应用。启用后，在模拟路径下，客户端未发送 thinking 时自动补充 {type:"enabled", budget_tokens: max_tokens-1}（max_tokens < 1024 的探测级请求不补充），并随之补充 context_management。thinking 启用时上游要求 temperature 必须为 1，这一冲突由 luban 注入引起，因此由注入这一步自行处理：客户端设置的其他 temperature 值会被移除。代价：注入 thinking 会改变模型行为（输出可能更长，thinking token 按输出计费）。如需避免这些副作用，可停用此项，代价是模拟形态少了一项与官方对齐的特征。',
+                'The official client always includes a thinking field on conversation requests; omitting it may cause the upstream to classify the request as third-party. When enabled, if the client did not send thinking, luban injects {type:"enabled", budget_tokens: max_tokens-1} in simulation mode (skipped for probe-level requests with max_tokens < 1024), and context_management is added automatically. Upstream requires temperature=1 when thinking is on; since that conflict is caused by luban’s own injection, the injection step handles it itself and strips any other temperature the client set. Cost: injected thinking changes model behaviour (outputs may be longer, thinking tokens are billed as output). Turn it off to avoid these side effects, at the cost of one fewer signal aligning with the official shape.',
               )}
             </>
           }
@@ -548,32 +558,6 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
-          k="sim_billing_only"
-          label={t('仅注入 billing 标识', 'Inject billing identifier only')}
-          summary={t(
-            '实验性，默认停用。启用后模拟请求只在 system 首块注入一条最小 billing 标识，不再补身份句、官方基座、第四块、官方工具、metadata/thread 等；客户端自带的 system 块与参数原样透传。',
-            'Experimental, disabled by default. When enabled, emulated requests inject only a minimal billing identifier as the first system block, and skip the identity line, official base prompt, fourth block, official tools, metadata/thread and the rest; the client’s own system blocks and parameters pass through unchanged.',
-          )}
-          requires={simulateRequires}
-          description={
-            <>
-              {t(
-                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，仅防 400 的无损归一照做；换头（官方 UA 等）照常进行。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
-                'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; only lossless normalization that prevents 400s still runs, and header rewriting (official UA, etc.) still applies. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="cch_sim_compute"
-          label={t('模拟请求计算计费校验值', 'Compute billing checksum for emulated requests')}
-          summary={t(
-            '模拟请求计费标识中的 cch 按最终发出的请求体计算，与官方客户端算法一致；停用时每条请求填入随机值。',
-            'The cch in the billing identifier of emulated requests is computed from the body actually sent, using the official client’s algorithm; when disabled, each request gets a random value.',
-          )}
-          requires={simulateRequires}
-        />
-        <ForwardingToggle
           k="sim_message_threads"
           label={t('按官方 message threads 形态续轮', 'Follow the official message-threads shape')}
           summary={t(
@@ -590,107 +574,78 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="sim_billing_only"
+          label={t('仅注入 billing 标识', 'Inject billing identifier only')}
+          summary={t(
+            '实验性，默认停用。启用后模拟请求只在 system 首块注入一条最小 billing 标识，不再补身份句、官方基座、第四块、官方工具、metadata/thread 等；客户端自带的 system 块与参数原样透传。',
+            'Experimental, disabled by default. When enabled, emulated requests inject only a minimal billing identifier as the first system block, and skip the identity line, official base prompt, fourth block, official tools, metadata/thread and the rest; the client’s own system blocks and parameters pass through unchanged.',
+          )}
+          requires={simulateRequires}
+          description={
+            <>
+              {t(
+                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
+                'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="cch_sim_compute"
+          label={t('模拟请求计算计费校验值', 'Compute billing checksum for emulated requests')}
+          summary={t(
+            '模拟请求计费标识中的 cch 按最终发出的请求体计算，与官方客户端算法一致；停用时每条请求填入随机值。',
+            'The cch in the billing identifier of emulated requests is computed from the body actually sent, using the official client’s algorithm; when disabled, each request gets a random value.',
+          )}
+          requires={simulateRequires}
+        />
       </SettingsGroup>
 
-      <SettingsGroup icon={SlidersHorizontalIcon} title={t('请求兼容性', 'Request compatibility')}>
-        <PolicySelect
-          label={t('Assistant Prefill', 'Assistant Prefill')}
-          summary={t(
-            '4.6+ 模型不支持 assistant message prefill（末尾 assistant 轮）。',
-            'Claude 4.6+ models do not support assistant message prefill (trailing assistant turns).',
-          )}
-          value={settingsQuery.data.prefill_policy as PolicyValue}
-          settingKey="prefill"
-        />
-        <PolicySelect
-          label={t('Sampling 参数', 'Sampling parameters')}
-          summary={t(
-            '4.7+ 模型不支持 temperature / top_p / top_k。',
-            'Claude 4.7+ models do not support temperature / top_p / top_k.',
-          )}
-          value={settingsQuery.data.sampling_policy as PolicyValue}
-          settingKey="sampling"
-        />
+      <SettingsGroup
+        icon={ActivityIcon}
+        title={t('遥测', 'Telemetry')}
+        description={t('按官方客户端的字段与节奏补发遥测。', 'Send telemetry with the fields and cadence of the official client.')}
+      >
         <ForwardingToggle
-          k="flatten_tool_schemas"
-          label={t('Schema 展平', 'Schema flattening')}
+          k="api_telemetry"
+          label={t('逐请求遥测', 'Per-request telemetry')}
           summary={t(
-            '展平 tool input_schema 顶层的 allOf / oneOf / anyOf。',
-            'Flatten top-level allOf / oneOf / anyOf in tool input_schema.',
+            '为每条转发的请求上报官方客户端会发送的整套遥测：事件链、Datadog 日志与用量指标；失败的请求上报错误事件。',
+            'Report the telemetry the official client sends for every forwarded request: the event chain, Datadog logs, and usage metrics — with an error event for the ones that fail.',
           )}
           description={
             <>
               {t(
-                '上游 API 不支持 JSON Schema 的 allOf / oneOf / anyOf 组合关键字出现在 input_schema 顶层，会直接返回 400。启用后自动将它们合并为一个普通 object schema 再转发。',
-                'The upstream API rejects allOf / oneOf / anyOf at the top level of tool input_schema with a 400 error. When enabled, these are automatically merged into a plain object schema before forwarding.',
+                '官方客户端每发一条请求，都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一组事件链（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。在此之前，luban 仅发送每 30 分钟一次的保活遥测，上游看到的是「API 用量很大，遥测中却没有任何一次 API 调用」。启用后，按 2.1.260 抓包的字段与节奏（事件每 30 秒、日志每 10 秒、指标每 5 分钟分批发送）为每个账号补发这些遥测；所用身份取自实际发往上游的请求，与请求保持一致。失败的请求同样上报：官方客户端对失败请求会发送 tengu_api_error 与 tengu_feature_bad，若只上报成功的请求，同样会留下一处可被比对出的差异。停用后只保留保活遥测。',
+                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Previously luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.260 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Failed requests are reported too — the official client sends tengu_api_error plus tengu_feature_bad for those, so reporting only the successes is itself a detectable discrepancy. Turn it off to keep only the keepalive telemetry.',
               )}
             </>
           }
         />
         <ForwardingToggle
-          k="strip_empty_text"
-          label={t('移除空 text 块', 'Strip empty text blocks')}
+          k="keepalive_telemetry"
+          label={t('保活遥测', 'Keepalive telemetry')}
           summary={t(
-            '移除 messages 中的空 text 内容块。',
-            'Strip empty text content blocks from messages.',
+            '每 30 分钟为每个账号发送一组空闲版本检查事件与 Datadog 日志，每 6 小时上报一次画像。',
+            'Every 30 minutes send a set of idle version-check events and Datadog logs for each account, plus a profile report every 6 hours.',
           )}
           description={
             <>
               {t(
-                '上游要求 text 内容块的 text 字段非空，部分第三方客户端会发送 {"type":"text","text":""} 这样的空块，导致 400。启用后自动移除空 text 块（若消息只含空 text 块，则保留原样）。',
-                'The upstream API requires text content blocks to be non-empty. Some third-party clients send {"type":"text","text":""}, which causes a 400. When enabled, empty text blocks are automatically stripped (if a message contains only empty text blocks, it is left unchanged).',
+                '模拟一个开着但空闲的 Claude Code 进程。账号近 3 小时内有真实会话时，事件沿用该会话的身份（相同的 session_id、设备 ID 与客户端版本），与真实客户端开着终端却无人输入时的行为一致；近期没有会话的账号才使用按账号派生的空闲身份。停用后仅停止遥测部分，token 刷新、启动握手（bootstrap / policy_limits / settings）与 401/403 探测保持不变。与「逐请求遥测」互不影响。',
+                'Simulates an open but idle Claude Code process. When the account has had a real session in the last 3 hours, the events are attached to that session (same session_id, device ID and client version), matching what a real client does when a terminal is left open with no input; only accounts with no recent session fall back to an account-derived idle identity. Turning it off stops only the telemetry part: token refresh, the startup handshake (bootstrap / policy_limits / settings) and 401/403 detection continue. Independent of “Per-request telemetry”.',
               )}
             </>
           }
         />
-        <ForwardingToggle
-          k="reject_openai_shape"
-          label={t('拒绝 OpenAI 转换残留', 'Reject OpenAI-format residue')}
-          summary={t(
-            '带有 OpenAI 格式转换痕迹的请求在本地直接返回 400，不修补、不转发。',
-            'Requests carrying traces of OpenAI-format conversion are rejected locally with 400, never repaired or forwarded.',
-          )}
-          description={
-            <>
-              {t(
-                '经 litellm、one-api、claude-code-router 等工具从 OpenAI 格式转换过来的请求，到达这里时已是 Anthropic 形态，只能靠残留特征识别：messages 开头（首条 user / assistant 之前）的 role:"system"、role:"tool"、消息上的 name / tool_calls、以 call_ 为前缀的工具调用 ID、字符串形态或 type:"function" 的 tool_choice、OpenAI function 形态的 tools、n / stop / user / response_format 等 OpenAI 专属顶层字段，以及 image_url 等 OpenAI 内容块。命中任意一项即在本地返回 400，错误消息会指出位置与 Anthropic 的对应写法。停用后退回下方「System Role 提升」等修补路径。不影响模拟路径：模拟路径只接管本来就是 Anthropic 形态的非 CC 请求。',
-                'Requests converted from the OpenAI format by litellm, one-api, claude-code-router and the like arrive already in Anthropic shape; the only way to tell is the residue they leave: role:"system" before the first user / assistant turn, role:"tool" in messages, name / tool_calls on a message, tool call IDs prefixed call_, a string or type:"function" tool_choice, tools in the OpenAI function shape, OpenAI-only top-level fields such as n / stop / user / response_format, and OpenAI content blocks such as image_url. Any hit is rejected locally with 400 and a message naming the location and the Anthropic equivalent. Turn it off to fall back to the repair paths below (“System role hoisting” and others). The simulation path is unaffected: it only takes over non-CC requests that are already in Anthropic shape.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="fable_refusal_fallback"
-          label={t('Fable 拒答自动换模型', 'Fable refusal fallback')}
-          summary={t(
-            'fable 主线程请求带上官方的服务端 fallback：安全分类器拒答时，由上游在同一次调用中改用 opus-5 重新生成。形态与官方 2.1.260 逐字相同，默认停用。',
-            'Fable main-thread requests carry the official server-side fallback: when the safety classifier refuses, upstream reruns the same call on opus-5. Byte-for-byte the official 2.1.260 shape; off by default.',
-          )}
-          description={
-            <>
-              {t(
-                'Fable 5.1 / Fable 5 带安全分类器，命中时（多为 cyber 类，正常的安全相关请求也可能被误判）返回 200 加 stop_reason refusal，正文为空。官方 Claude Code 2.1.260 在 fable 上自带 fallbacks: [{"model":"claude-opus-5"}] 和 server-side-fallback beta，拒答后由上游改用 Opus 5 重新生成，用户看不到拒答。启用后，luban 为 fable 主线程请求补上与官方逐字相同的这一字段，出站请求头一并带上 server-side-fallback-2026-06-01。该做法有抓包依据，补齐后更接近 2.1.260 的官方形态。但这替用户做出了决定：拒答后由 Opus 5 作答、按 Opus 计价、同一对话约一小时内固定在 Opus 上，用户也看不到拒答本身，所以默认停用，由用户自行启用。停用时，模拟出的 fable 请求比 2.1.260 少这一个字段，拒答直接返回、不换用其他模型重新生成；请求头里的 beta 仍按版本补上，「有 beta、无字段」正是 2.1.260 之前的官方形态；客户端自带的 fallbacks 仍予保留。客户端自己带了数组形态的 fallbacks 时不改动；helper、标题、安全分类、额度探测等辅助请求，官方均不发送该字段，luban 也不补充。上游以 400 拒绝 fallback 目标时，移除该字段后重发一次并记入「从上游学到的规则」，此后不再为该模型补充。落到 fallback 的回复按实际作答的模型计价，同一对话约一小时内会固定在 fallback 模型上。输出前就被拒的请求上游不计费，流水里花费记为 0。opus-5 的自定义 fallback 链由另一个开关控制，见下一条。Sonnet 5 与 Opus 4.7/4.8 同样带网络安全分类器，同样会以 200 加 stop_reason refusal 拒答；luban 只解析并记录它们的拒答，不为它们补 fallbacks。官方客户端在这些模型上不发送该字段，这是有意的产品限制，不是遗漏。',
-                'Fable 5.1 / Fable 5 run safety classifiers; a hit (mostly the cyber category, and benign security work gets caught too) returns 200 with stop_reason refusal and empty content. Official Claude Code 2.1.260 sends fallbacks: [{"model":"claude-opus-5"}] plus the server-side-fallback beta on fable, so upstream reruns a refused call on Opus 5 and the user never sees the refusal. When enabled, luban adds that exact field to fable main-thread requests, with server-side-fallback-2026-06-01 in the outbound header; this is backed by a capture, so adding it brings the request closer to the 2.1.260 official shape. But it also decides for the user that a refused request is answered by Opus 5, billed at Opus rates, with the conversation stuck to Opus for about an hour, and the user never sees the refusal itself, so it is off by default and left for the user to switch on. Turned off, simulated fable requests lack that one field and the refusal is returned as is, without a rerun; the beta header is still added per version, and “beta present, field absent” is exactly the official shape before 2.1.260. A client-supplied fallbacks field is kept as is. A client-supplied array form is left alone; helper / title / classifier / quota-probe requests are not touched, as the official client never sends the field there. If upstream rejects the fallback target with a 400, the field is stripped and the request resent once, and the rule lands under “Rules learned from upstream” so the field is not added for that model again. A reply served by a fallback is priced at the model that actually served it, and the conversation sticks to the fallback model for about an hour. Requests refused before any output are not billed upstream, so their cost is recorded as 0. The luban-defined opus-5 fallback chain is a separate switch, described next. Sonnet 5 and Opus 4.7/4.8 also run cybersecurity classifiers and refuse with 200 plus stop_reason refusal; luban parses and records those refusals but does not add fallbacks for them, because the official client never sends the field on those models. That is a deliberate product limit, not an omission.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="opus_refusal_fallback"
-          label={t('Opus 拒答自动换模型（实验）', 'Opus refusal fallback (experimental)')}
-          summary={t(
-            'opus-5 主线程请求带上 luban 自定义的 fallback 链：拒答时上游先回退到 4.8，再回退到 4.6。官方 opus 客户端不发送该字段，默认停用。',
-            'Opus-5 main-thread requests carry a luban-defined fallback chain: on refusal upstream falls to 4.8, then 4.6. The official opus client never sends this field; off by default.',
-          )}
-          description={
-            <>
-              {t(
-                '官方 Claude Code 2.1.260 的 opus 客户端只带 server-side-fallback beta，不发送 fallbacks 字段，「有 beta、无字段」即为官方形态。启用后，luban 为 opus-5 主线程请求补充自定义的 fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]（官方为 cyber 类拒答推荐的 fallback 正是 4.8）。这是官方客户端从不产生的请求形态：封号复盘中未发现它导致 account_on_hold，但作为可被风控识别的指纹风险，它只应作为独立的实验开关，默认停用，保持官方的 opus 请求形态。其余行为同上一条：只补主线程；客户端自带的不改动；上游以 400 拒绝目标后记为规则，此后不再补充；落到 fallback 的回复按实际作答的模型计价。若日后要重新启用，更稳妥的做法是发送字符串 "default"，让上游按当前推荐的模型路由；或先读取 /v1/models 的 allowed_fallback_models，所有目标都获允许时再发送自定链。',
-                'The official Claude Code 2.1.260 opus client sends only the server-side-fallback beta and no fallbacks field; “beta present, field absent” is the official shape. When enabled, luban adds a self-defined fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}] to opus-5 main-thread requests (4.8 is the fallback officially recommended for cyber refusals). That is a request shape the official client never produces: the ban post-mortem does not show it caused account_on_hold, but as a fingerprint risk it belongs behind a separate experimental switch, off by default, keeping the official opus request shape. Everything else matches the switch above: main thread only, client-supplied arrays left alone, a 400 on a fallback target is learned and the field is not added for that model again, and replies served by a fallback are priced at the model that answered. If you re-enable it later, the safer options are sending the string "default" so upstream routes to its current recommended model, or reading allowed_fallback_models from /v1/models first and only sending the custom chain when every target is allowed.',
-              )}
-            </>
-          }
-        />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={ShieldBanIcon}
+        title={t('本地拦截', 'Local interception')}
+        description={t('命中的请求在本地应答或拒绝，不发往上游。', 'Matching requests are answered or rejected locally and never reach upstream.')}
+      >
         <ForwardingToggle
           k="reject_probes"
           label={t('拒绝探针请求', 'Reject probe requests')}
@@ -759,46 +714,30 @@ export function ForwardingSettingsContent() {
           k="reject_learned_shapes"
           label={t('拒绝已学到的形态错误', 'Reject learned shape errors')}
           summary={t(
-            '上游以 400 拒过的「模型 + 某个取值」组合（如 effort: xhigh、role: system、某种 tool type），同样的请求再来时在本地直接返回 400。停用时既不拦截也不学习。',
-            'A model + value combination upstream has rejected with a 400 (such as effort: xhigh, role: system, or a tool type) is rejected locally with 400 when it comes again. Turned off, nothing is blocked and nothing is learned.',
+            '上游以 400 拒过的「模型 + 某个取值」组合（如 effort: xhigh、role: system、某种 tool type、被废弃的 temperature 等采样参数、不支持的 assistant prefill），同样的请求再来时在本地直接返回 400。停用时既不拦截也不学习。',
+            'A model + value combination upstream has rejected with a 400 (such as effort: xhigh, role: system, a tool type, a deprecated sampling parameter like temperature, or an unsupported assistant prefill) is rejected locally with 400 when it comes again. Turned off, nothing is blocked and nothing is learned.',
           )}
           description={
             <>
               {t(
-                '这是纯粹的请求形态错误：换哪个账号发送都是同一条 400，发往上游只会白占一次请求配额，并在上游留下一条与账号状态无关的 4xx。规则由上游的 400 学习而来，本地拒绝时返回的也是上游当时的原话。中途的 system 消息若会被「System Role 提升」整条移到顶层，则不受学到的 role: system 规则拦截。规则记录在「从上游学到的规则」中，7 天后到期，也可手动删除。停用后，这类请求原样发往上游，由上游返回 400，停用期间不会积累新规则。',
-                'These are pure request-shape errors: whichever account sends it gets the same 400, so forwarding it only wastes a request and leaves a 4xx upstream that has nothing to do with the account. Rules are learned from upstream 400s, and a local rejection returns upstream’s original message. A mid-conversation system message that “System role hoisting” will move to the top level is not blocked by a learned role: system rule. Rules live under “Rules learned from upstream”, expire after 7 days and can be removed by hand. Turned off, such requests go upstream as is and upstream answers with the 400; no new rules are learned meanwhile.',
+                '这是纯粹的请求形态错误：换哪个账号发送都是同一条 400，发往上游只会白占一次请求配额，并在上游留下一条与账号状态无关的 4xx。规则由上游的 400 学习而来，本地拒绝时返回的也是上游当时的原话。规则记录在「从上游学到的规则」中，7 天后到期，也可手动删除。停用后，这类请求原样发往上游，由上游返回 400，停用期间不会积累新规则。',
+                'These are pure request-shape errors: whichever account sends it gets the same 400, so forwarding it only wastes a request and leaves a 4xx upstream that has nothing to do with the account. Rules are learned from upstream 400s, and a local rejection returns upstream’s original message. Rules live under “Rules learned from upstream”, expire after 7 days and can be removed by hand. Turned off, such requests go upstream as is and upstream answers with the 400; no new rules are learned meanwhile.',
               )}
             </>
           }
         />
         <ForwardingToggle
-          k="reject_session_conflict"
-          label={t('拒绝会话 ID 冲突', 'Reject session ID conflicts')}
+          k="reject_openai_shape"
+          label={t('拒绝 OpenAI 转换残留', 'Reject OpenAI-format residue')}
           summary={t(
-            '请求头与 metadata 里的会话 ID 不一致时，在本地直接返回 400，不代替客户端择一。',
-            'When the session ID in the header and in metadata disagree, reject locally with 400 instead of picking one.',
+            '带有 OpenAI 格式转换痕迹的请求在本地直接返回 400，不修补、不转发。',
+            'Requests carrying traces of OpenAI-format conversion are rejected locally with 400, never repaired or forwarded.',
           )}
           description={
             <>
               {t(
-                '官方 Claude Code 在 X-Claude-Code-Session-Id 与 metadata.user_id 两处发送的是同一个值，逐字相同。两处给出两个各自合法却不同的 UUID，是官方从不产生的形态；而 luban 以会话 ID 作为会话链（cc_prompt_id / cc_prev_req / diagnostics.previous_message_id）的键，一旦选错，两条会话链会被错误地拼接在一起，且事后无从察觉。启用后，这类请求在本地返回 400，错误消息中列出两个值。停用后退回「取请求头里的值 + 记一条 warn 日志」。只有一处合法时不算冲突：这表示客户端只有一处填写正确，照常采用合法的那个值。',
-                'Official Claude Code sends the same value in X-Claude-Code-Session-Id and in metadata.user_id, byte for byte. Two different but individually valid UUIDs is a shape the official client never produces, and luban keys the session chain (cc_prompt_id / cc_prev_req / diagnostics.previous_message_id) on the session ID; picking the wrong one splices two chains together with no way to notice afterwards. When enabled such requests are rejected locally with 400, naming both values. Turn it off to fall back to using the header value and logging a warning. If only one of the two is a valid UUID it is not a conflict: the client simply got one of them right, and that one is used.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="hoist_system_role"
-          label={t('System Role 提升', 'System role hoisting')}
-          summary={t(
-            '将 messages 里的 role:"system" 消息提升到顶层 system 字段。',
-            'Hoist role:"system" messages to the top-level system field.',
-          )}
-          description={
-            <>
-              {t(
-                '上游 API 不接受出现在首条 user / assistant 之前的 role:"system"，较早的模型对对话中途的 role:"system" 也会返回 400。litellm 等采用 OpenAI 格式的客户端会把 system 指令放在 messages 里。启用后，自动将这些消息（无论位置）的内容提升到顶层 system 字段，再从 messages 中移除。以下几种例外：content 为空数组、只带 output_config 的指令消息留在原位不动（上游在任何位置都接受这种写法）；对话中途带 clear_at: "next_user_message" 的临时消息留在原位，提升后它会变成长期生效的指令；content 里含 tool_addition、tool_removal 等非文本块的消息整条留在原位，顶层 system 只接受文本块；既有正文又带 output_config 的消息拆成两部分，正文提升，output_config 作为一条指令消息留在原位，以免客户端在对话中途设置的 effort 等参数随提升丢失。被提升的消息上其余消息级字段不保留。仅在「拒绝 OpenAI 转换残留」停用时生效；该开关启用时，开头的 role:"system" 在入口即被拒绝，对话中途的作为原生 system 消息原样转发。官方 Claude Code 自己也会在 messages 里合法使用 role:"system"（deferred tools），所以 CC 形态的请求整体跳过提升，以免破坏形态。唯一的例外是空壳 role:"system" 消息，即 content 为空数组、空字符串、null、字段缺失，或整条只有空 text 块：无论本开关启用与否、也无论是否为 CC 形态，一律在出站前丢弃。上游对它始终返回 400（messages.N: system content must contain at least one block），而它没有任何内容块，丢弃不会损失语义。这种情况曾出现在某个 agent-sdk VS Code 扩展发出的正常 CC 请求中。',
-                'The upstream API does not accept role:"system" before the first user / assistant turn, and older models also return 400 for one mid-conversation. Clients using OpenAI format (e.g. litellm) place system instructions in messages. When enabled, the content of these messages (wherever they sit) is automatically hoisted to the top-level system field and removed from messages, with these exceptions: a directive message (an empty content array with only output_config) stays where it is, since upstream accepts that form at any position; a mid-conversation message with clear_at: "next_user_message" stays in place, since hoisting would turn a one-turn reminder into a standing instruction; a message whose content holds non-text blocks such as tool_addition or tool_removal stays in place as a whole, since the top-level system field accepts text blocks only; a message carrying both text and output_config is split, with the text hoisted and the output_config left in place as a directive, so settings such as an effort the client changed mid-conversation are not lost. Other message-level fields on a hoisted message are not kept. Only takes effect while “Reject OpenAI-format residue” is off: with that on, a leading role:"system" is rejected at the door and a mid-conversation one is forwarded as-is as a native system message. Official Claude Code also uses role:"system" inside messages legitimately (deferred tools), so CC-shaped requests skip hoisting entirely rather than have their shape broken. The one exception is an empty shell: a role:"system" message whose content is an empty array, an empty string, null, missing, or nothing but empty text blocks is dropped before the request goes out — whatever this switch is set to, and whether or not the request is CC-shaped. Upstream always rejects it (messages.N: system content must contain at least one block) and it carries no content to lose. This was found on a real request from an agent-sdk VS Code extension.',
+                '经 litellm、one-api、claude-code-router 等工具从 OpenAI 格式转换过来的请求，到达这里时已是 Anthropic 形态，只能靠残留特征识别：messages 开头（首条 user / assistant 之前）的 role:"system"、role:"tool"、消息上的 name / tool_calls、以 call_ 为前缀的工具调用 ID、字符串形态或 type:"function" 的 tool_choice、OpenAI function 形态的 tools、n / stop / user / response_format 等 OpenAI 专属顶层字段，以及 image_url 等 OpenAI 内容块。命中任意一项即在本地返回 400，错误消息会指出位置与 Anthropic 的对应写法。停用后原样转发，由上游返回官方报错。不影响模拟路径：模拟路径只接管本来就是 Anthropic 形态的非 CC 请求。',
+                'Requests converted from the OpenAI format by litellm, one-api, claude-code-router and the like arrive already in Anthropic shape; the only way to tell is the residue they leave: role:"system" before the first user / assistant turn, role:"tool" in messages, name / tool_calls on a message, tool call IDs prefixed call_, a string or type:"function" tool_choice, tools in the OpenAI function shape, OpenAI-only top-level fields such as n / stop / user / response_format, and OpenAI content blocks such as image_url. Any hit is rejected locally with 400 and a message naming the location and the Anthropic equivalent. Turned off, such requests are forwarded as is and upstream returns its own error. The simulation path is unaffected: it only takes over non-CC requests that are already in Anthropic shape.',
               )}
             </>
           }
@@ -807,7 +746,50 @@ export function ForwardingSettingsContent() {
 
       <LearnedRejections />
 
-      <SettingsGroup icon={RefreshCwIcon} title={t('限流与错误恢复', 'Rate limits & error recovery')}>
+      <SettingsGroup
+        icon={RouteIcon}
+        title={t('拒答换模型', 'Refusal fallback')}
+        description={t('上游分类器拒答时，由上游换用其他模型重新生成。', 'When the upstream classifier refuses, upstream regenerates the answer with another model.')}
+      >
+        <ForwardingToggle
+          k="fable_refusal_fallback"
+          label={t('Fable 拒答自动换模型', 'Fable refusal fallback')}
+          summary={t(
+            'fable 主线程请求带上官方的服务端 fallback：安全分类器拒答时，由上游在同一次调用中改用 opus-5 重新生成。形态与官方 2.1.260 逐字相同，默认停用。',
+            'Fable main-thread requests carry the official server-side fallback: when the safety classifier refuses, upstream reruns the same call on opus-5. Byte-for-byte the official 2.1.260 shape; off by default.',
+          )}
+          description={
+            <>
+              {t(
+                'Fable 5.1 / Fable 5 带安全分类器，命中时（多为 cyber 类，正常的安全相关请求也可能被误判）返回 200 加 stop_reason refusal，正文为空。官方 Claude Code 2.1.260 在 fable 上自带 fallbacks: [{"model":"claude-opus-5"}] 和 server-side-fallback beta，拒答后由上游改用 Opus 5 重新生成，用户看不到拒答。启用后，luban 为 fable 主线程请求补上与官方逐字相同的这一字段，出站请求头一并带上 server-side-fallback-2026-06-01。该做法有抓包依据，补齐后更接近 2.1.260 的官方形态。但这替用户做出了决定：拒答后由 Opus 5 作答、按 Opus 计价、同一对话约一小时内固定在 Opus 上，用户也看不到拒答本身，所以默认停用，由用户自行启用。停用时，模拟出的 fable 请求比 2.1.260 少这一个字段，拒答直接返回、不换用其他模型重新生成；请求头里的 beta 仍按版本补上，「有 beta、无字段」正是 2.1.260 之前的官方形态；客户端自带的 fallbacks 仍予保留。客户端自己带了数组形态的 fallbacks 时不改动；helper、标题、安全分类、额度探测等辅助请求，官方均不发送该字段，luban 也不补充。上游以 400 拒绝 fallback 目标时，移除该字段后重发一次并记入「从上游学到的规则」，此后不再为该模型补充。落到 fallback 的回复按实际作答的模型计价，同一对话约一小时内会固定在 fallback 模型上。输出前就被拒的请求上游不计费，流水里花费记为 0。opus-5 的自定义 fallback 链由另一个开关控制，见下一条。Sonnet 5 与 Opus 4.7/4.8 同样带网络安全分类器，同样会以 200 加 stop_reason refusal 拒答；luban 只解析并记录它们的拒答，不为它们补 fallbacks。官方客户端在这些模型上不发送该字段，这是有意的产品限制，不是遗漏。',
+                'Fable 5.1 / Fable 5 run safety classifiers; a hit (mostly the cyber category, and benign security work gets caught too) returns 200 with stop_reason refusal and empty content. Official Claude Code 2.1.260 sends fallbacks: [{"model":"claude-opus-5"}] plus the server-side-fallback beta on fable, so upstream reruns a refused call on Opus 5 and the user never sees the refusal. When enabled, luban adds that exact field to fable main-thread requests, with server-side-fallback-2026-06-01 in the outbound header; this is backed by a capture, so adding it brings the request closer to the 2.1.260 official shape. But it also decides for the user that a refused request is answered by Opus 5, billed at Opus rates, with the conversation stuck to Opus for about an hour, and the user never sees the refusal itself, so it is off by default and left for the user to switch on. Turned off, simulated fable requests lack that one field and the refusal is returned as is, without a rerun; the beta header is still added per version, and “beta present, field absent” is exactly the official shape before 2.1.260. A client-supplied fallbacks field is kept as is. A client-supplied array form is left alone; helper / title / classifier / quota-probe requests are not touched, as the official client never sends the field there. If upstream rejects the fallback target with a 400, the field is stripped and the request resent once, and the rule lands under “Rules learned from upstream” so the field is not added for that model again. A reply served by a fallback is priced at the model that actually served it, and the conversation sticks to the fallback model for about an hour. Requests refused before any output are not billed upstream, so their cost is recorded as 0. The luban-defined opus-5 fallback chain is a separate switch, described next. Sonnet 5 and Opus 4.7/4.8 also run cybersecurity classifiers and refuse with 200 plus stop_reason refusal; luban parses and records those refusals but does not add fallbacks for them, because the official client never sends the field on those models. That is a deliberate product limit, not an omission.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="opus_refusal_fallback"
+          label={t('Opus 拒答自动换模型（实验）', 'Opus refusal fallback (experimental)')}
+          summary={t(
+            'opus-5 主线程请求带上 luban 自定义的 fallback 链：拒答时上游先回退到 4.8，再回退到 4.6。官方 opus 客户端不发送该字段，默认停用。',
+            'Opus-5 main-thread requests carry a luban-defined fallback chain: on refusal upstream falls to 4.8, then 4.6. The official opus client never sends this field; off by default.',
+          )}
+          description={
+            <>
+              {t(
+                '官方 Claude Code 2.1.260 的 opus 客户端只带 server-side-fallback beta，不发送 fallbacks 字段，「有 beta、无字段」即为官方形态。启用后，luban 为 opus-5 主线程请求补充自定义的 fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}]（官方为 cyber 类拒答推荐的 fallback 正是 4.8）。这是官方客户端从不产生的请求形态：封号复盘中未发现它导致 account_on_hold，但作为可被风控识别的指纹风险，它只应作为独立的实验开关，默认停用，保持官方的 opus 请求形态。其余行为同上一条：只补主线程；客户端自带的不改动；上游以 400 拒绝目标后记为规则，此后不再补充；落到 fallback 的回复按实际作答的模型计价。若日后要重新启用，更稳妥的做法是发送字符串 "default"，让上游按当前推荐的模型路由；或先读取 /v1/models 的 allowed_fallback_models，所有目标都获允许时再发送自定链。',
+                'The official Claude Code 2.1.260 opus client sends only the server-side-fallback beta and no fallbacks field; “beta present, field absent” is the official shape. When enabled, luban adds a self-defined fallbacks: [{"model":"claude-opus-4-8"},{"model":"claude-opus-4-6"}] to opus-5 main-thread requests (4.8 is the fallback officially recommended for cyber refusals). That is a request shape the official client never produces: the ban post-mortem does not show it caused account_on_hold, but as a fingerprint risk it belongs behind a separate experimental switch, off by default, keeping the official opus request shape. Everything else matches the switch above: main thread only, client-supplied arrays left alone, a 400 on a fallback target is learned and the field is not added for that model again, and replies served by a fallback are priced at the model that answered. If you re-enable it later, the safer options are sending the string "default" so upstream routes to its current recommended model, or reading allowed_fallback_models from /v1/models first and only sending the custom chain when every target is allowed.',
+              )}
+            </>
+          }
+        />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={RefreshCwIcon}
+        title={t('限流与错误恢复', 'Rate limits & error recovery')}
+        description={t('限流换号，以及换号导致的 thinking 校验失败后的重试。', 'Account switching on rate limits, and retries after thinking validation fails because of a switch.')}
+      >
         <ForwardingToggle
           k="rate_limit_retry"
           label={t('429 自动换账号', '429 automatic account switching')}
@@ -850,22 +832,6 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
-          k="thinking_modified_retry"
-          label={t('thinking 修改兜底', 'thinking modification fallback')}
-          summary={t(
-            '上游检测到 thinking 块被修改时，自动降级并重试一次。',
-            'When the upstream detects modified thinking blocks, automatically downgrade them and retry once.',
-          )}
-          description={
-            <>
-              {t(
-                '成因通常是 JSON 序列化/反序列化改变了 thinking 块的编码（如 Unicode 转义、数字格式）。处理方式与签名兜底相同：把历史 thinking 块降级成普通文本后重试。',
-                'Usually caused by JSON serialization changing the encoding of thinking blocks (e.g. Unicode escapes, number formatting). Handled the same way as the signature fallback: historical thinking blocks are downgraded to plain text and retried.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
           k="redacted_thinking_retry"
           label={t('redacted thinking 兜底', 'redacted thinking fallback')}
           summary={t(
@@ -885,6 +851,17 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+      </SettingsGroup>
+
+      <SettingsGroup
+        icon={KeyRoundIcon}
+        title={t('登录授权范围', 'Login authorization scopes')}
+        description={t(
+          '添加账号时向 Claude 申请的权限范围。仅对此后新登录的账号生效，已添加的账号不受影响。',
+          'Which permissions are requested from Claude when adding an account. Only affects accounts added from now on; existing ones are unchanged.',
+        )}
+      >
+        <OAuthScopes />
       </SettingsGroup>
     </div>
   )
@@ -982,77 +959,6 @@ function OAuthScopes() {
         </div>
       </div>
     </Field>
-  )
-}
-
-type PolicyKey = 'prefill' | 'sampling'
-
-const POLICY_LABELS: Record<PolicyValue, [string, string]> = {
-  strip: ['移除后转发', 'Strip & forward'],
-  reject: ['本地拒绝', 'Reject locally'],
-  off: ['不处理', 'Off'],
-}
-
-function PolicySelect({
-  label,
-  summary,
-  value,
-  settingKey,
-}: {
-  label: string
-  summary: string
-  value: PolicyValue
-  settingKey: PolicyKey
-}) {
-  const { t } = useI18n()
-  const id = useId()
-
-  const items = (Object.keys(POLICY_LABELS) as PolicyValue[]).map((k) => ({
-    label: t(POLICY_LABELS[k][0], POLICY_LABELS[k][1]),
-    value: k,
-  }))
-
-  const save = useSettingsSave(
-    (next: PolicyValue) =>
-      settingKey === 'prefill' ? setPrefillPolicy(next) : setSamplingPolicy(next),
-    {
-      success: (settings) => {
-        const v = settingKey === 'prefill' ? settings.prefill_policy : settings.sampling_policy
-        const [zh, en] = POLICY_LABELS[v as PolicyValue] ?? ['', '']
-        return {
-          title: t(`${label}：${zh}`, `${label}: ${en}`),
-          description: summary,
-        }
-      },
-    },
-  )
-
-  return (
-    <SettingsRow
-      htmlFor={id}
-      label={label}
-      description={<ClampedDescription text={summary} />}
-    >
-      {/* 用全站那套 Select，不再手搓原生 <select>：原来这里是一个自己抄了一遍边框样式的
-          原生下拉，高度 h-8 写死，弹出层还是操作系统那一套，和同一页别处的下拉长得是两个东西。 */}
-      <Select
-        items={items}
-        value={value}
-        disabled={save.isPending}
-        onValueChange={(next) => next && save.mutate(next as PolicyValue)}
-      >
-        <SelectTrigger id={id} className="sm:w-40" aria-label={label}>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectPopup>
-          {items.map((item) => (
-            <SelectItem key={item.value} value={item.value}>
-              {item.label}
-            </SelectItem>
-          ))}
-        </SelectPopup>
-      </Select>
-    </SettingsRow>
   )
 }
 
@@ -1676,7 +1582,7 @@ function LearnedRejections() {
     kind === 'shape'
       ? t('本地拒绝', 'Rejected locally')
       : kind === 'deprecated'
-        ? t('已移除字段', 'Field stripped')
+        ? t('不再补 fallbacks', 'Fallbacks no longer added')
         : kind === 'empty_reply'
           ? t('零输出，本地拒绝', 'Empty reply, rejected locally')
           : kind === 'refusal'
@@ -1837,8 +1743,8 @@ function LearnedRejections() {
       icon={BrainIcon}
       title={t('从上游学到的规则', 'Rules learned from upstream')}
       description={t(
-        '上游明确拒绝过的组合会被记录下来：某模型不接受的取值（400，目前识别 effort 档位、messages 里的 role、tools 里的工具类型三种），下次在本地直接拒绝；某模型已废弃的参数（400），下次转发前移除；某模型对「无 tools 的单条消息 + 某个 max_tokens」返回过 200 却零输出的，同类请求下次在本地直接拒绝；某模型的分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的提示词，逐字相同地重发时在本地直接拒绝，只拦截那一条内容，同形态的其他请求不受影响。模型自己拒答的（无 category）或 fallback 没有执行成功的（带 recommended_model）不学习。命中拒答规则时本地回放上游那次的拒答（200 加同一段 stop_reason refusal），命中零输出规则时本地返回 403，两类分别受「拒绝已拒答的提示词」与「拒绝零输出请求类」开关控制；出站带 fallbacks 的请求不拦截。拒答规则的文案为「[类别] + 上游 stop_details 原文」，零输出规则的文案则为上游回复的开头。规则存入数据库、重启后保留，7 天后自动丢弃并重新验证。拒答规则不设数量上限，按「模型 + 类别」分组折叠，展开后可分页查看每条，也可整组删除；顶部可按模型 / 哈希 / 原文搜索，筛选到某一类时可只清空那一类。若上游已解除限制而本地仍在拦截，可在此删除对应规则。',
-        'Combinations upstream has called out are remembered: a value a model refuses (400; currently the effort level, a role in messages, and a tool type in tools) is rejected locally next time; a parameter a model deprecated (400) is stripped before forwarding; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape. Refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned. A refused-prompt hit replays the original upstream refusal locally (200 with the same stop_reason refusal body), while an empty-reply hit answers 403; the two are governed by “Reject refused prompts” and “Reject empty-reply request classes” respectively; requests going out with fallbacks are not blocked. Refusal rules keep “[category] ” plus the upstream stop_details verbatim as their text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to page through its prompts or remove the whole group, search by model / hash / text at the top, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
+        '上游明确拒绝过的组合会被记录下来：某模型不接受的取值（400，目前识别 effort 档位、messages 里的 role、tools 里的工具类型、被废弃的采样参数、末尾的 assistant prefill 五种；后两种只对 /v1/messages 生效），下次在本地直接拒绝；luban 替客户端补的 fallbacks 被某模型以 400 拒绝的，此后不再为该模型补充；某模型对「无 tools 的单条消息 + 某个 max_tokens」返回过 200 却零输出的，同类请求下次在本地直接拒绝；某模型的分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的提示词，逐字相同地重发时在本地直接拒绝，只拦截那一条内容，同形态的其他请求不受影响。模型自己拒答的（无 category）或 fallback 没有执行成功的（带 recommended_model）不学习。命中拒答规则时本地回放上游那次的拒答（200 加同一段 stop_reason refusal），命中零输出规则时本地返回 403，两类分别受「拒绝已拒答的提示词」与「拒绝零输出请求类」开关控制；出站带 fallbacks 的请求不拦截。拒答规则的文案为「[类别] + 上游 stop_details 原文」，零输出规则的文案则为上游回复的开头。规则存入数据库、重启后保留，7 天后自动丢弃并重新验证。拒答规则不设数量上限，按「模型 + 类别」分组折叠，展开后可分页查看每条，也可整组删除；顶部可按模型 / 哈希 / 原文搜索，筛选到某一类时可只清空那一类。若上游已解除限制而本地仍在拦截，可在此删除对应规则。',
+        'Combinations upstream has called out are remembered: a value a model refuses (400; currently the effort level, a role in messages, a tool type in tools, a deprecated sampling parameter, and a trailing assistant prefill — the last two apply to /v1/messages only) is rejected locally next time; fallbacks that luban added for the client and a model rejected with 400 are no longer added for that model; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape. Refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned. A refused-prompt hit replays the original upstream refusal locally (200 with the same stop_reason refusal body), while an empty-reply hit answers 403; the two are governed by “Reject refused prompts” and “Reject empty-reply request classes” respectively; requests going out with fallbacks are not blocked. Refusal rules keep “[category] ” plus the upstream stop_details verbatim as their text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to page through its prompts or remove the whole group, search by model / hash / text at the top, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
       )}
     >
       {query.isPending ? (
@@ -1864,8 +1770,8 @@ function LearnedRejections() {
             </EmptyTitle>
             <EmptyDescription className="text-xs leading-5">
               {t(
-                '上游拒绝某个取值、废弃某个参数，或对某条提示词拒答之后，规则会自动出现在这里。',
-                'Rules appear here on their own once upstream rejects a value, deprecates a parameter, or refuses a prompt.',
+                '上游拒绝某个取值、拒绝 luban 补的 fallbacks，或对某条提示词拒答之后，规则会自动出现在这里。',
+                'Rules appear here on their own once upstream rejects a value, rejects the fallbacks luban added, or refuses a prompt.',
               )}
             </EmptyDescription>
           </EmptyHeader>

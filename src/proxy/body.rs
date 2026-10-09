@@ -17,7 +17,7 @@ use super::simulation::{
     cc_profile_for, cc_profile_kind_for, is_cc_shaped, relocate_long_client_system,
     simulate_system,
 };
-use super::thinking::{preserve_thinking_encoding, strip_empty_thinking_blocks};
+use super::thinking::preserve_thinking_encoding;
 use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
 
 mod billing;
@@ -129,21 +129,13 @@ pub(super) fn rewrite_body_out(
     };
     // `sim_billing_only`：只注 `system[0]` billing header（在 [`simulate_system`] 里），下游所有
     // 把客户端内容改成官方 CC 形态的整形一律跳过——身份句/基座/第四块/官方工具/metadata/thread/
-    // 顶层重排，以及会动到客户端块的 cap/strip/ttl/eager。防 400 的无损归一照做，换头与 cch 重算
+    // 顶层重排，以及会动到客户端块的 cap/strip/ttl/eager。`fallbacks` 归一照做，换头与 cch 重算
     // 照旧。`billing_only` 蕴含 `sim.is_some()`，故所有 `sim.is_none()` 门控的步骤本就不触发。
     let billing_only = sim.is_some_and(|s| s.billing_only);
     // 全关且不模拟：连解析都不必做，原样返回。
-    // 额外检查：body 里含 allOf/oneOf/anyOf 或空 text 块时仍需解析（须对应开关开着）。
     // 要补 `fallbacks` 的也不能走这条：调用方已按同一个判断在头上补了 `server-side-fallback`
     // beta（[`build_forward_headers_for`]），体里不写字段就是「有 beta 没字段」——对 fable 而言
     // 恰是官方 2.1.260 之前的旧形态，且拒答时上游不会换模型重跑，开关等于没开。
-    let may_need_schema_fix = flags.flatten_tool_schemas
-        && [b"allOf", b"oneOf", b"anyOf"].iter().any(|n| body_contains(body, *n));
-    let may_have_empty_text = flags.strip_empty_text && body_has_pair(body, b"\"text\"", b"\"\"");
-    // 体里出现过 `"role": "system"` 的一律解析：`hoist_system_role` 关着时提升那步不跑，但
-    // **空壳照丢**（[`drop_empty_system_messages`]，上游对它恒 400），所以这一项不挂在那个
-    // 开关上。键值之间的空白由 [`body_has_pair`] 容掉，缩进过的体不会从这里漏过去。
-    let has_system_role_msg = body_has_pair(body, b"\"role\"", b"\"system\"");
     // 真 CC 路径要不要补 `eager_input_streaming` 得解析了才知道；没有 `tools` 字面量的体
     // 一定不补，不必为它解析。
     let may_fill_eager =
@@ -156,9 +148,6 @@ pub(super) fn rewrite_body_out(
         && !flags.strip_extra_fields
         && !force_stream
         && tool_names.is_none()
-        && !may_need_schema_fix
-        && !may_have_empty_text
-        && !has_system_role_msg
         && fallbacks.is_none()
         && !real_cch_stale(body, sim, flags)
     {
@@ -171,26 +160,6 @@ pub(super) fn rewrite_body_out(
         Ok(v) => v,
         Err(_) => return (body.clone(), None),
     };
-    // OpenAI 风格的 `tool_choice`（字符串 `"auto"`/`"none"`/`"required"`、`null`，或
-    // `{"type":"function","function":{"name":…}}`）归一成 Anthropic 的对象形态——上游对非对象
-    // 直接 400 `tool_choice: Input should be an object`。**无条件做**：这种形态在 Anthropic 这边
-    // 永远无效，没有「保留原样」的价值。放在最前：后面判「是不是强制工具」的几步（注入
-    // thinking、环境说明、补官方工具）都只认对象形态，看到 `"required"` 会当成没强制——注入
-    // thinking 时顺手剥掉的采样参数，在 thinking 因强制工具被删之后就找不回来了。归一出来的
-    // `{"type":"auto"}` 由 [`strip_extra_fields`] 按缺省剥掉。
-    let tool_choice_normalized = normalize_tool_choice(&mut v);
-    // 空壳 `role:"system"` 消息：一个内容块都没有的那种，上游恒 400
-    // （`messages.N: system content must contain at least one block`）。放在提升之前，
-    // 两条路都要过它——见 [`drop_empty_system_messages`] 里为什么不受 `hoist_system_role`
-    // 与 CC 形态那道豁免管。
-    let empty_system_dropped = drop_empty_system_messages(&mut v);
-    // role:"system" 提升：litellm 等第三方客户端把 system 放在 messages 里，
-    // 上游对开头那段恒 400、老模型对中途的也 400，提前挪到顶层 system 字段。必须在
-    // simulate_system 之前——后者和 align_system_shape 都只读顶层 system。
-    // CC 形态的请求跳过：CC 在 messages 里合法使用 role:"system"（如 deferred tools），
-    // 强行提升会破坏形态。严格检查开着时也跳过，见 [`hoists_system_role`]。
-    let system_hoisted =
-        hoists_system_role(&flags, is_cc_shaped(&v)) && hoist_system_role_messages(&mut v);
     // 来访自己是不是 CC 形态要在模拟之前看——模拟一跑，body 就都是 CC 形态了。
     // 只喂给 `strip_extra_fields` 判 `thinking.display` 该不该剥。
     let cc_inbound = is_cc_shaped(&v);
@@ -212,7 +181,7 @@ pub(super) fn rewrite_body_out(
     let raw_fps: Vec<crate::proxy::session_link::ThreadMsg> = sim
         .filter(|_| simulated && flags.sim_message_threads && !billing_only)
         .and_then(|_| v.get("messages"))
-        .map(|m| thread_snapshot(m, tool_names, flags.strip_empty_text))
+        .map(|m| thread_snapshot(m, tool_names))
         .unwrap_or_default();
     // 官方首轮那份环境说明（工作目录、模型、Agent 类型、技能、日期），每轮在同一位置补同一份，
     // 见 [`insert_env_note`]。跟在挪客户端 system 之后：haiku 那种写法里客户端那块要排在环境各段
@@ -273,7 +242,7 @@ pub(super) fn rewrite_body_out(
     // `fallbacks`：调用方给了字面量就补（[`ensure_fallbacks`]）；没给（族开关关着，或学到过
     // 该模型不收）只在模拟路径上把客户端自带的字符串归一成官方数组（[`normalize_fallbacks`]）。
     // `normalize_fallbacks` 不受 `billing_only` 门控：它是防 400 的无损归一（客户端已带的字符串
-    // `"default"` → 官方数组），和 `tool_choice` 归一同类。billing-only 下出站头仍会按
+    // `"default"` → 官方数组）：要它的是 luban 自己在头上声明的那个 beta，不是客户端写错了。billing-only 下出站头仍会按
     // `body_has_fallbacks` 声明 `server-side-fallback` beta，而新日期 beta 下上游只收数组，留着
     // 字符串就是一发稳定 400。只有**新增** fallback（`Some(plan)`）才在调用点按 billing-only 置空。
     let fallbacks_shaped = match fallbacks {
@@ -440,17 +409,6 @@ pub(super) fn rewrite_body_out(
         && !billing_only
         && eager_tools_wanted(&v, sim, cc_inbound, cc_kind, client.map(|c| c.version), adv_beta)
         && fill_eager_tools(&mut v);
-    // 工具去重：客户端可能声明同名工具多次，上游会直接拒（`Tool names must be unique`）。
-    // 放在混淆之前：混淆依赖 `tools` 里的名字集合算 seed，重复名进去会白占一个序号。
-    let tools_deduped = dedup_tools(&mut v);
-    // 空 text 块剥除：上游要求 text 块非空，第三方客户端常发空块。
-    let empty_text_stripped = flags.strip_empty_text && strip_empty_text_blocks(&mut v);
-    // 无签名空 thinking 块剥除：上游要求 thinking 块有内容或有签名。带签名的空块是上游
-    // 自己回的合法形态（官方 CC 原样回传，上游接受），不动；只剥第三方客户端拼出来的
-    // 无签名空块。无条件处理——这种块永远是无效的。
-    let empty_thinking_stripped = strip_empty_thinking_blocks(&mut v);
-    // input_schema 顶层的 allOf/oneOf/anyOf 展平：上游不支持，直接 400。
-    let schemas_flattened = flags.flatten_tool_schemas && flatten_tool_schemas(&mut v);
     // 工具名混淆放在最末：它只改 `name` 字段，与前面每一步都无交集。
     let tools_mimicked = tool_names.is_some_and(|m| apply_tool_names(&mut v, m));
     // message thread 排在所有改写之后：判「能不能接上上一轮」比的是**最终出站**的历史
@@ -460,8 +418,6 @@ pub(super) fn rewrite_body_out(
         && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps));
     tracing::debug!(
         billing_only,
-        empty_system_dropped,
-        system_hoisted,
         simulated,
         sys_relocated,
         env_noted,
@@ -482,24 +438,17 @@ pub(super) fn rewrite_body_out(
         cc_msg_shape,
         ttl_filled,
         streamed,
-        tool_choice_normalized,
         stripped,
         top_level_ordered,
         cc_tools_injected,
         eager_filled,
-        tools_deduped,
-        empty_text_stripped,
-        empty_thinking_stripped,
-        schemas_flattened,
         tools_mimicked,
         threaded,
         device_fp = %device_fp,
         spoof_device = %cred.spoof_device_id(device_fp).as_deref().unwrap_or("-"),
         "rewrote body"
     );
-    if !empty_system_dropped
-        && !system_hoisted
-        && !shaped
+    if !shaped
         && !capped
         && !spoofed
         && !cch_added
@@ -518,15 +467,10 @@ pub(super) fn rewrite_body_out(
         && !cc_msg_shape
         && !ttl_filled
         && !streamed
-        && !tool_choice_normalized
         && !stripped
         && !top_level_ordered
         && !cc_tools_injected
         && !eager_filled
-        && !tools_deduped
-        && !empty_text_stripped
-        && !empty_thinking_stripped
-        && !schemas_flattened
         && !tools_mimicked
         && !threaded
         // 排在最后：前面任何一项为真都不会走到这里，只有「看似没改」的体才多算一次哈希。

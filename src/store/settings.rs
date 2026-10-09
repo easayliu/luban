@@ -238,9 +238,6 @@ impl CredentialStore {
         if let Some(v) = on(THINKING_SIGNATURE_RETRY) {
             flags.thinking_signature_retry = v;
         }
-        if let Some(v) = on(THINKING_MODIFIED_RETRY) {
-            flags.thinking_modified_retry = v;
-        }
         if let Some(v) = on(REDACTED_THINKING_RETRY) {
             flags.redacted_thinking_retry = v;
         }
@@ -288,15 +285,6 @@ impl CredentialStore {
         }
         if let Some(v) = on(INJECT_THINKING) {
             flags.inject_thinking = v;
-        }
-        if let Some(v) = on(FLATTEN_TOOL_SCHEMAS) {
-            flags.flatten_tool_schemas = v;
-        }
-        if let Some(v) = on(STRIP_EMPTY_TEXT) {
-            flags.strip_empty_text = v;
-        }
-        if let Some(v) = on(HOIST_SYSTEM_ROLE) {
-            flags.hoist_system_role = v;
         }
         if let Some(v) = on(REJECT_OPENAI_SHAPE) {
             flags.reject_openai_shape = v;
@@ -347,29 +335,6 @@ impl CredentialStore {
         match self.get_setting(REQUIRE_DEVICE_ID).ok().flatten() {
             Some(v) => setting_is_on(&v),
             None => true,
-        }
-    }
-
-    /// 4.6+ 模型收到 assistant message prefill 时的处理策略。
-    ///
-    /// 走内存缓存，零查询。缺省（未设置）= [`PrefillPolicy::Strip`]（剥掉后转发）。
-    pub fn prefill_policy(&self) -> PrefillPolicy {
-        match self.settings.read().get(PREFILL_POLICY).map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) if v == "reject" => PrefillPolicy::Reject,
-            Some(v) if v == "off" => PrefillPolicy::Off,
-            _ => PrefillPolicy::Strip,
-        }
-    }
-
-    /// 4.7+ 模型收到 sampling 参数（`temperature`/`top_p`/`top_k`）时的处理策略。
-    ///
-    /// 走内存缓存，零查询。缺省（未设置）= [`PrefillPolicy::Strip`]（剥掉后转发）。
-    /// 复用 [`PrefillPolicy`] 枚举——三档语义完全相同。
-    pub fn sampling_policy(&self) -> PrefillPolicy {
-        match self.settings.read().get(SAMPLING_POLICY).map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) if v == "reject" => PrefillPolicy::Reject,
-            Some(v) if v == "off" => PrefillPolicy::Off,
-            _ => PrefillPolicy::Strip,
         }
     }
 
@@ -561,12 +526,8 @@ pub const ORIG_HEADER_CASE: &str = "orig_header_case";
 /// 缺省视为开启：它只在那一种 400 上触发，重试失败也会原样透传最初那条响应，开着不会更差。
 pub const THINKING_SIGNATURE_RETRY: &str = "thinking_signature_retry";
 
-/// 上游以「thinking 块被修改」拒绝时，是否降级历史 thinking 块后重试一次的 settings 键名。
-/// 缺省视为开启。成因通常是 JSON 序列化改变了 thinking 块的编码。
-pub const THINKING_MODIFIED_RETRY: &str = "thinking_modified_retry";
-
 /// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，是否降级历史 thinking 块后重试一次的
-/// settings 键名。缺省视为开启。与上面两项同一个兜底（[`crate::proxy::demote_thinking_blocks`]
+/// settings 键名。缺省视为开启。与上面那项同一个兜底（[`crate::proxy::demote_thinking_blocks`]
 /// 对 `redacted_thinking` 是整块删），只是上游点名的是那段密文。
 pub const REDACTED_THINKING_RETRY: &str = "redacted_thinking_retry";
 
@@ -623,22 +584,9 @@ pub const TOOL_NAME_MIMIC: &str = "tool_name_mimic";
 /// 见 [`ForwardFlags::inject_thinking`]。
 pub const INJECT_THINKING: &str = "inject_thinking";
 
-/// 是否展平 tool `input_schema` 顶层的 `allOf`/`oneOf`/`anyOf` 的 settings 键名。
-/// 缺省视为开启：上游不支持这些关键字，直接 400。
-pub const FLATTEN_TOOL_SCHEMAS: &str = "flatten_tool_schemas";
-
-/// 是否剥除 messages 里的空 text 内容块 `{"type":"text","text":""}` 的 settings 键名。
-/// 缺省视为开启：上游要求 text 块非空，部分第三方客户端常发空块。
-pub const STRIP_EMPTY_TEXT: &str = "strip_empty_text";
-
-/// 是否将 messages 里的 `role:"system"` 消息提升到顶层 `system` 字段的 settings 键名。
-/// 缺省视为开启：Anthropic API 不支持 messages 里出现 `role:"system"`（直接 400），
-/// litellm 等第三方客户端常用此格式。
-pub const HOIST_SYSTEM_ROLE: &str = "hoist_system_role";
-
 /// 是否本地拒绝带 OpenAI 格式转换残留的请求的 settings 键名。
 /// 缺省视为开启：messages 里的 `role:"system"`、`call_` 前缀的工具调用 id、OpenAI 专属顶层
-/// 字段等一律 400，不修补不转发。关掉后退回 `hoist_system_role` 等修补路径。
+/// 字段等一律 400，不转发。关掉后原样转发，由上游返回官方的 400。
 pub const REJECT_OPENAI_SHAPE: &str = "reject_openai_shape";
 
 /// 来访的会话 id 在**头与体两处不一致**时是否本地拒绝的 settings 键名。缺省视为开启。
@@ -714,45 +662,6 @@ pub const REFUSAL_FALLBACK_LEGACY: &str = "refusal_fallback";
 /// （`主.次.修` 串）的 settings 键名。启动时垫进 [`crate::oauth::latest_release`] 的缓存，
 /// 学到新值时写回；是来访 UA 自报版本的上限（见 `proxy::known_latest_release`）。
 pub const LATEST_CC_RELEASE: &str = "latest_cc_release";
-
-/// 4.6+ 模型不支持 assistant message prefill 时的处理策略的 settings 键名。
-///
-/// 取值：`"strip"`（默认）= 主动剥掉末尾 assistant 轮后转发；`"reject"` = 本地直接
-/// 400 拒绝、不转发；`"off"` = 不做任何处理：原样转发，上游的 400 也不重试。
-pub const PREFILL_POLICY: &str = "prefill_policy";
-
-/// 4.6+ 模型收到 assistant message prefill 时的处理策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefillPolicy {
-    /// 主动剥掉末尾 assistant 轮后转发（默认）。
-    Strip,
-    /// 本地直接 400 拒绝，不转发。
-    Reject,
-    /// 不做任何处理：原样转发，上游的 400 原样回给客户端。
-    Off,
-}
-
-impl PrefillPolicy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Strip => "strip",
-            Self::Reject => "reject",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl std::fmt::Display for PrefillPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// 4.7+ 模型不支持 sampling 参数（`temperature`/`top_p`/`top_k`）时的处理策略的 settings 键名。
-///
-/// 取值与 [`PREFILL_POLICY`] 相同：`"strip"`（默认）= 主动剥掉后转发；`"reject"` = 本地
-/// 直接 400 拒绝；`"off"` = 不做任何处理：原样转发，上游的 400 也不学。
-pub const SAMPLING_POLICY: &str = "sampling_policy";
 
 /// 官方基座那个缓存断点要不要带 `scope:"global"` 的 settings 键名。缺省视为开启：基座
 /// 全网同一份，跨账号共享缓存是白捡的。

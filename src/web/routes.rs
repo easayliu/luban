@@ -86,8 +86,6 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/settings/min-client-version", post(set_min_client_version))
         .route("/settings/latest-cc-release", post(set_latest_cc_release))
         .route("/settings/oauth-scopes", post(set_oauth_scopes))
-        .route("/settings/prefill-policy", post(set_prefill_policy))
-        .route("/settings/sampling-policy", post(set_sampling_policy))
         .route("/settings/forwarding", post(set_forwarding))
         .route("/export", get(export))
         .route("/import", post(import))

@@ -69,12 +69,6 @@ pub(super) struct SettingsResp {
     /// **7d 窗口**的同一档阈值，另算；0（默认）= 不按周用量停号，见
     /// [`crate::store::QUOTA_PAUSE_PCT_7D`]。
     quota_pause_pct_7d: i64,
-    /// 4.6+ 模型收到 assistant message prefill 时的处理策略：
-    /// `"strip"` = 剥掉后转发（默认），`"reject"` = 本地拒绝，`"off"` = 不处理。
-    prefill_policy: String,
-    /// 4.7+ 模型收到 sampling 参数时的处理策略：
-    /// `"strip"` = 剥掉后转发（默认），`"reject"` = 本地拒绝，`"off"` = 不处理。
-    sampling_policy: String,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
@@ -105,8 +99,6 @@ struct ForwardingResp {
     orig_header_case: bool,
     /// 上游拒绝 thinking 块签名时，降级历史 thinking 后重试一次。
     thinking_signature_retry: bool,
-    /// 上游拒绝被修改的 thinking 块时，降级历史 thinking 后重试一次。
-    thinking_modified_retry: bool,
     /// 上游拒绝 `redacted_thinking` 块的密文时，降级历史 thinking 后重试一次。
     redacted_thinking_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求。
@@ -139,12 +131,6 @@ struct ForwardingResp {
     tool_name_mimic: bool,
     /// 模拟路径下是否注入 thinking（及配套的 context_management）。
     inject_thinking: bool,
-    /// 展平 tool input_schema 顶层的 allOf/oneOf/anyOf。
-    flatten_tool_schemas: bool,
-    /// 剥除 messages 里的空 text 内容块。
-    strip_empty_text: bool,
-    /// 将 messages 里的 role:"system" 消息提升到顶层 system 字段。
-    hoist_system_role: bool,
     /// 本地拒绝带 OpenAI 格式转换残留的请求，不修补不转发。
     reject_openai_shape: bool,
     /// 会话 id 头体不一致时本地拒绝，不替客户端选一个。
@@ -184,7 +170,6 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             system_shape: f.system_shape,
             orig_header_case: f.orig_header_case,
             thinking_signature_retry: f.thinking_signature_retry,
-            thinking_modified_retry: f.thinking_modified_retry,
             redacted_thinking_retry: f.redacted_thinking_retry,
             simulate_cc: f.simulate_cc,
             simulate_full_system: f.simulate_full_system,
@@ -201,9 +186,6 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             strip_extra_fields: f.strip_extra_fields,
             tool_name_mimic: f.tool_name_mimic,
             inject_thinking: f.inject_thinking,
-            flatten_tool_schemas: f.flatten_tool_schemas,
-            strip_empty_text: f.strip_empty_text,
-            hoist_system_role: f.hoist_system_role,
             reject_openai_shape: f.reject_openai_shape,
             reject_session_conflict: f.reject_session_conflict,
             reject_probes: f.reject_probes,
@@ -265,8 +247,6 @@ pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
     let rate_limit_retry_max = state.store.rate_limit_retry_max() as i64;
     let quota_pause_pct = state.store.quota_pause_pct();
     let quota_pause_pct_7d = state.store.quota_pause_pct_7d();
-    let prefill_policy = state.store.prefill_policy().to_string();
-    let sampling_policy = state.store.sampling_policy().to_string();
     let forwarding = state.store.forward_flags().into();
     if let Some(k) = &state.client_key {
         return SettingsResp {
@@ -295,8 +275,6 @@ pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
             rate_limit_retry_max,
             quota_pause_pct,
             quota_pause_pct_7d,
-            prefill_policy,
-            sampling_policy,
             forwarding,
         };
     }
@@ -332,8 +310,6 @@ pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
         rate_limit_retry_max,
         quota_pause_pct,
         quota_pause_pct_7d,
-        prefill_policy,
-        sampling_policy,
         forwarding,
     }
 }

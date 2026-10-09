@@ -66,11 +66,9 @@ use probe_detect::{
 mod thinking;
 #[cfg(test)]
 use thinking::{
-    block_site, demote_thinking_blocks, empty_thinking_shape, error_block_path,
-    is_empty_thinking_error, is_redacted_thinking_data_error, is_thinking_modified_error,
-    is_thinking_signature_error, latest_assistant_diff, latest_assistant_has_thinking,
-    preserve_thinking_encoding, strip_empty_thinking_blocks, thinking_block_error_kind,
-    trace_thinking_block,
+    block_site, demote_thinking_blocks, error_block_path, is_redacted_thinking_data_error,
+    is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
+    preserve_thinking_encoding, thinking_block_error_kind, trace_thinking_block,
 };
 
 mod rate_limit;
@@ -93,13 +91,12 @@ use body::{
     CacheShape, CcClient, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
     cc_tools_core, cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint,
-    drop_empty_system_messages, ensure_beta_query, ensure_billing_cch, ensure_fallbacks,
-    extract_device_id, extract_session_id, flatten_tool_schemas, is_billable_messages,
-    is_fallback_rejection, known_latest_release, misplaced_system_role, normalize_tool_choice,
+    ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
+    is_billable_messages, is_fallback_rejection, known_latest_release, misplaced_system_role,
     outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
     remember_fallback_rejection, replace_json_str_field, rewrite_body_out, sim_device_fingerprint,
-    sim_device_id, sim_session_key, stream_requested, strip_empty_text_blocks, strip_extra_fields,
-    sync_metadata_session, trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
+    sim_device_id, sim_session_key, stream_requested, strip_extra_fields, sync_metadata_session,
+    trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
 pub(crate) use body::{SESSION_KEY_VERSION, has_cache_ttl_1h, parse_version};
 
@@ -127,14 +124,12 @@ pub(crate) use connectivity::{ProbeReport, probe};
 mod learned_rules;
 #[cfg(test)]
 use learned_rules::{
-    APP_COUNTER_MAX_KEYS, AppCounter, DEPRECATABLE_FIELDS, REFUSAL_REPLY_BYTES,
-    REJECTION_LOG_WINDOW, SHAPE_MEMORY_CAP, SHAPE_PROBES, SSE_CONTENT_TYPE,
-    TRANSIENT_BACKOFF_BASE_SECS, TRANSIENT_BACKOFF_RESET, TRANSIENT_MAX_ATTEMPTS,
-    app_system_digest, empty_reply_class, has_learned_deprecated_field, known_app_refusal,
-    known_empty_reply, known_refused_prompt, known_shape_rejection, maybe_strip_deprecated,
-    next_transient_backoff_at, prompt_digest, record_app_request, remember_app_refusal,
-    remember_deprecated_field, remember_empty_reply, remember_refused_prompt,
-    remember_shape_rejection, replay_refusal, take_rejection_log_slot,
+    APP_COUNTER_MAX_KEYS, AppCounter, REFUSAL_REPLY_BYTES, REJECTION_LOG_WINDOW, SHAPE_MEMORY_CAP,
+    SHAPE_PROBES, SSE_CONTENT_TYPE, TRANSIENT_BACKOFF_BASE_SECS, TRANSIENT_BACKOFF_RESET,
+    TRANSIENT_MAX_ATTEMPTS, app_system_digest, empty_reply_class, known_app_refusal,
+    known_empty_reply, known_refused_prompt, known_shape_rejection, next_transient_backoff_at,
+    prompt_digest, record_app_request, remember_app_refusal, remember_empty_reply,
+    remember_refused_prompt, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 pub(crate) use learned_rules::{
     DeprecatedFieldMemory, EmptyReplyMemory, LEARNED_KINDS, RejectionLog, SeededMemories,

@@ -281,27 +281,14 @@ fn take_last_cache_control(m: &mut serde_json::Value) -> Option<serde_json::Valu
 
 /// 插环境说明之前那份 `messages` 的线程指纹（[`apply_sim_thread`] 的 `raw_fps`）。
 ///
-/// 环境说明不进指纹，但 [`rewrite_body`] 后面对历史消息本身做的几步要先在快照上做一遍，与
-/// 最终出站一致——回复指纹记的是上游看到的那份：
-///
-/// - 剥空 `text` 块（开关 `strip_empty_text`，[`strip_empty_text_blocks`]）；
-/// - 剥无签名的空 thinking 块（无条件，[`strip_empty_thinking_blocks`]）；
-/// - 工具名混淆（[`apply_tool_names`]）。
-///
-/// 三步都只看块本身，与中间别的步骤无关，在快照上先做就与出站一致。剥块那两步自己会打 info
-/// 日志，出站那一遍已经打过，快照这一遍静音。
+/// 环境说明不进指纹，但 [`rewrite_body`] 后面对历史消息本身做的改动要先在快照上做一遍，与
+/// 最终出站一致——回复指纹记的是上游看到的那份：目前只有工具名混淆（[`apply_tool_names`]），
+/// 它只看块本身，与中间别的步骤无关，在快照上先做就与出站一致。
 pub(super) fn thread_snapshot(
     messages: &serde_json::Value,
     tool_names: Option<&ToolNameMap>,
-    strip_empty_text: bool,
 ) -> Vec<ThreadMsg> {
     let mut snap = serde_json::json!({ "messages": messages });
-    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-        strip_empty_thinking_blocks(&mut snap);
-        if strip_empty_text {
-            strip_empty_text_blocks(&mut snap);
-        }
-    });
     if let Some(map) = tool_names {
         apply_tool_names(&mut snap, map);
     }

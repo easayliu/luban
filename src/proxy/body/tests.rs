@@ -5,8 +5,8 @@ use crate::proxy::test_support::{
 };
 use crate::proxy::{
     Bytes, HeaderValue, apply_tool_names, build_forward_headers, build_tool_name_map, config,
-    ensure_billing_cch, header, is_billable_messages, merge_beta, normalize_tool_choice,
-    replace_json_str_field, store, strip_extra_fields,
+    ensure_billing_cch, header, is_billable_messages, merge_beta, replace_json_str_field, store,
+    strip_extra_fields,
 };
 
 /// 设备身份校验与出站体改写的作用域：只认 `/v1/messages`，且 `count_tokens` 除外
@@ -612,7 +612,6 @@ fn body_flags_off_passes_through_byte_for_byte() {
         system_shape: false,
         orig_header_case: false,
         thinking_signature_retry: false,
-        thinking_modified_retry: false,
         redacted_thinking_retry: false,
         simulate_cc: false,
         simulate_full_system: false,
@@ -629,9 +628,6 @@ fn body_flags_off_passes_through_byte_for_byte() {
         strip_extra_fields: false,
         tool_name_mimic: false,
         inject_thinking: false,
-        flatten_tool_schemas: true,
-        strip_empty_text: true,
-        hoist_system_role: false,
         reject_openai_shape: false,
         reject_session_conflict: false,
         reject_probes: false,
@@ -1060,55 +1056,6 @@ fn every_generated_alias_lives_under_the_shared_namespace() {
     );
 }
 
-/// OpenAI 方言的 `tool_choice` 翻译成 Anthropic 对象形态；上游对非对象直接 400
-/// `tool_choice: Input should be an object`。已是 Anthropic 形态或认不出的，一律不动。
-#[test]
-fn normalizes_openai_style_tool_choice() {
-    let run = |tc: serde_json::Value| {
-        let mut v =
-            serde_json::json!({ "model": "claude-sonnet-5", "tool_choice": tc, "messages": [] });
-        let changed = normalize_tool_choice(&mut v);
-        (changed, v.get("tool_choice").cloned())
-    };
-    assert_eq!(run(serde_json::json!("auto")), (true, Some(serde_json::json!({"type": "auto"}))));
-    assert_eq!(run(serde_json::json!("none")), (true, Some(serde_json::json!({"type": "none"}))));
-    assert_eq!(
-        run(serde_json::json!("required")),
-        (true, Some(serde_json::json!({"type": "any"})))
-    );
-    assert_eq!(run(serde_json::json!("ANY")), (true, Some(serde_json::json!({"type": "any"}))));
-    assert_eq!(run(serde_json::Value::Null), (true, None), "null 等于没写，删掉");
-    assert_eq!(
-        run(serde_json::json!({"type": "function", "function": {"name": "get_weather"}})),
-        (true, Some(serde_json::json!({"type": "tool", "name": "get_weather"})))
-    );
-    assert_eq!(
-        run(serde_json::json!({"type": "function"})),
-        (true, Some(serde_json::json!({"type": "any"})))
-    );
-    // Anthropic 形态原样不动，附加键也不动。
-    for keep in [
-        serde_json::json!({"type": "auto"}),
-        serde_json::json!({"type": "tool", "name": "x"}),
-        serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
-        serde_json::json!({"type": "none"}),
-    ] {
-        assert_eq!(run(keep.clone()), (false, Some(keep.clone())), "不该动: {keep}");
-    }
-    // 认不出的方言放行，让上游报它自己的错。
-    assert_eq!(run(serde_json::json!("whatever")), (false, Some(serde_json::json!("whatever"))));
-    assert_eq!(run(serde_json::json!(42)), (false, Some(serde_json::json!(42))));
-    // 没有这个字段：零操作。
-    let mut none = serde_json::json!({ "model": "claude-sonnet-5", "messages": [] });
-    assert!(!normalize_tool_choice(&mut none));
-    // 归一后与剥字段接力：`"auto"` 最终整个消失，与官方形态一致。
-    let mut chain =
-        serde_json::json!({ "model": "claude-sonnet-5", "tool_choice": "auto", "messages": [] });
-    assert!(normalize_tool_choice(&mut chain));
-    assert!(strip_extra_fields(&mut chain, false));
-    assert!(chain.get("tool_choice").is_none(), "{chain}");
-}
-
 /// 官方从不发的顶层字段要剥掉，客户端真正要的语义不能动。
 ///
 /// 判据取自 `cap/raw/00006`/`00009`：两份直连抓包都没有 `tool_choice`，
@@ -1135,18 +1082,11 @@ fn strips_only_the_fields_official_never_sends() {
         assert_eq!(v["tool_choice"], keep);
     }
 
-    // thinking.type == "disabled"：**只有 fable 族**要删（它不支持，上游直接 400），
-    // 删掉整个字段让上游走 adaptive 默认值。
-    let mut v = serde_json::json!({
-            "model": "claude-fable-5",
-            "thinking": {"type": "disabled"}});
-    assert!(strip_extra_fields(&mut v, false));
-    assert!(v.get("thinking").is_none(), "fable 上 disabled 应整个删掉: {v}");
-
-    // 别的族不动：`{"type":"disabled"}` 是 2.1.260 三个官方辅助 profile 的正常形态
-    // （无工具 helper / 标题生成是 haiku，安全分类是 sonnet）。删了既造出一个官方不
-    // 产生的形态，又把客户端「不要思考」翻成了「随你」——那是要花钱的。
-    for model in ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"] {
+    // thinking.type == "disabled" 一律不动：那是 2.1.260 三个官方辅助 profile 的正常形态
+    // （无工具 helper / 标题生成是 haiku，安全分类是 sonnet）。fable 族不收它，但那是客户端
+    // 自己写错的参数，由上游回 400，这里不替它改。
+    for model in ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5", "claude-fable-5"]
+    {
         let mut v = serde_json::json!({
                 "model": model,
                 "thinking": {"type": "disabled"}});
@@ -1170,43 +1110,25 @@ fn strips_only_the_fields_official_never_sends() {
     assert_eq!(official, before);
 }
 
-/// thinking 开着时上游要求 `top_p` 「不传或 >= 0.95」（线上撞到的原话：`top_p must be
-/// greater than or equal to 0.95 or unset when thinking is enabled or in adaptive mode`）。
-/// 与 temperature 那条同源：客户端设了不合规的值就剥掉，合规的与 thinking 关着的都不动。
+/// 客户端自己写的、与 thinking 冲突的参数不修补：低于 0.95 的 `top_p`、不等于 1 的
+/// `temperature`、不足 1024 的 `budget_tokens`、强制工具配手动预算 thinking，全都原样发出，
+/// 由上游回官方的 400。
 #[test]
-fn strips_low_top_p_when_thinking_is_on() {
-    let req = |thinking: serde_json::Value, top_p: serde_json::Value| {
-        serde_json::json!({
-                "model": "claude-opus-4-6",
-                "messages": [{"role": "user", "content": "hi"}],
-                "thinking": thinking,
-                "top_p": top_p})
-    };
-    // enabled / adaptive 两种开法，低于 0.95 都剥；非数字也剥（上游一样 400）。
-    for thinking in [
-        serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
-        serde_json::json!({"type": "adaptive"}),
+fn leaves_client_thinking_conflicts_to_upstream() {
+    let tools = serde_json::json!([{ "name": "Bash", "input_schema": { "type": "object" } }]);
+    for body in [
+        serde_json::json!({ "model": "claude-opus-4-6", "thinking": { "type": "adaptive" },
+            "top_p": 0.9, "temperature": 0.5, "messages": [] }),
+        serde_json::json!({ "model": "claude-opus-4-6",
+            "thinking": { "type": "enabled", "budget_tokens": 512 }, "messages": [] }),
+        serde_json::json!({ "model": "claude-haiku-4-5",
+            "thinking": { "type": "enabled", "budget_tokens": 2000 },
+            "tool_choice": { "type": "any" }, "tools": tools, "messages": [] }),
     ] {
-        for bad in [serde_json::json!(0.9), serde_json::json!(0.949), serde_json::json!("x")] {
-            let mut v = req(thinking.clone(), bad.clone());
-            assert!(strip_extra_fields(&mut v, false), "{thinking} + top_p={bad}: 应有改动");
-            assert!(v.get("top_p").is_none(), "{thinking} + top_p={bad}: 应剥掉: {v}");
-            assert!(v.get("thinking").is_some(), "thinking 自己不能动: {v}");
-        }
-        // 合规的取值照发。
-        for ok in [serde_json::json!(0.95), serde_json::json!(1.0)] {
-            let mut v = req(thinking.clone(), ok.clone());
-            assert!(!strip_extra_fields(&mut v, false), "{thinking} + top_p={ok}: 不该动");
-            assert_eq!(v["top_p"], ok);
-        }
+        let mut v = body.clone();
+        assert!(!strip_extra_fields(&mut v, false), "不该动: {body}");
+        assert_eq!(v, body);
     }
-    // thinking 关着（disabled 且非 fable 族）或压根没传：top_p 随便填，不归这里管。
-    let mut v = req(serde_json::json!({"type": "disabled"}), serde_json::json!(0.5));
-    assert!(!strip_extra_fields(&mut v, false), "disabled: 不该动: {v}");
-    assert_eq!(v["top_p"], 0.5);
-    let mut v = serde_json::json!({ "model": "claude-opus-4-6", "top_p": 0.5 });
-    assert!(!strip_extra_fields(&mut v, false), "无 thinking: 不该动: {v}");
-    assert_eq!(v["top_p"], 0.5);
 }
 
 /// 2.1.258 起官方 CC 自己发 `thinking: {type: adaptive, display: "updates"}`
@@ -1236,38 +1158,7 @@ fn keeps_thinking_display_for_cc_shaped_requests() {
     );
 }
 
-/// 空壳 system 的清理要能**自己撑起整条改写**：所有改写开关都关着时，入口的快速返回与
-/// 末尾的「什么都没改就回原体」都不能把它漏掉——漏掉就是空壳照样出站、上游照样 400。
-#[test]
-fn dropping_an_empty_system_message_survives_both_early_returns() {
-    let flags = store::ForwardFlags {
-        system_shape: false,
-        spoof_identity: false,
-        billing_cch: false,
-        cch_real_recompute: false,
-        cch_sim_compute: false,
-        strip_extra_fields: false,
-        flatten_tool_schemas: false,
-        strip_empty_text: false,
-        // 提升那步关掉：空壳的清理不该挂在它身上。
-        hoist_system_role: false,
-        ..store::ForwardFlags::default()
-    };
-    let body = Bytes::from(
-        r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"},{"role":"system","content":[]}]}"#,
-    );
-    let out = rewrite_body(&body, &test_cred(), "fp", flags, None, None);
-    let s = String::from_utf8(out.to_vec()).unwrap();
-    assert!(!s.contains(r#""role":"system""#), "空壳该被丢掉: {s}");
-    assert!(s.contains(r#""content":"hi""#), "用户消息要留着: {s}");
-    // 反向：同一套开关下，没有空壳的体一个字节都不该动。
-    let clean =
-        Bytes::from(r#"{"model":"claude-opus-5","messages":[{"role":"user","content":"hi"}]}"#);
-    assert_eq!(rewrite_body(&clean, &test_cred(), "fp", flags, None, None), clean);
-}
-
-/// 入口快速路径的粗筛容得下缩进：`"role": "system"`（键值之间有空白、还带换行）与紧凑写法
-/// 一样要进解析路径，否则 pretty-print 过的体会带着空壳原样出站。
+/// 字节粗筛 [`body_has_pair`] 容得下缩进：键值之间有空白、还带换行，与紧凑写法一样认。
 #[test]
 fn the_fast_path_probe_tolerates_pretty_printed_json() {
     let pair = |b: &str| crate::proxy::body_has_pair(b.as_bytes(), b"\"role\"", b"\"system\"");
@@ -1279,112 +1170,6 @@ fn the_fast_path_probe_tolerates_pretty_printed_json() {
     assert!(!pair(r#"{"role" "system"}"#), "缺冒号不算");
     assert!(!pair(r#"{"rolex":"system"}"#), "键不是 role 不算");
     assert!(!pair(r#"{"role":"#), "截断的体不算，也不能越界");
-
-    // 空 text 块那一项同样容空白。
-    let text = |b: &str| crate::proxy::body_has_pair(b.as_bytes(), b"\"text\"", b"\"\"");
-    assert!(text(r#"{"text":""}"#));
-    assert!(text("{\"text\" : \"\"}"));
-    assert!(!text(r#"{"text":"x"}"#));
-
-    // 端到端：所有改写开关都关着 + 缩进过的体，空壳照样被丢掉。
-    let flags = store::ForwardFlags {
-        system_shape: false,
-        spoof_identity: false,
-        billing_cch: false,
-        cch_real_recompute: false,
-        cch_sim_compute: false,
-        strip_extra_fields: false,
-        flatten_tool_schemas: false,
-        strip_empty_text: false,
-        hoist_system_role: false,
-        ..store::ForwardFlags::default()
-    };
-    let pretty = Bytes::from(
-        "{\n  \"model\": \"claude-opus-5\",\n  \"messages\": [\n    \
-             {\"role\": \"user\", \"content\": \"hi\"},\n    \
-             {\"role\": \"system\", \"content\": []}\n  ]\n}",
-    );
-    let out = rewrite_body(&pretty, &test_cred(), "fp", flags, None, None);
-    let s = String::from_utf8(out.to_vec()).unwrap();
-    assert!(!s.contains(r#""role":"system""#), "缩进过的体里的空壳也该被丢掉: {s}");
-    assert!(s.contains(r#""content":"hi""#), "用户消息要留着: {s}");
-}
-
-/// 提升跑不跑只看这一处：严格检查开着时不跑（放行的中途 system 是原生消息，原样出站），
-/// CC 形态不跑，`hoist_system_role` 关掉不跑。
-#[test]
-fn hoisting_is_off_while_the_strict_check_is_on() {
-    let on = all_on();
-    assert!(on.hoist_system_role && on.reject_openai_shape, "默认两个都开");
-    assert!(!super::hoists_system_role(&on, false), "严格检查开着：不提升");
-    let repair = store::ForwardFlags { reject_openai_shape: false, ..all_on() };
-    assert!(super::hoists_system_role(&repair, false));
-    assert!(!super::hoists_system_role(&repair, true), "CC 形态不提升");
-    let off = store::ForwardFlags { hoist_system_role: false, ..repair };
-    assert!(!super::hoists_system_role(&off, false));
-
-    // 走完整条改写：默认开关下中途那条 system 连同它自带的字段原样出站；关掉严格检查才提升。
-    let body = Bytes::from(
-        r#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief","clear_at":"x"}]}"#,
-    );
-    let kept: serde_json::Value =
-        serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", on, None, None)).unwrap();
-    assert_eq!(kept["messages"][1]["role"], "system");
-    assert_eq!(kept["messages"][1]["clear_at"], "x", "消息级字段不能丢");
-    let hoisted: serde_json::Value =
-        serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", repair, None, None))
-            .unwrap();
-    assert_eq!(hoisted["messages"].as_array().unwrap().len(), 1);
-    assert!(hoisted["system"].to_string().contains("be brief"));
-}
-
-/// 开头与对话中途的 `role:"system"` 一并提升：中途那条老模型不认，留着就是一条修得好
-/// 却没修的 400。顺序按原序，客户端原有的顶层 system 排在后面。
-#[test]
-fn all_system_role_messages_are_hoisted() {
-    let mut v = serde_json::json!({
-        "system": "orig",
-        "messages": [
-            {"role": "system", "content": "a"},
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "ok"},
-            {"role": "user", "content": "go on"},
-            {"role": "system", "content": [{"type": "text", "text": "mid"}]}
-        ]
-    });
-    assert!(crate::proxy::body::hoist_system_role_messages(&mut v));
-    let texts: Vec<_> =
-        v["system"].as_array().unwrap().iter().map(|b| b["text"].as_str().unwrap()).collect();
-    assert_eq!(texts, ["a", "mid", "orig"]);
-    let roles: Vec<_> =
-        v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
-    assert_eq!(roles, ["user", "assistant", "user"]);
-}
-
-/// 空壳 `role:"system"` 消息在出站前被丢掉：五种空形态都算（空数组、空串、`null`、
-/// 字段缺失、整条只有空 text 块），带内容的一字不动，别的角色一概不碰。
-///
-/// 最后一段走完整条 `rewrite_body`：**CC 形态的请求同样会丢**——`hoist_system_role` 的
-/// 「CC 形态跳过」保的是官方带内容的那条 `role:"system"`（deferred tools），不是空壳；
-/// 实跑里正是一条 agent-sdk 的 CC 请求带着空壳换回一次 400（`req_grlwDAtQQpqvf54d`）。
-/// 指令式 system（`content: []` + 消息级 `output_config`）不是空壳：2.1.285 官方就这么发，
-/// 上游放哪儿都收；当空壳丢掉等于把客户端中途调的 effort 删了。
-#[test]
-fn system_directive_is_not_dropped_as_an_empty_shell() {
-    let directive = serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": [] });
-    let user = serde_json::json!({ "role": "user", "content": "hi" });
-    let mut v = serde_json::json!({ "messages": [user.clone(), directive.clone()] });
-    assert!(!crate::proxy::drop_empty_system_messages(&mut v));
-    assert_eq!(v["messages"], serde_json::json!([user.clone(), directive]));
-
-    // 口径逐字照上游：只有空数组算指令式，空串 / 缺 content 带 output_config 照旧当空壳。
-    for shell in [
-        serde_json::json!({ "role": "system", "output_config": { "effort": "high" }, "content": "" }),
-        serde_json::json!({ "role": "system", "output_config": { "effort": "high" } }),
-    ] {
-        let mut v = serde_json::json!({ "messages": [user.clone(), shell.clone()] });
-        assert!(crate::proxy::drop_empty_system_messages(&mut v), "这条该算空壳: {shell}");
-    }
 }
 
 /// 末尾是指令式 system 时，消息断点补在它前一条上，指令留在原位、不挂断点。
@@ -1470,77 +1255,6 @@ fn misplaced_mid_conversation_system_is_rejected_with_the_upstream_wording() {
 }
 
 #[test]
-fn empty_system_messages_are_dropped_before_going_out() {
-    let sys = |content: Option<serde_json::Value>| match content {
-        Some(c) => serde_json::json!({ "role": "system", "content": c }),
-        None => serde_json::json!({ "role": "system" }),
-    };
-    let user = serde_json::json!({ "role": "user", "content": "hi" });
-
-    // 五种空形态，逐个单独验：丢掉之后只剩那条用户消息。
-    for content in [
-        Some(serde_json::json!([])),
-        Some(serde_json::json!("")),
-        Some(serde_json::Value::Null),
-        None,
-        Some(serde_json::json!([{ "type": "text", "text": "" }, { "type": "text", "text": "" }])),
-    ] {
-        let mut v = serde_json::json!({ "messages": [user.clone(), sys(content.clone())] });
-        assert!(crate::proxy::drop_empty_system_messages(&mut v), "这条该算空壳: {content:?}");
-        assert_eq!(v["messages"], serde_json::json!([user.clone()]));
-    }
-
-    // 带内容的一律不动：官方 deferred tools 那条、空格、数组里混着一个非空块。
-    for content in [
-        serde_json::json!("deferred"),
-        serde_json::json!(" "),
-        serde_json::json!([{ "type": "text", "text": "x" }]),
-        serde_json::json!([{ "type": "text", "text": "" }, { "type": "text", "text": "x" }]),
-        serde_json::json!({ "type": "text", "text": "" }),
-    ] {
-        let mut v = serde_json::json!({ "messages": [sys(Some(content.clone()))] });
-        assert!(!crate::proxy::drop_empty_system_messages(&mut v), "这条不该算空壳: {content}");
-        assert_eq!(v["messages"], serde_json::json!([sys(Some(content))]));
-    }
-
-    // 只碰 role:"system"：空 content 的 user / assistant 留着（删了会改轮次交替）。
-    let mut v = serde_json::json!({
-        "messages": [
-            { "role": "user", "content": [] },
-            { "role": "assistant", "content": [] },
-        ]
-    });
-    assert!(!crate::proxy::drop_empty_system_messages(&mut v));
-    assert_eq!(v["messages"].as_array().unwrap().len(), 2);
-
-    // 多条空壳一起丢，其余消息的相对顺序不变；没有 messages 的体不动。
-    let mut v = serde_json::json!({
-        "messages": [sys(Some(serde_json::json!([]))), user.clone(), sys(None), user.clone()]
-    });
-    assert!(crate::proxy::drop_empty_system_messages(&mut v));
-    assert_eq!(v["messages"], serde_json::json!([user.clone(), user.clone()]));
-    let mut v = serde_json::json!({ "model": "claude-opus-5" });
-    assert!(!crate::proxy::drop_empty_system_messages(&mut v));
-
-    // 整条 rewrite_body：CC 形态（system 里有身份句）的请求，空壳照丢。
-    let body = Bytes::from(
-        serde_json::json!({
-                "model": "claude-opus-5",
-                "messages": [user.clone(), sys(Some(serde_json::json!([]))), user.clone()],
-                "system": [{
-                    "type": "text",
-                    "text": "You are Claude Code, Anthropic's official CLI for Claude."}]})
-        .to_string(),
-    );
-    let out: serde_json::Value =
-        serde_json::from_slice(&rewrite_body(&body, &test_cred(), "fp", all_on(), None, None))
-            .unwrap();
-    let msgs = out["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 2, "空壳该被丢掉: {out}");
-    assert!(msgs.iter().all(|m| m["role"] == "user"), "留下的必须是那两条用户消息: {out}");
-}
-
-#[test]
 fn strip_extra_fields_is_wired_and_switchable() {
     let body = br#"{"model":"claude-opus-5","tool_choice":{"type":"auto"},"thinking":{"type":"adaptive","display":"summarized"},"messages":[]}"#;
     let only_strip = store::ForwardFlags {
@@ -1557,7 +1271,6 @@ fn strip_extra_fields_is_wired_and_switchable() {
             system_shape: false,
             orig_header_case: false,
             thinking_signature_retry: false,
-            thinking_modified_retry: false,
             redacted_thinking_retry: false,
             simulate_cc: false,
             simulate_full_system: false,
@@ -1574,9 +1287,6 @@ fn strip_extra_fields_is_wired_and_switchable() {
             strip_extra_fields: false,
             tool_name_mimic: false,
             inject_thinking: false,
-            flatten_tool_schemas: true,
-            strip_empty_text: true,
-            hoist_system_role: false,
             reject_openai_shape: false,
             reject_session_conflict: false,
             reject_probes: false,
@@ -1624,121 +1334,7 @@ fn missing_field_returns_none_no_insert() {
 
 // ---------- 空 text 块剥除 ----------
 
-#[test]
-fn strips_empty_text_blocks_mixed() {
-    let mut v = serde_json::json!({
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": ""},
-                {"type": "text", "text": "hello"},
-                {"type": "text", "text": ""}
-            ]}
-        ]
-    });
-    assert!(crate::proxy::strip_empty_text_blocks(&mut v));
-    let content = v["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 1);
-    assert_eq!(content[0]["text"], "hello");
-}
-
-#[test]
-fn keeps_all_empty_text_blocks_when_nothing_else() {
-    let mut v = serde_json::json!({
-        "messages": [
-            {"role": "assistant", "content": [
-                {"type": "text", "text": ""}
-            ]}
-        ]
-    });
-    assert!(!crate::proxy::strip_empty_text_blocks(&mut v));
-    assert_eq!(v["messages"][0]["content"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn noop_when_no_empty_text() {
-    let mut v = serde_json::json!({
-        "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]}
-        ]
-    });
-    assert!(!crate::proxy::strip_empty_text_blocks(&mut v));
-}
-
 // ---------- input_schema allOf/oneOf/anyOf 展平 ----------
-
-#[test]
-fn flattens_allof_in_tool_schema() {
-    let mut v = serde_json::json!({
-        "tools": [{
-            "name": "my_tool",
-            "input_schema": {
-                "allOf": [
-                    {"type": "object", "properties": {"a": {"type": "string"}}},
-                    {"properties": {"b": {"type": "number"}}, "required": ["a", "b"]}
-                ]
-            }
-        }]
-    });
-    assert!(crate::proxy::flatten_tool_schemas(&mut v));
-    let schema = &v["tools"][0]["input_schema"];
-    assert_eq!(schema["type"], "object");
-    assert!(schema["properties"]["a"].is_object());
-    assert!(schema["properties"]["b"].is_object());
-    let req = schema["required"].as_array().unwrap();
-    assert!(req.contains(&serde_json::json!("a")));
-    assert!(req.contains(&serde_json::json!("b")));
-    assert!(schema.get("allOf").is_none());
-}
-
-#[test]
-fn flattens_oneof_single_element() {
-    let mut v = serde_json::json!({
-        "tools": [{
-            "name": "t",
-            "input_schema": {
-                "oneOf": [{"type": "object", "properties": {"x": {"type": "string"}}}]
-            }
-        }]
-    });
-    assert!(crate::proxy::flatten_tool_schemas(&mut v));
-    let schema = &v["tools"][0]["input_schema"];
-    assert_eq!(schema["type"], "object");
-    assert!(schema["properties"]["x"].is_object());
-    assert!(schema.get("oneOf").is_none());
-}
-
-#[test]
-fn flattens_allof_with_existing_top_level_props() {
-    let mut v = serde_json::json!({
-        "tools": [{
-            "name": "t",
-            "input_schema": {
-                "type": "object",
-                "description": "desc",
-                "allOf": [
-                    {"properties": {"a": {"type": "string"}}, "required": ["a"]}
-                ]
-            }
-        }]
-    });
-    assert!(crate::proxy::flatten_tool_schemas(&mut v));
-    let schema = &v["tools"][0]["input_schema"];
-    assert_eq!(schema["type"], "object");
-    assert_eq!(schema["description"], "desc");
-    assert!(schema["properties"]["a"].is_object());
-    assert!(schema.get("allOf").is_none());
-}
-
-#[test]
-fn noop_when_no_compound_schema() {
-    let mut v = serde_json::json!({
-        "tools": [{
-            "name": "t",
-            "input_schema": {"type": "object", "properties": {"a": {"type": "string"}}}
-        }]
-    });
-    assert!(!crate::proxy::flatten_tool_schemas(&mut v));
-}
 
 /// `refusal_fallbacks_for`：只给主线程、计费、且该族开关开着的 fable / opus-5 补；fable 用
 /// 官方那份（默认开），opus-5 用 luban 自定的 4.8 → 4.6 链（默认关、要显式开）；两档互不
@@ -1820,8 +1416,6 @@ fn refusal_fallbacks_are_chosen_per_family_and_gated() {
         crate::proxy::refusal_fallbacks_for(Some("claude-opus-5"), on, true, Main, &dep2),
         Some(config::OPUS_REFUSAL_FALLBACKS)
     );
-    // `fallbacks` 不在采样参数名单里：客户端自带的不会被 sampling_policy 当采样参数剥掉。
-    assert!(!crate::proxy::DEPRECATABLE_FIELDS.contains(&"fallbacks"));
 }
 
 /// [`client_supplied_fallbacks`]：客户端带了数组（哪怕是空数组）算它自己的；字符串
@@ -2291,7 +1885,6 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         system_shape: false,
         orig_header_case: false,
         thinking_signature_retry: false,
-        thinking_modified_retry: false,
         redacted_thinking_retry: false,
         simulate_cc: false,
         simulate_full_system: false,
@@ -2308,9 +1901,6 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         strip_extra_fields: false,
         tool_name_mimic: false,
         inject_thinking: false,
-        flatten_tool_schemas: false,
-        strip_empty_text: false,
-        hoist_system_role: false,
         reject_openai_shape: false,
         reject_session_conflict: false,
         reject_probes: false,
@@ -2547,7 +2137,7 @@ fn trim_switch_drops_exactly_the_three_user_switchable_tools() {
 
 /// 开关 `sim_billing_only`：开着时模拟路径只在 `system[0]` 注一条最小 billing header，客户端自己的
 /// system 块 / 工具 / metadata 原样透传，不补身份句 / 基座 / 第四块 / 官方工具 / diagnostics /
-/// output_config / thread；防 400 的无损归一照做，cch 仍按出站字节重算。默认停用。
+/// output_config / thread；`fallbacks` 归一照做，cch 仍按出站字节重算。默认停用。
 #[cfg(test)]
 mod billing_only {
     use super::*;
@@ -2626,9 +2216,9 @@ mod billing_only {
         assert_eq!(&copy, bytes.as_ref(), "出站 cch 已是对出站字节算的真值");
     }
 
-    /// 防 400 的无损归一照做：空壳 `role:"system"` 消息丢弃、重复工具去重——即便开着 billing-only。
+    /// 客户端自己发错的形态不修补：空壳 `role:"system"` 消息、重复工具原样出站，由上游回 400。
     #[test]
-    fn still_drops_empty_system_and_dedups_tools() {
+    fn passes_empty_system_and_duplicate_tools_through() {
         let raw = Bytes::from_static(
             concat!(
                 r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
@@ -2651,10 +2241,10 @@ mod billing_only {
         .unwrap();
         let names: Vec<&str> =
             v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["dup"], "重复工具去重");
+        assert_eq!(names, ["dup", "dup"], "重复工具原样保留");
         let roles: Vec<&str> =
             v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
-        assert_eq!(roles, ["user"], "空壳 system 消息被丢弃");
+        assert_eq!(roles, ["system", "user"], "空壳 system 消息原样保留");
     }
 
     /// 不 cap、不 strip 客户端块：客户端给了 6 块 system（超过官方 5 块上限），billing-only 下
@@ -2874,9 +2464,8 @@ fn cc_tools_to_inject_names_exactly_what_gets_injected() {
     assert_eq!(v["tools"].as_array().unwrap().len(), all.len() + 2);
 }
 
-/// 流水的注入统计按**出站**算：`tool_choice` 用 OpenAI 方言（`"required"` / `"any"` /
-/// `{"type":"function"}`）写的无工具请求，归一成 `any` / `tool` 之后注入那一步不补，统计也
-/// 必须是「没补」；拿来访原文预判会把它们误记成 `tools_filled`。`"auto"` 归一后照补。
+/// 流水的注入统计按**出站**算：强制调工具（`any` / 指定工具）的无工具请求注入那一步不补，
+/// 统计也必须是「没补」；`auto` 照补。
 #[test]
 fn injection_stats_follow_the_rewritten_body_not_the_inbound_one() {
     use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
@@ -2899,19 +2488,14 @@ fn injection_stats_follow_the_rewritten_body_not_the_inbound_one() {
         let injected = super::injected_tools_of(&inbound, &out, sim.profile);
         (injected.len(), !injected.is_empty() && super::declares_no_tools(&inbound), out)
     };
-    for choice in [
-        r#""required""#,
-        r#""any""#,
-        r#"{"type":"function"}"#,
-        r#"{"type":"function","function":{"name":"x"}}"#,
-    ] {
+    for choice in [r#"{"type":"any"}"#, r#"{"type":"tool","name":"x"}"#] {
         let (n, filled, out) = stats(choice);
         assert!(out.get("tools").is_none(), "{choice}: 强制调工具不补: {out}");
         assert_eq!((n, filled), (0, false), "{choice}: 统计按出站，不记 tools_filled");
     }
-    let (n, filled, _) = stats(r#""auto""#);
+    let (n, filled, _) = stats(r#"{"type":"auto"}"#);
     // 默认开着 `sim_trim_tools`：注的是 11 条。
-    assert_eq!((n, filled), (11, true), "auto 归一后照补，统计也记上");
+    assert_eq!((n, filled), (11, true), "auto 照补，统计也记上");
     // 自带工具只被补缺的：有注入名单，但不是 `tools_filled`。
     let raw = Bytes::from_static(
             br#"{"model":"claude-sonnet-5","max_tokens":64,"tools":[{"name":"exec","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}"#,
@@ -3402,39 +2986,6 @@ fn injected_thinking_cleans_its_own_conflicts_without_strip_extra_fields() {
         r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#,
     );
     assert_eq!(haiku["thinking"]["budget_tokens"], 1024, "{haiku}");
-}
-
-/// OpenAI 写法的强制工具（`"required"`、`{"type":"function",…}`）要先归一再判注入 thinking：
-/// 否则注入时剥掉的 `temperature` / `top_p`，在 thinking 因强制工具被删之后就找不回来了；
-/// 「移除多余字段」关着时更会把「手动预算 thinking + 强制工具」这对上游必拒的组合发出去。
-#[test]
-fn openai_forced_tool_choice_blocks_thinking_injection() {
-    for strip in [true, false] {
-        let flags = store::ForwardFlags {
-            strip_extra_fields: strip,
-            reject_openai_shape: false,
-            ..all_on()
-        };
-        for tc in [
-            serde_json::json!("required"),
-            serde_json::json!({"type": "function", "function": {"name": "Bash"}}),
-        ] {
-            let body = serde_json::json!({
-                "model": "claude-haiku-4-5-20251001", "max_tokens": 32000,
-                "temperature": 0.5, "top_p": 0.5, "tool_choice": tc,
-                "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
-                "messages": [{"role": "user", "content": "hi"}],
-            })
-            .to_string();
-            let b = Bytes::from(body.clone());
-            let sim = sim_for(&body);
-            let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
-            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-            assert!(v.get("thinking").is_none(), "strip={strip}: 强制工具不该注入 thinking: {v}");
-            assert_eq!(v["temperature"], 0.5, "strip={strip}: {v}");
-            assert_eq!(v["top_p"], 0.5, "strip={strip}: {v}");
-        }
-    }
 }
 
 /// 族开关关着（没计划）时，客户端的字符串 `fallbacks:"default"` 在模拟路径上归一成官方数组：
@@ -5043,8 +4594,6 @@ fn rewrite_recomputes_stale_real_cch() {
         strip_extra_fields: false,
         system_shape: false,
         eager_tool_streaming: false,
-        flatten_tool_schemas: false,
-        strip_empty_text: false,
         ..store::ForwardFlags::default()
     };
     let run = |body: &Bytes, flags: store::ForwardFlags| {
@@ -5947,40 +5496,6 @@ fn historical_switch_survives_edited_history() {
     }
 }
 
-/// 客户端回传的历史里夹着无签名的空 thinking 块：出站会剥掉它（上游必拒），上游那条回复里也
-/// 从来没有它。线程指纹得按剥过的算，正常的工具续轮才接得上。
-#[test]
-fn sim_threads_continue_when_the_client_adds_an_empty_thinking_block() {
-    use crate::proxy::session_link::CcSessionLink;
-    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·空 thinking" });
-    let (_, p1) =
-        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
-    CcSessionLink::record_thread(
-        &p1.unwrap(),
-        "msg_ET",
-        vec!["toolu_et".into()],
-        reply_of(serde_json::json!([bash_use("toolu_et", "ls")])),
-        1000,
-    );
-    let msgs = serde_json::json!([
-        user1,
-        { "role": "assistant", "content": [
-            { "type": "thinking", "thinking": "" },
-            { "type": "text", "text": "" },
-            bash_use("toolu_et", "ls"),
-        ] },
-        { "role": "user", "content": [
-            { "type": "tool_result", "tool_use_id": "toolu_et", "content": "a.txt" },
-        ] },
-    ]);
-    let (v2, _) = thread_turn(&thread_body("claude-opus-5-5", msgs), all_on());
-    assert_eq!(
-        v2["thread"],
-        serde_json::json!({ "type": "continue", "previous_message_id": "msg_ET" }),
-        "{v2}"
-    );
-}
-
 /// 换模型那一轮来访以 `role: system` 收尾：指令式写法（`content: []` 带 `output_config`）原样
 /// 留在最后、模型说明另起一条排在它前面；字符串形态的普通 system 就并进去。两条路都不能丢说明。
 #[test]
@@ -5994,11 +5509,7 @@ fn model_notice_survives_a_trailing_client_system_message() {
                   claude-sonnet-5-5. Assistant knowledge cutoff is June 2026.";
     for threads in [false, true] {
         for (tag, tail) in [("指令", &directive), ("字符串", &plain)] {
-            let flags = store::ForwardFlags {
-                sim_message_threads: threads,
-                hoist_system_role: false,
-                ..all_on()
-            };
+            let flags = store::ForwardFlags { sim_message_threads: threads, ..all_on() };
             let run = |model: &str, msgs: serde_json::Value| {
                 let body =
                     serde_json::json!({ "model": model, "max_tokens": 16, "messages": msgs });
@@ -6033,50 +5544,6 @@ fn model_notice_survives_a_trailing_client_system_message() {
             }
         }
     }
-}
-
-/// 提升只搬普通 system：指令式那条（`content: []` 带 `output_config`）的意义全在消息级字段上，
-/// 搬过去只剩一个空数组，等于连同客户端中途调的 effort 一起删了。它留在原位，上游哪儿都收；
-/// 带正文的拆开，正文提升、`output_config` 留成原位的指令。
-#[test]
-fn hoisting_leaves_system_directives_in_place() {
-    let directive = serde_json::json!({
-        "role": "system", "output_config": { "effort": "low" }, "content": [],
-    });
-    let mut v = serde_json::json!({ "messages": [
-        { "role": "system", "content": "be brief" },
-        { "role": "user", "content": "hi" },
-        directive,
-        { "role": "assistant", "content": "ok" },
-        { "role": "user", "content": "go on" },
-    ] });
-    assert!(super::hoist_system_role_messages(&mut v));
-    assert_eq!(v["system"], serde_json::json!([{ "type": "text", "text": "be brief" }]));
-    let msgs = v["messages"].as_array().unwrap();
-    let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
-    assert_eq!(roles, ["user", "system", "assistant", "user"], "{v}");
-    assert_eq!(msgs[1], directive, "指令原样留着");
-
-    // 带正文又带 `output_config` 的拆成两半：正文提升，原位留一条只有 `output_config` 的指令。
-    // 别的消息级字段不跟着留。
-    let mut split = serde_json::json!({ "messages": [
-        { "role": "system", "output_config": { "effort": "low" }, "clear_at": 3, "content": "be brief" },
-        { "role": "user", "content": "hi" },
-    ] });
-    assert!(super::hoist_system_role_messages(&mut split));
-    assert_eq!(split["system"], serde_json::json!([{ "type": "text", "text": "be brief" }]));
-    assert_eq!(
-        split["messages"][0],
-        serde_json::json!({ "role": "system", "output_config": { "effort": "low" }, "content": [] }),
-        "{split}"
-    );
-    assert_eq!(split["messages"][1]["role"], "user");
-
-    let mut only =
-        serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }, directive] });
-    let before = only.clone();
-    assert!(!super::hoist_system_role_messages(&mut only), "只有指令时什么都不搬");
-    assert_eq!(only, before);
 }
 
 /// 模拟路径上开头夹着一条指令：客户端那段长 system 要挪进首条**用户**消息、环境说明跟在它后面，
@@ -6124,29 +5591,6 @@ fn sim_run(
     let b = Bytes::from(body.to_string());
     let sim = detect_for(&b, flags).expect("走模拟");
     serde_json::from_slice(&rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None)).unwrap()
-}
-
-/// 只管一轮的 system（`clear_at: "next_user_message"`）在修补模式下留在原位：提升上去就成了
-/// 永久指令。开头那种上游本来就不收，照旧提升。
-#[test]
-fn hoisting_keeps_turn_scoped_system_messages_in_place() {
-    let scoped = serde_json::json!({
-        "role": "system", "content": "临时提醒", "clear_at": "next_user_message",
-    });
-    let flags = store::ForwardFlags { reject_openai_shape: false, ..all_on() };
-    let out = sim_run(
-        "claude-sonnet-5-5",
-        serde_json::json!([{ "role": "user", "content": "临时 system·提升" }, scoped]),
-        flags,
-    );
-    let msgs = out["messages"].as_array().unwrap();
-    assert_eq!(msgs.last().unwrap(), &scoped, "原样留在最后: {out}");
-    assert!(!out["system"].to_string().contains("临时提醒"), "没进顶层 system");
-
-    let mut leading =
-        serde_json::json!({ "messages": [scoped, { "role": "user", "content": "hi" }] });
-    assert!(super::hoist_system_role_messages(&mut leading));
-    assert_eq!(leading["messages"].as_array().unwrap().len(), 1, "开头那种照旧提升");
 }
 
 /// 换模型说明与 `<total_tokens>` 不并进只管一轮的 system：并进去下一轮就跟着失效，模型只剩
@@ -6296,27 +5740,6 @@ fn system_citations_are_dropped() {
     }
 }
 
-/// 强制工具时只删手动预算那种 thinking（上游实测 400）；adaptive 在 Claude API 上是合法组合，
-/// 留着。`any` 与 `tool` 同等对待。
-#[test]
-fn forced_tool_choice_only_drops_manual_thinking() {
-    let tools = serde_json::json!([{ "name": "Bash", "input_schema": { "type": "object" } }]);
-    let mut adaptive = serde_json::json!({ "model": "claude-opus-4-8", "thinking": { "type": "adaptive" },
-        "tool_choice": { "type": "tool", "name": "Bash" }, "tools": tools, "messages": [] });
-    super::strip_extra_fields(&mut adaptive, true);
-    assert_eq!(adaptive["thinking"]["type"], "adaptive");
-    for choice in [
-        serde_json::json!({ "type": "any" }),
-        serde_json::json!({ "type": "tool", "name": "Bash" }),
-    ] {
-        let mut manual = serde_json::json!({ "model": "claude-haiku-4-5",
-            "thinking": { "type": "enabled", "budget_tokens": 2000 },
-            "tool_choice": choice, "tools": tools, "messages": [] });
-        assert!(super::strip_extra_fields(&mut manual, true));
-        assert!(manual.get("thinking").is_none(), "{manual}");
-    }
-}
-
 /// `tool_choice: any` 同样不补 thinking：haiku 补出来的是手动预算那种，上游实测 400
 /// `Thinking may not be enabled when tool_choice forces tool use.`
 #[test]
@@ -6358,29 +5781,6 @@ fn haiku_budget_at_the_floor_matches_the_live_result() {
     .unwrap();
     assert_eq!(v["thinking"]["budget_tokens"], 1024, "{v}");
     assert_eq!(v["max_tokens"], 1024);
-}
-
-/// 带 `tool_addition` / `tool_removal` 的 system 整条留在原位：顶层 `system` 只收文本块。文本与
-/// 工具变更混在一条里的也一样。
-#[test]
-fn hoisting_leaves_tool_change_messages_in_place() {
-    let removal = serde_json::json!({ "role": "system", "content": [
-        { "type": "tool_removal", "name": "lookup" },
-    ] });
-    let mixed = serde_json::json!({ "role": "system", "content": [
-        { "type": "text", "text": "工具有变化" },
-        { "type": "tool_addition", "tool": { "name": "lookup", "input_schema": { "type": "object" } } },
-    ] });
-    let mut v = serde_json::json!({ "messages": [
-        { "role": "user", "content": "hi" },
-        removal,
-        { "role": "assistant", "content": "ok" },
-        { "role": "user", "content": "go on" },
-        mixed,
-    ] });
-    let before = v.clone();
-    assert!(!super::hoist_system_role_messages(&mut v), "没有能提升的");
-    assert_eq!(v, before);
 }
 
 /// 工具声明换了假名，按名字指它的协议位置也得跟着换：`tool_addition` / `tool_removal` 的

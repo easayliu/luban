@@ -285,7 +285,8 @@ async fn client_error(
     compressed: bool,
 ) -> Response {
     let Ctx { state, request_id, .. } = *cx;
-    let Inbound { ref body, ref body_json, ref req_model, ref device_fp, flags, .. } = *inb;
+    let Inbound { ref body, ref body_json, ref req_model, ref device_fp, flags, billable, .. } =
+        *inb;
     let Pick { ref cred, .. } = *pick;
     let tool_names = &prepared.tool_names;
     let upgrade_stream = prepared.upgrade_stream;
@@ -319,19 +320,14 @@ async fn client_error(
         // 各自的开关关着就不学：关掉的意思是不处理，学了只会在开关打开那一刻冒出来。
         let mut learned = Vec::new();
         if flags.reject_learned_shapes {
+            // 按出站体判的那几条探针要看实际发出去的那份（非计费路径不学它们）。
+            let outbound =
+                billable.then(|| serde_json::from_slice::<serde_json::Value>(sent).ok()).flatten();
             learned.extend(remember_shape_rejection(
                 &state.shape_rejections,
                 req_model.as_deref(),
                 body_json.as_ref(),
-                &err_bytes,
-            ));
-        }
-        // `sampling_policy=off` 是「不处理」：上游的 deprecated 400 原样回给客户端，不学。
-        if state.store.sampling_policy() != store::PrefillPolicy::Off {
-            learned.extend(remember_deprecated_field(
-                &state.deprecated_fields,
-                req_model.as_deref(),
-                body_json.as_ref(),
+                outbound.as_ref(),
                 &err_bytes,
             ));
         }
@@ -347,25 +343,6 @@ async fn client_error(
             inbound_bytes = body.len(),
             inbound_body = %String::from_utf8_lossy(body),
             "third-party rejection: dumping the INBOUND (client-original) request body for local replay"
-        );
-    }
-    // 「each thinking block must contain thinking」：出站前已经剥过空 thinking 块，
-    // 还被拒就说明剥除条件与上游的真实判据有出入。把客户端原始请求体整体打出来
-    // （与上面第三方拒绝那条同一取舍：可复现优先），再附一份出站体的结构摘要——
-    // 摘要里 thinking 块带 len/sig_len，一眼能看出被拒的块有没有签名。
-    if !compressed && status == StatusCode::BAD_REQUEST && is_empty_thinking_error(&err_bytes) {
-        let (_, message) = parse_upstream_error(&err_bytes);
-        let outbound = match serde_json::from_slice::<serde_json::Value>(sent) {
-            Ok(v) => request_digest(&v).to_string(),
-            Err(_) => format!("<unparsable {} bytes>", sent.len()),
-        };
-        tracing::warn!(
-            cred_id = cred.id, cred = %cred.label,
-            upstream_message = %message,
-            outbound_digest = %outbound,
-            inbound_bytes = body.len(),
-            inbound_body = %String::from_utf8_lossy(body),
-            "upstream rejected an empty thinking block; dumping the INBOUND (client-original) request body for local replay"
         );
     }
     // 历史思考块验不过的那三条 400（签名 / 被改过 / `redacted_thinking` 的密文）：
@@ -475,38 +452,8 @@ async fn client_error(
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
     }
-    // thinking 块被修改降级重试（JSON 序列化改变了编码）。
-    if status == StatusCode::BAD_REQUEST && !compressed && is_thinking_modified_error(&err_bytes) {
-        if !flags.thinking_modified_retry {
-            tracing::warn!(
-                cred_id = cred.id, cred = %cred.label,
-                "upstream rejected modified thinking blocks; demote-and-retry is off, passing through as is"
-            );
-        } else if !latest_assistant_has_thinking(sent) {
-            // 这条 400 点名的是最后一条 assistant 消息，而降级重试的全部动作就是
-            // 处理思考块。那一轮里一个都没有时，重发的还是同一条被拒的形态——
-            // 这一发上游往返注定白费，且它每轮复发（历史里那个缺口不会自己长回来）。
-            //
-            // 判的是 `sent` 不是 `body`：哪几条消息挨在一起（上游据此并轮）是改写
-            // 之后才定下来的，摘掉一条 `role:"system"` 就能让两条 assistant 变成
-            // 相邻。见 [`latest_assistant_has_thinking`]。
-            tracing::warn!(
-                cred_id = cred.id, cred = %cred.label,
-                "upstream rejected modified thinking blocks, but the latest assistant message has no thinking block to demote (its blocks were most likely dropped by the client before it got here); skipping the retry that could not change that turn, passing through as is"
-            );
-        } else if let Some(up) = retry_demoted_thinking(
-            upstream,
-            cred,
-            device_fp,
-            body,
-            &mut rl,
-            "modified thinking blocks",
-        )
-        .await
-        {
-            return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
-        }
-    }
+    // 「thinking 块被修改」那条 400 不兜：那是客户端自己改了上一轮的 thinking，上游的 400
+    // 原样回给它（上面那行取证日志照打）。
     // `redacted_thinking` 密文验不过：与签名那条同一类事、同一个兜底。
     if status == StatusCode::BAD_REQUEST
         && !compressed
@@ -529,16 +476,6 @@ async fn client_error(
         {
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
-    }
-    // assistant prefill 不支持时，剥掉末尾 assistant 轮后重试一次。
-    // `prefill_policy=off` 是「不处理」：上游的 400 原样回给客户端，不重试。
-    if status == StatusCode::BAD_REQUEST
-        && !compressed
-        && state.store.prefill_policy() != store::PrefillPolicy::Off
-        && is_prefill_not_supported_error(&err_bytes)
-        && let Some(up) = retry_without_prefill(upstream, cred, device_fp, body, &mut rl).await
-    {
-        return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
     }
     // luban 补的 `fallbacks` 被上游拒了（目标不在 allowed_fallback_models 之类）：
     // 记下来以后不补，这一发剥掉重试一次。客户端自己带的 fallbacks 不在此列——

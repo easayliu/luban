@@ -1,13 +1,11 @@
 use crate::proxy::Bytes;
-use crate::proxy::digest::block_label;
 use crate::proxy::test_support::{all_on, rewrite_body, test_cred};
 
-/// 删掉空壳 system 消息之后，thinking 块的原始字节仍要落回**它自己**那一块。
+/// 改写之后，thinking 块的原始字节仍要落回**它自己**那一块。
 ///
-/// [`preserve_thinking_encoding`] 原先按 `(消息下标, 块下标)` 配对；一旦有整条消息被删
-/// （空壳 system、role:"system" 提升）或消息内的块被剥（空 text / 无签名空 thinking），
-/// 下标就会前移，A 块的原始字节会被盖到 B 块上——历史与签名一起错乱，上游按签名校验必拒。
-/// 现在带 `signature` / `data` 的按那个值配，与下标无关。
+/// [`preserve_thinking_encoding`] 原先按 `(消息下标, 块下标)` 配对；下标一旦移动，A 块的原始
+/// 字节会被盖到 B 块上——历史与签名一起错乱，上游按签名校验必拒。现在带 `signature` / `data`
+/// 的按那个值配，与下标无关。空壳 system 原样出站（luban 不替客户端删）。
 #[test]
 fn thinking_bytes_follow_their_own_block_when_messages_are_dropped() {
     // 两条空壳 system 夹在两轮之间；两轮 thinking 的正文都带 \u003c 转义（serde 重新
@@ -19,7 +17,7 @@ fn thinking_bytes_follow_their_own_block_when_messages_are_dropped() {
     ));
     let out = rewrite_body(&body, &test_cred(), "fp", all_on(), None, None);
     let s = String::from_utf8(out.to_vec()).unwrap();
-    assert!(!s.contains(r#""role":"system""#), "空壳该被丢掉: {s}");
+    assert_eq!(s.matches(r#""role":"system""#).count(), 2, "空壳原样出站: {s}");
     assert!(s.contains(A), "A 轮的原始字节该原样落回 A 块: {s}");
     assert!(s.contains(B), "B 轮的原始字节该原样落回 B 块: {s}");
     assert_eq!(s.matches("sigA==").count(), 1, "A 的签名不该被复制到第二轮: {s}");
@@ -56,7 +54,6 @@ fn detects_only_the_redacted_thinking_data_400() {
     // 三条老判据都不该认领它，否则日志与重试原因会张冠李戴。
     assert!(!crate::proxy::is_thinking_signature_error(hit));
     assert!(!crate::proxy::is_thinking_modified_error(hit));
-    assert!(!crate::proxy::is_empty_thinking_error(hit));
 
     for miss in [
             // 签名那条：有 thinking 没 redacted_thinking。
@@ -457,91 +454,6 @@ fn latest_assistant_diff_ignores_reformatting_around_the_blocks() {
     assert_eq!(d.thinking_bytes_same, Some(true), "块本身逐字相同，排版不算改");
 }
 
-/// 最后一条 assistant 消息里有没有可降级的思考块——「被改过」那条 400 要不要花一次
-/// 上游往返去重试，全看这个。
-#[test]
-fn latest_assistant_has_thinking_gates_the_pointless_retry() {
-    // 现网形态：末轮只有一个 tool_use，思考块被客户端丢了。降级改不到它，重试白跑。
-    let no_thinking = br#"{"messages":[
-            {"role":"user","content":[{"type":"text","text":"hi"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(!crate::proxy::latest_assistant_has_thinking(no_thinking));
-
-    // 末轮带思考块：降级动得到它，该重试。
-    let with_thinking = br#"{"messages":[
-            {"role":"assistant","content":[
-                {"type":"thinking","thinking":"t","signature":"SIG"},
-                {"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(crate::proxy::latest_assistant_has_thinking(with_thinking));
-
-    // redacted_thinking 同样算：降级对它是整块删。
-    let redacted = br#"{"messages":[{"role":"assistant","content":[
-            {"type":"redacted_thinking","data":"ZZZZ"}]}]}"#;
-    assert!(crate::proxy::latest_assistant_has_thinking(redacted));
-
-    // 隔着一条 user 的更早那轮不算：上游不会把它并进来，降级救不了被点名的那一轮。
-    let only_earlier = br#"{"messages":[
-            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
-            {"role":"user","content":[{"type":"text","text":"go on"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(!crate::proxy::latest_assistant_has_thinking(only_earlier));
-
-    // 连续两条 assistant：上游并成一轮，思考块在前一条上，降级动得到它 —— 该重试。
-    // 只看数组里最后那一条会判成「没有」，把一条本可救回的会话判死。
-    let merged_run = br#"{"messages":[
-            {"role":"user","content":[{"type":"text","text":"hi"}]},
-            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(
-        crate::proxy::latest_assistant_has_thinking(merged_run),
-        "相邻同角色会被上游并成一轮，思考块在串里就算有"
-    );
-
-    // 夹着一条 `role:"system"` 的两条 assistant：**按这份体**它们不相邻，串就只有最后
-    // 那一条，判「没有」是对的。但 rewrite_body 可能把这条 system 整条摘走（修补模式的
-    // hoist_system_role_messages / drop_empty_system_messages），出站时两条 assistant
-    // 挨在一起、被上游并成一轮，那一轮是带思考块的——所以调用处必须传出站体。
-    // 下面两条断言钉的就是这个差别：同一段历史，改写前后结论相反。
-    let separated = br#"{"messages":[
-            {"role":"user","content":[{"type":"text","text":"hi"}]},
-            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
-            {"role":"system","content":[{"type":"text","text":"deferred tools"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(
-        !crate::proxy::latest_assistant_has_thinking(separated),
-        "这份体里那条 system 还夹在中间，串确实只有最后一条"
-    );
-    let hoisted = br#"{"system":[{"type":"text","text":"deferred tools"}],"messages":[
-            {"role":"user","content":[{"type":"text","text":"hi"}]},
-            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(
-        crate::proxy::latest_assistant_has_thinking(hoisted),
-        "system 被提升走之后两条 assistant 相邻，这一轮带着思考块，该重试"
-    );
-
-    // 三条连着、思考块在最前面那条：整串都要看，不是只看倒数第二条。
-    let long_run = br#"{"messages":[
-            {"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"SIG"}]},
-            {"role":"assistant","content":[{"type":"text","text":"a"}]},
-            {"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{}}]}]}"#;
-    assert!(crate::proxy::latest_assistant_has_thinking(long_run));
-
-    // 取不到就当没有：宁可少跑一次重试，也不拿一次上游往返去赌。
-    for none in [
-        &br#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#[..],
-        &br#"{"messages":[{"role":"assistant","content":"plain string"}]}"#[..],
-        &br#"{"model":"x"}"#[..],
-        &b"not json"[..],
-    ] {
-        assert!(
-            !crate::proxy::latest_assistant_has_thinking(none),
-            "不该算有: {}",
-            String::from_utf8_lossy(none)
-        );
-    }
-}
-
 /// 轮摘要封顶：块标签不含正文，但一轮几十块拼起来照样刷屏。
 #[test]
 fn latest_assistant_diff_caps_a_long_turn_label() {
@@ -736,73 +648,3 @@ fn preserve_thinking_handles_redacted() {
 }
 
 // ---------- 空 thinking 块剥除 ----------
-
-#[test]
-fn strips_empty_thinking_blocks_and_keeps_all_empty_message() {
-    let mut v = serde_json::json!({
-        "model": "claude-fable-5-1",
-        "messages": [
-            {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "", "signature": "abc"},
-                {"type": "text", "text": "hello"}
-            ]},
-            {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": ""}
-            ]},
-            {"role": "user", "content": [
-                {"type": "thinking", "thinking": ""}
-            ]}
-        ]
-    });
-    assert!(!crate::proxy::strip_empty_thinking_blocks(&mut v), "带签名的空块合法，整体无改动");
-    let first = v["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(first.len(), 2, "带签名的空 thinking 块原样放行（cap/2.1.260 官方回传形态）");
-    assert_eq!(v["messages"][1]["content"].as_array().unwrap().len(), 1, "全空的消息原样保留");
-    assert_eq!(v["messages"][2]["content"].as_array().unwrap().len(), 1, "非 assistant 不动");
-}
-
-#[test]
-fn strips_only_unsigned_empty_thinking_blocks() {
-    let mut v = serde_json::json!({
-        "model": "claude-opus-5",
-        "messages": [
-            {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": ""},
-                {"type": "thinking", "thinking": "", "signature": ""},
-                {"type": "thinking", "thinking": "", "signature": "signed"},
-                {"type": "thinking", "thinking": "real", "signature": ""},
-                {"type": "text", "text": "hello"}
-            ]}
-        ]
-    });
-    assert!(crate::proxy::strip_empty_thinking_blocks(&mut v));
-    let kept: Vec<String> =
-        v["messages"][0]["content"].as_array().unwrap().iter().map(block_label).collect();
-    assert_eq!(
-        kept,
-        ["thinking(len=0,sig_len=6)", "thinking(len=4,sig_len=0)", "text(len=5)"],
-        "无签名空块剥掉（含 signature 为空串的），带签名或有内容的留下"
-    );
-}
-
-#[test]
-fn empty_thinking_shape_reports_keys_signature_and_kind() {
-    let signed = serde_json::json!({"type": "thinking", "thinking": "", "signature": "abcd"});
-    assert_eq!(
-        crate::proxy::empty_thinking_shape(&signed),
-        "keys=[type,thinking,signature] sig_len=4 thinking=empty"
-    );
-    let bare = serde_json::json!({"type": "thinking"});
-    assert_eq!(
-        crate::proxy::empty_thinking_shape(&bare),
-        "keys=[type] sig_len=none thinking=missing"
-    );
-}
-
-#[test]
-fn detects_empty_thinking_error() {
-    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.0: each thinking block must contain thinking"}}"#;
-    assert!(crate::proxy::is_empty_thinking_error(body));
-    let other = br#"{"type":"error","error":{"type":"invalid_request_error","message":"Invalid signature in thinking block"}}"#;
-    assert!(!crate::proxy::is_empty_thinking_error(other));
-}

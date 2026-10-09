@@ -24,20 +24,19 @@ use super::ban::{
 use super::body::{
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
     client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
-    extract_session_id, hoists_system_role, is_billable_messages, is_fallback_rejection,
-    known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
+    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
+    misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
     remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
     stream_requested, trusted_cc_version, ua_of,
 };
 use super::connectivity::{session_start, spawn_session_handshake};
-use super::digest::{redact_headers, request_digest};
+use super::digest::redact_headers;
 use super::headers::{BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta};
 use super::learned_rules::{
     MODEL_DENIAL_MAX_SWAPS, RejectionLog, TRANSIENT_MAX_ATTEMPTS, app_system_digest,
-    empty_reply_class, has_deprecated_sampling_field, has_learned_deprecated_field, is_max_plan,
-    known_app_refusal, known_empty_reply, known_refused_prompt, known_shape_rejection,
-    maybe_strip_deprecated, model_rejects_sampling, next_transient_backoff, prompt_digest,
-    remember_deprecated_field, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
+    empty_reply_class, has_outbound_shape_rules, is_max_plan, known_app_refusal, known_empty_reply,
+    known_refused_prompt, known_shape_rejection, next_transient_backoff, prompt_digest,
+    remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 use super::logging::{
     ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
@@ -56,17 +55,14 @@ use super::session_id::{
 use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{SimSessionSeed, Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
-    block_site, error_block_path, is_empty_thinking_error, is_redacted_thinking_data_error,
-    is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
-    latest_assistant_has_thinking, retry_demoted_thinking, retry_without_prefill,
-    thinking_block_error_kind, trace_thinking_block,
+    block_site, error_block_path, is_redacted_thinking_data_error, is_thinking_signature_error,
+    latest_assistant_diff, retry_demoted_thinking, thinking_block_error_kind, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
-    has_trailing_assistant, is_prefill_not_supported_error, model_rejects_prefill,
     note_upstream_send, rebuild_response, relay_upstream, resp_builder, resp_shape,
-    retry_thread_as_create, retry_without_fallbacks, strip_assistant_prefill,
-    try_acquire_session_concurrency, upstream_error_kind, upstream_load_snapshot,
+    retry_thread_as_create, retry_without_fallbacks, try_acquire_session_concurrency,
+    upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
     EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_REPLY,

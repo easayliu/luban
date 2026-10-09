@@ -298,6 +298,24 @@ pub(super) async fn prepare<'a>(
     // 出站体 + 它的取证摘要一并拿：摘要借改写刚建好的那份 `Value` 算，
     // 不再为它把同一份 JSON 第二次解析一遍，见 [`Upstream::shape_outbound`]。
     let (sent, sent_bits) = upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+    // 按**出站体**判的那几条学到的规则（废弃的采样参数、prefill，见 [`ShapeProbe::on_outbound`]）：
+    // 改写之后、发送之前才查。入口那道只查来访原件判得准的那几条——模拟路径注入 thinking 时会
+    // 剥掉冲突的 `temperature` / `top_p`，拿来访原件去拦会拦下一条出站本来不会触犯规则的请求。
+    // 只在这个模型确有这类规则时才再解析一遍出站体。
+    if billable
+        && flags.reject_learned_shapes
+        && has_outbound_shape_rules(&state.shape_rejections, req_model.as_deref())
+        && let Ok(out) = serde_json::from_slice::<serde_json::Value>(&sent)
+        && let Some((field, value, message)) =
+            known_shape_rejection(&state.shape_rejections, req_model.as_deref(), Some(&out), true)
+    {
+        tracing::warn!(
+            method = %method, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), %field, %value,
+            "rejected locally: upstream has already rejected this outbound request shape"
+        );
+        return Err(error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message));
+    }
     // `extended-cache-ttl` 跟着**出站体**走（[`ensure_cache_ttl_beta`]）：头建在改写之前，
     // 那时只看得到来访体；整形补出来的 1h 断点要在这里补上它的 beta。模拟路径的串由
     // profile 整条给出，不在此列。

@@ -6,7 +6,7 @@ use super::ban::parse_upstream_error;
 use super::digest::{block_label, turn_label};
 use super::logging::{ReqLog, UsageSniffer};
 use super::rate_limit::RateLimitInfo;
-use super::upstream::{Upstream, error_chain, resp_shape, strip_assistant_prefill};
+use super::upstream::{Upstream, error_chain, resp_shape};
 
 /// 上游验不过历史思考块（签名、被改过的编码、`redacted_thinking` 的密文）之后的兜底：把历史
 /// thinking 降级成 text、`redacted_thinking` 整块删掉，用**同一个凭证**重发一次。
@@ -107,17 +107,6 @@ pub(super) fn is_thinking_modified_error(body: &[u8]) -> bool {
     hay.contains("cannot be modified") && hay.contains("thinking")
 }
 
-/// 上游那条 400 是不是「thinking 块没有 thinking 内容」，形如
-/// `messages.N.content.M: each thinking block must contain thinking`。
-///
-/// [`strip_empty_thinking_blocks`] 本该在出站前把这种块剥干净；还能撞上，说明要么剥除
-/// 条件没覆盖到（比如整条 content 只有空块而被刻意保留），要么触发条件根本不是「空」
-/// 而是别的（签名缺失？）。所以命中时把**客户端原始请求体**整体打出来供复现，见调用处。
-pub(super) fn is_empty_thinking_error(body: &[u8]) -> bool {
-    let (_, message) = parse_upstream_error(body);
-    message.to_lowercase().contains("must contain thinking")
-}
-
 /// 上游那条 400 是不是「`redacted_thinking` 块的密文验不过」，形如
 /// `messages.5.content.48: Invalid \`data\` in \`redacted_thinking\` block`。
 ///
@@ -154,69 +143,6 @@ pub(super) fn thinking_block_error_kind(body: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// 上游拒绝 prefill 时，剥掉末尾 assistant 轮后用同一个凭证重试一次。
-///
-/// 模式与 [`retry_demoted_thinking`] 一致：对原始客户端 body 改写后走 `upstream.shape()` →
-/// `upstream.send()`，成功则替换请求日志里的状态/用量/限流信息并返回上游响应；
-/// 失败或重试仍被拒则返回 `None`，调用侧透传最初那条 400。
-pub(super) async fn retry_without_prefill(
-    upstream: &Upstream<'_>,
-    cred: &crate::credentials::Credential,
-    device_fp: &str,
-    client_body: &Bytes,
-    rl: &mut ReqLog,
-) -> Option<wreq::Response> {
-    let Some(stripped) = strip_assistant_prefill(client_body) else {
-        tracing::warn!(
-            cred_id = cred.id,
-            cred = %cred.label,
-            "upstream says prefill not supported, but no trailing assistant message found; passing through as is"
-        );
-        return None;
-    };
-    tracing::warn!(
-        cred_id = cred.id,
-        cred = %cred.label,
-        "upstream says this model does not support assistant message prefill: stripped trailing assistant message(s), retrying once"
-    );
-
-    // 同 [`retry_demoted_thinking`]：留下实际发出去的那份。
-    let retried = upstream.shape(&stripped, cred, device_fp);
-    let up = match upstream.send(retried.clone()).await {
-        Ok(up) => up,
-        Err(e) => {
-            tracing::warn!(
-                error = %error_chain(&e),
-                "the retry after stripping prefill could not be sent, passing the original 400 through"
-            );
-            return None;
-        }
-    };
-    let status = up.status();
-    if !status.is_success() {
-        tracing::warn!(
-            cred_id = cred.id,
-            cred = %cred.label,
-            status = status.as_u16(),
-            "the retry after stripping prefill was rejected too, passing the original 400 through"
-        );
-        return None;
-    }
-
-    let (is_stream, encoding) = resp_shape(&up);
-    rl.status = status.as_u16();
-    rl.ttft_ms = None;
-    rl.sniffer = UsageSniffer::new(is_stream, encoding.is_some());
-    rl.ratelimit = RateLimitInfo::from_headers(up.headers());
-    rl.note_retry(
-        "no_prefill",
-        up.headers(),
-        &retried,
-        upstream.sim.as_ref().and_then(|s| s.take_thread()),
-    );
-    Some(up)
 }
 
 /// 把 assistant 轮里的 `thinking` 块降级成 `text` 块：推理原文原样搬进 text（外面裹一层
@@ -313,9 +239,7 @@ pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
         let Ok(s) = std::str::from_utf8(&rewritten) else { return rewritten };
         thinking_block_byte_ranges(s)
     };
-    // 改写过程中整条消息可能被删掉（[`drop_empty_system_messages`]、
-    // [`hoist_system_role_messages`]），消息里的块也可能被剥掉（[`strip_empty_text_blocks`]、
-    // [`strip_empty_thinking_blocks`]）——下标一移，按 `(msg, blk)` 配对就会把 A 块的原始字节
+    // 改写过程中下标可能移动（模拟路径会在历史里插消息，见下）——下标一移，按 `(msg, blk)` 配对就会把 A 块的原始字节
     // 盖到 B 块上，历史与签名一起错乱。所以带 `signature` / `data` 的按那个值配（base64，
     // 改写前后逐字相同），只有两侧的 `(msg, blk)` 完全对齐时才退回按位置配。
     //
@@ -632,47 +556,6 @@ pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAs
     }
 }
 
-/// 末尾那串 assistant 消息里有没有 `thinking` / `redacted_thinking` 块。
-///
-/// [`is_thinking_modified_error`] 那条 400 点名的是**最后一条 assistant 消息**（按上游的合并
-/// 口径即末尾那一串，见 [`latest_assistant_run`]），而 [`retry_demoted_thinking`] 的全部动作
-/// 就是把思考块降级成 text、把 `redacted_thinking` 删掉。那一串里一个思考块都没有时，降级
-/// 改不到它一个字节，重发出去的还是同一条被拒的形态——这一发上游往返是**注定白费的**，
-/// 且它每轮复发（历史里那个缺口不会自己长回来）。
-///
-/// 现网形态：`assistant:tool_use(Edit)` 单块一串——上游当初连着 `tool_use` 一起签发的那个
-/// thinking 块被客户端或它上游的中转丢掉了，于是每一轮都先撞一次 400、再白跑一次重试。
-///
-/// **按串不按条**：`assistant(thinking) → assistant(tool_use)` 在上游眼里是一轮，思考块在
-/// 前一条上，降级动得到它，这种要照常重试。存疑一律算「有」——多跑一次重试只是回到改这道
-/// 闸之前，而少跑一次就是把一条本可救回的会话判死。
-///
-/// **必须传出站体**（`sent`），不能传客户端原件。哪几条消息挨在一起是 [`rewrite_body`] 之后
-/// 才定下来的：[`hoist_system_role_messages`]（修补模式，见 [`hoists_system_role`]）与
-/// [`drop_empty_system_messages`] 会把 `messages` 里的 `role:"system"` 整条摘走，于是
-/// `assistant(thinking) → system → assistant(tool_use)` 出站时变成两条挨着的 assistant、
-/// 被上游并成一轮。拿原件判，那条 system 还夹在中间，串就只剩最后一条、看着没有思考块，
-/// 于是跳过一次**本该跑**的重试。出站体是上游真正看到并拒掉的那一份，不必去复刻改写规则。
-///
-/// 降级本身仍作用在客户端原件上（[`retry_demoted_thinking`] 拿 `client_body` 重走一遍
-/// `shape`），这不矛盾：它对**每一条** assistant 消息一视同仁地降级，出站串里那些块无论
-/// 原先隔着什么，源头都在原件里，降级都动得到。
-pub(super) fn latest_assistant_has_thinking(outbound: &[u8]) -> bool {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(outbound) else { return false };
-    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
-    let Some(run) = latest_assistant_run(msgs) else { return false };
-    msgs[run].iter().any(|m| {
-        m.get("content").and_then(|c| c.as_array()).is_some_and(|bs| {
-            bs.iter().any(|b| {
-                matches!(
-                    b.get("type").and_then(|t| t.as_str()),
-                    Some("thinking") | Some("redacted_thinking")
-                )
-            })
-        })
-    })
-}
-
 /// 一串消息里全部思考块的**原始字节**，按出现顺序。
 ///
 /// 取原文切片而不是解析后的值：上游对 `signature` / `data` 是按字节校验的，而
@@ -709,8 +592,7 @@ enum InboundMatch<'a> {
 /// 不唯一时还留一条能答的路，但**坐标本身不算数**：`coord_turn_identical` 说的是「入站与出站
 /// 在同一条消息下标上那一轮逐字节相同」，相同才认这个坐标。
 ///
-/// 只比坐标不够。前面丢过消息时（[`drop_empty_system_messages`]、[`hoist_system_role_messages`]）
-/// 整串下标会前移，出站 `(mi, bi)` 上那个块可能来自入站的另一条消息，而入站同一坐标上恰好是
+/// 只比坐标不够。前面插过或丢过消息时整串下标会移动，出站 `(mi, bi)` 上那个块可能来自入站的另一条消息，而入站同一坐标上恰好是
 /// 另一处同款载荷——载荷对得上、坐标也对得上，配出来却是两条不同的轮次，`turn_identical` 于是
 /// 又成了那个凭空的 `false`。轮次逐字节相同则不然：那一轮一致，它的第 `bi` 块自然是同一个块，
 /// 报出来的三项都成立（贴了两遍但 luban 没挪动过任何东西，是重复里最常见的一种，这条能答就答）。
@@ -836,96 +718,6 @@ pub(super) fn trace_thinking_block(
         inbound_turn: in_turn.as_ref().map(turn_label).unwrap_or_else(|| "-".into()),
         outbound_turn: out_turn.as_ref().map(turn_label).unwrap_or_else(|| "-".into()),
     })
-}
-
-/// 剥除 `messages` 历史里 `thinking` 为空**且没有 `signature`** 的 `thinking` 块。
-///
-/// 上游对没有内容的 thinking 块回 400（`each thinking block must contain thinking`）。
-/// 但**带签名的空块是合法的**：上游不带 `display` 时本来就只回空文本 + 签名（`cap/2.1.258`
-/// 00025/00031、`cap/2.1.258-api` 00023/00025），官方 CC 下一轮原样回传，上游 200
-/// （`cap/2.1.260` 00021/00025/00028/00029/00031，签名 776～2592 字节）。实跑日志里一条
-/// 669 消息的 opus 请求被剥掉 33 块，**全部带签名**——那些都是不该动的。
-///
-/// 所以剥除只针对无签名的空块：那是第三方客户端自己拼出来的历史，上游必拒。带签名的
-/// 原样放行，与 CC 直连形态一致，也不触发上游对 thinking 块的「不可修改」校验。
-///
-/// 与 [`strip_empty_text_blocks`] 对称：只剥目标块，留下其余内容块；若整个 `content`
-/// 只有这种块则保留原样（空 `content` 数组是另一种 400）。
-pub(super) fn strip_empty_thinking_blocks(v: &mut serde_json::Value) -> bool {
-    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return false;
-    };
-    let total = msgs.len();
-    let mut changed = false;
-    // 每个被剥块的形态：`msg=<第几条>/<总数> keys=[..] sig_len=none thinking=<missing|empty>`。
-    // 按现在的判据 sig_len 恒为 none；保留字段是为了万一判据再变时日志形态不用改。
-    let mut stripped: Vec<String> = Vec::new();
-    let mut kept_all_empty: Vec<String> = Vec::new();
-    for (mi, msg) in msgs.iter_mut().enumerate() {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-            continue;
-        }
-        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
-            continue;
-        };
-        let is_empty_thinking = |blk: &serde_json::Value| {
-            blk.get("type").and_then(|t| t.as_str()) == Some("thinking")
-                && blk.get("thinking").and_then(|t| t.as_str()).is_none_or(|t| t.is_empty())
-                && blk.get("signature").and_then(|s| s.as_str()).is_none_or(|s| s.is_empty())
-        };
-        let non_empty_count = content.iter().filter(|blk| !is_empty_thinking(blk)).count();
-        if non_empty_count == content.len() {
-            continue;
-        }
-        let shapes = content
-            .iter()
-            .filter(|blk| is_empty_thinking(blk))
-            .map(|blk| format!("msg={}/{} {}", mi, total, empty_thinking_shape(blk)));
-        if non_empty_count == 0 {
-            kept_all_empty.extend(shapes);
-            continue;
-        }
-        stripped.extend(shapes);
-        content.retain(|blk| !is_empty_thinking(blk));
-        changed = true;
-    }
-    if changed {
-        tracing::info!(
-            model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
-            count = stripped.len(),
-            blocks = %stripped.join("; "),
-            "stripped unsigned empty thinking blocks from messages"
-        );
-    }
-    if !kept_all_empty.is_empty() {
-        tracing::warn!(
-            model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
-            count = kept_all_empty.len(),
-            blocks = %kept_all_empty.join("; "),
-            "kept unsigned empty thinking blocks: stripping would leave the message with empty content"
-        );
-    }
-    changed
-}
-
-/// 一个空 thinking 块的形态摘要，供 [`strip_empty_thinking_blocks`] 与
-/// [`block_label`] 打日志用：有哪些 key、签名多长、`thinking` 是缺失还是空串。
-/// 不打签名本身（几 KB 的 base64，没有信息量），也不打任何正文。
-pub(super) fn empty_thinking_shape(blk: &serde_json::Value) -> String {
-    let keys: Vec<&str> =
-        blk.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
-    let sig_len = blk
-        .get("signature")
-        .and_then(|s| s.as_str())
-        .map(|s| s.len().to_string())
-        .unwrap_or_else(|| "none".into());
-    let thinking = match blk.get("thinking") {
-        None => "missing",
-        Some(serde_json::Value::String(s)) if s.is_empty() => "empty",
-        Some(serde_json::Value::String(_)) => "non-empty",
-        Some(_) => "non-string",
-    };
-    format!("keys=[{}] sig_len={sig_len} thinking={thinking}", keys.join(","))
 }
 
 #[cfg(test)]

@@ -381,61 +381,6 @@ pub(super) async fn set_latest_cc_release(
     Ok(Json(settings_resp(&state)))
 }
 
-/// prefill / sampling 两项策略共用的写法：`strip`（含空串）是默认值，删键即回到默认；
-/// `reject` / `off` 照存；其余回 400。`field` 是请求里的字段名，报错与日志都用它。
-fn save_strip_policy(state: &AppState, key: &str, field: &str, raw: &str) -> Result<(), ApiError> {
-    let value = raw.trim().to_ascii_lowercase();
-    // 日志沿用原来的口径：`prefill policy` 而非字段名 `prefill_policy`。
-    let label = field.replace('_', " ");
-    match value.as_str() {
-        "" | "strip" => {
-            state.store.delete_setting(key).map_err(internal)?;
-            tracing::info!("{label} reset to default (strip)");
-        }
-        "reject" | "off" => {
-            state.store.set_setting(key, &value).map_err(internal)?;
-            tracing::info!(policy = %value, "{label} changed");
-        }
-        _ => {
-            return Err(bad_request(format!(r#"{field} must be "strip", "reject", or "off""#)));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-pub(super) struct SetPrefillPolicyReq {
-    /// `"strip"` / `"reject"` / `"off"`；空串或缺省回到默认的 `"strip"`。
-    prefill_policy: String,
-}
-
-pub(super) async fn set_prefill_policy(
-    State(state): State<AppState>,
-    Json(req): Json<SetPrefillPolicyReq>,
-) -> Result<Json<SettingsResp>, ApiError> {
-    save_strip_policy(&state, crate::store::PREFILL_POLICY, "prefill_policy", &req.prefill_policy)?;
-    Ok(Json(settings_resp(&state)))
-}
-
-#[derive(Deserialize)]
-pub(super) struct SetSamplingPolicyReq {
-    /// `"strip"` / `"reject"` / `"off"`；空串或缺省回到默认的 `"strip"`。
-    sampling_policy: String,
-}
-
-pub(super) async fn set_sampling_policy(
-    State(state): State<AppState>,
-    Json(req): Json<SetSamplingPolicyReq>,
-) -> Result<Json<SettingsResp>, ApiError> {
-    save_strip_policy(
-        &state,
-        crate::store::SAMPLING_POLICY,
-        "sampling_policy",
-        &req.sampling_policy,
-    )?;
-    Ok(Json(settings_resp(&state)))
-}
-
 #[derive(Deserialize)]
 pub(super) struct SetOAuthScopesReq {
     /// 登录时申请的 scope（空格分隔）；空串表示回到默认的 [`crate::config::SCOPES`]。
@@ -482,7 +427,6 @@ pub(super) struct SetForwardingReq {
     system_shape: Option<bool>,
     orig_header_case: Option<bool>,
     thinking_signature_retry: Option<bool>,
-    thinking_modified_retry: Option<bool>,
     redacted_thinking_retry: Option<bool>,
     simulate_cc: Option<bool>,
     simulate_full_system: Option<bool>,
@@ -499,9 +443,6 @@ pub(super) struct SetForwardingReq {
     strip_extra_fields: Option<bool>,
     tool_name_mimic: Option<bool>,
     inject_thinking: Option<bool>,
-    flatten_tool_schemas: Option<bool>,
-    strip_empty_text: Option<bool>,
-    hoist_system_role: Option<bool>,
     reject_openai_shape: Option<bool>,
     reject_session_conflict: Option<bool>,
     reject_probes: Option<bool>,
@@ -525,15 +466,13 @@ pub(super) async fn set_forwarding(
     use crate::store::{
         API_TELEMETRY, CCH_REAL_RECOMPUTE, CCH_SIM_COMPUTE, EAGER_TOOL_STREAMING,
         FABLE_REFUSAL_FALLBACK, FILL_ABSENT_TOOLS, FILL_CLIENT_HEADERS, FILL_METADATA,
-        FLATTEN_TOOL_SCHEMAS, HOIST_SYSTEM_ROLE, INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA,
-        NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP, OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE,
-        RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY, REJECT_EMPTY_REPLIES, REJECT_LEARNED_SHAPES,
-        REJECT_OPENAI_SHAPE, REJECT_PROBES, REJECT_PROBES_STRICT, REJECT_REFUSALS,
-        REJECT_SESSION_CONFLICT, SIM_BILLING_ONLY, SIM_MESSAGE_THREADS, SIM_TRIM_TOOLS,
-        SIMULATE_CC, SIMULATE_FULL_SYSTEM, SPOOF_BILLING_CCH, SPOOF_DEVICE_ID,
-        SPOOF_IDENTITY_ENABLED, STRIP_EMPTY_TEXT, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
-        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_MODIFIED_RETRY, THINKING_SIGNATURE_RETRY,
-        TOOL_NAME_MIMIC,
+        INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
+        OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE, RATE_LIMIT_RETRY, REDACTED_THINKING_RETRY,
+        REJECT_EMPTY_REPLIES, REJECT_LEARNED_SHAPES, REJECT_OPENAI_SHAPE, REJECT_PROBES,
+        REJECT_PROBES_STRICT, REJECT_REFUSALS, REJECT_SESSION_CONFLICT, SIM_BILLING_ONLY,
+        SIM_MESSAGE_THREADS, SIM_TRIM_TOOLS, SIMULATE_CC, SIMULATE_FULL_SYSTEM, SPOOF_BILLING_CCH,
+        SPOOF_DEVICE_ID, SPOOF_IDENTITY_ENABLED, STRIP_EXTRA_FIELDS, SYSTEM_CACHE_SCOPE,
+        SYSTEM_CACHE_TTL, SYSTEM_SHAPE, THINKING_SIGNATURE_RETRY, TOOL_NAME_MIMIC,
     };
     let items = [
         (SPOOF_IDENTITY_ENABLED, req.spoof_identity),
@@ -547,7 +486,6 @@ pub(super) async fn set_forwarding(
         (SYSTEM_SHAPE, req.system_shape),
         (ORIG_HEADER_CASE, req.orig_header_case),
         (THINKING_SIGNATURE_RETRY, req.thinking_signature_retry),
-        (THINKING_MODIFIED_RETRY, req.thinking_modified_retry),
         (REDACTED_THINKING_RETRY, req.redacted_thinking_retry),
         (SIMULATE_CC, req.simulate_cc),
         (SIMULATE_FULL_SYSTEM, req.simulate_full_system),
@@ -564,9 +502,6 @@ pub(super) async fn set_forwarding(
         (STRIP_EXTRA_FIELDS, req.strip_extra_fields),
         (TOOL_NAME_MIMIC, req.tool_name_mimic),
         (INJECT_THINKING, req.inject_thinking),
-        (FLATTEN_TOOL_SCHEMAS, req.flatten_tool_schemas),
-        (STRIP_EMPTY_TEXT, req.strip_empty_text),
-        (HOIST_SYSTEM_ROLE, req.hoist_system_role),
         (REJECT_OPENAI_SHAPE, req.reject_openai_shape),
         (REJECT_SESSION_CONFLICT, req.reject_session_conflict),
         (REJECT_PROBES, req.reject_probes),

@@ -71,9 +71,6 @@ pub struct ForwardFlags {
     /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
     /// （见 [`crate::proxy::demote_thinking_blocks`]）。
     pub thinking_signature_retry: bool,
-    /// 上游以「thinking 块被修改」拒绝时，降级历史 thinking 块后重试一次。
-    /// 成因通常是 JSON 序列化改变了 thinking 块的编码。
-    pub thinking_modified_retry: bool,
     /// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，降级历史 thinking 块后重试一次。
     /// 那段密文是上游自己签发的，验不过通常是会话中途换了号、或那一轮 assistant 消息被改写过
     /// （见 [`crate::proxy::trace_thinking_block`] 那行日志怎么分辨）。
@@ -234,36 +231,12 @@ pub struct ForwardFlags {
     /// （输出更长、token 消耗更多），且会强制 `temperature=1`（`strip_extra_fields` 自动剥）。
     /// 不想要这些副作用就关掉——代价是模拟形态少一个正面信号。
     pub inject_thinking: bool,
-    /// 展平 tool `input_schema` 顶层的 `allOf`/`oneOf`/`anyOf`。
-    /// 上游不支持这些关键字，直接 400。
-    pub flatten_tool_schemas: bool,
-    /// 剥除 messages 里的空 text 内容块 `{"type":"text","text":""}`。
-    /// 上游要求 text 块非空，部分第三方客户端常发空块。
-    pub strip_empty_text: bool,
-    /// 将 messages 里的 `role:"system"` 消息提升到顶层 `system` 字段。
-    ///
-    /// 上游对首条 user/assistant 之前的 `role:"system"` 直接 400，老模型对对话中途的也 400；
-    /// litellm 等第三方客户端采用 OpenAI 格式，会把 system 内容放在 messages 里。开启后自动把
-    /// 这些消息（不论位置）的 content 提升到顶层 `system`（已有则追加），再从 messages 里移除。
-    /// 几种例外：指令式（`content: []` 带 `output_config`）、对话中途只管一轮的
-    /// （`clear_at: "next_user_message"`）、带非文本块的（`tool_addition` / `tool_removal`）
-    /// 整条留在原位；带正文又带 `output_config` 的拆成「正文提升 + 原位留指令」，见
-    /// `proxy::hoist_system_role_messages`。
-    ///
-    /// 只在 `reject_openai_shape` 关着时生效，那个开关默认开着。
-    ///
-    /// **CC 形态的请求整个跳过**：官方自己在 messages 里合法使用 `role:"system"`
-    /// （deferred tools），硬提升会破坏形态。唯一的例外是**空壳**（content 为空数组 / 空串 /
-    /// `null` / 缺失 / 整条只有空 text 块）：不论这个开关与来访形态，一律在出站前丢掉，见
-    /// `proxy::drop_empty_system_messages`——上游对它恒回 400，而它一个内容块都没有。
-    pub hoist_system_role: bool,
     /// 本地拒绝带 OpenAI 格式转换残留的请求（messages 开头的 `role:"system"`、`call_` 前缀的
     /// 工具调用 id、OpenAI 方言的 `tool_choice` / `tools`、`n` / `stop` / `user` 等 OpenAI 专属
     /// 顶层字段），不修补、不转发，见 `proxy::find_openai_marker`。
     ///
-    /// 开着时 `hoist_system_role` 整个不跑：开头的 system 入口就拒了，能放行的只剩对话中途的
-    /// 原生 system 消息，原样出站（见 `proxy::hoists_system_role`）；关掉才退回修补。
-    /// 模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
+    /// 关掉即原样转发，由上游返回官方的 400——客户端自己发错的形态 luban 不再替它修补。
+    /// 对话中途的原生 system 消息不算残留，原样出站。模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
     pub reject_openai_shape: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
     ///
@@ -386,7 +359,6 @@ impl Default for ForwardFlags {
             system_shape: true,
             orig_header_case: true,
             thinking_signature_retry: true,
-            thinking_modified_retry: true,
             redacted_thinking_retry: true,
             simulate_cc: true,
             simulate_full_system: true,
@@ -403,9 +375,6 @@ impl Default for ForwardFlags {
             strip_extra_fields: true,
             tool_name_mimic: true,
             inject_thinking: true,
-            flatten_tool_schemas: true,
-            strip_empty_text: true,
-            hoist_system_role: true,
             reject_openai_shape: true,
             reject_session_conflict: true,
             reject_probes: true,

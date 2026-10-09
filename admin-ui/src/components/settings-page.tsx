@@ -62,7 +62,7 @@ export function SettingsPage({
     {
       key: 'forwarding',
       label: t('转发策略', 'Forwarding policy'),
-      navDescription: t('授权、兼容与错误恢复', 'Scopes, compatibility, and recovery'),
+      navDescription: t('身份、形态、拦截与恢复', 'Identity, shape, interception, and recovery'),
       icon: SlidersHorizontalIcon,
     },
     {

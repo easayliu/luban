@@ -884,7 +884,7 @@ queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 
 // 学到的规则：四个种类各一两条，上游原话故意写长，用来检查列表与清空确认框在手机上的样子。
 queryClient.setQueryData(['learned-rejections'], [
   { kind: 'shape', model: 'claude-haiku-4-5', field: 'output_config.effort', value: 'xhigh', message: "invalid_request_error: output_config.effort: Input should be 'low', 'medium' or 'high' for this model; received 'xhigh'", learned_at: now - 5 * 3600, expires_at: now + 6 * 86400 },
-  { kind: 'deprecated', model: 'claude-opus-5-5', field: 'temperature', value: '', message: 'invalid_request_error: temperature is deprecated for this model and will be ignored; remove it from the request', learned_at: now - 26 * 3600, expires_at: now + 5 * 86400 },
+  { kind: 'deprecated', model: 'claude-fable-5-1', field: 'fallbacks', value: '', message: 'invalid_request_error: fallbacks.0.model: claude-opus-5 is not an allowed fallback model for this request', learned_at: now - 26 * 3600, expires_at: now + 5 * 86400 },
   { kind: 'empty_reply', model: 'claude-fable-5-1', field: 'max_tokens', value: '1', message: '{"type":"message","content":[],"stop_reason":"max_tokens","usage":{"input_tokens":12,"output_tokens":0}}', learned_at: now - 2 * 3600, expires_at: now + 7 * 86400 - 7200 },
   { kind: 'refusal', model: 'claude-fable-5-1', field: 'prompt_sha', value: '9f2c7d1a4b8e6f03a5d2c9e17b4f8a60d3e5c2b1a9f7e4d6c8b0a2f4e6d8c0b1', message: '[cyber] stop_details={"category":"cyber","explanation":"The request asks for step-by-step instructions that could facilitate unauthorized access to computer systems"}', learned_at: now - 40 * 60, expires_at: now + 7 * 86400 - 2400 },
 ])

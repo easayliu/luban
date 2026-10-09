@@ -1,5 +1,5 @@
 use crate::proxy::test_support::{ROLE_400, err_json};
-use crate::proxy::{Bytes, StatusCode, store};
+use crate::proxy::{StatusCode, store};
 
 /// 测试用：一段上游拒答的整段 JSON 响应体（非流式），当作学规则时记下的回放体。
 fn json_reply() -> store::LearnedReply {
@@ -88,7 +88,7 @@ fn role_req(model: &str, role: &str) -> Option<serde_json::Value> {
 }
 
 /// 学到的 `role 'system'` 只拦对话中途带 system、且出站时还留着它的请求：只在开头带
-/// system 的（上游回的是另一句），以及出站前会被整条提升的，都不能跟着一起在本地拒掉。
+/// system 的（上游回的是另一句）、中途只有空壳的（出站前丢掉），都不能跟着一起在本地拒掉。
 #[test]
 fn learned_system_role_does_not_block_leading_system_prompts() {
     let mem = crate::proxy::ShapeMemory::default();
@@ -96,6 +96,7 @@ fn learned_system_role_does_not_block_leading_system_prompts() {
     let learned = crate::proxy::remember_shape_rejection(
         &mem,
         Some("claude-haiku-4-5"),
+        mid.as_ref(),
         mid.as_ref(),
         &err_json(ROLE_400),
     );
@@ -116,51 +117,7 @@ fn learned_system_role_does_not_block_leading_system_prompts() {
         crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), mid.as_ref(), false)
             .is_some()
     );
-    // 出站前会被整条提升（hoist 开着、非 CC 形态）：上游看不到这个 role，不拦。
-    assert!(
-        crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), mid.as_ref(), true)
-            .is_none()
-    );
-    // 指令式 system 提升不动它，照样送到上游：豁免不成立，照拦。
-    let directive = json_body(
-        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","output_config":{"effort":"low"},"content":[]}]}"#,
-    );
-    assert!(
-        crate::proxy::known_shape_rejection(
-            &mem,
-            Some("claude-haiku-4-5"),
-            directive.as_ref(),
-            true
-        )
-        .is_some()
-    );
-    // 只管一轮的 system：开头那条会被提升走，出站没有 system 了，照常豁免；中途那条留在原位，
-    // 不豁免。判据与提升本身共用。
-    let leading_scoped = json_body(
-        r#"{"model":"claude-haiku-4-5","messages":[{"role":"system","clear_at":"next_user_message","content":"tmp"},{"role":"user","content":"hi"},{"role":"system","content":"you are…"}]}"#,
-    );
-    assert!(
-        crate::proxy::known_shape_rejection(
-            &mem,
-            Some("claude-haiku-4-5"),
-            leading_scoped.as_ref(),
-            true
-        )
-        .is_none()
-    );
-    let mid_scoped = json_body(
-        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","clear_at":"next_user_message","content":"tmp"}]}"#,
-    );
-    assert!(
-        crate::proxy::known_shape_rejection(
-            &mem,
-            Some("claude-haiku-4-5"),
-            mid_scoped.as_ref(),
-            true
-        )
-        .is_some()
-    );
-    // 严格模式（不提升）下中途只有一条空壳：出站前一律丢掉，上游看不到 system，不拦。
+    // 中途只有一条空壳：出站前一律丢掉，上游看不到 system，不拦。
     let only_shell = json_body(
         r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","content":[]}]}"#,
     );
@@ -172,27 +129,6 @@ fn learned_system_role_does_not_block_leading_system_prompts() {
             false
         )
         .is_none()
-    );
-    // 空壳在提升之前就被丢掉，带着 `clear_at` 也不算留下来的 system：照常豁免。
-    let shell_scoped = json_body(
-        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","clear_at":"next_user_message","content":[]},{"role":"system","content":"you are…"}]}"#,
-    );
-    assert!(
-        crate::proxy::known_shape_rejection(
-            &mem,
-            Some("claude-haiku-4-5"),
-            shell_scoped.as_ref(),
-            true
-        )
-        .is_none()
-    );
-    // 带正文又带 `output_config` 的会拆出一条指令留在原位，同样不豁免。
-    let split = json_body(
-        r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"},{"role":"system","output_config":{"effort":"low"},"content":"be brief"}]}"#,
-    );
-    assert!(
-        crate::proxy::known_shape_rejection(&mem, Some("claude-haiku-4-5"), split.as_ref(), true)
-            .is_some()
     );
 }
 
@@ -211,6 +147,7 @@ fn positional_system_400_is_not_learned_and_stale_rows_are_dropped() {
         &mem,
         Some("claude-opus-5-5"),
         body.as_ref(),
+        body.as_ref(),
         &err_json(SYSTEM_POSITION_400),
     );
     assert!(learned.is_empty(), "位置约束不该学成形态规则");
@@ -223,6 +160,7 @@ fn positional_system_400_is_not_learned_and_stale_rows_are_dropped() {
     let learned = crate::proxy::remember_shape_rejection(
         &mem,
         Some("claude-haiku-4-5"),
+        role_req("claude-haiku-4-5", "system").as_ref(),
         role_req("claude-haiku-4-5", "system").as_ref(),
         &err_json(ROLE_400),
     );
@@ -266,7 +204,13 @@ fn rejects_a_learned_request_shape_locally() {
     assert!(hit(&role_req("claude-opus-4-6", "system"), "claude-opus-4-6").is_none());
 
     let learn = |model: &str, body: &Option<serde_json::Value>, msg: &str| {
-        crate::proxy::remember_shape_rejection(&mem, Some(model), body.as_ref(), &err_json(msg));
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some(model),
+            body.as_ref(),
+            body.as_ref(),
+            &err_json(msg),
+        );
     };
     learn("claude-sonnet-5", &effort_req("claude-sonnet-5", "xhigh"), EFFORT_400);
     learn("claude-opus-4-6", &role_req("claude-opus-4-6", "system"), ROLE_400);
@@ -309,6 +253,7 @@ fn learns_the_named_tool_type_but_never_the_suggested_ones() {
     crate::proxy::remember_shape_rejection(
         &mem,
         Some("claude-fable-5"),
+        body.as_ref(),
         body.as_ref(),
         &err_json(TOOL_TYPE_400),
     );
@@ -355,6 +300,7 @@ fn learns_nothing_when_another_tool_type_is_named() {
         &mem,
         Some("claude-fable-5"),
         body.as_ref(),
+        body.as_ref(),
         &err_json(OTHER_400),
     );
     assert!(mem.read().is_empty(), "建议清单里出现过也不算被点名");
@@ -376,7 +322,13 @@ fn learns_nothing_when_the_error_does_not_name_the_value() {
     for (model, msg) in cases {
         let mem = crate::proxy::ShapeMemory::default();
         let body = effort_req(model, "xhigh");
-        crate::proxy::remember_shape_rejection(&mem, Some(model), body.as_ref(), &err_json(msg));
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some(model),
+            body.as_ref(),
+            body.as_ref(),
+            &err_json(msg),
+        );
         assert!(mem.read().is_empty(), "不该学: {msg}");
         assert!(
             crate::proxy::known_shape_rejection(&mem, Some(model), body.as_ref(), false).is_none()
@@ -386,7 +338,13 @@ fn learns_nothing_when_the_error_does_not_name_the_value() {
     // 认不出模型名 → 学不到东西（这条 400 照常透传，只是记不下来）。
     let mem = crate::proxy::ShapeMemory::default();
     let body = effort_req("claude-sonnet-5", "xhigh");
-    crate::proxy::remember_shape_rejection(&mem, None, body.as_ref(), &err_json(EFFORT_400));
+    crate::proxy::remember_shape_rejection(
+        &mem,
+        None,
+        body.as_ref(),
+        body.as_ref(),
+        &err_json(EFFORT_400),
+    );
     assert!(mem.read().is_empty());
 }
 
@@ -403,6 +361,7 @@ fn never_learns_a_conditional_rejection() {
         &mem,
         Some("claude-opus-5"),
         body.as_ref(),
+        body.as_ref(),
         &err_json(COND_400),
     );
     assert!(mem.read().is_empty(), "条件句不该进表: {COND_400}");
@@ -418,11 +377,13 @@ fn never_learns_a_conditional_rejection() {
         &mem,
         Some("claude-sonnet-5"),
         effort_req("claude-sonnet-5", "xhigh").as_ref(),
+        effort_req("claude-sonnet-5", "xhigh").as_ref(),
         &err_json(EFFORT_400),
     );
     crate::proxy::remember_shape_rejection(
         &mem,
         Some("claude-opus-4-6"),
+        role_req("claude-opus-4-6", "system").as_ref(),
         role_req("claude-opus-4-6", "system").as_ref(),
         &err_json(ROLE_400),
     );
@@ -441,6 +402,7 @@ fn shape_memory_is_capped() {
             &mem,
             Some("claude-opus-4-6"),
             body.as_ref(),
+            body.as_ref(),
             &err_json(&msg),
         );
     }
@@ -450,18 +412,188 @@ fn shape_memory_is_capped() {
 // ── deprecated field 学习与剥离 ──────────────────────────────────
 
 const TEMP_400: &str = "`temperature` is deprecated for this model.";
+const PREFILL_400: &str = "This model does not support assistant message prefill. \
+                           The conversation must end with a user message.";
 
-fn temp_req(model: &str) -> Option<serde_json::Value> {
-    json_body(&format!(
-        r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"temperature":0.7}}"#
-    ))
+/// 采样参数被模型废弃：按「模型 + 参数名」学，之后同模型带同一个参数的对话请求本地回上游原话；
+/// 别的参数、别的模型、`count_tokens`（非计费）都不受影响。与 thinking 冲突的条件句不学。
+#[test]
+fn learns_deprecated_sampling_params_per_model_and_field() {
+    let mem = crate::proxy::ShapeMemory::default();
+    let body = |model: &str, extra: &str| {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]{extra}}}"#
+        ))
+    };
+    let temp = body("claude-opus-5", r#","temperature":0.7"#);
+    // count_tokens（非计费）那条路不学。
+    assert!(
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-opus-5"),
+            temp.as_ref(),
+            None,
+            &err_json(TEMP_400)
+        )
+        .is_empty()
+    );
+    let learned = crate::proxy::remember_shape_rejection(
+        &mem,
+        Some("claude-opus-5"),
+        temp.as_ref(),
+        temp.as_ref(),
+        &err_json(TEMP_400),
+    );
+    assert_eq!(
+        learned.iter().map(|r| (r.field.as_str(), r.value.as_str())).collect::<Vec<_>>(),
+        [("sampling", "temperature")]
+    );
+    let hit = crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), temp.as_ref(), true)
+        .expect("同模型带 temperature 该本地拒");
+    assert_eq!((hit.0, hit.1.as_str(), hit.2.as_str()), ("sampling", "temperature", TEMP_400));
+    // 非计费路径不拦；只带 top_p 的不拦；别的模型不拦。
+    assert!(
+        crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), temp.as_ref(), false)
+            .is_none()
+    );
+    let top_p = body("claude-opus-5", r#","top_p":0.9"#);
+    assert!(
+        crate::proxy::known_shape_rejection(&mem, Some("claude-opus-5"), top_p.as_ref(), true)
+            .is_none()
+    );
+    let other = body("claude-opus-4-6", r#","temperature":0.7"#);
+    assert!(
+        crate::proxy::known_shape_rejection(&mem, Some("claude-opus-4-6"), other.as_ref(), true)
+            .is_none()
+    );
+    // 与 thinking 冲突的条件句不学：temperature 并非一律不行。
+    let mem = crate::proxy::ShapeMemory::default();
+    let conditional = "temperature may only be set to 1 when thinking is enabled. \
+                       Please consult our documentation.";
+    let deprecated_when = "`temperature` is deprecated when thinking is enabled.";
+    for msg in [conditional, deprecated_when] {
+        assert!(
+            crate::proxy::remember_shape_rejection(
+                &mem,
+                Some("claude-opus-4-6"),
+                other.as_ref(),
+                other.as_ref(),
+                &err_json(msg)
+            )
+            .is_empty(),
+            "{msg}"
+        );
+    }
 }
 
-fn top_p_req(model: &str) -> Option<serde_json::Value> {
-    json_body(&format!(
-        r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"top_p":0.9}}"#
-    ))
+/// prefill 不支持：按模型学，之后同模型末尾是 assistant 的对话请求本地回上游原话；末尾是
+/// user 的、别的模型、非计费路径都不拦。
+#[test]
+fn learns_unsupported_prefill_per_model() {
+    let mem = crate::proxy::ShapeMemory::default();
+    let prefill = |model: &str| {
+        json_body(&format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":"Sure"}}]}}"#
+        ))
+    };
+    let learned = crate::proxy::remember_shape_rejection(
+        &mem,
+        Some("claude-sonnet-5"),
+        prefill("claude-sonnet-5").as_ref(),
+        prefill("claude-sonnet-5").as_ref(),
+        &err_json(PREFILL_400),
+    );
+    assert_eq!(
+        learned.iter().map(|r| (r.field.as_str(), r.value.as_str())).collect::<Vec<_>>(),
+        [("prefill", "assistant")]
+    );
+    let hit = crate::proxy::known_shape_rejection(
+        &mem,
+        Some("claude-sonnet-5"),
+        prefill("claude-sonnet-5").as_ref(),
+        true,
+    )
+    .expect("同模型 prefill 该本地拒");
+    assert_eq!(hit.2, PREFILL_400);
+    let ends_with_user = json_body(
+        r#"{"model":"claude-sonnet-5","messages":[{"role":"assistant","content":"x"},{"role":"user","content":"hi"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-sonnet-5"),
+            ends_with_user.as_ref(),
+            true
+        )
+        .is_none()
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-haiku-4-5"),
+            prefill("claude-haiku-4-5").as_ref(),
+            true
+        )
+        .is_none()
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(
+            &mem,
+            Some("claude-sonnet-5"),
+            prefill("claude-sonnet-5").as_ref(),
+            false
+        )
+        .is_none()
+    );
+    // 别的 400 提到 prefill 但没说不支持（不点名）：不学。
+    let mem = crate::proxy::ShapeMemory::default();
+    assert!(
+        crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-sonnet-5"),
+            prefill("claude-sonnet-5").as_ref(),
+            prefill("claude-sonnet-5").as_ref(),
+            &err_json("prefill text is too long")
+        )
+        .is_empty()
+    );
 }
+
+/// 新的两类规则随其他形态规则落库，重启后能回填。
+#[test]
+fn sampling_and_prefill_rules_round_trip_through_seed() {
+    let rows = vec![
+        store::LearnedRejection {
+            kind: "shape".into(),
+            model: "claude-opus-5".into(),
+            field: "sampling".into(),
+            value: "top_k".into(),
+            message: "`top_k` is deprecated for this model.".into(),
+            reply: None,
+        },
+        store::LearnedRejection {
+            kind: "shape".into(),
+            model: "claude-opus-5".into(),
+            field: "prefill".into(),
+            value: "assistant".into(),
+            message: PREFILL_400.into(),
+            reply: None,
+        },
+    ];
+    let shape = crate::proxy::ShapeMemory::default();
+    let dep = crate::proxy::DeprecatedFieldMemory::default();
+    let empty = crate::proxy::EmptyReplyMemory::default();
+    let seeded = crate::proxy::seed_learned_memories(&shape, &dep, &empty, rows);
+    assert_eq!(seeded.shape, 2);
+    let body = json_body(
+        r#"{"model":"claude-opus-5","top_k":5,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert!(
+        crate::proxy::known_shape_rejection(&shape, Some("claude-opus-5"), body.as_ref(), true)
+            .is_some()
+    );
+}
+const FALLBACK_400: &str = "fallbacks: model 'claude-opus-4-8' is not in allowed_fallback_models";
 
 /// 零输出请求类的归类与命中：只有「无 tools（按值算）+ 恰好一条用户消息 + 带 max_tokens」
 /// 才归类；带 tools、多轮、换 max_tokens、换模型的都不命中——宁可多放一条，不误伤真业务。
@@ -546,6 +678,7 @@ fn learned_rejections_round_trip_through_seed() {
         &shape,
         Some("claude-opus-5"),
         Some(&body),
+        Some(&body),
         &err_json(EFFORT_400),
     );
     assert_eq!(learned_shape.len(), 1, "{learned_shape:?}");
@@ -563,29 +696,31 @@ fn learned_rejections_round_trip_through_seed() {
             &shape,
             Some("claude-opus-5"),
             Some(&body),
+            Some(&body),
             &err_json(EFFORT_400)
         )
         .is_empty()
     );
-    let learned_dep = crate::proxy::remember_deprecated_field(
-        &dep,
-        Some("claude-opus-5"),
-        Some(&body),
-        &err_json(TEMP_400),
-    );
-    assert_eq!(learned_dep.len(), 1, "{learned_dep:?}");
+    let learned_dep =
+        crate::proxy::remember_fallback_rejection(&dep, "claude-opus-5", &err_json(FALLBACK_400))
+            .expect("首次学到");
     assert_eq!(
-        (
-            learned_dep[0].kind.as_str(),
-            learned_dep[0].field.as_str(),
-            learned_dep[0].value.as_str()
-        ),
-        ("deprecated", "temperature", "")
+        (learned_dep.kind.as_str(), learned_dep.field.as_str(), learned_dep.value.as_str()),
+        ("deprecated", "fallbacks", "")
     );
+    // 旧版本学进库里的采样参数（那套剥离已经拿掉）：不回填、报成过期。
+    let legacy_sampling = store::LearnedRejection {
+        kind: "deprecated".into(),
+        model: "claude-opus-5".into(),
+        field: "temperature".into(),
+        value: String::new(),
+        message: TEMP_400.into(),
+        reply: None,
+    };
 
     // 模拟重启：空表 + 从「库里」读回的行（多两条对不上的脏行）。
     let mut rows: Vec<store::LearnedRejection> =
-        learned_shape.into_iter().chain(learned_dep).collect();
+        learned_shape.into_iter().chain([learned_dep, legacy_sampling.clone()]).collect();
     rows.push(store::LearnedRejection {
         kind: "shape".into(),
         model: "m".into(),
@@ -594,14 +729,16 @@ fn learned_rejections_round_trip_through_seed() {
         message: String::new(),
         reply: None,
     });
-    rows.push(store::LearnedRejection {
+    // deprecated 类只认 `fallbacks`，别的字段一律报成过期。
+    let dirty_dep = store::LearnedRejection {
         kind: "deprecated".into(),
         model: "m".into(),
         field: "model".into(),
         value: String::new(),
         message: String::new(),
         reply: None,
-    });
+    };
+    rows.push(dirty_dep.clone());
     // 零输出那类：一条正常的，一条 value 不是整数的脏行。
     let ping = serde_json::json!({
         "model": "claude-fable-5", "max_tokens": 16,
@@ -701,7 +838,7 @@ fn learned_rejections_round_trip_through_seed() {
             empty_reply: 1,
             refusal: 1,
             app_refusal: 1,
-            stale: vec![stale, legacy_refusal, legacy_app]
+            stale: vec![legacy_sampling, dirty_dep, stale, legacy_refusal, legacy_app]
         }
     );
     let opus_ping = serde_json::json!({
@@ -827,15 +964,10 @@ fn learned_rejections_round_trip_through_seed() {
         crate::proxy::known_shape_rejection(&shape2, Some("claude-opus-5"), Some(&body), false)
             .expect("形态规则应已回填");
     assert_eq!((hit.0, hit.1.as_str()), ("effort", "xhigh"));
-    assert!(crate::proxy::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&body)));
+    assert!(dep2.read().contains_key(&("claude-opus-5".to_string(), "fallbacks".to_string())));
     assert!(
-        !crate::proxy::has_learned_deprecated_field(&dep2, Some("claude-sonnet-5"), Some(&body)),
-        "别的模型不受影响"
-    );
-    let no_temp = serde_json::json!({ "model": "claude-opus-5", "messages": [] });
-    assert!(
-        !crate::proxy::has_learned_deprecated_field(&dep2, Some("claude-opus-5"), Some(&no_temp)),
-        "请求里没带那个字段就不算"
+        !dep2.read().contains_key(&("claude-opus-5".to_string(), "temperature".to_string())),
+        "旧的采样参数行不回填"
     );
 }
 
@@ -1169,143 +1301,6 @@ fn resync_learned_memories_drops_rows_missing_from_store() {
     let seeded = crate::proxy::resync_learned_memories(&shape, &dep, &empty, vec![]);
     assert_eq!(seeded, crate::proxy::SeededMemories::default());
     assert_eq!(crate::proxy::learned_memory_len(&shape, &dep, &empty), 0);
-}
-
-/// 已知模型（4.7+）即使没学过也会主动剥掉 sampling 参数。
-#[test]
-fn strips_sampling_for_known_models_without_learning() {
-    let mem = crate::proxy::DeprecatedFieldMemory::default();
-    for model in &[
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-    ] {
-        let body = temp_req(model);
-        let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out = crate::proxy::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw);
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert!(v.get("temperature").is_none(), "{model}: temperature 应该被主动剥掉");
-        assert!(v.get("model").is_some(), "{model}: 不该动别的字段");
-    }
-}
-
-/// 4.6 及更早的模型不在预置名单里，不应主动剥。
-#[test]
-fn does_not_strip_sampling_for_old_models() {
-    let mem = crate::proxy::DeprecatedFieldMemory::default();
-    for model in &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
-        let body = temp_req(model);
-        let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-        let out =
-            crate::proxy::maybe_strip_deprecated(&mem, Some(model), body.as_ref(), raw.clone());
-        assert_eq!(out, raw, "{model}: 不该主动剥");
-    }
-}
-
-/// 对于不在预置名单的模型，学一次 400 之后才会剥；不同模型不受影响。
-#[test]
-fn strips_deprecated_field_after_learning() {
-    let mem = crate::proxy::DeprecatedFieldMemory::default();
-    // 用 4.6（不在预置名单里）测试学习流程。
-    let body = temp_req("claude-opus-4-6");
-
-    // 学之前不剥。
-    let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-    let out = crate::proxy::maybe_strip_deprecated(
-        &mem,
-        Some("claude-opus-4-6"),
-        body.as_ref(),
-        raw.clone(),
-    );
-    assert_eq!(out, raw, "学之前应该原样返回");
-
-    // 喂一条 400。
-    crate::proxy::remember_deprecated_field(
-        &mem,
-        Some("claude-opus-4-6"),
-        body.as_ref(),
-        &err_json(TEMP_400),
-    );
-    assert_eq!(mem.read().len(), 1);
-
-    // 学过之后剥掉。
-    let out =
-        crate::proxy::maybe_strip_deprecated(&mem, Some("claude-opus-4-6"), body.as_ref(), raw);
-    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert!(v.get("temperature").is_none(), "temperature 应该被剥掉: {v}");
-    assert!(v.get("model").is_some(), "不该动别的字段: {v}");
-    assert!(v.get("messages").is_some(), "不该动 messages: {v}");
-
-    // 不同模型不受影响（用 sonnet-4-6，也不在预置名单里）。
-    let other_body = temp_req("claude-sonnet-4-6");
-    let other_raw = Bytes::from(serde_json::to_vec(other_body.as_ref().unwrap()).unwrap());
-    let out = crate::proxy::maybe_strip_deprecated(
-        &mem,
-        Some("claude-sonnet-4-6"),
-        other_body.as_ref(),
-        other_raw.clone(),
-    );
-    assert_eq!(out, other_raw, "不同模型不该被剥");
-}
-
-/// 不该学的几种 400：没有 `deprecated`、没有反引号引用字段名、请求里不含该字段。
-#[test]
-fn learns_nothing_from_unrelated_errors() {
-    let cases: &[(&str, &str)] = &[
-        // 普通 400，跟 deprecated 无关。
-        ("claude-fable-5", "max_tokens: 200000 > 64000, which is the maximum allowed"),
-        // 有 deprecated 但没用反引号引字段名。
-        ("claude-fable-5", "temperature is deprecated for this model."),
-        // 反引号包的不是请求里有的字段。
-        ("claude-fable-5", "`top_k` is deprecated for this model."),
-    ];
-    for (model, msg) in cases {
-        let mem = crate::proxy::DeprecatedFieldMemory::default();
-        let body = temp_req(model);
-        crate::proxy::remember_deprecated_field(&mem, Some(model), body.as_ref(), &err_json(msg));
-        assert!(mem.read().is_empty(), "不该学: {msg}");
-    }
-}
-
-/// `top_p` 也走同一套机制。
-#[test]
-fn learns_top_p_deprecated() {
-    let mem = crate::proxy::DeprecatedFieldMemory::default();
-    let body = top_p_req("claude-fable-5");
-    crate::proxy::remember_deprecated_field(
-        &mem,
-        Some("claude-fable-5"),
-        body.as_ref(),
-        &err_json("`top_p` is deprecated for this model."),
-    );
-    assert_eq!(mem.read().len(), 1);
-    let raw = Bytes::from(serde_json::to_vec(body.as_ref().unwrap()).unwrap());
-    let out =
-        crate::proxy::maybe_strip_deprecated(&mem, Some("claude-fable-5"), body.as_ref(), raw);
-    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert!(v.get("top_p").is_none(), "top_p 应该被剥掉: {v}");
-}
-
-/// 没有模型或没有请求体时安全地不学不剥。
-#[test]
-fn graceful_on_missing_model_or_body() {
-    let mem = crate::proxy::DeprecatedFieldMemory::default();
-    // model 为 None。
-    crate::proxy::remember_deprecated_field(
-        &mem,
-        None,
-        temp_req("x").as_ref(),
-        &err_json(TEMP_400),
-    );
-    assert!(mem.read().is_empty());
-    // body 为 None。
-    crate::proxy::remember_deprecated_field(&mem, Some("x"), None, &err_json(TEMP_400));
-    assert!(mem.read().is_empty());
-    // 剥也一样安全。
-    let raw = Bytes::from_static(b"{}");
-    assert_eq!(crate::proxy::maybe_strip_deprecated(&mem, None, None, raw.clone()), raw);
 }
 
 /// [`record_app_request`]：按比例学——拒答至少 3 条且占该应用请求数三成以上才学；风暴应用
