@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use sqlx::PgConnection;
 
 use super::super::{
-    CLIENT_API_KEY, COLS, CONSOLE_AUTH_KEYS, Credential, DEPLOYMENT_ONLY_KEYS, ImportOutcome,
-    PortableApiKey, PortableCredential, PortableProxy, SavedProxy, seal, token_fingerprint,
+    CLIENT_API_KEY, CONSOLE_AUTH_KEYS, DEPLOYMENT_ONLY_KEYS, ImportOutcome, PortableApiKey,
+    PortableCredential, PortableProxy, Scope, seal, token_fingerprint,
 };
 use super::PgStore;
 use crate::credentials::{PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN};
@@ -55,12 +55,12 @@ impl PgStore {
     /// **含明文 access/refresh token**——迁移要的就是它们，脱敏过的导出等于没导。谁能调到
     /// 这个口子就等于拿到了这些账号，故接口侧另加了一道闸（见 `crate::web` 的 `export`）。
     pub async fn export_credentials(&self) -> Result<Vec<PortableCredential>> {
-        Ok(self.list_local().await?.iter().map(PortableCredential::from).collect())
+        Ok(self.list().await?.iter().map(PortableCredential::from).collect())
     }
 
     /// 导出代理池的可迁移形态。
     pub async fn export_proxies(&self) -> Result<Vec<PortableProxy>> {
-        Ok(self.list_proxies_all_local().await?.iter().map(PortableProxy::from).collect())
+        Ok(self.list_proxies(Scope::All).await?.iter().map(PortableProxy::from).collect())
     }
 
     /// 导入一条代理：admin 名下已有这个 URL 则更新 label，没有则新增。返回是 Added 还是 Updated。
@@ -270,7 +270,7 @@ impl PgStore {
                 }
                 continue;
             }
-            self.set_setting_local(k, v).await?;
+            self.set_setting(k, v).await?;
             n += 1;
         }
         Ok(n)
@@ -307,57 +307,6 @@ impl PgStore {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(ImportOutcome::Added)
-    }
-
-    // ---------- 别的模块的方法的本地副本（整合时去重） ----------
-
-    /// `settings::set_setting` 的本地副本：先落库，成功后再更新内存镜像。
-    async fn set_setting_local(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, $2) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        self.settings.write().insert(key.to_string(), value.to_string());
-        Ok(())
-    }
-
-    /// `credential::list` 的本地副本：先惰性恢复到点的限流暂停号（`resume_due`），再按
-    /// (priority, id) 列出全部号。
-    async fn list_local(&self) -> Result<Vec<Credential>> {
-        sqlx::query(
-            "UPDATE credentials SET disabled = 0, ban_reason = NULL, resume_at = NULL, \
-                    updated_at = unixepoch() \
-             WHERE disabled = 1 AND resume_at IS NOT NULL AND resume_at <= unixepoch()",
-        )
-        .execute(&self.pool)
-        .await?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {COLS} FROM credentials ORDER BY priority ASC, id ASC"
-        )))
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(super::row_to_cred).collect()
-    }
-
-    /// `proxies::list_proxies(Scope::All)` 的本地副本。
-    async fn list_proxies_all_local(&self) -> Result<Vec<SavedProxy>> {
-        let rows: Vec<(i64, String, String, i64)> =
-            sqlx::query_as("SELECT id, label, url, created_at FROM proxies ORDER BY id ASC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(id, label, url, created_at)| SavedProxy {
-                id,
-                label,
-                url,
-                created_at: created_at as u64,
-            })
-            .collect())
     }
 }
 
@@ -417,7 +366,7 @@ mod tests {
         store.import_credential(&raw("rt-b", r#","priority":0"#)).await.unwrap();
         store.import_credential(&raw("rt-c", r#","priority":7"#)).await.unwrap();
         let by_rt: HashMap<String, i64> = store
-            .list_local()
+            .list()
             .await
             .unwrap()
             .into_iter()
@@ -446,7 +395,7 @@ mod tests {
             .unwrap();
         let base = base("rt-1");
         assert_eq!(store.import_credential(&base).await.unwrap(), ImportOutcome::Added);
-        let before = store.list_local().await.unwrap().len();
+        let before = store.list().await.unwrap().len();
 
         // 同一个账号、新的 refresh_token（源站重新授权过）→ 覆盖那一行，不新增。
         let reauthed = PortableCredential {
@@ -456,9 +405,9 @@ mod tests {
             ..base.clone()
         };
         assert_eq!(store.import_credential(&reauthed).await.unwrap(), ImportOutcome::Updated);
-        assert_eq!(store.list_local().await.unwrap().len(), before, "同一个账号不该变成两行");
+        assert_eq!(store.list().await.unwrap().len(), before, "同一个账号不该变成两行");
         let got = store
-            .list_local()
+            .list()
             .await
             .unwrap()
             .into_iter()
@@ -517,7 +466,7 @@ mod tests {
         // 团队那行在源站重新授权过（新 refresh_token），按组织认回团队那行，个人那行不动。
         let team2 = PortableCredential { refresh_token: "rt-t2".into(), ..team.clone() };
         assert_eq!(store.import_credential(&team2).await.unwrap(), ImportOutcome::Updated);
-        let rows = store.list_local().await.unwrap();
+        let rows = store.list().await.unwrap();
         assert_eq!(rows.len(), 2);
         let by_label = |l: &str| rows.iter().find(|c| c.label == l).unwrap().clone();
         assert_eq!(by_label("team").refresh_token, "rt-t2");
@@ -534,7 +483,7 @@ mod tests {
         assert_eq!(store.import_credential(&legacy).await.unwrap(), ImportOutcome::Added);
         let fresh = PortableCredential { refresh_token: "rt-new".into(), ..personal.clone() };
         assert_eq!(store.import_credential(&fresh).await.unwrap(), ImportOutcome::Updated);
-        assert_eq!(store.list_local().await.unwrap().len(), 1);
+        assert_eq!(store.list().await.unwrap().len(), 1);
     }
 
     /// 导出的每一项都要能原样导回来：迁移文件就是「导出的响应原样喂给导入」，

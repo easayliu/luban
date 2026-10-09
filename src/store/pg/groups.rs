@@ -463,8 +463,7 @@ impl PgStore {
     /// 环境变量也没设时才不校验来访身份（与老版本「没配接入 Key 就不校验」一致）；配过之后
     /// 把 Key 全删了也不会因此敞开。
     pub async fn api_keys_required(&self) -> Result<bool> {
-        // 直接读设置镜像（同 `get_setting`，那个归 settings 模块）。
-        if self.settings.read().contains_key(API_KEYS_CONFIGURED) {
+        if self.get_setting(API_KEYS_CONFIGURED)?.is_some() {
             return Ok(true);
         }
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM api_keys)")

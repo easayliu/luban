@@ -147,6 +147,8 @@ impl PgStore {
     pub async fn clear(&self) -> Result<usize> {
         // 串行化：不能和选号交错——选号刚读到的号在这里被删掉后，它照样会把绑定写回来。
         let mut tx = self.begin_write().await?;
+        // 先锁全部账号行，理由同 [`Self::remove`]。
+        sqlx::query("SELECT id FROM credentials FOR UPDATE").execute(&mut *tx).await?;
         for table in [
             "usage_logs",
             "usage_rollup",
@@ -367,6 +369,12 @@ impl PgStore {
         }
         // 串行化：与选号互斥，选号不会把设备绑回一个刚删掉的号。
         let mut tx = self.begin_write().await?;
+        // 先锁账号行，再动挂在它上面的小表：在途的流水写入是「账号行 FOR KEY SHARE → 账本 upsert」
+        // 这个顺序（见 `insert_usage_log_at`），这里反过来先删账本行就会和它互相等、被判死锁。
+        sqlx::query("SELECT id FROM credentials WHERE id = ANY($1) FOR UPDATE")
+            .bind(ids)
+            .execute(&mut *tx)
+            .await?;
         release_bindings(&mut tx, ids, "account_removed").await?;
         for table in ["credential_stats", "device_costs", "model_denials", "credential_groups"] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1489,5 +1497,38 @@ mod tests {
         assert_eq!(q.requests_5h, Some(1));
         assert_eq!(q.cost_7d, None, "无 7d reset 时不应给出 0");
         assert_eq!(q.requests_7d, None, "无 7d reset 时请求数也应未知");
+    }
+
+    /// 删号时正好有一条流水在写：两边都得成功，不能死锁。
+    ///
+    /// 写流水的事务先对账号行上 `FOR KEY SHARE`，再 upsert 账本（见 `insert_usage_log_at`）。
+    /// 删号若先删账本行、最后才删账号行，就是反向加锁：它拿着账本行等账号行，流水拿着账号行
+    /// 等账本行，PG 判死锁、杀掉其中一个。这里手工复现流水事务的那两步，把删号夹在中间。
+    #[sqlx::test]
+    async fn removing_a_credential_does_not_deadlock_with_an_in_flight_usage_log(pool: PgPool) {
+        let (store, ids) = store_with(pool, &["a"]).await;
+        let id = ids[0];
+        log_row(&store, id, 1_000, 1.0, None, None).await;
+        let store = std::sync::Arc::new(store);
+
+        let mut usage = store.pool.begin().await.unwrap();
+        sqlx::query("SELECT owner_id FROM credentials WHERE id = $1 FOR KEY SHARE")
+            .bind(id)
+            .execute(&mut *usage)
+            .await
+            .unwrap();
+        let s = store.clone();
+        let removal = tokio::spawn(async move { s.remove(&[id]).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        sqlx::query(
+            "UPDATE credential_stats SET cost_total_usd = cost_total_usd + 1 WHERE cred_id = $1",
+        )
+        .bind(id)
+        .execute(&mut *usage)
+        .await
+        .expect("the in-flight usage log must not be chosen as a deadlock victim");
+        usage.commit().await.unwrap();
+        assert_eq!(removal.await.unwrap().unwrap(), 1);
+        assert_eq!(scalar(&store, "SELECT COUNT(*) FROM credential_stats").await, 0);
     }
 }

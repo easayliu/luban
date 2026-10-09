@@ -31,6 +31,8 @@ mod bans;
 mod billing;
 mod bindings;
 mod credential;
+#[cfg(test)]
+mod cross_tests;
 mod flags;
 mod groups;
 mod learned;
