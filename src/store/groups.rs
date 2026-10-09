@@ -55,7 +55,7 @@ pub struct KeyAccess {
 pub const API_KEYS_CONFIGURED: &str = "api_keys_configured";
 
 /// 默认分组的名称（建库时）。
-const DEFAULT_GROUP_NAME: &str = "默认分组";
+pub(super) const DEFAULT_GROUP_NAME: &str = "默认分组";
 
 /// 明文显示几位前缀。
 const KEY_PREFIX_LEN: usize = 10;

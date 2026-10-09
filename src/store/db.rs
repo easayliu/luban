@@ -4,6 +4,9 @@
 //! 改表结构就加一个新的 `NNNN_*.sql`，**已发布的文件不能再改**：sqlx 记着每个文件的校验和，
 //! 改过的文件在已经跑过它的库上会直接报错、拒绝启动。
 
+// 移植期间还没有调用方。
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};

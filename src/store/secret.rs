@@ -147,10 +147,10 @@ pub(super) fn open_column(stored: String, col: usize) -> rusqlite::Result<String
 
 /// 密钥校验值：库里存一份用当前密钥加密的它，启动时解开比对——跟库里有没有号、有没有接入
 /// Key 无关，换了密钥都当场发现，不会混进第二把密钥加密的数据。
-const SECRET_CHECK_KEY: &str = "secret_key_check";
-const SECRET_CHECK_PLAINTEXT: &str = "luban-secret-key-check";
+pub(super) const SECRET_CHECK_KEY: &str = "secret_key_check";
+pub(super) const SECRET_CHECK_PLAINTEXT: &str = "luban-secret-key-check";
 
-fn mismatch(what: &str) -> anyhow::Error {
+pub(super) fn mismatch(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "the secret key does not match the one used to encrypt the stored secrets ({what}); \
          restore the original secret.key or LUBAN_SECRET_KEY"
