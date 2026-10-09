@@ -445,6 +445,9 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/usage", Owned::Nothing),
     // 分层账单：handler 按身份收窄可见的号主与拆分维度。
     ("/billing", Owned::Nothing),
+    // 上号 Key：handler 按身份收窄到本人名下的（admin 看全部）。
+    ("/provision-keys", Owned::Nothing),
+    ("/provision-keys/{id}", Owned::Nothing),
 ];
 
 /// 路由的访问级别，默认只给 admin。
@@ -470,8 +473,9 @@ fn access_of(path: &str) -> Access {
 ///   地址里的密码由 [`redact_url_credentials`] 遮掉；
 /// - `/users`：访客是来看号池的，用不着控制台账号名单；
 /// - `/api-keys`：带着查看明文的接口，看到就等于能用。
+/// - `/provision-keys`：访客建不了 Key，列表也没必要看。
 const VIEWER_DENIED: &[&str] =
-    &["/authorize", "/export", "/settings", "/learned-rejections", "/users", "/api-keys"];
+    &["/authorize", "/export", "/settings", "/learned-rejections", "/users", "/api-keys", "/provision-keys"];
 
 /// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
 /// `POST`，但只作废访客自己的会话，不放行的话访客点「退出」只清得掉本地 token。
@@ -585,6 +589,9 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
     let Some(token) = bearer(req.headers()) else {
         return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
     };
+    if token.starts_with(store::PROVISION_KEY_PREFIX) {
+        return provision_key_request(&state, token.to_owned(), req, next).await;
+    }
     let token_hash = sha256_hex(token);
     let row = match state.store.session_lookup(&token_hash) {
         Ok(Some(row)) => row,
@@ -640,6 +647,74 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
     req.extensions_mut().insert(actor);
     let resp = next.run(req).await;
     if viewer { redact_for_viewer(resp).await } else { resp }
+}
+
+/// 请求是拿上号 Key 来的（放进请求扩展）。上号时没指定代理就自动从代理池分配，见
+/// `web::login::exchange`。
+#[derive(Debug, Clone, Copy)]
+pub struct ViaProvisionKey;
+
+/// 上号 Key 能打的接口（路径不带 `/api` 前缀）：取授权链接、交授权码、列出能选的分组与
+/// 本人的代理池（按 id 选代理用）。其余一律 403——Key 是放在脚本里的，泄露了也只能往这个人
+/// 名下添号。回给 Key 的响应里代理密码一律打码。
+const PROVISION_ROUTES: &[(Method, &str)] = &[
+    (Method::GET, "/authorize"),
+    (Method::POST, "/exchange"),
+    (Method::GET, "/groups"),
+    (Method::GET, "/proxies"),
+];
+
+/// 上号 Key 建时记下的密码指纹是否仍与所属账号此刻的一致（与会话同一套判据）。
+pub(crate) fn provision_key_current(
+    state: &AppState,
+    role: UserRole,
+    stored_hash: &str,
+    key_tag: &str,
+) -> bool {
+    let current = password_tag(state, role, stored_hash);
+    !current.is_empty() && constant_time_eq(current.as_bytes(), key_tag.as_bytes())
+}
+
+/// 带上号 Key 的请求：认出所属账号，只放行 [`PROVISION_ROUTES`]，以这个人的身份进 handler。
+/// 访客名下不该有 Key（建不出来），万一有也不认。
+async fn provision_key_request(
+    state: &AppState,
+    token: String,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let invalid = || (StatusCode::UNAUTHORIZED, "invalid provision key").into_response();
+    let hit = match state.store.provision_key_lookup(&token) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return invalid(),
+        Err(e) => return internal(e).into_response(),
+    };
+    // 密码指纹对不上（改过密码、被重置、环境变量里的密码换了或撤了）：这把 Key 作废、删掉。
+    if !provision_key_current(state, hit.user.role, &hit.password_hash, &hit.pw_tag) {
+        if let Err(e) = state.store.delete_provision_key(hit.id, None) {
+            tracing::warn!(error = %e, key_id = hit.id, "failed to delete a revoked provision key");
+        }
+        return invalid();
+    }
+    let user = hit.user;
+    if user.effectively_disabled() || user.role == UserRole::Viewer {
+        return invalid();
+    }
+    if let Err(e) = state.store.touch_provision_key(hit.id) {
+        tracing::warn!(error = %e, "failed to record provision key use");
+    }
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = path.strip_prefix("/api").unwrap_or(&path);
+    if !PROVISION_ROUTES.iter().any(|(m, p)| m == req.method() && *p == path) {
+        return (StatusCode::FORBIDDEN, "a provision key can only add accounts").into_response();
+    }
+    req.extensions_mut().insert(Actor::from(user));
+    req.extensions_mut().insert(ViaProvisionKey);
+    redact_for_viewer(next.run(req).await).await
 }
 
 // ---------- 接口 ----------

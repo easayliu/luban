@@ -67,6 +67,11 @@ fn app(state: &crate::web::AppState) -> Router {
             .route("/users", get(who).post(who))
             .route("/auth/me", get(who))
             .route("/auth/logout", post(who))
+            .route("/authorize", get(who))
+            .route("/exchange", post(who))
+            .route("/groups", get(who).post(who))
+            .route("/provision-keys", get(who).post(who))
+            .route("/proxies", get(who))
             .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_login))
             .with_state(state.clone()),
     )
@@ -558,4 +563,85 @@ fn unknown_username_flood_cannot_unlock_a_real_account() {
     }
     assert!(!super::reserve_login_attempt(key, true), "真实账号的锁定不能被挤掉");
     assert!(super::LOGIN_GUARD.lock().unknown.len() <= super::LOGIN_UNKNOWN_CAPACITY);
+}
+
+/// 上号 Key：只认上号那几条路由，以所属账号的身份进 handler；停用、删除、账号停用都随即失效。
+#[tokio::test]
+async fn provision_keys_only_reach_the_add_account_routes() {
+    let state = test_state();
+    let admin_id = set_admin_password(&state, "pw1234");
+    let app = app(&state);
+    let agent = create(&state, "agent1", UserRole::Agent, admin_id);
+    let user = create(&state, "user1", UserRole::User, agent);
+    let new_key = |owner: i64| {
+        let key = crate::store::generate_provision_key();
+        let hash = state.store.user_password_hash(owner).unwrap().unwrap_or_default();
+        let tag = super::password_tag(&state, UserRole::User, &hash);
+        (state.store.create_provision_key(owner, "script", &key, &tag).unwrap(), key)
+    };
+    let (id, key) = new_key(user);
+
+    for (m, uri) in
+        [
+        (Method::GET, "/api/authorize"),
+        (Method::POST, "/api/exchange"),
+        (Method::GET, "/api/groups"),
+        (Method::GET, "/api/proxies"),
+    ]
+    {
+        assert_eq!(call(&app, m, uri, Some(&key), "{}").await, StatusCode::OK, "{uri}");
+    }
+    for (m, uri) in [
+        (Method::GET, "/api/credentials"),
+        (Method::POST, "/api/groups"),
+        (Method::GET, "/api/provision-keys"),
+        (Method::POST, "/api/provision-keys"),
+        (Method::GET, "/api/auth/me"),
+        (Method::GET, "/api/export"),
+    ] {
+        assert_eq!(call(&app, m, uri, Some(&key), "{}").await, StatusCode::FORBIDDEN, "{uri}");
+    }
+    assert_eq!(
+        call(&app, Method::GET, "/api/authorize", Some("lbp-nope"), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 上级停用：所属账号生效停用，Key 跟着失效。
+    state.store.set_user_disabled(agent, true, None).unwrap();
+    assert_eq!(
+        call(&app, Method::GET, "/api/authorize", Some(&key), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+    state.store.set_user_disabled(agent, false, None).unwrap();
+
+    // 别人改不了、删不了；本人停用后失效。
+    assert!(!state.store.update_provision_key(id, Some(agent), "x", true).unwrap());
+    assert!(!state.store.delete_provision_key(id, Some(agent)).unwrap());
+    assert!(state.store.update_provision_key(id, Some(user), "script", true).unwrap());
+    assert_eq!(
+        call(&app, Method::GET, "/api/authorize", Some(&key), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+    let keys = state.store.list_provision_keys(None).unwrap();
+    assert_eq!((keys.len(), keys[0].username.as_str()), (1, "user1"));
+    assert!(keys[0].last_used_at.is_some());
+    assert!(state.store.list_provision_keys(Some(agent)).unwrap().is_empty());
+
+    // 改密码（含被重置）：建 Key 时的指纹对不上，Key 作废并被删掉。
+    let (id2, key2) = new_key(user);
+    assert_eq!(call(&app, Method::GET, "/api/authorize", Some(&key2), "").await, StatusCode::OK);
+    let reset = super::hash_password_blocking("new-pw").unwrap();
+    state.store.set_user_password_hash(user, &reset, None).unwrap();
+    assert_eq!(
+        call(&app, Method::GET, "/api/authorize", Some(&key2), "").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        !state.store.list_provision_keys(None).unwrap().iter().any(|k| k.id == id2),
+        "作废的 Key 认证时就删掉"
+    );
+
+    // 删掉账号连带删 Key。
+    state.store.delete_user(user, None).unwrap().unwrap();
+    assert!(state.store.list_provision_keys(None).unwrap().is_empty());
 }

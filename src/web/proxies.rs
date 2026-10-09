@@ -317,27 +317,39 @@ pub(super) struct TestProxyReq {
 
 #[derive(Serialize)]
 pub(super) struct TestProxyResult {
-    ok: bool,
+    pub(super) ok: bool,
     ip: Option<String>,
     country: Option<String>,
     city: Option<String>,
     region: Option<String>,
     org: Option<String>,
     latency_ms: u128,
-    error: Option<String>,
+    pub(super) error: Option<String>,
 }
 
 /// 测试代理连通性：通过指定代理访问 ip-api.com 获取出口 IP 和地理信息。
 pub(super) async fn test_proxy(
     Json(req): Json<TestProxyReq>,
 ) -> Result<Json<TestProxyResult>, ApiError> {
-    let started = std::time::Instant::now();
     let url =
         crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
     let client =
         crate::clients::upstream_client(Some(&url)).map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(probe_proxy(&client, PROXY_TEST_TIMEOUT).await))
+}
+
+/// 「测试代理」的超时。
+pub(super) const PROXY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 经 `client`（已配好代理）打一次 ip-api.com，看代理通不通。「测试代理」按钮与上号 Key
+/// 自动分配代理共用这一份判据。
+pub(super) async fn probe_proxy(
+    client: &wreq::Client,
+    timeout: std::time::Duration,
+) -> TestProxyResult {
+    let started = std::time::Instant::now();
     let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        timeout,
         client
             .get("http://ip-api.com/json/?fields=query,country,regionName,city,org,status")
             .send(),
@@ -346,7 +358,7 @@ pub(super) async fn test_proxy(
     {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            return Ok(Json(TestProxyResult {
+            return TestProxyResult {
                 ok: false,
                 ip: None,
                 country: None,
@@ -355,10 +367,10 @@ pub(super) async fn test_proxy(
                 org: None,
                 latency_ms: started.elapsed().as_millis(),
                 error: Some(format!("{e:#}")),
-            }));
+            };
         }
         Err(_) => {
-            return Ok(Json(TestProxyResult {
+            return TestProxyResult {
                 ok: false,
                 ip: None,
                 country: None,
@@ -366,15 +378,15 @@ pub(super) async fn test_proxy(
                 region: None,
                 org: None,
                 latency_ms: started.elapsed().as_millis(),
-                error: Some("proxy test timed out (15s)".into()),
-            }));
+                error: Some(format!("proxy test timed out ({}s)", timeout.as_secs())),
+            };
         }
     };
     let latency_ms = started.elapsed().as_millis();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
     let ok = body.get("status").and_then(|s| s.as_str()) == Some("success");
     let str_field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    Ok(Json(TestProxyResult {
+    TestProxyResult {
         ok,
         ip: str_field("query"),
         country: str_field("country"),
@@ -383,7 +395,7 @@ pub(super) async fn test_proxy(
         org: str_field("org"),
         latency_ms,
         error: if ok { None } else { Some(body.to_string()) },
-    }))
+    }
 }
 
 #[derive(Deserialize)]
