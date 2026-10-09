@@ -294,7 +294,7 @@ impl Cooling {
 impl RateLimitCooldown {
     /// 打上**参与选号门禁**的冷却。`model` 为 `None` 即账号级（所有模型）。
     /// 同一条时间线重复命中时取**较晚**的那个结束时刻，不让新的短冷却缩短旧的长冷却。
-    fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
+    pub(super) fn mark(&self, cred_id: i64, model: Option<&str>, dur: Duration) {
         let deadline = Instant::now() + dur;
         let mut until = self.until.lock();
         let slot = until.entry((cred_id, model.unwrap_or_default().to_string())).or_default();
@@ -326,7 +326,7 @@ impl RateLimitCooldown {
     /// 「这个账号 + 这个模型」，这两格的冷却都不再成立，其它模型的格子不动（sonnet 通了
     /// 证明不了 fable 通）。`None` 时清掉该凭证的**所有**格——用于手动解除：冷却只是选号
     /// 提示，解除错了最坏也只是再撞一次 429、重新打上，和「全员冷却时忽略冷却」同一条哲学。
-    fn clear(&self, cred_id: i64, model: Option<&str>) {
+    pub(super) fn clear(&self, cred_id: i64, model: Option<&str>) {
         let mut until = self.until.lock();
         match model {
             Some(m) => {
@@ -358,7 +358,7 @@ impl RateLimitCooldown {
     /// **注意这一档在正常路径上几乎恒为 0**：账号级 429 现在走
     /// [`CredentialStore::pause_for_rate_limit`] 落库（`resume_at`），只有落库失败的兜底
     /// 分支才会退回进程内冷却。留着它正是为了让那个兜底状态在后台能看见。
-    fn remaining_secs(&self, cred_id: i64) -> i64 {
+    pub(super) fn remaining_secs(&self, cred_id: i64) -> i64 {
         let now = Instant::now();
         self.until.lock().get(&(cred_id, String::new())).map(|c| c.gate_remaining(now)).unwrap_or(0)
     }
@@ -368,7 +368,7 @@ impl RateLimitCooldown {
     /// 补的是一个真实的观测盲区：模型级 429（实测里 fable 撞超额池就是这一档）只写进
     /// `(cred_id, 模型)` 那些格子，而后台读的是账号级那一格，于是选号侧明明已经跳过这个
     /// 模型、界面上却什么都看不到——「冷却中」那套筛选与徽章形同虚设。
-    fn model_remaining(&self, cred_id: i64) -> Vec<(String, i64, bool)> {
+    pub(super) fn model_remaining(&self, cred_id: i64) -> Vec<(String, i64, bool)> {
         let now = Instant::now();
         let mut out: Vec<(String, i64, bool)> = self
             .until
@@ -470,7 +470,7 @@ pub(super) const DEVICE_RATE_MAX_KEYS: usize = 4096;
 /// 会话限流窗口表里最多留多少个键，见 [`CredentialStore::take_session_rpm_slot`]。
 /// 比设备那个高一档（16384）：会话 id 正常使用下就在不断产生新值，撞上清扫的机会本就更大，
 /// 而清扫要遍历全表，不该在还装得下的时候触发。
-const SESSION_RATE_MAX_KEYS: usize = 16384;
+pub(super) const SESSION_RATE_MAX_KEYS: usize = 16384;
 
 /// RPM（每分钟请求数）的统计窗口：最近 60 秒。
 pub const RPM_WINDOW_SECS: i64 = 60;

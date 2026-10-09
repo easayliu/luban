@@ -16,7 +16,7 @@
 use super::*;
 
 /// 汇总的时间桶宽（秒）。
-const BILLING_BUCKET_SECS: i64 = 3600;
+pub(super) const BILLING_BUCKET_SECS: i64 = 3600;
 
 /// 回填过存量流水的标记（只回填一次）。
 pub(super) const BILLING_BACKFILLED: &str = "billing_backfilled";

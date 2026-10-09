@@ -689,7 +689,7 @@ pub const LATEST_CC_RELEASE: &str = "latest_cc_release";
 pub const SYSTEM_CACHE_SCOPE: &str = "system_cache_scope";
 
 /// 布尔型设置的统一口径：仅 `"0"`/`"false"`（忽略大小写与首尾空白）为关，其余为开。
-fn setting_is_on(value: &str) -> bool {
+pub(super) fn setting_is_on(value: &str) -> bool {
     !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false")
 }
 

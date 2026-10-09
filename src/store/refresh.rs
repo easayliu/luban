@@ -6,14 +6,14 @@ use super::*;
 ///
 /// 每失败一轮就停用一个凭证（可用池严格变小），循环必然收敛；这个上限只是防御性兜底，
 /// 免得停用没生效时打成死循环。也顺带给单次请求的耗时封了顶——每一轮都是一次上游往返。
-const MAX_REFRESH_FAILOVER: usize = 5;
+pub(super) const MAX_REFRESH_FAILOVER: usize = 5;
 
 /// 刷新没拿到结果（网络 / 代理 / 超时 / 5xx / 非作废的 4xx）后，这个号暂停调度多久。
 ///
 /// 这类失败多半是这个号的出口出了问题（代理挂了、过期了），不停的话绑在它上面的设备每条
 /// 请求都要白等一次刷新超时再吃 503。写的是 `resume_at`，与限流暂停同一套恢复：到点
 /// 惰性放回、连通性测试通过当场放回。取得短，网络抖一下的号很快就回来了。
-const REFRESH_FAIL_PAUSE_SECS: u64 = 120;
+pub(super) const REFRESH_FAIL_PAUSE_SECS: u64 = 120;
 
 /// 刷新失败暂停写进 `ban_reason` 的开头标签，前端 `isRefreshFailurePause` 按它认。
 pub const REFRESH_FAIL_PAUSE_TAG: &str = "[refresh-failed]";
@@ -135,7 +135,7 @@ pub fn refresh_ban(reason: &str) -> BanContext {
 /// 会让捕获了 `&CredentialStore`/`&wreq::Client` 的闭包推不出 `Send`
 /// （报 `implementation of Send is not general enough`），而这条链最终要塞进 axum handler。
 /// 固定成单个 `'a` 就没有这个问题；代价是每轮一次 Box 分配，紧挨着一次上游往返，可忽略。
-type AttemptFut<'a> =
+pub(super) type AttemptFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<TokenAttempt>> + Send + 'a>>;
 
 /// [`valid_access_token_for_device`] 的重选循环本体。把「取 token」这一步抽成参数注入，

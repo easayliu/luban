@@ -13,7 +13,7 @@ use super::*;
 pub const SESSION_TTL_SECS: i64 = 7 * 24 * 3600;
 
 /// 会话剩余有效期低于这个值才顺延：每个请求都写一次会话表没有必要，一天顺延一次足够。
-const SESSION_RENEW_BELOW_SECS: i64 = SESSION_TTL_SECS - 24 * 3600;
+pub(super) const SESSION_RENEW_BELOW_SECS: i64 = SESSION_TTL_SECS - 24 * 3600;
 
 /// 旧版管理 / 访客密码（无盐 sha256）迁移进 `users.password_hash` 时加的前缀，用来跟
 /// argon2 的 PHC 串（`$argon2id$…`）分开。登录校验通过后即重算成 argon2 覆盖掉。
@@ -43,7 +43,7 @@ impl UserRole {
         }
     }
 
-    fn parse(s: &str) -> rusqlite::Result<Self> {
+    pub(super) fn parse(s: &str) -> rusqlite::Result<Self> {
         match s {
             "admin" => Ok(UserRole::Admin),
             "viewer" => Ok(UserRole::Viewer),
@@ -131,9 +131,9 @@ pub enum DeleteUserError {
 }
 
 /// 带上级停用标记取用户的列（`u` 是用户本表，`p` 是 LEFT JOIN 的上级）。
-const USER_COLS: &str = "u.id, u.username, u.role, u.parent_id, u.disabled, \
+pub(super) const USER_COLS: &str = "u.id, u.username, u.role, u.parent_id, u.disabled, \
      COALESCE(p.disabled, 0), u.password_hash <> '', u.created_at, u.updated_at";
-const USER_FROM: &str = "users u LEFT JOIN users p ON p.id = u.parent_id";
+pub(super) const USER_FROM: &str = "users u LEFT JOIN users p ON p.id = u.parent_id";
 
 fn row_to_user(row: &Row) -> rusqlite::Result<User> {
     Ok(User {

@@ -37,7 +37,7 @@ pub(super) enum RollupDim {
 }
 
 impl RollupDim {
-    fn tag(self) -> &'static str {
+    pub(super) fn tag(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Model => "model",
@@ -372,7 +372,7 @@ fn upsert(
 
 /// 三个维度上的键：`model` 维是模型名（没有为空串），`cred` 维是账号 id 的十进制串（没选到号
 /// 的本地拒绝为空串），与拆分表的 `key` 同口径。
-fn keys(model: Option<&str>, cred_id: Option<i64>) -> [(RollupDim, String); 3] {
+pub(super) fn keys(model: Option<&str>, cred_id: Option<i64>) -> [(RollupDim, String); 3] {
     [
         (RollupDim::All, String::new()),
         (RollupDim::Model, model.unwrap_or_default().to_string()),

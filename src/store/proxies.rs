@@ -242,7 +242,7 @@ impl CredentialStore {
 ///
 /// 先去掉 `scheme://`，再去掉 `user:pass@`，保留剩余部分（`host:port`）。
 /// 解析失败时回退到完整 URL。
-fn url_to_label(raw: &str) -> String {
+pub(super) fn url_to_label(raw: &str) -> String {
     let after_scheme = raw.find("://").map(|i| &raw[i + 3..]).unwrap_or(raw);
     let after_auth =
         after_scheme.rfind('@').map(|i| &after_scheme[i + 1..]).unwrap_or(after_scheme);

@@ -22,7 +22,7 @@ pub struct CacheBucket {
 }
 
 impl CacheBucket {
-    fn empty(ts: i64) -> Self {
+    pub(super) fn empty(ts: i64) -> Self {
         Self { ts, input_tokens: 0, cached_tokens: 0, written_tokens: 0 }
     }
 }
@@ -143,7 +143,7 @@ pub struct CredentialStatsBucket {
 }
 
 impl CredentialStatsBucket {
-    fn add(&mut self, row: &CredentialStatsBucket) {
+    pub(super) fn add(&mut self, row: &CredentialStatsBucket) {
         self.requests += row.requests;
         self.errors += row.errors;
         self.rejected += row.rejected;
@@ -170,7 +170,7 @@ pub struct CredentialStatsGroup {
 }
 
 impl CredentialStatsGroup {
-    fn add(&mut self, row: &CredentialStatsBucket) {
+    pub(super) fn add(&mut self, row: &CredentialStatsBucket) {
         self.requests += row.requests;
         self.errors += row.errors;
         self.tokens +=
@@ -561,7 +561,7 @@ impl CredentialStore {
 }
 
 /// 把汇总格子按展示桶（桶宽与时区偏移见 [`display_grid`]）合并，按时间升序。
-fn regroup<'a>(
+pub(super) fn regroup<'a>(
     cells: impl IntoIterator<Item = &'a RollupCell>,
     bucket_secs: i64,
     tz_offset_secs: i64,
@@ -575,7 +575,7 @@ fn regroup<'a>(
 }
 
 /// 一组格子的合计。
-fn total<'a>(cells: impl IntoIterator<Item = &'a RollupCell>) -> RollupAgg {
+pub(super) fn total<'a>(cells: impl IntoIterator<Item = &'a RollupCell>) -> RollupAgg {
     let mut out = RollupAgg::default();
     for c in cells {
         out.add(&c.agg);

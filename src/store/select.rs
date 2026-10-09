@@ -160,7 +160,7 @@ fn free_session_slot(
 /// [`CredentialStore::select_for_device`] 里这条请求按哪张表粘住账号、占哪种名额。
 /// 两张表列名不同、上限字段不同、拒绝的错误类型不同，其余规则逐条相同。
 #[derive(Clone, Copy)]
-enum Binding<'a> {
+pub(super) enum Binding<'a> {
     /// 客户端自带的设备身份，`device_bindings`。
     Device(&'a str),
     /// 模拟路径上没有设备身份的来访，按会话键，`session_bindings`。见 [`Select::session_key`]。
@@ -168,28 +168,28 @@ enum Binding<'a> {
 }
 
 impl<'a> Binding<'a> {
-    fn table(self) -> &'static str {
+    pub(super) fn table(self) -> &'static str {
         match self {
             Self::Device(_) => "device_bindings",
             Self::Session(_) => "session_bindings",
         }
     }
 
-    fn column(self) -> &'static str {
+    pub(super) fn column(self) -> &'static str {
         match self {
             Self::Device(_) => "device_id",
             Self::Session(_) => "session_key",
         }
     }
 
-    fn key(self) -> &'a str {
+    pub(super) fn key(self) -> &'a str {
         match self {
             Self::Device(k) | Self::Session(k) => k,
         }
     }
 
     /// 所有可调度的号名额都满了时的拒绝理由。
-    fn limit_error(self) -> anyhow::Error {
+    pub(super) fn limit_error(self) -> anyhow::Error {
         match self {
             Self::Device(_) => DeviceLimitReached.into(),
             Self::Session(_) => SessionLimitReached.into(),

@@ -176,11 +176,11 @@ pub(super) fn migrate_groups(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn key_hash(key: &str) -> String {
+pub(super) fn key_hash(key: &str) -> String {
     token_fingerprint(key)
 }
 
-fn key_prefix(key: &str) -> String {
+pub(super) fn key_prefix(key: &str) -> String {
     key.chars().take(KEY_PREFIX_LEN).collect()
 }
 
@@ -240,7 +240,7 @@ fn groups_exist(conn: &Connection, ids: &[i64]) -> Result<bool> {
 }
 
 /// 去重、保持首次出现的顺序。
-fn dedup_ordered(ids: &[i64]) -> Vec<i64> {
+pub(super) fn dedup_ordered(ids: &[i64]) -> Vec<i64> {
     let mut seen = HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
