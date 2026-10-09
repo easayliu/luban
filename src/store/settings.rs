@@ -256,6 +256,12 @@ impl CredentialStore {
         if let Some(v) = on(SIM_BILLING_ONLY) {
             flags.sim_billing_only = v;
         }
+        if let Some(v) = on(SIM_BILLING_KEEP_USER_ID) {
+            flags.sim_billing_keep_user_id = v;
+        }
+        if let Some(v) = on(REAL_BILLING_KEEP_USER_ID) {
+            flags.real_billing_keep_user_id = v;
+        }
         if let Some(v) = on(SIM_MESSAGE_THREADS) {
             flags.sim_message_threads = v;
         }
@@ -548,9 +554,17 @@ pub const FILL_ABSENT_TOOLS: &str = "fill_absent_tools";
 /// 缺省视为启用，见 [`ForwardFlags::sim_trim_tools`]。
 pub const SIM_TRIM_TOOLS: &str = "sim_trim_tools";
 
-/// 模拟路径是否只注入 `system[0]` billing header、其余注入全部跳过的 settings 键名。
+/// 是否只保证 `system[0]` 有 billing header、其余注入全部跳过（模拟与真实客户端都生效）的 settings 键名。
 /// 缺省视为停用，见 [`ForwardFlags::sim_billing_only`]。
 pub const SIM_BILLING_ONLY: &str = "sim_billing_only";
+
+/// billing-only 下是否保留**模拟请求**自带 `metadata.user_id` 的 settings 键名（关掉即剥离）。
+/// 缺省视为开启，见 [`ForwardFlags::sim_billing_keep_user_id`]。
+pub const SIM_BILLING_KEEP_USER_ID: &str = "sim_billing_keep_user_id";
+
+/// billing-only 下是否保留**真实客户端**自带 `metadata.user_id` 的 settings 键名（关掉即剥离）。
+/// 缺省视为开启，见 [`ForwardFlags::real_billing_keep_user_id`]。
+pub const REAL_BILLING_KEEP_USER_ID: &str = "real_billing_keep_user_id";
 
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。

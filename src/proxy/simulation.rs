@@ -211,7 +211,7 @@ pub(super) fn inbound_facts(v: &serde_json::Value) -> InboundFacts {
         system_blocks: texts.len(),
         system_bytes: texts.iter().map(|t| t.len()).sum(),
         billing_header: texts.iter().any(|t| t.starts_with("x-anthropic-billing-header:")),
-        identity: texts.iter().any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX)),
+        identity: texts.iter().any(|t| has_cc_identity(t)),
         tools: v.get("tools").and_then(|t| t.as_array()).map_or(0, |t| t.len()),
         max_tokens: request_max_tokens(Some(v)),
     }
@@ -240,9 +240,6 @@ impl Simulation {
         // 账号钉住（[`account_session_id`]，同一条会话换号后不该带着同一个 uuid 出现在另一个
         // 组织下），没带才按缓存前缀 + 对话起点（[`sim_session_key`]）派生。
         let session_id = match (incoming_session_id(headers, Some(v)), seed) {
-            // `sim_billing_only`：metadata 原样透传（body 里保留客户端自己的 session_id），出站会话头
-            // 也沿用客户端这个合法值，两处同值、不自造矛盾。客户端没带才落到下面的派生。
-            (Some(sid), _) if flags.sim_billing_only => sid,
             (Some(sid), SimSessionSeed::Prefix(_)) => {
                 pin_session_id(cred, sid, flags.spoof_identity)
             }
@@ -432,8 +429,9 @@ pub(super) fn simulation_reason(
 
 /// 来访是否已经是 Claude Code 形态——两条判据命中任一即算是：
 ///
-/// 1. `system` 里包含身份声明前缀 [`config::CC_SYSTEM_IDENTITY_PREFIX`]（主代理 + agent-sdk
-///    主进程，写法是 `"You are Claude Code, Anthropic's official CLI for Claude…"`）；
+/// 1. `system` 里包含官方身份句（[`has_cc_identity`]）：身份声明前缀 [`config::CC_SYSTEM_IDENTITY_PREFIX`]
+///    （主代理 + agent-sdk 主进程，`"You are Claude Code, Anthropic's official CLI for Claude…"`），
+///    或 SDK 子代理那句 [`config::CC_SDK_AGENT_IDENTITY`]（`claude -p`、子代理、Helper）；
 /// 2. `system` 里有以 `x-anthropic-billing-header:` 开头的块（所有 CC 形态——包括子代理
 ///    explore/search——都带 billing header，即使身份句完全不同）。
 ///
@@ -447,8 +445,16 @@ pub(super) fn is_cc_shaped(v: &serde_json::Value) -> bool {
         Some(serde_json::Value::String(s)) => vec![s.as_str()],
         _ => return false,
     };
-    texts.iter().any(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
+    texts.iter().any(|t| has_cc_identity(t))
         || texts.iter().any(|t| t.starts_with("x-anthropic-billing-header:"))
+}
+
+/// 这段 system 文本里有没有官方身份句：CLI / agent-sdk 主进程那句（[`config::CC_SYSTEM_IDENTITY_PREFIX`]），
+/// 或 SDK 子代理 / `claude -p` / Helper 那句（[`config::CC_SDK_AGENT_IDENTITY`]）。后者单独就能过上游
+/// 放行闸；真实客户端关掉 billing header（`CLAUDE_CODE_ATTRIBUTION_HEADER=0`）后只剩它，不认它就会
+/// 被当成第三方送进模拟、整套换头。
+pub(super) fn has_cc_identity(text: &str) -> bool {
+    text.contains(config::CC_SYSTEM_IDENTITY_PREFIX) || text.contains(config::CC_SDK_AGENT_IDENTITY)
 }
 
 /// `system` 里是否带着官方那段基座提示词：任一块（或字符串形态的整段）长度不小于

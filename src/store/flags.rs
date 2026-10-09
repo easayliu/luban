@@ -116,8 +116,10 @@ pub struct ForwardFlags {
     ///   新会话首轮约少 1.4 万 token 的写入。
     /// - **关**：注入完整的 14 条，与官方默认配置相同。
     pub sim_trim_tools: bool,
-    /// 模拟路径只在 `system[0]` 注一条最小 billing header（`cc_version` / `cc_entrypoint` /
-    /// `cch`），其余注入一概跳过（[`Self::simulate_cc`] 的子项，实验性）。
+    /// 只在 `system[0]` 注一条最小 billing header（`cc_version` / `cc_entrypoint` / `cch`），
+    /// 其余注入一概跳过（[`Self::simulate_cc`] 的子项，实验性）。对所有来访生效：真实 CC 客户端
+    /// 不走模拟，自带的 billing header 照旧（缺了只补 billing header、不补身份句），`metadata.user_id`
+    /// 的去留看 [`Self::sim_billing_keep_user_id`] / [`Self::real_billing_keep_user_id`]，身份补全 / 会话链 / 工具名混淆 / 断点与 system 整形 / 字段剥除等改写同样一概跳过，见 [`Self::billing_only`]。
     ///
     /// - **开**：不补身份句、官方基座、第四块、官方工具、`metadata` / `thread` / `diagnostics` /
     ///   `output_config`，不重排顶层键；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
@@ -126,6 +128,21 @@ pub struct ForwardFlags {
     ///   一两轮的辅助调用，长多轮带工具的主对话官方从不这样发，属官方不产生的形态。
     /// - **关**（默认）：按完整官方形态模拟。
     pub sim_billing_only: bool,
+    /// billing-only 下**模拟请求**自带的 `metadata.user_id` 留不留（[`Self::sim_billing_only`] 的子项）。
+    /// 真实客户端另由 [`Self::real_billing_keep_user_id`] 管。
+    ///
+    /// - **开**（默认）：带了就保留，并照常按身份伪装 / 归一化规则改写（[`Self::spoof_identity`]、
+    ///   [`Self::spoof_device_id`]、[`Self::normalize_device_fp`]），会话段对齐出站会话头；没带不补。
+    /// - **关**：整个剥掉（`metadata` 剥空了一并去掉）。
+    pub sim_billing_keep_user_id: bool,
+    /// billing-only 下**真实 CC 客户端**自带的 `metadata.user_id` 留不留（[`Self::sim_billing_only`]
+    /// 的子项）。
+    ///
+    /// - **开**（默认）：带了就保留，并照常按身份伪装 / 归一化规则改写（account 换成本号、device 按
+    ///   设备指纹派生、会话段对齐按账号钉住的出站会话头）；身份伪装关着时原样透传。没带不补。
+    /// - **关**：整个剥掉。官方本就有不带 `user_id` 的形态（Claude Desktop 不带，Claude Code 也能用
+    ///   环境变量关掉）。
+    pub real_billing_keep_user_id: bool,
     /// 模拟路径的主线程按官方的 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项；
     /// 2.1.285 的 fable-5-1 除外——官方那一版不发，2.1.291 起发）。
     ///
@@ -340,8 +357,16 @@ impl ForwardFlags {
     /// 真实客户端（不走模拟）带设备身份时**按会话**占名额、设备上限不生效：设备指纹归一化开着、
     /// 身份伪装连同 device 一起换，出站 device_id 只剩「账号 + 平台 + 客户端版本」那几种，绑了
     /// 几台真实机器上游看不见。见 [`Select::per_session`](super::Select::per_session) 与 `crate::proxy::session_plan`。
+    /// billing-only 下保留的 `user_id` 同样按这套规则改写、剥掉的上游看不见设备，口径不变。
     pub fn devices_by_session(self) -> bool {
         self.normalize_device_fp && self.spoof_identity && self.spoof_device_id
+    }
+
+    /// [`Self::sim_billing_only`] 实际生效：它挂在「模拟 Claude Code」下（后者又要 `merge_beta`），
+    /// 父开关关着就不生效。生效时**所有来访**——模拟的第三方与不走模拟的真实 CC 客户端——都只
+    /// 保证 `system[0]` 有合法 billing header，其余请求体原样透传。
+    pub fn billing_only(self) -> bool {
+        self.sim_billing_only && self.simulate_cc && self.merge_beta
     }
 }
 
@@ -365,6 +390,8 @@ impl Default for ForwardFlags {
             fill_absent_tools: true,
             sim_trim_tools: true,
             sim_billing_only: false,
+            sim_billing_keep_user_id: true,
+            real_billing_keep_user_id: true,
             sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,

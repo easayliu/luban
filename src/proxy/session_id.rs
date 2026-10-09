@@ -225,8 +225,9 @@ pub(super) fn outbound_session_id(
 /// 来访没带 `metadata.user_id` 时用来补一份的 session_id；不需要补时为 `None`。
 /// 语义与各项前提见 [`Upstream::bare_session`]。
 ///
-/// 六个前提缺一不可：
+/// 七个前提缺一不可：
 /// - `sim.is_none()`：模拟那条路自己带 session_id，不走这里；
+/// - `!flags.billing_only()`：billing-only 下不补 metadata，客户端没带就不带；
 /// - `flags.fill_metadata`：本功能自己的开关（网页可关）；
 /// - `flags.spoof_identity`：身份伪装总开关——补出来的那份身份正是它管的东西，
 ///   它关着还补，等于绕过总开关；
@@ -248,6 +249,7 @@ pub(super) fn bare_session_id(
     device_fp: &str,
 ) -> Option<String> {
     if sim.is_some()
+        || flags.billing_only()
         || !flags.fill_metadata
         || !flags.spoof_identity
         || !billable

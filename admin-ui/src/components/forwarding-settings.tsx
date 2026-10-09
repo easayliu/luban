@@ -578,15 +578,55 @@ export function ForwardingSettingsContent() {
           k="sim_billing_only"
           label={t('仅注入 billing 标识', 'Inject billing identifier only')}
           summary={t(
-            '实验性，默认停用。启用后模拟请求只在 system 首块注入一条最小 billing 标识，不再补身份句、官方基座、第四块、官方工具、metadata/thread 等；客户端自带的 system 块与参数原样透传。',
-            'Experimental, disabled by default. When enabled, emulated requests inject only a minimal billing identifier as the first system block, and skip the identity line, official base prompt, fourth block, official tools, metadata/thread and the rest; the client’s own system blocks and parameters pass through unchanged.',
+            '实验性，默认停用。启用后对所有客户端生效：只保证 system 首块有一条合法 billing 标识，不再补身份句、官方基座、第四块、官方工具、metadata/thread 等；客户端自带的 system 块与参数原样透传。真实 Claude Code 客户端自带的 billing 标识照旧，缺失时只补 billing 标识。',
+            'Experimental, disabled by default. When enabled it applies to every client: only a valid billing identifier is ensured as the first system block, and the identity line, official base prompt, fourth block, official tools, metadata/thread and the rest are skipped; the client’s own system blocks and parameters pass through unchanged. Real Claude Code clients keep their own billing identifier, and get only a billing identifier added when it is missing.',
           )}
           requires={simulateRequires}
           description={
             <>
               {t(
-                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
-                'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+                '上游放行只认两把钥匙之一：请求 system 里的身份句，或 system 首块里合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关让模拟请求只走第二把——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 metadata/thread/diagnostics/output_config、不重排顶层键。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：它本就带 billing 标识，照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 的去留由「模拟请求保留 user_id」「真实客户端保留 user_id」分别决定；补全 metadata、会话关联字段（cc_prompt_id、diagnostics 等）、工具名混淆、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过。好处：第三方客户端借订阅额度调用时保留自己的提示词与行为，模型按客户端的 system 正常作答，不被套上 CC 人格。权衡：官方「仅 billing 标识、无身份句」的请求几乎都是零工具、一两轮的短辅助调用，长多轮带工具的主对话官方从不只发 billing 标识，因此用本开关跑重度长对话属于官方不会产生的形态，按需启用即可规避。与完整模拟并存，默认停用，可随时回退。',
+                'The upstream gate accepts one of two keys: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch takes only the second path — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no metadata/thread/diagnostics/output_config, and no top-level key reordering. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. Real Claude Code clients (including the VSCode extension, agent-sdk and subagents) are covered too: they already carry a billing identifier, which is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; whether metadata.user_id is kept is decided separately by “Keep user_id on emulated requests” and “Keep user_id on real clients”; filling metadata, session-chain fields (cc_prompt_id, diagnostics, etc.), tool-name obfuscation, system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped. Benefit: a third-party client borrowing subscription quota keeps its own prompt and behavior, and the model answers per the client’s system without being given the CC persona. Trade-off: official “billing-only, no identity line” requests are almost all zero-tool, one-or-two-turn helper calls; the official client never sends billing-only for a long multi-turn tool conversation, so using this for heavy long sessions is a shape the official client never produces — enable it only when needed to avoid that. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="sim_billing_keep_user_id"
+          label={t('模拟请求保留 user_id', 'Keep user_id on emulated requests')}
+          summary={t(
+            '仅注入 billing 标识时，模拟请求自带的 metadata.user_id 保留并按身份规则改写，没带不补；停用后整个剥离。',
+            'With billing-identifier-only injection, an emulated request’s own metadata.user_id is kept and rewritten by the identity rules, and nothing is added when absent; when disabled it is stripped entirely.',
+          )}
+          requires={[
+            { key: 'sim_billing_only', label: t('仅注入 billing 标识', 'Inject billing identifier only') },
+            ...simulateRequires,
+          ]}
+          description={
+            <>
+              {t(
+                '启用（默认）：客户端带了 user_id 就保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 换成号池账号，device_id 按设备指纹派生，会话段与出站会话 id 请求头对齐；「身份一致性」停用时原样发送。客户端没带就不补。停用：user_id 整个剥离（metadata 剥空后一并去掉）。只作用于模拟请求（第三方客户端，以及形态未被认作官方的请求），真实 Claude Code 客户端由「真实客户端保留 user_id」单独控制。',
+                'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid becomes the pooled account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session id header; with “Identity consistency” disabled it is sent unchanged. Nothing is added when the client sends none. Disabled: user_id is stripped entirely (metadata is removed once empty). Applies only to emulated requests (third-party clients and requests whose shape is not recognized as official); real Claude Code clients are controlled separately by “Keep user_id on real clients”.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="real_billing_keep_user_id"
+          label={t('真实客户端保留 user_id', 'Keep user_id on real clients')}
+          summary={t(
+            '仅注入 billing 标识时，真实 Claude Code 客户端自带的 metadata.user_id 保留并按身份规则改写，没带不补；停用后整个剥离。',
+            'With billing-identifier-only injection, a real Claude Code client’s own metadata.user_id is kept and rewritten by the identity rules, and nothing is added when absent; when disabled it is stripped entirely.',
+          )}
+          requires={[
+            { key: 'sim_billing_only', label: t('仅注入 billing 标识', 'Inject billing identifier only') },
+            ...simulateRequires,
+          ]}
+          description={
+            <>
+              {t(
+                '启用（默认）：客户端带了 user_id 就保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 换成号池账号，device_id 按设备指纹派生，会话段与出站会话 id 请求头对齐；「身份一致性」停用时原样发送。客户端没带就不补。停用：user_id 整个剥离（metadata 剥空后一并去掉）。只作用于真实 Claude Code 客户端。官方本就有不带 user_id 的形态（Claude Desktop 不带，Claude Code 也可通过环境变量不带），剥离同样是官方会出现的形态。',
+                'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid becomes the pooled account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session id header; with “Identity consistency” disabled it is sent unchanged. Nothing is added when the client sends none. Disabled: user_id is stripped entirely (metadata is removed once empty). Applies only to real Claude Code clients. Official clients already send requests without user_id (Claude Desktop never does, and Claude Code can omit it via an environment variable), so stripping is also a shape the official client produces.',
               )}
             </>
           }

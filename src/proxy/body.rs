@@ -14,8 +14,8 @@ use super::session_link::{
 };
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, SimEnv, Simulation, billing_header_text, cap_system_blocks,
-    cc_profile_for, cc_profile_kind_for, is_cc_shaped, relocate_long_client_system,
-    simulate_system,
+    cc_profile_for, cc_profile_kind_for, has_cc_identity, is_cc_shaped,
+    relocate_long_client_system, simulate_system,
 };
 use super::thinking::preserve_thinking_encoding;
 use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
@@ -130,14 +130,29 @@ pub(super) fn rewrite_body_out(
     // `sim_billing_only`：只注 `system[0]` billing header（在 [`simulate_system`] 里），下游所有
     // 把客户端内容改成官方 CC 形态的整形一律跳过——身份句/基座/第四块/官方工具/metadata/thread/
     // 顶层重排，以及会动到客户端块的 cap/strip/ttl/eager。`fallbacks` 归一照做，换头与 cch 重算
-    // 照旧。`billing_only` 蕴含 `sim.is_some()`，故所有 `sim.is_none()` 门控的步骤本就不触发。
-    let billing_only = sim.is_some_and(|s| s.billing_only);
+    // 照旧。不走模拟的真实 CC 客户端同样生效（[`store::ForwardFlags::billing_only`]）：自带的
+    // billing header 照旧、缺了只补 billing header，`sim.is_none()` 那几步（system 整形、消息断点、
+    // thinking.display、会话链、会话同步、eager）一并跳过。模拟请求按 `sim` 自己那份判——
+    // 连通性探测恒走完整形态，不跟开关。
+    let billing_only = match sim {
+        Some(s) => s.billing_only,
+        None => flags.billing_only(),
+    };
+    // billing-only 下客户端自带的 `metadata.user_id` 要不要剥：模拟与真实客户端各一个开关，
+    // 见 [`store::ForwardFlags::sim_billing_keep_user_id`] / [`store::ForwardFlags::real_billing_keep_user_id`]。
+    let keep_uid = match sim {
+        Some(_) => flags.sim_billing_keep_user_id,
+        None => flags.real_billing_keep_user_id,
+    };
+    let strip_uid = billing_only && !keep_uid;
     // 全关且不模拟：连解析都不必做，原样返回。
     // 要补 `fallbacks` 的也不能走这条：调用方已按同一个判断在头上补了 `server-side-fallback`
     // beta（[`build_forward_headers_for`]），体里不写字段就是「有 beta 没字段」——对 fable 而言
     // 恰是官方 2.1.260 之前的旧形态，且拒答时上游不会换模型重跑，开关等于没开。
     // 真 CC 路径要不要补 `eager_input_streaming` 得解析了才知道；没有 `tools` 字面量的体
     // 一定不补，不必为它解析。
+    // billing-only 也不能走这条：缺的 billing header 要补（[`ensure_cc_system_prefix`]）、客户端的
+    // 字符串 `fallbacks` 要归一、`user_id` 可能要剥，都得解析了才知道。
     let may_fill_eager =
         flags.eager_tool_streaming && adv_beta && body_contains(body, b"\"tools\"");
     if sim.is_none()
@@ -149,6 +164,7 @@ pub(super) fn rewrite_body_out(
         && !force_stream
         && tool_names.is_none()
         && fallbacks.is_none()
+        && !billing_only
         && !real_cch_stale(body, sim, flags)
     {
         return (body.clone(), None);
@@ -224,6 +240,7 @@ pub(super) fn rewrite_body_out(
     // `display_beta` 取自实际发出的头——头上没那项 beta 时体里写 `updates` 是一发稳定 400
     // （agent-sdk / VSCode 扩展的 beta 串没有 `advisor-tool`，`merge_beta` 不给它补）。
     let display_filled = sim.is_none()
+        && !billing_only
         && cc_inbound
         && flags.merge_beta
         && display_beta
@@ -245,9 +262,16 @@ pub(super) fn rewrite_body_out(
     // `"default"` → 官方数组）：要它的是 luban 自己在头上声明的那个 beta，不是客户端写错了。billing-only 下出站头仍会按
     // `body_has_fallbacks` 声明 `server-side-fallback` beta，而新日期 beta 下上游只收数组，留着
     // 字符串就是一发稳定 400。只有**新增** fallback（`Some(plan)`）才在调用点按 billing-only 置空。
-    let fallbacks_shaped = match fallbacks {
-        Some(plan) => ensure_fallbacks(&mut v, plan),
-        None => sim.is_some_and(|s| normalize_fallbacks(&mut v, s.profile)),
+    // 真实客户端在 billing-only 下同样归一（按请求模型的 profile）：计划被置空后再没有
+    // [`ensure_fallbacks`] 替它把字符串换掉，口径与 [`outbound_carries_fallbacks`] 一致。
+    let fallbacks_shaped = match (fallbacks, sim) {
+        (Some(plan), _) => ensure_fallbacks(&mut v, plan),
+        (None, Some(s)) => normalize_fallbacks(&mut v, s.profile),
+        (None, None) if billing_only => {
+            let profile = v.get("model").and_then(|m| m.as_str()).map(cc_profile_for);
+            profile.is_some_and(|p| normalize_fallbacks(&mut v, p))
+        }
+        (None, None) => false,
     };
     // 官方那第三个断点在最后一条消息上，模拟路径此前从不碰 `messages`，故要补。
     // 跟在 `simulate_system` 之后：断点预算得把它已经用掉的那些算进去。
@@ -262,6 +286,7 @@ pub(super) fn rewrite_body_out(
     // messages 标了断点也是未命中，只会把裸算换成更贵的写入；会话第一轮同样不补。按
     // 请求类别分谱系：同一会话里主线程与辅助请求交替出现，不能互相当对方的「上一轮」。
     let cc_msg_shape = shape
+        && !billing_only
         && sim.is_none()
         && cc_inbound
         && cc_kind.allows_system_prefix()
@@ -274,7 +299,7 @@ pub(super) fn rewrite_body_out(
         })
         && ensure_cc_message_breakpoint(&mut v);
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
-    let shaped = shape && !simulated && align_system_shape(&mut v, cache);
+    let shaped = shape && !billing_only && !simulated && align_system_shape(&mut v, cache);
     // CC 子代理/desktop-3p 有时不带 billing header，上游按第三方计、限流更严。
     // 补上 billing + 身份句让上游按订阅额度计。放在 ensure_billing_cch 之前——后者给
     // billing header 追加 cch，得先有 billing header 它才有东西追加。
@@ -291,7 +316,7 @@ pub(super) fn rewrite_body_out(
     let prefix_injected = flags.simulate_cc
         && sim.is_none()
         && cc_kind.allows_system_prefix()
-        && ensure_cc_system_prefix(&mut v, client);
+        && ensure_cc_system_prefix(&mut v, client, !billing_only);
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
     // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。
@@ -341,33 +366,36 @@ pub(super) fn rewrite_body_out(
     // `flags.spoof_identity`：用户一旦关掉身份伪装，客户端自己带的 device/account/session
     // 就被删掉、且没人补回来——头上还有会话 id、体里却什么都没有。那既违背这个开关的语义
     // （「别改身份」被执行成了「把身份删了」），也违背客户端数据透传契约。
-    // `billing_only`：`metadata.user_id` 完全原样透传（不剥、不重建、不改身份），客户端自带的
-    // account/device/session 全部保留。
-    if sim.is_some()
-        && !billing_only
-        && flags.spoof_identity
-        && let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut())
-    {
-        meta.remove("user_id");
-        if meta.is_empty() {
-            v.as_object_mut().map(|o| o.remove("metadata"));
-        }
+    // `billing_only`：不剥不重建；客户端自带的 `user_id` 留还是剥看下面的 `meta_stripped`，留下的
+    // 按身份伪装规则改写（`spoofed` / `session_synced`），没带的不补。
+    if sim.is_some() && !billing_only && flags.spoof_identity {
+        strip_metadata_user_id(&mut v);
     }
+    // billing-only 且这条路（模拟 / 真实客户端）关了「保留 user_id」：整个剥掉。客户端那份写的是
+    // 它自己登录的账号，与 luban 换上的 token 不是同一个账号；官方本身就有不带 `user_id` 的形态
+    // （Claude Desktop 不带，Claude Code 也能用环境变量关掉）。开着（默认）则原样透传。
+    let meta_stripped = strip_uid && strip_metadata_user_id(&mut v);
     let sim_meta = flags.spoof_identity
         && !billing_only
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
-    let spoofed = flags.spoof_identity
-        && !billing_only
-        && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
+    // billing-only 下同样跑：保留下来的 `user_id` 按身份伪装 / 归一化的规则改写；剥掉了或客户端
+    // 本就没带时这里没有东西可改（billing-only 不补 metadata）。
+    let spoofed =
+        flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
     // 客户端自带的那份 user_id 里，会话段要和出站头同值。跟在 [`spoof_identity`] 之后——
     // 那一步刻意保留 session 段，这一步只在「luban 选的和它写的不是一个」时才动它。
     //
     // 与 `sim_meta`/`spoofed` 同一道闸（`spoof_identity`）：这仍是在改客户端写的身份字段，
     // 用户把身份伪装整个关掉时，体照旧原样透传（头那侧的归一不受此闸影响——它落的就是
     // 客户端自己给的那个合法值，见 [`outbound_session_id`]）。
-    let session_synced = flags.spoof_identity
-        && sim.is_none()
-        && session_out.is_some_and(|sid| sync_metadata_session(&mut v, sid));
+    // 模拟路径平时整份重建、会话段本就是 `sim.session_id`；billing-only 保留客户端那份时没重建，
+    // 会话段同样对齐到模拟出站头上那个。
+    let synced_sid = match sim {
+        Some(s) => billing_only.then_some(s.session_id.as_str()),
+        None => session_out,
+    };
+    let session_synced =
+        flags.spoof_identity && synced_sid.is_some_and(|sid| sync_metadata_session(&mut v, sid));
     // 流式化：`stream` 在官方线序里就在队尾，来访带了它就原位改值、没带就追加，两条路
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
@@ -422,6 +450,7 @@ pub(super) fn rewrite_body_out(
         sys_relocated,
         env_noted,
         sim_meta,
+        meta_stripped,
         shaped,
         capped,
         spoofed,
@@ -457,6 +486,9 @@ pub(super) fn rewrite_body_out(
         && !sys_relocated
         && !env_noted
         && !sim_meta
+        && !meta_stripped
+        && !prefix_injected
+        && !session_synced
         && !thinking_filled
         && !display_filled
         && !ctx_mgmt
@@ -502,3 +534,17 @@ pub(super) fn rewrite_body_out(
 
 #[cfg(test)]
 mod tests;
+
+/// 剥掉 `metadata.user_id`，剥完 `metadata` 空了就整个去掉。剥了返回 `true`。
+fn strip_metadata_user_id(v: &mut serde_json::Value) -> bool {
+    let Some(meta) = v.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        return false;
+    };
+    if meta.remove("user_id").is_none() {
+        return false;
+    }
+    if meta.is_empty() {
+        v.as_object_mut().map(|o| o.remove("metadata"));
+    }
+    true
+}

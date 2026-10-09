@@ -81,6 +81,10 @@ export interface Settings {
   sim_trim_tools: boolean
   /** 模拟路径只在 system[0] 注一条最小 billing header、其余注入全部跳过（身份句/基座/工具/metadata/thread 一律不补），客户端 system 与参数原样透传；实验性，默认停用。 */
   sim_billing_only: boolean
+  /** 仅注入 billing 标识时保留模拟请求自带的 metadata.user_id（按身份规则改写，没带不补）；停用后整个剥离；默认启用。 */
+  sim_billing_keep_user_id: boolean
+  /** 仅注入 billing 标识时保留真实客户端自带的 metadata.user_id（按身份规则改写，没带不补）；停用后整个剥离；默认启用。 */
+  real_billing_keep_user_id: boolean
   /** 模拟路径的主线程按官方 message threads 形态写 thread：首轮 create，接得上的续轮 continue 只发增量（2.1.291 起四族都写）；并在末尾补官方的 total_tokens 提醒。 */
   sim_message_threads: boolean
   /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
@@ -148,6 +152,8 @@ export type ForwardingKey =
   | 'fill_absent_tools'
   | 'sim_trim_tools'
   | 'sim_billing_only'
+  | 'sim_billing_keep_user_id'
+  | 'real_billing_keep_user_id'
   | 'sim_message_threads'
   | 'fill_metadata'
   | 'rate_limit_retry'

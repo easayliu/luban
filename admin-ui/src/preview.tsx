@@ -879,6 +879,8 @@ queryClient.setQueryData(['settings'], {
   fill_absent_tools: true,
   sim_trim_tools: true,
   sim_billing_only: false,
+  sim_billing_keep_user_id: true,
+  real_billing_keep_user_id: true,
   sim_message_threads: true,
   fill_metadata: true,
   rate_limit_retry: true,

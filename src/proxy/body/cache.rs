@@ -378,7 +378,7 @@ pub(in crate::proxy) fn text_block(
 /// req_ujomarOOPtXL38jx）发的 system 是 `[身份句(带断点), 基座, …]`——有身份句、没 billing
 /// header。原先只查 billing header 在不在，于是两块都插，出站变成
 /// `[billing, 身份句, 身份句(带断点), …]`：身份句重复、块数还多了一块。改成按块判：身份句
-/// （[`config::CC_SYSTEM_IDENTITY_PREFIX`]，含 agent-sdk 那种逗号变体）已在任一块里，就只在
+/// （[`has_cc_identity`]：CC 那句含 agent-sdk 的逗号变体，以及 SDK 子代理那句）已在任一块里，就只在
 /// 最前面插 billing header；官方序本来就是 billing 在身份句之前，客户端的身份句连同它自己的
 /// `cache_control` 原样留在第二块。
 ///
@@ -387,6 +387,8 @@ pub(in crate::proxy) fn text_block(
 pub(super) fn ensure_cc_system_prefix(
     v: &mut serde_json::Value,
     client: Option<CcClient<'_>>,
+    // 缺身份句时要不要一并补上；billing-only 下只补 billing header。
+    with_identity: bool,
 ) -> bool {
     let has_billing = match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
@@ -401,12 +403,10 @@ pub(super) fn ensure_cc_system_prefix(
         return false;
     }
     let has_identity = match v.get("system") {
-        Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))
-        }),
-        Some(serde_json::Value::String(s)) => s.contains(config::CC_SYSTEM_IDENTITY_PREFIX),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .any(|b| b.get("text").and_then(|t| t.as_str()).is_some_and(has_cc_identity)),
+        Some(serde_json::Value::String(s)) => has_cc_identity(s),
         _ => false,
     };
     let mut prefix = vec![text_block_bare(&billing_header_text(
@@ -414,7 +414,7 @@ pub(super) fn ensure_cc_system_prefix(
         client.map(|c| c.version),
         client.map(|c| c.entrypoint),
     ))];
-    if !has_identity {
+    if !has_identity && with_identity {
         prefix.push(text_block_bare(config::CC_SYSTEM_IDENTITY));
     }
     match v.get_mut("system") {
@@ -439,6 +439,8 @@ pub(super) fn ensure_cc_system_prefix(
         tracing::info!(
             "injected billing header into system for a CC client that had only the identity line"
         );
+    } else if !with_identity {
+        tracing::info!("injected billing header only (billing-only) into system for a CC client");
     } else {
         tracing::info!(
             "injected billing header + identity into system for a CC client without them"

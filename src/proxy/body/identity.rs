@@ -21,7 +21,8 @@ pub(in crate::proxy) fn sim_device_id(
     cred: &crate::credentials::Credential,
     device_fp: &str,
 ) -> Option<String> {
-    if (sim.is_none() && bare_session.is_none()) || !flags.spoof_identity {
+    // billing-only 下不补 metadata（[`ensure_cc_metadata`] 不跑），没有伪装 device_id 可记。
+    if (sim.is_none() && bare_session.is_none()) || !flags.spoof_identity || flags.billing_only() {
         return None;
     }
     cred.spoof_device_id(device_fp).map(|d| format!("sim:{d}"))

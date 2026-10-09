@@ -618,6 +618,8 @@ fn body_flags_off_passes_through_byte_for_byte() {
         fill_absent_tools: false,
         sim_trim_tools: false,
         sim_billing_only: false,
+        sim_billing_keep_user_id: false,
+        real_billing_keep_user_id: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -1277,6 +1279,8 @@ fn strip_extra_fields_is_wired_and_switchable() {
             fill_absent_tools: false,
             sim_trim_tools: false,
             sim_billing_only: false,
+            sim_billing_keep_user_id: false,
+            real_billing_keep_user_id: false,
             sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -1891,6 +1895,8 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         fill_absent_tools: false,
         sim_trim_tools: false,
         sim_billing_only: false,
+        sim_billing_keep_user_id: false,
+        real_billing_keep_user_id: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -2201,6 +2207,16 @@ mod billing_only {
         assert_eq!(v["metadata"]["user_id"], "client-uid-123");
     }
 
+    /// 关掉模拟那项「保留 user_id」：模拟路径整个剥掉，`metadata` 剥空了一并去掉；只关真实
+    /// 客户端那项不影响模拟路径。
+    #[test]
+    fn strips_client_metadata_when_keep_is_off() {
+        let v = out(store::ForwardFlags { sim_billing_keep_user_id: false, ..on_flags() });
+        assert!(v.get("metadata").is_none(), "模拟路径剥掉 user_id: {v}");
+        let v = out(store::ForwardFlags { real_billing_keep_user_id: false, ..on_flags() });
+        assert_eq!(v["metadata"]["user_id"], "client-uid-123", "真实客户端那项不管模拟路径");
+    }
+
     /// cch 仍按出站字节重算：出站 `system[0]` 里的 cch 等于对（cch 归零后的）出站字节算的真值，
     /// 且不是跨账号恒定的 `00000`。
     #[test]
@@ -2316,10 +2332,10 @@ mod billing_only {
         assert_eq!(billing_headers, 1, "全局只剩一条 billing header，客户端抄的那行已剥");
     }
 
-    /// 修复 2：billing-only 保留客户端 metadata 时，出站会话 id 沿用客户端自带的合法值——
-    /// 头与 body 两处同值。这里断言 `sim.session_id` 即客户端那个（头由它派生）。
+    /// billing-only 保留客户端 metadata 时，会话 id 照常派生（不照抄客户端 uuid），body 里的会话段
+    /// 对齐到出站头那个——头体同值。
     #[test]
-    fn prefers_client_session_id_so_header_matches_body() {
+    fn synced_session_id_so_header_matches_body() {
         const SID: &str = "11111111-1111-4111-8111-111111111111";
         let raw = Bytes::from(format!(
             concat!(
@@ -2334,15 +2350,13 @@ mod billing_only {
             crate::proxy::test_support::detect_with(&raw, &crate::proxy::HeaderMap::new(), on)
                 .unwrap();
         assert!(sim.billing_only);
-        assert_eq!(sim.session_id, SID, "billing-only 沿用客户端自带会话 id");
-        // 关着时走派生：不等于客户端那个原值。
-        let sim_off = crate::proxy::test_support::detect_with(
-            &raw,
-            &crate::proxy::HeaderMap::new(),
-            all_on(),
-        )
-        .unwrap();
-        assert_ne!(sim_off.session_id, SID, "完整模拟按账号派生、不照抄客户端 uuid");
+        assert_ne!(sim.session_id, SID, "按账号派生、不照抄客户端 uuid");
+        let v: serde_json::Value =
+            serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", on, Some(&sim), None))
+                .unwrap();
+        let uid: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(uid["session_id"], sim.session_id.as_str(), "体里会话段对齐出站头");
     }
 
     /// 修复 3：客户端自带字符串 `fallbacks:"default"` 仍按防 400 归一成官方数组——即便 billing-only。
@@ -2392,6 +2406,160 @@ mod billing_only {
             v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.iter().any(|n| config::CC_TOOL_NAMES.contains(n)), "完整模拟注官方工具");
         assert!(v.get("output_config").is_some(), "完整模拟补 output_config");
+    }
+
+    /// 真实 CC 来访（不走模拟，`sim = None`）带完整身份时：billing-only 下 system 原样透传，
+    /// `metadata.user_id` 默认保留并按身份伪装规则改写（关掉身份伪装则原样）、关掉「保留 user_id」则整个剥掉。
+    const REAL: &str = concat!(
+        r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+        r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;"},"#,
+        r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},"#,
+        r#"{"type":"text","text":"CLIENT 基座"}],"#,
+        r#""metadata":{"user_id":"{\"device_id\":\"dev-real\",\"account_uuid\":\"acct-real\",\"session_id\":\"0b6c2d6e-4f53-4c43-9a43-5a1f7c3b2e10\"}"},"#,
+        r#""messages":[{"role":"user","content":"hi"}]}"#
+    );
+
+    fn real_out(flags: store::ForwardFlags, raw: &'static str) -> serde_json::Value {
+        let raw = Bytes::from_static(raw.as_bytes());
+        serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", flags, None, None)).unwrap()
+    }
+
+    #[test]
+    fn real_client_passes_identity_and_system_through() {
+        let src: serde_json::Value = serde_json::from_str(REAL).unwrap();
+        let v = real_out(on_flags(), REAL);
+        let uid: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(uid["account_uuid"], ACCOUNT_UUID, "默认保留：account 按规则换成本号");
+        assert_ne!(uid["device_id"], "dev-real", "device 按规则派生");
+        let raw_keep = real_out(store::ForwardFlags { spoof_identity: false, ..on_flags() }, REAL);
+        assert_eq!(raw_keep["metadata"], src["metadata"], "身份伪装关着时原样透传");
+        let stripped =
+            real_out(store::ForwardFlags { real_billing_keep_user_id: false, ..on_flags() }, REAL);
+        assert!(stripped.get("metadata").is_none(), "关掉保留即剥掉: {stripped}");
+        let sim_off =
+            real_out(store::ForwardFlags { sim_billing_keep_user_id: false, ..on_flags() }, REAL);
+        assert_eq!(sim_off["metadata"], v["metadata"], "模拟那项不管真实客户端");
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "不整形、不加块: {v}");
+        for (a, b) in sys.iter().zip(src["system"].as_array().unwrap()).skip(1) {
+            assert_eq!(a, b, "客户端块原样");
+        }
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+    }
+
+    /// 真实 CC 来访缺 billing header：billing-only 下只补 billing header，不补身份句。
+    #[test]
+    fn real_client_without_billing_gets_only_billing_header() {
+        const BARE: &str = concat!(
+            r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+            r#""system":[{"type":"text","text":"CLIENT 指令"}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let v = real_out(on_flags(), BARE);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "billing header + 客户端原块: {v}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+        assert_eq!(sys[1]["text"], "CLIENT 指令");
+        let off = real_out(all_on(), BARE);
+        assert!(
+            off["system"].as_array().unwrap().iter().any(|b| b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains(config::CC_SYSTEM_IDENTITY_PREFIX))),
+            "关着时照旧补身份句: {off}"
+        );
+    }
+
+    /// SDK 子代理 / `claude -p` 那句身份句（不带 billing header）也算 CC 形态：billing-only 下只补
+    /// billing header；完整路径下也不再多插一句 CC 身份句。
+    #[test]
+    fn sdk_agent_identity_without_billing_counts_as_cc() {
+        const SDK: &str = concat!(
+            r#"{"model":"claude-haiku-5-5","max_tokens":64,"#,
+            r#""system":[{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},"#,
+            r#"{"type":"text","text":"CLIENT 基座"}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        assert!(crate::proxy::is_cc_shaped(&serde_json::from_str(SDK).unwrap()));
+        for flags in [on_flags(), all_on()] {
+            let v = real_out(flags, SDK);
+            let sys = v["system"].as_array().unwrap();
+            assert_eq!(sys.len(), 3, "billing header + 两块原块，不多插身份句: {v}");
+            assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+            assert_eq!(sys[1]["text"], config::CC_SDK_AGENT_IDENTITY);
+        }
+    }
+
+    /// 回归：billing-only + `billing_cch` 关，真实 CC 缺 billing header 与 user_id 时，补上的
+    /// billing header 不能被收尾的「没改动就原样返回」丢掉。
+    #[test]
+    fn injected_billing_header_survives_without_other_rewrites() {
+        const BARE: &str = concat!(
+            r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+            r#""system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},"#,
+            r#"{"type":"text","text":"CLIENT 基座"}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let v = real_out(store::ForwardFlags { billing_cch: false, ..on_flags() }, BARE);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "补上的 billing header 要出站: {v}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+    }
+
+    /// 回归：billing-only 下真实客户端带字符串 `fallbacks:"default"`（fable），计划被置空后仍要
+    /// 归一成官方数组——头上声明的新日期 beta 只收数组。
+    #[test]
+    fn real_client_string_fallbacks_still_normalized() {
+        const FB: &str = concat!(
+            r#"{"model":"claude-fable-5-1","max_tokens":64,"fallbacks":"default","#,
+            r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;"},"#,
+            r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let v = real_out(on_flags(), FB);
+        assert!(v["fallbacks"].is_array(), "字符串应归一成数组: {}", v["fallbacks"]);
+        assert_eq!(v["fallbacks"][0]["model"], "claude-opus-5");
+    }
+
+    /// 回归：快速返回那条（system_shape / spoof_identity / billing_cch / strip_extra_fields 全关、
+    /// 不流式化、cch 无需重算）不能绕过 billing-only——缺的 billing header 照补、字符串 fallbacks 照归一。
+    #[test]
+    fn fast_path_does_not_skip_billing_only() {
+        let lean = store::ForwardFlags {
+            system_shape: false,
+            spoof_identity: false,
+            billing_cch: false,
+            strip_extra_fields: false,
+            eager_tool_streaming: false,
+            ..on_flags()
+        };
+        const BARE: &str = concat!(
+            r#"{"model":"claude-opus-5-5","max_tokens":64,"stream":true,"#,
+            r#""system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},"#,
+            r#"{"type":"text","text":"CLIENT 基座"}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let v = real_out(lean, BARE);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "快速返回不能吞掉补上的 billing header: {v}");
+        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+
+        const FB: &str = concat!(
+            r#"{"model":"claude-fable-5-1","max_tokens":64,"stream":true,"fallbacks":"default","#,
+            r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli; cch=00000;"},"#,
+            r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let v = real_out(store::ForwardFlags { cch_real_recompute: false, ..lean }, FB);
+        assert!(v["fallbacks"].is_array(), "快速返回不能跳过归一: {}", v["fallbacks"]);
+    }
+
+    /// 父开关关着时不生效。
+    #[test]
+    fn effective_flag_follows_parents() {
+        assert!(on_flags().billing_only());
+        assert!(!store::ForwardFlags { simulate_cc: false, ..on_flags() }.billing_only());
+        assert!(!store::ForwardFlags { merge_beta: false, ..on_flags() }.billing_only());
     }
 }
 

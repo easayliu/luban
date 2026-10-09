@@ -1138,8 +1138,9 @@ pub(super) fn client_session_link(
     billable: bool,
     cred: &crate::credentials::Credential,
 ) -> Option<(String, CcSessionLink)> {
-    // 模拟那条路自己带链；`billing_cch` 是「允不允许动 billing header」的总开关。
-    if sim.is_some() || !billable || !flags.billing_cch {
+    // 模拟那条路自己带链；`billing_cch` 是「允不允许动 billing header」的总开关；
+    // billing-only 下 billing header 只保证在、不往里追加会话关联字段。
+    if sim.is_some() || !billable || !flags.billing_cch || flags.billing_only() {
         return None;
     }
     let v = body?;
