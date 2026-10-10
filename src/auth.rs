@@ -474,8 +474,15 @@ fn access_of(path: &str) -> Access {
 /// - `/users`：访客是来看号池的，用不着控制台账号名单；
 /// - `/api-keys`：带着查看明文的接口，看到就等于能用。
 /// - `/provision-keys`：访客建不了 Key，列表也没必要看。
-const VIEWER_DENIED: &[&str] =
-    &["/authorize", "/export", "/settings", "/learned-rejections", "/users", "/api-keys", "/provision-keys"];
+const VIEWER_DENIED: &[&str] = &[
+    "/authorize",
+    "/export",
+    "/settings",
+    "/learned-rejections",
+    "/users",
+    "/api-keys",
+    "/provision-keys",
+];
 
 /// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
 /// `POST`，但只作废访客自己的会话，不放行的话访客点「退出」只清得掉本地 token。

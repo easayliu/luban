@@ -42,7 +42,7 @@ pub struct ProvisionKeyHit {
 pub const PROVISION_KEY_PREFIX: &str = "lbp-";
 
 /// 明文显示几位前缀。
-const KEY_PREFIX_LEN: usize = 10;
+pub(super) const KEY_PREFIX_LEN: usize = 10;
 
 /// 建表，由 `init_schema` 调用。幂等，每次启动都跑。
 pub(super) fn migrate_provision_keys(conn: &Connection) -> Result<()> {
@@ -63,7 +63,8 @@ pub(super) fn migrate_provision_keys(conn: &Connection) -> Result<()> {
     )
     .context("failed to create the provision key table")?;
     // 早先建的表没有 pw_tag：补上空串，空指纹恒对不上，那几把 Key 作废、需要重建。
-    let _ = conn.execute("ALTER TABLE provision_keys ADD COLUMN pw_tag TEXT NOT NULL DEFAULT ''", []);
+    let _ =
+        conn.execute("ALTER TABLE provision_keys ADD COLUMN pw_tag TEXT NOT NULL DEFAULT ''", []);
     Ok(())
 }
 

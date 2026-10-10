@@ -59,7 +59,7 @@ fn row_to_user(row: &PgRow) -> Result<User> {
 }
 
 /// 按 id 取用户（带上级停用标记）。
-async fn user_by_id_on(conn: &mut PgConnection, id: i64) -> Result<Option<User>> {
+pub(super) async fn user_by_id_on(conn: &mut PgConnection, id: i64) -> Result<Option<User>> {
     sqlx::query(AssertSqlSafe(user_sql("u.id = $1")))
         .bind(id)
         .fetch_optional(conn)
@@ -389,6 +389,7 @@ impl PgStore {
         for sql in [
             "DELETE FROM sessions WHERE user_id = $1",
             "DELETE FROM proxies WHERE owner_id = $1",
+            "DELETE FROM provision_keys WHERE user_id = $1",
             "DELETE FROM users WHERE id = $1",
         ] {
             sqlx::query(sql).bind(id).execute(&mut *tx).await?;

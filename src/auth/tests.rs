@@ -581,14 +581,12 @@ async fn provision_keys_only_reach_the_add_account_routes() {
     };
     let (id, key) = new_key(user);
 
-    for (m, uri) in
-        [
+    for (m, uri) in [
         (Method::GET, "/api/authorize"),
         (Method::POST, "/api/exchange"),
         (Method::GET, "/api/groups"),
         (Method::GET, "/api/proxies"),
-    ]
-    {
+    ] {
         assert_eq!(call(&app, m, uri, Some(&key), "{}").await, StatusCode::OK, "{uri}");
     }
     for (m, uri) in [

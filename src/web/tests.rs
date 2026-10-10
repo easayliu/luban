@@ -632,25 +632,39 @@ async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
         group_ids: vec![],
     };
 
-    let (url, _) = resolve_proxy(&state, &actor, &req(Some("http://u:x@h:9"), None), true, all_up).await.unwrap();
+    let (url, _) = resolve_proxy(&state, &actor, &req(Some("http://u:x@h:9"), None), true, all_up)
+        .await
+        .unwrap();
     assert_eq!(url.as_deref(), Some("http://u:x@h:9"));
-    let (url, _) = resolve_proxy(&state, &actor, &req(None, Some(pa.id)), false, all_up).await.unwrap();
+    let (url, _) =
+        resolve_proxy(&state, &actor, &req(None, Some(pa.id)), false, all_up).await.unwrap();
     assert_eq!(url.as_deref(), Some(pa.url.as_str()));
     assert_eq!(
-        resolve_proxy(&state, &actor, &req(None, Some(foreign.id)), true, all_up).await.err().map(|e| e.0),
+        resolve_proxy(&state, &actor, &req(None, Some(foreign.id)), true, all_up)
+            .await
+            .err()
+            .map(|e| e.0),
         Some(StatusCode::NOT_FOUND)
     );
     assert_eq!(
-        resolve_proxy(&state, &actor, &req(Some(&pa.url), Some(pa.id)), true, all_up).await.err().map(|e| e.0),
+        resolve_proxy(&state, &actor, &req(Some(&pa.url), Some(pa.id)), true, all_up)
+            .await
+            .err()
+            .map(|e| e.0),
         Some(StatusCode::BAD_REQUEST)
     );
-    assert_eq!(resolve_proxy(&state, &actor, &req(None, None), false, all_up).await.unwrap().0, None);
+    assert_eq!(
+        resolve_proxy(&state, &actor, &req(None, None), false, all_up).await.unwrap().0,
+        None
+    );
 
     // A 已经挂了一个号（别人的也算）：先分到 B；B 在途时两边各 1，并列取 id 小的 A；
     // 在途的放掉之后又回到 B。
-    let (first, held) = resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
+    let (first, held) =
+        resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
     assert_eq!(first.as_deref(), Some(pb.url.as_str()));
-    let (second, _held2) = resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
+    let (second, _held2) =
+        resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
     assert_eq!(second.as_deref(), Some(pa.url.as_str()));
     drop(held);
     drop(_held2);
@@ -688,5 +702,8 @@ async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
 
     let lonely = store.create_user("agent3", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
     let lonely = Actor { id: lonely, username: "agent3".into(), role: UserRole::Agent };
-    assert_eq!(resolve_proxy(&state, &lonely, &req(None, None), true, all_up).await.unwrap().0, None);
+    assert_eq!(
+        resolve_proxy(&state, &lonely, &req(None, None), true, all_up).await.unwrap().0,
+        None
+    );
 }

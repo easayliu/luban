@@ -64,8 +64,9 @@ pub(super) fn take_pkce(
 
 /// 自动分配时已选中、还没入库的代理：`url` → 在途几次。并发的几个脚本同时上号时，库里的
 /// 挂号数还没变，只看库会全挑到同一条上；把在途的也算进去才分得开。
-static PROXY_IN_FLIGHT: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, usize>>> =
-    std::sync::LazyLock::new(Default::default);
+static PROXY_IN_FLIGHT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// 自动分配占着的一个名额，上号结束（成功或失败）时放掉。
 pub(super) struct ProxyReservation(String);
