@@ -7,6 +7,10 @@
 //! **接入 Key**也只有 admin 能建，给外部系统对接用。一把 Key 按顺序绑定若干分组：请求只在这些
 //! 分组的号里选，排在前面的分组优先（见 `CredentialStore::select_with_slot`）。不绑定分组的 Key
 //! 用全部号。库里存 Key 的 sha256（校验用）和加密后的明文（admin 随时可以查看、复制）。
+//!
+//! 分组名不区分大小写唯一：唯一索引建在 `lower(name)` 上，按名字查一律比 `lower(...)`，撞名按
+//! PG 的 23505 认。「先核对分组 / 开放对象存在、再写」的都走 [`CredentialStore::begin_write`]：
+//! 核对与写入之间分组被删掉的话，会留下指向不存在分组的绑定。
 
 use super::*;
 
@@ -50,6 +54,22 @@ pub struct KeyAccess {
     pub groups: Option<Vec<i64>>,
 }
 
+/// [`CredentialStore::api_key_access`] 的进程内缓存：每条转发请求都要认一次 Key，Key 表又
+/// 极少变动，逐条查库就是每请求一到两次往返。
+///
+/// 只缓存认得出的 Key（键是 [`key_hash`]）：认不出的不进缓存，乱发 Key 撑不大它，条数以
+/// `api_keys` 的行数为上限。改动 Key 或分组绑定的写路径用
+/// [`CredentialStore::commit_invalidating_keys`] 提交，提交结束后整体作废；`generation` 挡住
+/// 「提交之前读到的旧值在作废之后才放进缓存」。[`KEY_CACHE_TTL`] 兜底：直接改库（运维手工 SQL）最多这么久后生效。
+#[derive(Default)]
+pub(super) struct KeyAccessCache {
+    generation: u64,
+    hits: HashMap<String, (std::time::Instant, KeyAccess)>,
+}
+
+/// [`KeyAccessCache`] 里一条的有效期。
+const KEY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// 配过接入 Key 的标记：有了它，转发就恒要求带 Key——哪怕后来把 Key 全删了，也只是谁都
 /// 进不来，而不是退回「没配 Key 就不校验」。
 pub const API_KEYS_CONFIGURED: &str = "api_keys_configured";
@@ -59,122 +79,6 @@ pub(super) const DEFAULT_GROUP_NAME: &str = "默认分组";
 
 /// 明文显示几位前缀。
 const KEY_PREFIX_LEN: usize = 10;
-
-/// 建表与迁移，由 `init_schema` 调用。幂等，每次启动都跑。
-///
-/// - 默认分组恒存在；不在任何分组里的号（存量号、直接写库的号）补进默认分组；
-/// - 旧版的全局接入 Key（settings 的 `client_api_key`）迁成一把不绑定分组的 Key，再删掉
-///   那个设置项。
-///
-/// 搬过旧版全局 Key（明文从 settings 里删掉了）就在同一个事务里落下清理标记，迁移跑完由
-/// 调用方清空闲页。
-pub(super) fn migrate_groups(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pool_groups (
-             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-             name       TEXT    NOT NULL COLLATE NOCASE UNIQUE,
-             note       TEXT    NOT NULL DEFAULT '',
-             is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
-             created_at INTEGER NOT NULL DEFAULT (unixepoch())
-         ) STRICT;
-         CREATE UNIQUE INDEX IF NOT EXISTS uq_pool_groups_default
-             ON pool_groups(is_default) WHERE is_default = 1;
-         CREATE TABLE IF NOT EXISTS credential_groups (
-             cred_id  INTEGER NOT NULL,
-             group_id INTEGER NOT NULL,
-             PRIMARY KEY (cred_id, group_id)
-         ) STRICT, WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS idx_credential_groups_group ON credential_groups(group_id);
-         CREATE TABLE IF NOT EXISTS group_grants (
-             group_id INTEGER NOT NULL,
-             user_id  INTEGER NOT NULL,
-             PRIMARY KEY (group_id, user_id)
-         ) STRICT, WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS idx_group_grants_user ON group_grants(user_id);
-         CREATE TABLE IF NOT EXISTS api_keys (
-             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-             label      TEXT    NOT NULL DEFAULT '',
-             key_hash   TEXT    NOT NULL UNIQUE,
-             key_sealed TEXT    NOT NULL,
-             key_prefix TEXT    NOT NULL DEFAULT '',
-             all_groups INTEGER NOT NULL DEFAULT 1 CHECK (all_groups IN (0,1)),
-             disabled   INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
-             created_at INTEGER NOT NULL DEFAULT (unixepoch())
-         ) STRICT;
-         CREATE TABLE IF NOT EXISTS api_key_groups (
-             key_id   INTEGER NOT NULL,
-             group_id INTEGER NOT NULL,
-             ord      INTEGER NOT NULL DEFAULT 0,
-             PRIMARY KEY (key_id, group_id)
-         ) STRICT, WITHOUT ROWID;",
-    )
-    .context("failed to create the group and API key tables")?;
-
-    // 新插入的号先落进默认分组：上号接口随后按所选分组整体替换；迁移文件导入、直接写库的
-    // 号就留在默认分组里，不会因为一个分组都不在而永远调度不到。
-    conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS trg_credentials_default_group
-             AFTER INSERT ON credentials
-         BEGIN
-             INSERT OR IGNORE INTO credential_groups (cred_id, group_id)
-             SELECT NEW.id, id FROM pool_groups WHERE is_default = 1;
-         END;",
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO pool_groups (name, is_default) \
-         SELECT ?1, 1 WHERE NOT EXISTS (SELECT 1 FROM pool_groups WHERE is_default = 1)",
-        [DEFAULT_GROUP_NAME],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO credential_groups (cred_id, group_id) \
-         SELECT c.id, (SELECT id FROM pool_groups WHERE is_default = 1) FROM credentials c \
-          WHERE NOT EXISTS (SELECT 1 FROM credential_groups g WHERE g.cred_id = c.id)",
-        [],
-    )?;
-    // 删号不顺手清关联（`remove` 在别处），这里兜底把孤儿行扫掉。
-    conn.execute(
-        "DELETE FROM credential_groups WHERE cred_id NOT IN (SELECT id FROM credentials)",
-        [],
-    )?;
-
-    // 早先建的表没有 all_groups：补列时把已绑了分组的 Key 标成「只限分组」。
-    if conn
-        .execute("ALTER TABLE api_keys ADD COLUMN all_groups INTEGER NOT NULL DEFAULT 1", [])
-        .is_ok()
-    {
-        conn.execute(
-            "UPDATE api_keys SET all_groups = 0 WHERE id IN (SELECT key_id FROM api_key_groups)",
-            [],
-        )?;
-    }
-    // 库里有 Key 就一定配过：补上标记（升级前建的库）。
-    conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) SELECT ?1, '1' WHERE EXISTS (SELECT 1 FROM api_keys)",
-        [API_KEYS_CONFIGURED],
-    )?;
-
-    let legacy: Option<String> = conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", [CLIENT_API_KEY], |r| r.get(0))
-        .optional()?
-        .map(|v: String| v.trim().to_owned())
-        .filter(|v| !v.is_empty());
-    if let Some(key) = legacy {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO api_keys (label, key_hash, key_sealed, key_prefix) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params!["默认 Key", key_hash(&key), seal(&key), key_prefix(&key)],
-        )?;
-        tx.execute("DELETE FROM settings WHERE key = ?1", [CLIENT_API_KEY])?;
-        tx.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
-            [API_KEYS_CONFIGURED],
-        )?;
-        mark_scrub_pending(&tx)?;
-        tx.commit()?;
-    }
-    Ok(())
-}
 
 pub(super) fn key_hash(key: &str) -> String {
     token_fingerprint(key)
@@ -227,231 +131,285 @@ impl std::fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
-/// `ids` 里的分组是不是全都存在。
-fn groups_exist(conn: &Connection, ids: &[i64]) -> Result<bool> {
-    let mut stmt =
-        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM pool_groups WHERE id = ?1)")?;
-    for id in ids {
-        if !stmt.query_row([id], |r| r.get::<_, bool>(0))? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// 去重、保持首次出现的顺序。
 pub(super) fn dedup_ordered(ids: &[i64]) -> Vec<i64> {
     let mut seen = HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
 
+use std::collections::{HashMap, HashSet};
+
+use anyhow::{Context, Result};
+use sqlx::{PgConnection, Row};
+
+use super::CredentialStore;
+use super::{User, UserRole, seal};
+
+/// `ids` 里的分组是不是全都存在。
+async fn groups_exist(conn: &mut PgConnection, ids: &[i64]) -> Result<bool> {
+    let ids = dedup_ordered(ids);
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pool_groups WHERE id = ANY($1)")
+        .bind(&ids)
+        .fetch_one(conn)
+        .await?;
+    Ok(n as usize == ids.len())
+}
+
+/// 分组是不是默认分组；不存在为 None。
+async fn group_is_default(conn: &mut PgConnection, id: i64) -> Result<Option<bool>> {
+    Ok(sqlx::query_scalar::<_, i64>("SELECT is_default FROM pool_groups WHERE id = $1")
+        .bind(id)
+        .fetch_optional(conn)
+        .await?
+        .map(|v| v != 0))
+}
+
+/// 整体替换一把 Key 的分组绑定（按给定顺序记 `ord`）。
+async fn write_key_groups(conn: &mut PgConnection, key_id: i64, group_ids: &[i64]) -> Result<()> {
+    sqlx::query("DELETE FROM api_key_groups WHERE key_id = $1")
+        .bind(key_id)
+        .execute(&mut *conn)
+        .await?;
+    for (ord, gid) in group_ids.iter().enumerate() {
+        sqlx::query("INSERT INTO api_key_groups (key_id, group_id, ord) VALUES ($1, $2, $3)")
+            .bind(key_id)
+            .bind(gid)
+            .bind(ord as i64)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// 是不是唯一约束冲突（PG 的 23505）。
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.is_unique_violation())
+}
+
 impl CredentialStore {
     /// 默认分组的 id。
-    pub fn default_group_id(&self) -> Result<i64> {
-        let conn = self.conn.lock();
-        Ok(conn.query_row("SELECT id FROM pool_groups WHERE is_default = 1", [], |r| r.get(0))?)
+    pub async fn default_group_id(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar("SELECT id FROM pool_groups WHERE is_default = 1")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// 全部分组（admin / 访客用），带号数与开放名单。默认分组排第一。
-    pub fn list_groups(&self) -> Result<Vec<PoolGroup>> {
-        let conn = self.conn.lock();
+    pub async fn list_groups(&self) -> Result<Vec<PoolGroup>> {
         let mut grants: HashMap<i64, Vec<i64>> = HashMap::new();
-        {
-            let mut stmt =
-                conn.prepare("SELECT group_id, user_id FROM group_grants ORDER BY user_id")?;
-            for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-                let (g, u) = row?;
-                grants.entry(g).or_default().push(u);
-            }
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT group_id, user_id FROM group_grants ORDER BY user_id")
+                .fetch_all(&self.pool)
+                .await?;
+        for (g, u) in rows {
+            grants.entry(g).or_default().push(u);
         }
-        let mut stmt = conn.prepare(
+        let rows = sqlx::query(
             "SELECT g.id, g.name, g.note, g.is_default, g.created_at, \
                     (SELECT COUNT(*) FROM credential_groups c WHERE c.group_id = g.id) \
                FROM pool_groups g ORDER BY g.is_default DESC, g.id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let id: i64 = r.get(0)?;
-            Ok(PoolGroup {
-                id,
-                name: r.get(1)?,
-                note: r.get(2)?,
-                is_default: r.get::<_, i64>(3)? != 0,
-                created_at: r.get::<_, i64>(4)? as u64,
-                credential_count: Some(r.get(5)?),
-                grants: Some(grants.get(&id).cloned().unwrap_or_default()),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let id: i64 = r.try_get(0)?;
+                Ok(PoolGroup {
+                    id,
+                    name: r.try_get(1)?,
+                    note: r.try_get(2)?,
+                    is_default: r.try_get::<i64, _>(3)? != 0,
+                    created_at: r.try_get::<i64, _>(4)? as u64,
+                    credential_count: Some(r.try_get(5)?),
+                    grants: Some(grants.get(&id).cloned().unwrap_or_default()),
+                })
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .collect()
     }
 
     /// 某个代理或用户能用的分组 id：默认分组，加上开放给他的；用户挂在代理名下时，开放给
     /// 那个代理的也算（继承）。
-    pub fn visible_group_ids(&self, user: &User) -> Result<HashSet<i64>> {
-        let conn = self.conn.lock();
+    pub async fn visible_group_ids(&self, user: &User) -> Result<HashSet<i64>> {
         let inherit = match (user.role, user.parent_id) {
             (UserRole::User, Some(parent)) => Some(parent),
             _ => None,
         };
-        let mut stmt = conn.prepare(
+        let rows: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM pool_groups WHERE is_default = 1 \
-             UNION SELECT group_id FROM group_grants WHERE user_id = ?1 \
-             UNION SELECT group_id FROM group_grants WHERE user_id = ?2 \
-                   AND EXISTS (SELECT 1 FROM users WHERE id = ?2 AND role = 'agent')",
-        )?;
-        let rows = stmt.query_map(params![user.id, inherit], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+             UNION SELECT group_id FROM group_grants WHERE user_id = $1 \
+             UNION SELECT group_id FROM group_grants WHERE user_id = $2 \
+                   AND EXISTS (SELECT 1 FROM users WHERE id = $2 AND role = 'agent')",
+        )
+        .bind(user.id)
+        .bind(inherit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// 某个代理或用户能看到的分组（只有名称与说明，不带号数和开放名单）。
-    pub fn visible_groups(&self, user: &User) -> Result<Vec<PoolGroup>> {
-        let ids = self.visible_group_ids(user)?;
+    pub async fn visible_groups(&self, user: &User) -> Result<Vec<PoolGroup>> {
+        let ids = self.visible_group_ids(user).await?;
         Ok(self
-            .list_groups()?
+            .list_groups()
+            .await?
             .into_iter()
             .filter(|g| ids.contains(&g.id))
             .map(|g| PoolGroup { credential_count: None, grants: None, ..g })
             .collect())
     }
 
-    /// 新建分组。
-    pub fn create_group(
+    /// 新建分组。名称撞了（不区分大小写）回 [`GroupError::NameTaken`]。
+    pub async fn create_group(
         &self,
         name: &str,
         note: &str,
     ) -> Result<std::result::Result<i64, GroupError>> {
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "INSERT OR IGNORE INTO pool_groups (name, note) VALUES (?1, ?2)",
-            params![name, note],
-        )?;
-        if n == 0 {
-            return Ok(Err(GroupError::NameTaken));
-        }
-        Ok(Ok(conn.last_insert_rowid()))
+        // 不写冲突目标：撞的是 lower(name) 上的唯一索引。
+        let id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO pool_groups (name, note) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING RETURNING id",
+        )
+        .bind(name)
+        .bind(note)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.ok_or(GroupError::NameTaken))
     }
 
     /// 改分组的名称与说明。
-    pub fn update_group(
+    pub async fn update_group(
         &self,
         id: i64,
         name: &str,
         note: &str,
     ) -> Result<std::result::Result<(), GroupError>> {
-        let conn = self.conn.lock();
-        let taken: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pool_groups WHERE name = ?1 AND id <> ?2)",
-            params![name, id],
-            |r| r.get(0),
-        )?;
+        let mut tx = self.begin_write().await?;
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pool_groups WHERE lower(name) = lower($1) AND id <> $2)",
+        )
+        .bind(name)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
         if taken {
             return Ok(Err(GroupError::NameTaken));
         }
-        let n = conn.execute(
-            "UPDATE pool_groups SET name = ?2, note = ?3 WHERE id = ?1",
-            params![id, name, note],
-        )?;
+        let n = match sqlx::query("UPDATE pool_groups SET name = $2, note = $3 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .bind(note)
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(r) => r.rows_affected(),
+            // 上面已在写锁下核对过，这里兜底：不走 begin_write 的写入（直接改库）撞上时同样报撞名。
+            Err(e) if is_unique_violation(&e) => return Ok(Err(GroupError::NameTaken)),
+            Err(e) => return Err(e.into()),
+        };
+        tx.commit().await?;
         Ok(if n > 0 { Ok(()) } else { Err(GroupError::NotFound) })
     }
 
     /// 删分组：默认分组不能删。组里的号若因此一个分组都不剩，挪进默认分组；开放名单与接入
     /// Key 上的绑定一并清掉。
-    pub fn delete_group(&self, id: i64) -> Result<std::result::Result<(), GroupError>> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        let is_default: Option<bool> = tx
-            .query_row("SELECT is_default FROM pool_groups WHERE id = ?1", [id], |r| {
-                Ok(r.get::<_, i64>(0)? != 0)
-            })
-            .optional()?;
-        match is_default {
+    pub async fn delete_group(&self, id: i64) -> Result<std::result::Result<(), GroupError>> {
+        let mut tx = self.begin_write().await?;
+        match group_is_default(&mut tx, id).await? {
             None => return Ok(Err(GroupError::NotFound)),
             Some(true) => return Ok(Err(GroupError::DefaultGroup)),
             Some(false) => {}
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO credential_groups (cred_id, group_id) \
+        sqlx::query(
+            "INSERT INTO credential_groups (cred_id, group_id) \
              SELECT cg.cred_id, (SELECT id FROM pool_groups WHERE is_default = 1) \
-               FROM credential_groups cg WHERE cg.group_id = ?1 \
+               FROM credential_groups cg WHERE cg.group_id = $1 \
                 AND NOT EXISTS (SELECT 1 FROM credential_groups o \
-                                 WHERE o.cred_id = cg.cred_id AND o.group_id <> ?1)",
-            [id],
-        )?;
-        tx.execute("DELETE FROM credential_groups WHERE group_id = ?1", [id])?;
-        tx.execute("DELETE FROM group_grants WHERE group_id = ?1", [id])?;
-        tx.execute("DELETE FROM api_key_groups WHERE group_id = ?1", [id])?;
-        tx.execute("DELETE FROM pool_groups WHERE id = ?1", [id])?;
-        tx.commit()?;
+                                 WHERE o.cred_id = cg.cred_id AND o.group_id <> $1) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        for sql in [
+            "DELETE FROM credential_groups WHERE group_id = $1",
+            "DELETE FROM group_grants WHERE group_id = $1",
+            "DELETE FROM api_key_groups WHERE group_id = $1",
+            "DELETE FROM pool_groups WHERE id = $1",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+        }
+        // 绑着这个分组的 Key 能用的分组变了。
+        self.commit_invalidating_keys(tx).await?;
         Ok(Ok(()))
     }
 
     /// 整体替换一个分组的开放名单。开放对象只能是代理，或 admin 直属的用户。默认分组本来
     /// 就对所有人开放，不需要名单。
-    pub fn set_group_grants(
+    pub async fn set_group_grants(
         &self,
         id: i64,
         user_ids: &[i64],
     ) -> Result<std::result::Result<(), GroupError>> {
         let user_ids = dedup_ordered(user_ids);
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        let is_default: Option<bool> = tx
-            .query_row("SELECT is_default FROM pool_groups WHERE id = ?1", [id], |r| {
-                Ok(r.get::<_, i64>(0)? != 0)
-            })
-            .optional()?;
-        match is_default {
+        let mut tx = self.begin_write().await?;
+        match group_is_default(&mut tx, id).await? {
             None => return Ok(Err(GroupError::NotFound)),
             Some(true) => return Ok(Err(GroupError::DefaultGroup)),
             Some(false) => {}
         }
-        {
-            let mut ok = tx.prepare(
-                "SELECT EXISTS (SELECT 1 FROM users u WHERE u.id = ?1 AND (u.role = 'agent' \
+        for uid in &user_ids {
+            let ok: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM users u WHERE u.id = $1 AND (u.role = 'agent' \
                     OR (u.role = 'user' AND u.parent_id = (SELECT id FROM users WHERE role = 'admin'))))",
-            )?;
-            for uid in &user_ids {
-                if !ok.query_row([uid], |r| r.get::<_, bool>(0))? {
-                    return Ok(Err(GroupError::InvalidGrantee));
-                }
+            )
+            .bind(uid)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !ok {
+                return Ok(Err(GroupError::InvalidGrantee));
             }
         }
-        tx.execute("DELETE FROM group_grants WHERE group_id = ?1", [id])?;
-        {
-            let mut ins =
-                tx.prepare("INSERT INTO group_grants (group_id, user_id) VALUES (?1, ?2)")?;
-            for uid in &user_ids {
-                ins.execute(params![id, uid])?;
-            }
+        sqlx::query("DELETE FROM group_grants WHERE group_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for uid in &user_ids {
+            sqlx::query("INSERT INTO group_grants (group_id, user_id) VALUES ($1, $2)")
+                .bind(id)
+                .bind(uid)
+                .execute(&mut *tx)
+                .await?;
         }
-        tx.commit()?;
+        tx.commit().await?;
         Ok(Ok(()))
     }
 
     /// 号 → 所在分组（升序）。
-    pub fn credential_group_map(&self) -> Result<HashMap<i64, Vec<i64>>> {
-        let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT cred_id, group_id FROM credential_groups ORDER BY group_id")?;
+    pub async fn credential_group_map(&self) -> Result<HashMap<i64, Vec<i64>>> {
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT cred_id, group_id FROM credential_groups ORDER BY group_id")
+                .fetch_all(&self.pool)
+                .await?;
         let mut out: HashMap<i64, Vec<i64>> = HashMap::new();
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-            let (c, g) = row?;
+        for (c, g) in rows {
             out.entry(c).or_default().push(g);
         }
         Ok(out)
     }
 
     /// 一个号所在的分组（升序）。
-    pub fn credential_groups(&self, cred_id: i64) -> Result<Vec<i64>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT group_id FROM credential_groups WHERE cred_id = ?1 ORDER BY group_id",
-        )?;
-        let rows = stmt.query_map([cred_id], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    pub async fn credential_groups(&self, cred_id: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT group_id FROM credential_groups WHERE cred_id = $1 ORDER BY group_id",
+        )
+        .bind(cred_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// 整体替换一批号的分组。至少一个分组，且都得存在；能不能选由调用方按身份先核对。
-    pub fn set_credential_groups(
+    pub async fn set_credential_groups(
         &self,
         cred_ids: &[i64],
         group_ids: &[i64],
@@ -460,102 +418,101 @@ impl CredentialStore {
         if group_ids.is_empty() {
             return Ok(Err(GroupError::Empty));
         }
-        let conn = self.conn.lock();
-        if !groups_exist(&conn, &group_ids)? {
+        let mut tx = self.begin_write().await?;
+        if !groups_exist(&mut tx, &group_ids).await? {
             return Ok(Err(GroupError::UnknownGroup));
         }
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut del = tx.prepare("DELETE FROM credential_groups WHERE cred_id = ?1")?;
-            let mut ins =
-                tx.prepare("INSERT INTO credential_groups (cred_id, group_id) VALUES (?1, ?2)")?;
-            for cid in cred_ids {
-                del.execute([cid])?;
-                for gid in &group_ids {
-                    ins.execute(params![cid, gid])?;
-                }
+        for cid in cred_ids {
+            sqlx::query("DELETE FROM credential_groups WHERE cred_id = $1")
+                .bind(cid)
+                .execute(&mut *tx)
+                .await?;
+            for gid in &group_ids {
+                // 同一个号在 `cred_ids` 里出现两次时第二轮会先删再插，不会撞主键；这里照旧
+                // 不吞冲突，与旧版一致。
+                sqlx::query("INSERT INTO credential_groups (cred_id, group_id) VALUES ($1, $2)")
+                    .bind(cid)
+                    .bind(gid)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
-        tx.commit()?;
+        tx.commit().await?;
         Ok(Ok(()))
     }
 
     // ---------- 接入 Key ----------
 
     /// 全部接入 Key（不含明文）。
-    pub fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let conn = self.conn.lock();
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let mut groups: HashMap<i64, Vec<i64>> = HashMap::new();
-        {
-            let mut stmt =
-                conn.prepare("SELECT key_id, group_id FROM api_key_groups ORDER BY key_id, ord")?;
-            for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
-                let (k, g) = row?;
-                groups.entry(k).or_default().push(g);
-            }
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT key_id, group_id FROM api_key_groups ORDER BY key_id, ord")
+                .fetch_all(&self.pool)
+                .await?;
+        for (k, g) in rows {
+            groups.entry(k).or_default().push(g);
         }
-        let mut stmt = conn.prepare(
-            "SELECT id, label, key_prefix, disabled, created_at, all_groups FROM api_keys ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let id: i64 = r.get(0)?;
-            Ok(ApiKey {
-                id,
-                label: r.get(1)?,
-                prefix: r.get(2)?,
-                disabled: r.get::<_, i64>(3)? != 0,
-                created_at: r.get::<_, i64>(4)? as u64,
-                all_groups: r.get::<_, i64>(5)? != 0,
-                groups: groups.get(&id).cloned().unwrap_or_default(),
+        let rows = sqlx::query(
+            "SELECT id, label, key_prefix, disabled, created_at, all_groups \
+               FROM api_keys ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let id: i64 = r.try_get(0)?;
+                Ok(ApiKey {
+                    id,
+                    label: r.try_get(1)?,
+                    prefix: r.try_get(2)?,
+                    disabled: r.try_get::<i64, _>(3)? != 0,
+                    created_at: r.try_get::<i64, _>(4)? as u64,
+                    all_groups: r.try_get::<i64, _>(5)? != 0,
+                    groups: groups.get(&id).cloned().unwrap_or_default(),
+                })
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    fn write_key_groups(tx: &Connection, key_id: i64, group_ids: &[i64]) -> Result<()> {
-        tx.execute("DELETE FROM api_key_groups WHERE key_id = ?1", [key_id])?;
-        let mut ins =
-            tx.prepare("INSERT INTO api_key_groups (key_id, group_id, ord) VALUES (?1, ?2, ?3)")?;
-        for (ord, gid) in group_ids.iter().enumerate() {
-            ins.execute(params![key_id, gid, ord as i64])?;
-        }
-        Ok(())
+            .collect()
     }
 
     /// 新建一把接入 Key，回它的 id。`group_ids` 按优先顺序，空 = 用全部号。建过一把之后
     /// 转发就恒要求带 Key（[`API_KEYS_CONFIGURED`]）。
-    pub fn create_api_key(
+    ///
+    /// 标记与 Key 在同一个事务里落库（旧版是建完 Key 再单独写设置），提交后再同步内存镜像。
+    pub async fn create_api_key(
         &self,
         label: &str,
         key: &str,
         group_ids: &[i64],
     ) -> Result<std::result::Result<i64, GroupError>> {
         let group_ids = dedup_ordered(group_ids);
-        let id = {
-            let conn = self.conn.lock();
-            if !groups_exist(&conn, &group_ids)? {
-                return Ok(Err(GroupError::UnknownGroup));
-            }
-            let tx = conn.unchecked_transaction()?;
-            tx.execute(
-                "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix, all_groups) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    label,
-                    key_hash(key),
-                    seal(key),
-                    key_prefix(key),
-                    group_ids.is_empty() as i64
-                ],
-            )
-            .context("this API key already exists")?;
-            let id = tx.last_insert_rowid();
-            Self::write_key_groups(&tx, id, &group_ids)?;
-            tx.commit()?;
-            id
-        };
-        // 走 set_setting 而不是直接写表：设置在内存里有一份镜像。
-        self.set_setting(API_KEYS_CONFIGURED, "1")?;
+        let mut tx = self.begin_write().await?;
+        if !groups_exist(&mut tx, &group_ids).await? {
+            return Ok(Err(GroupError::UnknownGroup));
+        }
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix, all_groups) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(label)
+        .bind(key_hash(key))
+        .bind(seal(key))
+        .bind(key_prefix(key))
+        .bind(group_ids.is_empty() as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .context("this API key already exists")?;
+        write_key_groups(&mut tx, id, &group_ids).await?;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, '1') \
+             ON CONFLICT (key) DO UPDATE SET value = '1'",
+        )
+        .bind(API_KEYS_CONFIGURED)
+        .execute(&mut *tx)
+        .await?;
+        self.commit_invalidating_keys(tx).await?;
+        // 设置在内存里有一份镜像（见 `CredentialStore::settings`），落库成功后同步。
+        self.settings.write().insert(API_KEYS_CONFIGURED.to_string(), "1".to_string());
         Ok(Ok(id))
     }
 
@@ -568,7 +525,7 @@ impl CredentialStore {
     ///
     /// 绑定的分组被删光的 Key 是「只限分组、列表为空」：只改个名字、停用再启用，不能因此
     /// 变成全部号。
-    pub fn update_api_key(
+    pub async fn update_api_key(
         &self,
         id: i64,
         label: &str,
@@ -577,80 +534,319 @@ impl CredentialStore {
         all_groups: Option<bool>,
     ) -> Result<std::result::Result<(), GroupError>> {
         let group_ids = dedup_ordered(group_ids);
-        let conn = self.conn.lock();
-        if all_groups == Some(false) && !groups_exist(&conn, &group_ids)? {
+        let mut tx = self.begin_write().await?;
+        if all_groups == Some(false) && !groups_exist(&mut tx, &group_ids).await? {
             return Ok(Err(GroupError::UnknownGroup));
         }
-        let tx = conn.unchecked_transaction()?;
-        let n = tx.execute(
-            "UPDATE api_keys SET label = ?2, disabled = ?3 WHERE id = ?1",
-            params![id, label, disabled as i64],
-        )?;
+        let n = sqlx::query("UPDATE api_keys SET label = $2, disabled = $3 WHERE id = $1")
+            .bind(id)
+            .bind(label)
+            .bind(disabled as i64)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if n == 0 {
             return Ok(Err(GroupError::NotFound));
         }
-        match all_groups {
-            Some(true) => {
-                tx.execute("UPDATE api_keys SET all_groups = 1 WHERE id = ?1", [id])?;
-                Self::write_key_groups(&tx, id, &[])?;
-            }
-            Some(false) => {
-                tx.execute("UPDATE api_keys SET all_groups = 0 WHERE id = ?1", [id])?;
-                Self::write_key_groups(&tx, id, &group_ids)?;
-            }
-            None => {}
+        if let Some(all) = all_groups {
+            sqlx::query("UPDATE api_keys SET all_groups = $2 WHERE id = $1")
+                .bind(id)
+                .bind(all as i64)
+                .execute(&mut *tx)
+                .await?;
+            write_key_groups(&mut tx, id, if all { &[] } else { &group_ids }).await?;
         }
-        tx.commit()?;
+        self.commit_invalidating_keys(tx).await?;
         Ok(Ok(()))
     }
 
     /// 删一把 Key。返回是否确有删除。
-    pub fn delete_api_key(&self, id: i64) -> Result<bool> {
-        let conn = self.conn.lock();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM api_key_groups WHERE key_id = ?1", [id])?;
-        let n = tx.execute("DELETE FROM api_keys WHERE id = ?1", [id])?;
-        tx.commit()?;
+    pub async fn delete_api_key(&self, id: i64) -> Result<bool> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query("DELETE FROM api_key_groups WHERE key_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let n = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        self.commit_invalidating_keys(tx).await?;
         Ok(n > 0)
     }
 
     /// 一把 Key 的明文（admin 查看、复制用）。
-    pub fn reveal_api_key(&self, id: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock();
-        let sealed: Option<String> = conn
-            .query_row("SELECT key_sealed FROM api_keys WHERE id = ?1", [id], |r| r.get(0))
-            .optional()?;
-        sealed.map(|s| secret::open(&s)).transpose()
+    pub async fn reveal_api_key(&self, id: i64) -> Result<Option<String>> {
+        let sealed: Option<String> =
+            sqlx::query_scalar("SELECT key_sealed FROM api_keys WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        sealed.map(|s| super::open(&s)).transpose()
     }
 
     /// 转发要不要求带接入 Key：库里有 Key，或者配过（[`API_KEYS_CONFIGURED`]）。从没配过、
     /// 环境变量也没设时才不校验来访身份（与老版本「没配接入 Key 就不校验」一致）；配过之后
     /// 把 Key 全删了也不会因此敞开。
-    pub fn api_keys_required(&self) -> Result<bool> {
+    pub async fn api_keys_required(&self) -> Result<bool> {
         if self.get_setting(API_KEYS_CONFIGURED)?.is_some() {
             return Ok(true);
         }
-        let conn = self.conn.lock();
-        Ok(conn.query_row("SELECT EXISTS (SELECT 1 FROM api_keys)", [], |r| r.get(0))?)
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM api_keys)")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// 按来访带的 Key 明文认身份：启用中的 Key 才算，回它能用的分组（按优先顺序）。
-    pub fn api_key_access(&self, key: &str) -> Result<Option<KeyAccess>> {
-        let conn = self.conn.lock();
-        let hit: Option<(i64, bool)> = conn
-            .query_row(
-                "SELECT id, all_groups FROM api_keys WHERE key_hash = ?1 AND disabled = 0",
-                [key_hash(key)],
-                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
-            )
-            .optional()?;
+    /// 认得出的结果在进程内缓存，见 [`KeyAccessCache`]。
+    pub async fn api_key_access(&self, key: &str) -> Result<Option<KeyAccess>> {
+        let hash = key_hash(key);
+        let generation = {
+            let cache = self.key_cache.lock();
+            if let Some((at, access)) = cache.hits.get(&hash)
+                && at.elapsed() < KEY_CACHE_TTL
+            {
+                return Ok(Some(access.clone()));
+            }
+            cache.generation
+        };
+        let access = self.api_key_access_uncached(&hash).await?;
+        if let Some(access) = &access {
+            let mut cache = self.key_cache.lock();
+            if cache.generation == generation {
+                cache.hits.insert(hash, (std::time::Instant::now(), access.clone()));
+            }
+        }
+        Ok(access)
+    }
+
+    /// [`Self::api_key_access`] 查库的那一半，`hash` 是 [`key_hash`]。
+    async fn api_key_access_uncached(&self, hash: &str) -> Result<Option<KeyAccess>> {
+        let hit: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, all_groups FROM api_keys WHERE key_hash = $1 AND disabled = 0",
+        )
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
         let Some((id, all)) = hit else { return Ok(None) };
-        if all {
+        if all != 0 {
             return Ok(Some(KeyAccess { key_id: Some(id), groups: None }));
         }
-        let mut stmt = conn
-            .prepare_cached("SELECT group_id FROM api_key_groups WHERE key_id = ?1 ORDER BY ord")?;
-        let groups = stmt.query_map([id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let groups: Vec<i64> = sqlx::query_scalar(
+            "SELECT group_id FROM api_key_groups WHERE key_id = $1 ORDER BY ord",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(Some(KeyAccess { key_id: Some(id), groups: Some(groups) }))
+    }
+
+    /// 提交一笔改了 `api_keys` / `api_key_groups` 的写事务，**提交结束之后**作废
+    /// [`KeyAccessCache`]。两步放在一个不受调用方取消影响的任务里（[`Self::run_tracked`]）：
+    /// 请求在 COMMIT 途中被取消时，库里照样可能生效，作废必须等提交真正结束再做——早了的话，
+    /// 提交完成前别的请求读到旧权限又放回缓存，已停用的 Key 还能放行一阵。提交失败也作废，无害。
+    async fn commit_invalidating_keys(&self, tx: super::WriteTx) -> Result<()> {
+        let cache = self.key_cache.clone();
+        self.run_tracked(async move {
+            let committed = tx.commit().await;
+            let mut cache = cache.lock();
+            cache.generation += 1;
+            cache.hits.clear();
+            committed
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::super::token_fingerprint;
+    use super::*;
+
+    /// 直接写库插一个号（上号走 credential 模块，不归这里），回 id。插入时由触发器落进默认分组。
+    async fn insert_cred(store: &CredentialStore, label: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO credentials (label, access_token, refresh_token, refresh_token_hash, \
+                                      expires_at) \
+             VALUES ($1, $2, $3, $4, 0) RETURNING id",
+        )
+        .bind(label)
+        .bind(seal(&format!("t-{label}")))
+        .bind(seal(&format!("r-{label}")))
+        .bind(token_fingerprint(&format!("r-{label}")))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+    }
+
+    /// 分组可见范围：默认分组人人可见；开放给代理的，代理和它名下的用户都能用；admin 直属用户
+    /// 只看开放给自己的；用户不能单独被开放（只能开放给代理或 admin 直属用户）。
+    #[sqlx::test]
+    async fn group_visibility_follows_grants_and_inheritance(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let admin = store.admin_user().await.unwrap().id;
+        let default = store.default_group_id().await.unwrap();
+        let agent =
+            store.create_user("agent", "", UserRole::Agent, admin).await.unwrap().unwrap().id;
+        let sub = store.create_user("sub", "", UserRole::User, agent).await.unwrap().unwrap().id;
+        let direct =
+            store.create_user("direct", "", UserRole::User, admin).await.unwrap().unwrap().id;
+        let g1 = store.create_group("g1", "").await.unwrap().unwrap();
+        let g2 = store.create_group("g2", "").await.unwrap().unwrap();
+        assert_eq!(store.create_group("G1", "").await.unwrap(), Err(GroupError::NameTaken));
+        store.set_group_grants(g1, &[agent]).await.unwrap().unwrap();
+        store.set_group_grants(g2, &[direct]).await.unwrap().unwrap();
+        assert_eq!(
+            store.set_group_grants(g2, &[sub]).await.unwrap(),
+            Err(GroupError::InvalidGrantee)
+        );
+        assert_eq!(
+            store.set_group_grants(default, &[agent]).await.unwrap(),
+            Err(GroupError::DefaultGroup)
+        );
+        let vis = async |id: i64| {
+            let u = store.user_by_id(id).await.unwrap().unwrap();
+            let mut v: Vec<i64> = store.visible_group_ids(&u).await.unwrap().into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(vis(agent).await, vec![default, g1]);
+        assert_eq!(vis(sub).await, vec![default, g1], "代理名下的用户继承代理的分组");
+        assert_eq!(vis(direct).await, vec![default, g2]);
+
+        // 删成员连带删它的分组授权，不留孤儿行。
+        store.delete_user(direct, None).await.unwrap().unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_grants WHERE user_id = $1")
+            .bind(direct)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    /// 改名撞名不区分大小写；改自己的大小写不算撞。
+    #[sqlx::test]
+    async fn renaming_a_group_checks_names_case_insensitively(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let g1 = store.create_group("g1", "").await.unwrap().unwrap();
+        let g2 = store.create_group("g2", "").await.unwrap().unwrap();
+        assert_eq!(store.update_group(g2, "G1", "").await.unwrap(), Err(GroupError::NameTaken));
+        store.update_group(g1, "G1", "note").await.unwrap().unwrap();
+        assert_eq!(store.update_group(9999, "x", "").await.unwrap(), Err(GroupError::NotFound));
+        let g = store.list_groups().await.unwrap().into_iter().find(|g| g.id == g1).unwrap();
+        assert_eq!((g.name.as_str(), g.note.as_str()), ("G1", "note"));
+    }
+
+    /// 删分组：默认分组删不了；只剩这一个分组的号挪进默认分组，还有别的分组的不动；Key 上的
+    /// 绑定一并清掉。
+    #[sqlx::test]
+    async fn deleting_a_group_rehomes_its_only_members(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let default = store.default_group_id().await.unwrap();
+        let g1 = store.create_group("g1", "").await.unwrap().unwrap();
+        let g2 = store.create_group("g2", "").await.unwrap().unwrap();
+        let a = insert_cred(&store, "a").await;
+        let b = insert_cred(&store, "b").await;
+        store.set_credential_groups(&[a], &[g1]).await.unwrap().unwrap();
+        store.set_credential_groups(&[b], &[g1, g2]).await.unwrap().unwrap();
+        assert_eq!(store.set_credential_groups(&[a], &[]).await.unwrap(), Err(GroupError::Empty));
+        assert_eq!(
+            store.set_credential_groups(&[a], &[9999]).await.unwrap(),
+            Err(GroupError::UnknownGroup)
+        );
+        let key = store.create_api_key("k", "key-1", &[g1, g2]).await.unwrap().unwrap();
+        // 先认一次，结果进了缓存；删分组之后缓存要跟着作废。
+        assert_eq!(
+            store.api_key_access("key-1").await.unwrap().unwrap().groups,
+            Some(vec![g1, g2])
+        );
+        assert_eq!(store.delete_group(default).await.unwrap(), Err(GroupError::DefaultGroup));
+        store.delete_group(g1).await.unwrap().unwrap();
+        assert_eq!(store.credential_groups(a).await.unwrap(), vec![default]);
+        assert_eq!(store.credential_groups(b).await.unwrap(), vec![g2]);
+        assert_eq!(store.api_key_access("key-1").await.unwrap().unwrap().groups, Some(vec![g2]));
+        assert_eq!(store.list_api_keys().await.unwrap()[0].id, key);
+    }
+
+    /// 停用的 Key 认不出来；库里有 Key 时 `has_api_keys` 为真（停用的也算，不会因此变成放行）。
+    #[sqlx::test]
+    async fn disabled_api_keys_are_rejected(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        assert!(!store.api_keys_required().await.unwrap());
+        let id = store.create_api_key("k", "key-x", &[]).await.unwrap().unwrap();
+        assert!(store.api_key_access("key-x").await.unwrap().is_some());
+        assert!(store.api_key_access("key-x").await.unwrap().is_some(), "第二次走缓存");
+        store.update_api_key(id, "k", true, &[], None).await.unwrap().unwrap();
+        assert!(store.api_key_access("key-x").await.unwrap().is_none());
+        assert!(store.api_keys_required().await.unwrap());
+        assert_eq!(store.reveal_api_key(id).await.unwrap().as_deref(), Some("key-x"));
+        let sealed: String = sqlx::query_scalar("SELECT key_sealed FROM api_keys WHERE id = $1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(sealed.starts_with("enc1:"), "库里存的是密文");
+    }
+
+    /// 配过接入 Key 之后把 Key 全删了，转发仍要求带 Key（不退回「不校验」）。
+    #[sqlx::test]
+    async fn deleting_every_key_keeps_auth_required(pool: PgPool) {
+        let store = CredentialStore::for_test(pool.clone()).await;
+        assert!(!store.api_keys_required().await.unwrap(), "从没配过：不校验");
+        let id = store.create_api_key("k", "key-only", &[]).await.unwrap().unwrap();
+        store.delete_api_key(id).await.unwrap();
+        assert!(store.api_keys_required().await.unwrap(), "删光了也仍要求带 Key");
+        assert!(store.api_key_access("key-only").await.unwrap().is_none());
+        // 标记落了库：重启（重新读设置）之后照样要求。
+        let reopened = CredentialStore::for_test(pool).await;
+        assert!(reopened.api_keys_required().await.unwrap());
+    }
+
+    /// Key 唯一绑定的分组被删掉：这把 Key 变成一个号都不能用，而不是全部号；显式不绑分组的
+    /// Key 才是全部号。（旧测试里「拿这把 Key 选号失败」那一句归 select 模块。）
+    #[sqlx::test]
+    async fn deleting_a_keys_only_group_fails_closed(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let g = store.create_group("g", "").await.unwrap().unwrap();
+        insert_cred(&store, "a").await;
+        store.create_api_key("bound", "key-bound", &[g]).await.unwrap().unwrap();
+        store.create_api_key("all", "key-all", &[]).await.unwrap().unwrap();
+        store.delete_group(g).await.unwrap().unwrap();
+        let bound = store.api_key_access("key-bound").await.unwrap().unwrap();
+        assert_eq!(bound.groups, Some(vec![]));
+        assert_eq!(store.api_key_access("key-all").await.unwrap().unwrap().groups, None);
+        let keys = store.list_api_keys().await.unwrap();
+        assert!(!keys.iter().find(|k| k.label == "bound").unwrap().all_groups);
+    }
+
+    /// 绑定的分组删光后，只改名字、停用再启用都不会把这把 Key 变成全部号；显式选「全部号」才是。
+    #[sqlx::test]
+    async fn editing_an_orphaned_key_never_widens_it(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let g = store.create_group("g", "").await.unwrap().unwrap();
+        let id = store.create_api_key("bound", "key-orphan", &[g]).await.unwrap().unwrap();
+        store.delete_group(g).await.unwrap().unwrap();
+        let scope = async || store.api_key_access("key-orphan").await.unwrap().map(|a| a.groups);
+        store.update_api_key(id, "renamed", false, &[], None).await.unwrap().unwrap();
+        assert_eq!(scope().await, Some(Some(vec![])), "改名不放开");
+        store.update_api_key(id, "renamed", true, &[], None).await.unwrap().unwrap();
+        store.update_api_key(id, "renamed", false, &[], None).await.unwrap().unwrap();
+        assert_eq!(scope().await, Some(Some(vec![])), "停用再启用不放开");
+        store.update_api_key(id, "renamed", false, &[], Some(false)).await.unwrap().unwrap();
+        assert_eq!(scope().await, Some(Some(vec![])), "显式只限分组、列表为空：仍是一个号都不能用");
+        store.update_api_key(id, "renamed", false, &[], Some(true)).await.unwrap().unwrap();
+        assert_eq!(scope().await, Some(None), "显式选全部号才是全部号");
+    }
+
+    /// 同一把 Key 不能建两次。
+    #[sqlx::test]
+    async fn duplicate_api_keys_are_refused(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        store.create_api_key("a", "key-dup", &[]).await.unwrap().unwrap();
+        assert!(store.create_api_key("b", "key-dup", &[]).await.is_err());
+        assert_eq!(store.list_api_keys().await.unwrap().len(), 1);
     }
 }

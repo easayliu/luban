@@ -171,13 +171,13 @@ fn probe_quota_reads_ratelimit_headers() {
 ///
 /// 同时钉住另外两件事：这条日志按**实际用量**计价（测试真的花了钱，不记等于让累计花费
 /// 虚低），且以 `device_id = "probe"` 标出，翻日志时能与真实流量分开。
-#[test]
-fn probe_usage_log_feeds_the_card_quota() {
+#[sqlx::test]
+async fn probe_usage_log_feeds_the_card_quota(pool: sqlx::PgPool) {
     // Arc 包着：落库现在走 spawn_blocking（见 `spawn_usage_log`），要能把 store 交出去。
     // 这个测试不在 tokio 运行时里，故 `Handle::try_current` 失败、退回就地同步写——
     // 下面的断言因此仍能立刻读到结果。
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let info = rl_headers(&[
         ("anthropic-ratelimit-unified-status", "allowed"),
         ("anthropic-ratelimit-unified-5h-utilization", "0.32"),
@@ -199,7 +199,8 @@ fn probe_usage_log_feeds_the_card_quota() {
                 br#"{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"probe-dev-out\",\"account_uuid\":\"a\",\"session_id\":\"probe-sess\"}"}}"#,
             )}
         .record(StatusCode::OK, &body, &info, Some("req_up_test"));
-    let logged = &store.list_usage_logs(1).unwrap()[0];
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logged = &store.list_usage_logs(1).await.unwrap()[0];
     assert_eq!(
         logged.forensics.device_id_out.as_deref(),
         Some("probe-dev-out"),
@@ -208,12 +209,13 @@ fn probe_usage_log_feeds_the_card_quota() {
     assert_eq!(logged.forensics.session_id.as_deref(), Some("probe-sess"));
     assert!(logged.forensics.shape.is_some());
 
-    let q = store.latest_quota(cred.id).unwrap().expect("卡片应能读到这次测试的额度");
+    let q = store.latest_quota(cred.id).await.unwrap().expect("卡片应能读到这次测试的额度");
     assert_eq!(q.rl_5h_utilization, Some(0.32));
     assert_eq!(q.rl_7d_utilization, Some(0.76));
     assert_eq!(q.unified_status.as_deref(), Some("allowed"));
 
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].device_id.as_deref(), Some("probe"), "日志里要能认出这是测试");
     assert_eq!(logs[0].model.as_deref(), Some("claude-opus-5-20260115"), "模型以上游回报为准");
@@ -421,31 +423,37 @@ fn probe_report_passes_only_on_a_complete_message() {
 
 /// 回归：订阅未生效暂停中的号，一次**失败**的测试（200 里带错误事件、半截流）不能把它放回
 /// 池子；只有完整 Message 那次才恢复。恢复与否只看 `report.ok`，这里把报告与恢复连起来测。
-#[test]
-fn broken_probe_does_not_resume_a_subscription_pause() {
+#[sqlx::test]
+async fn broken_probe_does_not_resume_a_subscription_pause(pool: sqlx::PgPool) {
     use super::{ProbeStreamEnd as End, probe_report, settle_passing_probe};
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
-    assert!(crate::proxy::park_org_oauth_disallowed(&store, &cred, 403, "forward"));
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+    assert!(crate::proxy::park_org_oauth_disallowed(&store, &cred, 403, "forward").await);
     let info = super::RateLimitInfo::from_headers(&crate::proxy::HeaderMap::new());
-    let settle = |status, body: &[u8], end| {
+    let settle = async |status, body: &[u8], end| {
         let report = probe_report(status, body, end, 1, None);
         if report.ok {
-            settle_passing_probe(&store, &cred, "claude-opus-5", &info, true);
+            settle_passing_probe(&store, &cred, "claude-opus-5", &info, true).await;
         }
         report.ok
     };
     let err = br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-    assert!(!settle(StatusCode::OK, err, End::UpstreamError));
-    assert!(!settle(
-        StatusCode::OK,
-        b"event: message_start\n",
-        End::Incomplete("no message_stop event")
-    ));
-    assert!(store.get(cred.id).unwrap().unwrap().is_subscription_paused(), "坏掉的测试不该恢复");
+    assert!(!settle(StatusCode::OK, err, End::UpstreamError).await);
+    assert!(
+        !settle(
+            StatusCode::OK,
+            b"event: message_start\n",
+            End::Incomplete("no message_stop event")
+        )
+        .await
+    );
+    assert!(
+        store.get(cred.id).await.unwrap().unwrap().is_subscription_paused(),
+        "坏掉的测试不该恢复"
+    );
 
     let msg = br#"{"type":"message","model":"claude-opus-5","content":[]}"#;
-    assert!(settle(StatusCode::OK, msg, End::Complete));
-    let got = store.get(cred.id).unwrap().unwrap();
+    assert!(settle(StatusCode::OK, msg, End::Complete).await);
+    let got = store.get(cred.id).await.unwrap().unwrap();
     assert!(!got.disabled && got.ban_reason.is_none(), "完整 Message 那次才恢复");
 }

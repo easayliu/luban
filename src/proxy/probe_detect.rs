@@ -129,13 +129,14 @@ impl ProbeKind {
 /// 请求，这里分不出来——那时剩下的信号只有行为（身份轮换、节奏），不在本函数范围内。
 ///
 /// 只看形态与身份、一条就判，不做任何计数——所以不存在「合法流量大了会误伤」的问题。
-pub(super) fn probe_signature(
+pub(super) async fn probe_signature(
     body: Option<&serde_json::Value>,
     device_id: Option<&str>,
     beta: &[String],
     from_cc_client: bool,
     strict: bool,
-    device_known: impl FnOnce() -> bool,
+    // 只在走到「一次性对话」那条判据时才 await，别的判据命中或不适用时不查库。
+    device_known: impl std::future::Future<Output = bool>,
 ) -> Option<ProbeKind> {
     let v = body?;
     // 身份句重复：不依赖下面「无 tools / 单条消息」的前提，先判。
@@ -216,7 +217,7 @@ pub(super) fn probe_signature(
         && !is_official_classifier_request(v, beta)
         && !is_official_thread_continuation(v, beta)
         && device_id.is_some()
-        && !device_known()
+        && !device_known.await
     {
         return Some(ProbeKind::ThrowawayConversation);
     }

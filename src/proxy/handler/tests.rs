@@ -134,33 +134,42 @@ impl MockUpstream {
 }
 
 /// 一个装好 `n` 个号（token `tok-0`、`tok-1`…）的库与指向 `base` 的状态。
-fn setup(n: usize, base: &str) -> (Arc<CredentialStore>, AppState, Vec<i64>) {
-    setup_tier(n, base, "max")
+async fn setup(
+    pool: sqlx::PgPool,
+    n: usize,
+    base: &str,
+) -> (Arc<CredentialStore>, AppState, Vec<i64>) {
+    setup_tier(pool.clone(), n, base, "max").await
 }
 
-fn setup_tier(n: usize, base: &str, tier: &str) -> (Arc<CredentialStore>, AppState, Vec<i64>) {
-    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
+async fn setup_tier(
+    pool: sqlx::PgPool,
+    n: usize,
+    base: &str,
+    tier: &str,
+) -> (Arc<CredentialStore>, AppState, Vec<i64>) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
     // 新会话的启动握手会打真上游，测试里关掉；探针拦截与这里要测的分支无关，也关掉。
-    store.set_setting(store::API_TELEMETRY, "0").unwrap();
-    store.set_setting(store::REJECT_PROBES, "0").unwrap();
+    store.set_setting(store::API_TELEMETRY, "0").await.unwrap();
+    store.set_setting(store::REJECT_PROBES, "0").await.unwrap();
     let far_future = crate::credentials::now_secs() + 30 * 24 * 3600;
-    let ids = (0..n)
-        .map(|i| {
-            store
-                .insert(
-                    &format!("acct-{i}"),
-                    Some(tier),
-                    &format!("tok-{i}"),
-                    &format!("rt-{i}"),
-                    far_future,
-                    Some(&format!("00000000-0000-4000-8000-00000000000{i}")),
-                    None,
-                    1,
-                )
-                .unwrap()
-                .id
-        })
-        .collect();
+    let mut ids = Vec::with_capacity(n);
+    for i in 0..n {
+        let cred = store
+            .insert(
+                &format!("acct-{i}"),
+                Some(tier),
+                &format!("tok-{i}"),
+                &format!("rt-{i}"),
+                far_future,
+                Some(&format!("00000000-0000-4000-8000-00000000000{i}")),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        ids.push(cred.id);
+    }
     let mut state = AppState::for_test(store.clone());
     state.upstream_base = base.into();
     (store, state, ids)
@@ -219,7 +228,7 @@ async fn send(state: &AppState, req: (HeaderMap, Bytes)) -> (StatusCode, HeaderM
 async fn usage_logs(store: &CredentialStore, n: usize) -> Vec<store::UsageLog> {
     let mut rows = Vec::new();
     for _ in 0..300 {
-        rows = store.list_usage_logs(50).unwrap();
+        rows = store.list_usage_logs(50).await.unwrap();
         if rows.len() >= n {
             break;
         }
@@ -228,15 +237,25 @@ async fn usage_logs(store: &CredentialStore, n: usize) -> Vec<store::UsageLog> {
     rows
 }
 
-fn is_out_of_pool(store: &CredentialStore, id: i64) -> bool {
-    store.get(id).unwrap().unwrap().disabled
+async fn is_out_of_pool(store: &CredentialStore, id: i64) -> bool {
+    store.get(id).await.unwrap().unwrap().disabled
+}
+
+/// `ids` 里的号一个都没停。
+async fn none_out_of_pool(store: &CredentialStore, ids: &[i64]) -> bool {
+    for &id in ids {
+        if is_out_of_pool(store, id).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// 一发成功的流式回复原样转回客户端，上游收到的是号的 token，流水记到这个号上、带用量。
-#[tokio::test]
-async fn a_successful_stream_is_relayed_and_logged() {
+#[sqlx::test]
+async fn a_successful_stream_is_relayed_and_logged(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![sse_ok("waves fold into foam")]).await;
-    let (store, state, ids) = setup(1, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
 
     let (status, headers, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -258,14 +277,14 @@ async fn a_successful_stream_is_relayed_and_logged() {
 }
 
 /// 401 账号级错误（token 作废）：停用这个号，换一个号重发，客户端拿到的是第二个号的 200。
-#[tokio::test]
-async fn an_account_level_401_disables_the_credential_and_swaps() {
+#[sqlx::test]
+async fn an_account_level_401_disables_the_credential_and_swaps(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(401, "authentication_error", "invalid bearer token"),
         sse_ok("second account answered"),
     ])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, _, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -276,20 +295,20 @@ async fn an_account_level_401_disables_the_credential_and_swaps() {
     assert_ne!(seen[0].token, seen[1].token, "第二发必须换了号");
     let first = ids[if seen[0].token == "tok-0" { 0 } else { 1 }];
     let second = ids[if seen[1].token == "tok-0" { 0 } else { 1 }];
-    assert!(is_out_of_pool(&store, first), "吃到账号级 401 的号要停用");
-    assert!(store.get(first).unwrap().unwrap().ban_reason.is_some());
-    assert!(!is_out_of_pool(&store, second));
+    assert!(is_out_of_pool(&store, first).await, "吃到账号级 401 的号要停用");
+    assert!(store.get(first).await.unwrap().unwrap().ban_reason.is_some());
+    assert!(!is_out_of_pool(&store, second).await);
 }
 
 /// 403 账号级错误（账号被停用）：同 401，停用并换号。
-#[tokio::test]
-async fn an_account_level_403_disables_the_credential_and_swaps() {
+#[sqlx::test]
+async fn an_account_level_403_disables_the_credential_and_swaps(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(403, "permission_error", "This account has been disabled"),
         sse_ok("second account answered"),
     ])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -298,26 +317,26 @@ async fn an_account_level_403_disables_the_credential_and_swaps() {
     assert_eq!(seen.len(), 2);
     assert_ne!(seen[0].token, seen[1].token);
     let first = ids[if seen[0].token == "tok-0" { 0 } else { 1 }];
-    assert!(is_out_of_pool(&store, first));
+    assert!(is_out_of_pool(&store, first).await);
 }
 
 /// 与账号无关的 403（请求本身没权限）：原样交回，不换号、不停用，流水照记。
-#[tokio::test]
-async fn a_request_level_403_is_passed_through_without_swapping() {
+#[sqlx::test]
+async fn a_request_level_403_is_passed_through_without_swapping(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![Reply::json_error(
         403,
         "permission_error",
         "You do not have permission to use this feature",
     )])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, _, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(String::from_utf8_lossy(&body).contains("You do not have permission"));
     assert_eq!(mock.seen().len(), 1, "与账号无关，换号没有意义");
-    assert!(ids.iter().all(|&id| !is_out_of_pool(&store, id)));
+    assert!(none_out_of_pool(&store, &ids).await);
     let rows = usage_logs(&store, 1).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, 403);
@@ -328,8 +347,8 @@ fn in_secs(secs: i64) -> String {
 }
 
 /// 429 且 5h 窗口打满：这个号的额度真没了 → 暂停调度（到点自动恢复），换号重发。
-#[tokio::test]
-async fn an_exhausted_account_429_parks_the_credential_and_swaps() {
+#[sqlx::test]
+async fn an_exhausted_account_429_parks_the_credential_and_swaps(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(429, "rate_limit_error", "rate limited").with_headers(&[
             ("anthropic-ratelimit-unified-status", "rejected".into()),
@@ -340,7 +359,7 @@ async fn an_exhausted_account_429_parks_the_credential_and_swaps() {
         sse_ok("second account answered"),
     ])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -348,28 +367,29 @@ async fn an_exhausted_account_429_parks_the_credential_and_swaps() {
     let seen = mock.seen();
     assert_eq!(seen.len(), 2);
     assert_ne!(seen[0].token, seen[1].token);
-    let first = store.get(ids[if seen[0].token == "tok-0" { 0 } else { 1 }]).unwrap().unwrap();
+    let first =
+        store.get(ids[if seen[0].token == "tok-0" { 0 } else { 1 }]).await.unwrap().unwrap();
     assert!(first.disabled && first.resume_at.is_some(), "额度耗尽是暂停，到点自动恢复");
 }
 
 /// 一个限流头都没带的 429：不是额度问题，原样交回、不打冷却、不换号。
-#[tokio::test]
-async fn a_bare_429_is_passed_through_untouched() {
+#[sqlx::test]
+async fn a_bare_429_is_passed_through_untouched(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![Reply::json_error(429, "rate_limit_error", "Error")]).await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, headers, _) = send(&state, cc_request(serde_json::json!({}))).await;
 
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(headers.get(header::RETRY_AFTER).is_none(), "裸 429 不改写 retry-after");
     assert_eq!(mock.seen().len(), 1);
-    assert!(ids.iter().all(|&id| !is_out_of_pool(&store, id)));
+    assert!(none_out_of_pool(&store, &ids).await);
 }
 
 /// 带限流头、但没有一个窗口满的 429（容量 / 速率限制）：不换号，交回时 `retry-after` 换成
 /// 我们算的退避。
-#[tokio::test]
-async fn a_transient_429_is_not_swapped_and_gets_a_backoff() {
+#[sqlx::test]
+async fn a_transient_429_is_not_swapped_and_gets_a_backoff(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(
             429,
@@ -384,7 +404,7 @@ async fn a_transient_429_is_not_swapped_and_gets_a_backoff() {
         ]),
     ])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, headers, _) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -392,18 +412,18 @@ async fn a_transient_429_is_not_swapped_and_gets_a_backoff() {
     assert_eq!(mock.seen().len(), 1, "不是这个号的问题，换号只会撞同一堵墙");
     let retry: u64 = headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap().parse().unwrap();
     assert!(retry >= 1);
-    assert!(ids.iter().all(|&id| !is_out_of_pool(&store, id)), "瞬时限流不停号");
+    assert!(none_out_of_pool(&store, &ids).await, "瞬时限流不停号");
 }
 
 /// 400 形态错误：原样交回并学成规则；同一形态再来一条，本地直接拒，不再打上游。
-#[tokio::test]
-async fn a_shape_400_is_learned_and_the_next_one_is_rejected_locally() {
+#[sqlx::test]
+async fn a_shape_400_is_learned_and_the_next_one_is_rejected_locally(pool: sqlx::PgPool) {
     const EFFORT_400: &str = "This model does not support effort level 'xhigh'. \
                               Supported levels: high, low, max, medium.";
     let mock =
         MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", EFFORT_400)])
             .await;
-    let (store, state, _) = setup(1, &mock.base);
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let req = || cc_request(serde_json::json!({"output_config": {"effort": "xhigh"}}));
 
     let (status, _, body) = send(&state, req()).await;
@@ -411,7 +431,7 @@ async fn a_shape_400_is_learned_and_the_next_one_is_rejected_locally() {
     assert!(String::from_utf8_lossy(&body).contains("effort level 'xhigh'"));
     assert_eq!(mock.seen().len(), 1);
     assert!(
-        store.learned_rejections().unwrap().iter().any(|r| r.field == "effort"),
+        store.learned_rejections().await.unwrap().iter().any(|r| r.field == "effort"),
         "学到的规则要落库"
     );
 
@@ -422,14 +442,14 @@ async fn a_shape_400_is_learned_and_the_next_one_is_rejected_locally() {
 }
 
 /// 连不上上游：502，流水照记（标 `connection_error`）。
-#[tokio::test]
-async fn an_unreachable_upstream_is_a_502_and_logged() {
+#[sqlx::test]
+async fn an_unreachable_upstream_is_a_502_and_logged(pool: sqlx::PgPool) {
     // 先占一个端口再放掉，拿到一个此刻没人在听的地址。
     let addr = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
     };
-    let (store, state, ids) = setup(1, &format!("http://{addr}"));
+    let (store, state, ids) = setup(pool.clone(), 1, &format!("http://{addr}")).await;
 
     let (status, _, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -439,26 +459,26 @@ async fn an_unreachable_upstream_is_a_502_and_logged() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, 502);
     assert_eq!(rows[0].cred_id, Some(ids[0]));
-    assert!(!is_out_of_pool(&store, ids[0]), "连不上不是账号的问题");
+    assert!(!is_out_of_pool(&store, ids[0]).await, "连不上不是账号的问题");
 }
 
 /// 只有一个号时吃到账号级 401：停用它，没有号可换，401 原样交回。
-#[tokio::test]
-async fn an_account_level_401_with_nothing_to_swap_to_is_passed_through() {
+#[sqlx::test]
+async fn an_account_level_401_with_nothing_to_swap_to_is_passed_through(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![Reply::json_error(
         401,
         "authentication_error",
         "invalid bearer token",
     )])
     .await;
-    let (store, state, ids) = setup(1, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
 
     let (status, _, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(String::from_utf8_lossy(&body).contains("invalid bearer token"));
     assert_eq!(mock.seen().len(), 1);
-    assert!(is_out_of_pool(&store, ids[0]));
+    assert!(is_out_of_pool(&store, ids[0]).await);
     let rows = usage_logs(&store, 1).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, 401);
@@ -466,8 +486,8 @@ async fn an_account_level_401_with_nothing_to_swap_to_is_passed_through() {
 
 /// 429 只说「组织关了超额」、一个额度窗口都没报，打的又是高档模型、号不是 Max：这个号的套餐
 /// 不含这个模型 → 记下准入、换号重发（不受 429 换号开关约束）。
-#[tokio::test]
-async fn a_plan_denial_429_remembers_the_model_and_swaps() {
+#[sqlx::test]
+async fn a_plan_denial_429_remembers_the_model_and_swaps(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(429, "rate_limit_error", "rate limited").with_headers(&[
             ("anthropic-ratelimit-unified-status", "rejected".into()),
@@ -477,7 +497,7 @@ async fn a_plan_denial_429_remembers_the_model_and_swaps() {
         sse_ok("second account answered"),
     ])
     .await;
-    let (store, state, ids) = setup_tier(2, &mock.base, "Pro");
+    let (store, state, ids) = setup_tier(pool.clone(), 2, &mock.base, "Pro").await;
 
     let (status, _, _) =
         send(&state, cc_request(serde_json::json!({"model": "claude-fable-5"}))).await;
@@ -488,23 +508,23 @@ async fn a_plan_denial_429_remembers_the_model_and_swaps() {
     assert_ne!(seen[0].token, seen[1].token);
     let first = ids[if seen[0].token == "tok-0" { 0 } else { 1 }];
     assert!(
-        store.denied_models(first).unwrap().iter().any(|d| d.model.contains("fable")),
+        store.denied_models(first).await.unwrap().iter().any(|d| d.model.contains("fable")),
         "套餐不含这个模型要记下来"
     );
-    assert!(!is_out_of_pool(&store, first), "不含某个模型不是停号的理由");
+    assert!(!is_out_of_pool(&store, first).await, "不含某个模型不是停号的理由");
 }
 
 /// 429 换号开关关掉：账号级 401 不在循环里换号，交给后面的 4xx 段停用并原样透传。
-#[tokio::test]
-async fn with_retry_off_an_account_level_401_is_banned_but_not_swapped() {
+#[sqlx::test]
+async fn with_retry_off_an_account_level_401_is_banned_but_not_swapped(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![Reply::json_error(
         401,
         "authentication_error",
         "invalid bearer token",
     )])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
-    store.set_setting(store::RATE_LIMIT_RETRY, "0").unwrap();
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
+    store.set_setting(store::RATE_LIMIT_RETRY, "0").await.unwrap();
 
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
 
@@ -512,26 +532,26 @@ async fn with_retry_off_an_account_level_401_is_banned_but_not_swapped() {
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
     let first = ids[if seen[0].token == "tok-0" { 0 } else { 1 }];
-    assert!(is_out_of_pool(&store, first), "不换号，但账号级错误照样停用");
+    assert!(is_out_of_pool(&store, first).await, "不换号，但账号级错误照样停用");
 }
 
 /// 裸 401（网关 / CDN 拦的，没有 `error.type`）：不是账号的问题，不停用、不换号，原样交回。
-#[tokio::test]
-async fn a_bare_401_is_passed_through_without_swapping() {
+#[sqlx::test]
+async fn a_bare_401_is_passed_through_without_swapping(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![Reply {
         status: 401,
         headers: vec![("content-type".into(), "text/plain".into())],
         body: b"Unauthorized".to_vec(),
     }])
     .await;
-    let (store, state, ids) = setup(2, &mock.base);
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
 
     let (status, _, body) = send(&state, cc_request(serde_json::json!({}))).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(&body[..], b"Unauthorized");
     assert_eq!(mock.seen().len(), 1);
-    assert!(ids.iter().all(|&id| !is_out_of_pool(&store, id)));
+    assert!(none_out_of_pool(&store, &ids).await);
 }
 
 // ---------- 入口闸门：都在选号之前本地作答，一发上游都不该有 ----------
@@ -553,11 +573,11 @@ async fn assert_local_reject(
     assert!(mock.seen().is_empty(), "本地拒绝不该打上游");
 }
 
-#[tokio::test]
-async fn gate_invalid_api_key() {
+#[sqlx::test]
+async fn gate_invalid_api_key(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.create_api_key("k", "the-right-key", &[]).unwrap().unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.create_api_key("k", "the-right-key", &[]).await.unwrap().unwrap();
     let req = cc_request(serde_json::json!({}));
     assert_local_reject(
         &mock,
@@ -570,11 +590,11 @@ async fn gate_invalid_api_key() {
     .await;
 }
 
-#[tokio::test]
-async fn gate_client_version_below_minimum() {
+#[sqlx::test]
+async fn gate_client_version_below_minimum(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::MIN_CLIENT_VERSION, "9.0.0").unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::MIN_CLIENT_VERSION, "9.0.0").await.unwrap();
     let req = cc_request(serde_json::json!({}));
     assert_local_reject(
         &mock,
@@ -587,10 +607,10 @@ async fn gate_client_version_below_minimum() {
     .await;
 }
 
-#[tokio::test]
-async fn gate_missing_device_identity() {
+#[sqlx::test]
+async fn gate_missing_device_identity(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (_, state, _) = setup(1, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let (headers, body) = cc_request(serde_json::json!({}));
     let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     v.as_object_mut().unwrap().remove("metadata");
@@ -606,10 +626,10 @@ async fn gate_missing_device_identity() {
     .await;
 }
 
-#[tokio::test]
-async fn gate_session_id_mismatch() {
+#[sqlx::test]
+async fn gate_session_id_mismatch(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (_, state, _) = setup(1, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let (mut headers, body) = cc_request(serde_json::json!({}));
     headers.insert(
         "x-claude-code-session-id",
@@ -626,10 +646,10 @@ async fn gate_session_id_mismatch() {
     .await;
 }
 
-#[tokio::test]
-async fn gate_openai_residue() {
+#[sqlx::test]
+async fn gate_openai_residue(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (_, state, _) = setup(1, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let req = cc_request(serde_json::json!({"messages": [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}]}));
     let (status, _, _) = send(&state, req).await;
@@ -638,8 +658,8 @@ async fn gate_openai_residue() {
 }
 
 /// `reject_learned_shapes` 关掉：上游的形态 400 不学；表里已有的规则也不拦，照常送上游。
-#[tokio::test]
-async fn learned_shapes_off_neither_learns_nor_blocks() {
+#[sqlx::test]
+async fn learned_shapes_off_neither_learns_nor_blocks(pool: sqlx::PgPool) {
     const EFFORT_400: &str = "This model does not support effort level 'xhigh'. \
                               Supported levels: high, low, max, medium.";
     let mock = MockUpstream::start(vec![
@@ -647,8 +667,8 @@ async fn learned_shapes_off_neither_learns_nor_blocks() {
         Reply::json_error(400, "invalid_request_error", EFFORT_400),
     ])
     .await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::REJECT_LEARNED_SHAPES, "false").unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::REJECT_LEARNED_SHAPES, "false").await.unwrap();
     let req = || cc_request(serde_json::json!({"output_config": {"effort": "xhigh"}}));
 
     let (status, _, _) = send(&state, req()).await;
@@ -667,14 +687,14 @@ async fn learned_shapes_off_neither_learns_nor_blocks() {
 
 /// 采样参数被废弃的 400 原样回给客户端，并学成规则；同样的请求再来时本地回同一句原话，
 /// 不再发往上游。
-#[tokio::test]
-async fn deprecated_sampling_400_passes_through_then_is_rejected_locally() {
+#[sqlx::test]
+async fn deprecated_sampling_400_passes_through_then_is_rejected_locally(pool: sqlx::PgPool) {
     const TEMP_400: &str = "`temperature` is deprecated for this model.";
     let mock =
         MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TEMP_400)]).await;
-    let (store, state, _) = setup(1, &mock.base);
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
     // 不注入 thinking：temperature 原样出站，上游才会点它的名。
-    store.set_setting(store::INJECT_THINKING, "0").unwrap();
+    store.set_setting(store::INJECT_THINKING, "0").await.unwrap();
     let req = || cc_request(serde_json::json!({"temperature": 0.7}));
 
     let (status, _, body) = send(&state, req()).await;
@@ -689,12 +709,12 @@ async fn deprecated_sampling_400_passes_through_then_is_rejected_locally() {
 
 /// 规则按**出站体**判：已学到「该模型不收 temperature」，但这条请求走模拟路径、注入 thinking
 /// 时会剥掉冲突的 `temperature: 0.7` 与 `top_p: 0.5`，出站里没有它们，不该在本地拦下。
-#[tokio::test]
-async fn sampling_rule_does_not_block_when_the_outbound_body_drops_the_param() {
+#[sqlx::test]
+async fn sampling_rule_does_not_block_when_the_outbound_body_drops_the_param(pool: sqlx::PgPool) {
     const TEMP_400: &str = "`temperature` is deprecated for this model.";
     const TOP_P_400: &str = "`top_p` is deprecated for this model.";
     let mock = MockUpstream::start(vec![sse_ok("ok")]).await;
-    let (_, state, _) = setup(1, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let learned_from = serde_json::json!({"model": "claude-sonnet-5", "temperature": 0.7, "top_p": 0.5,
         "messages": [{"role": "user", "content": "hi"}]});
     for msg in [TEMP_400, TOP_P_400] {
@@ -717,14 +737,14 @@ async fn sampling_rule_does_not_block_when_the_outbound_body_drops_the_param() {
 }
 
 /// prefill 不支持的 400 同理：原样回给客户端并学成规则，第二条本地拒。
-#[tokio::test]
-async fn unsupported_prefill_400_passes_through_then_is_rejected_locally() {
+#[sqlx::test]
+async fn unsupported_prefill_400_passes_through_then_is_rejected_locally(pool: sqlx::PgPool) {
     const PREFILL_400: &str = "This model does not support assistant message prefill. \
                                The conversation must end with a user message.";
     let mock =
         MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", PREFILL_400)])
             .await;
-    let (_, state, _) = setup(1, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 1, &mock.base).await;
     let req = || {
         cc_request(serde_json::json!({"messages": [
             {"role": "user", "content": "write a haiku about the sea"},
@@ -739,8 +759,8 @@ async fn unsupported_prefill_400_passes_through_then_is_rejected_locally() {
 }
 
 /// 零输出拦截开关决定学不学：开着学到这一类，关着什么也不记。
-#[tokio::test]
-async fn empty_reply_learning_follows_its_switch() {
+#[sqlx::test]
+async fn empty_reply_learning_follows_its_switch(pool: sqlx::PgPool) {
     let empty_sse = || {
         let events = [
             serde_json::json!({"type": "message_start", "message": {
@@ -763,19 +783,25 @@ async fn empty_reply_learning_follows_its_switch() {
     };
     for on in [false, true] {
         let mock = MockUpstream::start(vec![empty_sse()]).await;
-        let (store, state, _) = setup(1, &mock.base);
-        store.set_setting(store::REJECT_EMPTY_REPLIES, if on { "true" } else { "false" }).unwrap();
+        let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+        store
+            .set_setting(store::REJECT_EMPTY_REPLIES, if on { "true" } else { "false" })
+            .await
+            .unwrap();
         let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
         assert_eq!(status, StatusCode::OK);
         usage_logs(&store, 1).await;
         let learned = !state.empty_replies.read().classes.is_empty();
         assert_eq!(learned, on, "reject_empty_replies={on}");
+        // 两轮共用同一个测试库：清掉这一轮的号与流水，下一轮从空库开始。
+        store.drain_writes(std::time::Duration::from_secs(3)).await;
+        store.clear().await.unwrap();
     }
 }
 
 /// 429 开关关掉：「套餐不含该模型」的 429 原样透传，不记准入、不换号。
-#[tokio::test]
-async fn plan_denial_with_rate_limit_retry_off_passes_through() {
+#[sqlx::test]
+async fn plan_denial_with_rate_limit_retry_off_passes_through(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
         Reply::json_error(429, "rate_limit_error", "Error").with_headers(&[
             ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled".into()),
@@ -784,24 +810,24 @@ async fn plan_denial_with_rate_limit_retry_off_passes_through() {
         sse_ok("should not be reached"),
     ])
     .await;
-    let (store, state, ids) = setup_tier(2, &mock.base, "pro");
-    store.set_setting(store::RATE_LIMIT_RETRY, "false").unwrap();
+    let (store, state, ids) = setup_tier(pool.clone(), 2, &mock.base, "pro").await;
+    store.set_setting(store::RATE_LIMIT_RETRY, "false").await.unwrap();
 
     let (status, _, _) =
         send(&state, cc_request(serde_json::json!({"model": "claude-fable-5"}))).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(mock.seen().len(), 1, "关着不该换号");
     for id in ids {
-        assert!(store.denied_models(id).unwrap().is_empty(), "关着不该记准入");
+        assert!(store.denied_models(id).await.unwrap().is_empty(), "关着不该记准入");
     }
 }
 
 /// 会话 RPM 上限 1：第一条放行，第二条本地 429 + `retry-after`，上游只收到一发。
-#[tokio::test]
-async fn gate_session_rpm_limit() {
+#[sqlx::test]
+async fn gate_session_rpm_limit(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![sse_ok("first"), sse_ok("second")]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::SESSION_RPM_LIMIT, "1").unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SESSION_RPM_LIMIT, "1").await.unwrap();
 
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
     assert_eq!(status, StatusCode::OK);
@@ -812,11 +838,11 @@ async fn gate_session_rpm_limit() {
 }
 
 /// 设备 RPM 上限 1：同上，按设备算。
-#[tokio::test]
-async fn gate_device_rpm_limit() {
+#[sqlx::test]
+async fn gate_device_rpm_limit(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![sse_ok("first"), sse_ok("second")]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    store.set_setting(store::DEVICE_RPM_LIMIT, "1").unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::DEVICE_RPM_LIMIT, "1").await.unwrap();
 
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
     assert_eq!(status, StatusCode::OK);
@@ -827,10 +853,10 @@ async fn gate_device_rpm_limit() {
 }
 
 /// 没有可用的号：503，上游一发都没有。
-#[tokio::test]
-async fn no_credential_is_a_503() {
+#[sqlx::test]
+async fn no_credential_is_a_503(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (_, state, _) = setup(0, &mock.base);
+    let (_, state, _) = setup(pool.clone(), 0, &mock.base).await;
     let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(mock.seen().is_empty());
@@ -838,15 +864,15 @@ async fn no_credential_is_a_503() {
 
 /// 接入 Key 绑定了分组：转发只落在这些分组的号上（上游收到的是组里那个号的 token）；
 /// 分组里没有号时本地拒掉，一发上游都不打。
-#[tokio::test]
-async fn api_key_groups_route_to_their_accounts() {
+#[sqlx::test]
+async fn api_key_groups_route_to_their_accounts(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![sse_ok("ok")]).await;
-    let (store, state, ids) = setup(2, &mock.base);
-    let vip = store.create_group("vip", "").unwrap().unwrap();
-    let empty = store.create_group("empty", "").unwrap().unwrap();
-    store.set_credential_groups(&[ids[1]], &[vip]).unwrap().unwrap();
-    store.create_api_key("vip", "key-vip", &[vip]).unwrap().unwrap();
-    store.create_api_key("empty", "key-empty", &[empty]).unwrap().unwrap();
+    let (store, state, ids) = setup(pool.clone(), 2, &mock.base).await;
+    let vip = store.create_group("vip", "").await.unwrap().unwrap();
+    let empty = store.create_group("empty", "").await.unwrap().unwrap();
+    store.set_credential_groups(&[ids[1]], &[vip]).await.unwrap().unwrap();
+    store.create_api_key("vip", "key-vip", &[vip]).await.unwrap().unwrap();
+    store.create_api_key("empty", "key-empty", &[empty]).await.unwrap().unwrap();
 
     let mut req = cc_request(serde_json::json!({}));
     req.0.insert("x-api-key", HeaderValue::from_static("key-vip"));
@@ -862,12 +888,12 @@ async fn api_key_groups_route_to_their_accounts() {
 }
 
 /// 唯一一把接入 Key 删掉之后，不带 Key、带旧 Key 都被拒（不退回「没配 Key 就放行」）。
-#[tokio::test]
-async fn deleting_the_last_key_does_not_open_the_proxy() {
+#[sqlx::test]
+async fn deleting_the_last_key_does_not_open_the_proxy(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (store, state, _) = setup(1, &mock.base);
-    let id = store.create_api_key("k", "old-key", &[]).unwrap().unwrap();
-    store.delete_api_key(id).unwrap();
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let id = store.create_api_key("k", "old-key", &[]).await.unwrap().unwrap();
+    store.delete_api_key(id).await.unwrap();
     for key in [None, Some("old-key")] {
         let mut req = cc_request(serde_json::json!({}));
         if let Some(k) = key {

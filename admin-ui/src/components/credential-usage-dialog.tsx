@@ -86,12 +86,10 @@ export function CredentialUsageDialog({
   const [pageSize, setPageSize] = useState<(typeof PAGE_SIZES)[number]>(PAGE_SIZES[0])
   const [page, setPage] = useState(0)
   /**
-   * 本轮翻页的锚点（首次响应给出，之后每页原样带回）。
-   *
-   * 放 ref 而不是 state，也不进 queryKey：它在一轮翻页里恒定，进 key 只会让第一页在拿到
-   * 锚点后再白白重取一次。整轮钉住同一个快照，翻页期间新到的请求不会把记录往后挤。
+   * 第几轮翻页。重新取一轮（刷新、关掉再开）时加一。轮次进 queryKey：各轮的查询缓存互不相干，
+   * 上一轮迟到的响应只落进上一轮的缓存，新一轮翻到同一页不会命中它。
    */
-  const anchor = useRef<number | null>(null)
+  const [round, setRound] = useState(0)
   const wideEnoughForTable = useMediaQuery('(min-width: 64rem)')
   /**
    * 点开了哪条请求的查询弹窗（请求 id）。
@@ -101,23 +99,51 @@ export function CredentialUsageDialog({
    */
   const [lookupId, setLookupId] = useState<string | null>(null)
 
-  const usage = useQuery({
-    queryKey: ['credential-usage', cred.id, page, pageSize],
-    queryFn: async () => {
-      const res = await listCredentialUsage(cred.id, {
+  /**
+   * 本轮第一页：不带锚点取，响应里的锚点与总条数、总花费就是这一轮的快照，后续页把锚点原样带回、
+   * 统计沿用它（后续页后端不再回统计）。快照直接从这条查询的数据里取——命中缓存、queryFn
+   * 没跑也一样有，不另存一份。
+   *
+   * 一轮之内不再重取（`staleTime: Infinity`）：重取会换一个新锚点，与已经翻到的后续页错开。
+   * 要看新请求就开新一轮（[reload]）。
+   */
+  const first = useQuery({
+    // 首页与后续页的请求语义不同（首页不带锚点、回统计），查询身份分开：共用 key 时禁用着的
+    // 后续页查询也会改写这条查询的选项，失效重取时首页就会误带锚点、丢了统计。
+    queryKey: ['credential-usage', cred.id, round, 'first', pageSize],
+    queryFn: () => listCredentialUsage(cred.id, { limit: pageSize, offset: 0 }),
+    enabled: open,
+    staleTime: Infinity,
+    // 换每页条数时先留着上一份，避免表格整块闪成骨架屏。
+    placeholderData: keepPreviousData,
+  })
+  const snapshot =
+    first.data && !first.isPlaceholderData && first.data.total != null
+      ? { anchor: first.data.anchor, total: first.data.total, cost: first.data.total_cost ?? 0 }
+      : null
+  /** 后续页：等本轮快照定下来再取，带着它的锚点；锚点之下的记录不会再变，同样不重取。 */
+  const later = useQuery({
+    // 锚点进 key：首页被显式失效重取、换了锚点时，后续页跟着按新锚点重取，不沿用旧锚点的缓存。
+    queryKey: ['credential-usage', cred.id, round, 'page', snapshot?.anchor ?? null, page, pageSize],
+    queryFn: () =>
+      listCredentialUsage(cred.id, {
         limit: pageSize,
         offset: page * pageSize,
-        until: anchor.current ?? undefined,
-      })
-      if (anchor.current == null) anchor.current = res.anchor
-      return res
-    },
-    enabled: open,
+        until: snapshot?.anchor ?? undefined,
+      }),
+    enabled: open && page > 0 && snapshot != null,
+    staleTime: Infinity,
     // 翻页时先留着上一页，避免表格整块闪成骨架屏。
     placeholderData: keepPreviousData,
   })
+  const usage = page === 0 ? first : later
 
-  const total = usage.data?.total ?? 0
+  // 显示用：换每页条数、新快照还在路上时，先沿用占位的上一份统计，别闪成「没有记录」。
+  // 取后续页只认真正的 `snapshot`。
+  const shown = snapshot ?? (first.data?.total != null
+    ? { total: first.data.total, cost: first.data.total_cost ?? 0 }
+    : null)
+  const total = shown?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const rows = usage.data?.logs ?? []
   // 页码越界（改了每页条数、或刷新后记录变少）时退回最后一页，而不是显示一页空白。
@@ -125,19 +151,20 @@ export function CredentialUsageDialog({
   if (currentPage !== page) setPage(currentPage)
   const retentionNoteId = `credential-usage-retention-${cred.id}`
 
-  /** 重新取一轮：丢掉锚点回到第一页，于是能看到刚发生的请求。 */
+  /**
+   * 重新取一轮：丢掉锚点回到第一页，于是能看到刚发生的请求。旧轮的查询取消并清掉，轮次加一
+   * （新 queryKey，必定重取）。关掉对话框也走这里，下次打开是新的一轮。
+   */
   const reload = () => {
-    anchor.current = null
+    void qc.cancelQueries({ queryKey: ['credential-usage', cred.id] })
+    qc.removeQueries({ queryKey: ['credential-usage', cred.id] })
+    setRound((r) => r + 1)
     setPage(0)
-    void qc.invalidateQueries({ queryKey: ['credential-usage', cred.id] })
   }
 
   const handleOpenChange = (next: boolean) => {
     // 关掉即重置，下次打开是新的一轮（新锚点、第一页）。
-    if (!next) {
-      anchor.current = null
-      setPage(0)
-    }
+    if (!next) reload()
     onOpenChange(next)
   }
 
@@ -183,7 +210,7 @@ export function CredentialUsageDialog({
                 {t('近 8 天明细花费', 'Request cost, last 8 days')}
               </p>
               <p className="font-semibold text-sm tabular-nums sm:mt-0.5">
-                {usage.data ? formatUsd(usage.data.total_cost) : '—'}
+                {shown ? formatUsd(shown.cost) : '—'}
               </p>
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">

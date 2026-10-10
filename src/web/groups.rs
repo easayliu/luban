@@ -79,24 +79,24 @@ fn check_group_name(raw: &str) -> Result<&str, ApiError> {
 }
 
 /// `actor` 上号、改分组时能选哪些分组：admin 随便选（`None`），其余只能选开放给自己的。
-pub(super) fn selectable_groups(
+pub(super) async fn selectable_groups(
     state: &AppState,
     actor: &Actor,
 ) -> Result<Option<std::collections::HashSet<i64>>, ApiError> {
     if actor.is_admin() {
         return Ok(None);
     }
-    let user = state.store.user_by_id(actor.id).map_err(internal)?.ok_or_else(not_found)?;
-    Ok(Some(state.store.visible_group_ids(&user).map_err(internal)?))
+    let user = state.store.user_by_id(actor.id).await.map_err(internal)?.ok_or_else(not_found)?;
+    Ok(Some(state.store.visible_group_ids(&user).await.map_err(internal)?))
 }
 
 /// 核对一组分组 id 是不是 `actor` 都能选的；不能选的按「分组不存在」回（不透露别的分组）。
-pub(super) fn check_selectable(
+pub(super) async fn check_selectable(
     state: &AppState,
     actor: &Actor,
     group_ids: &[i64],
 ) -> Result<(), ApiError> {
-    if let Some(allowed) = selectable_groups(state, actor)?
+    if let Some(allowed) = selectable_groups(state, actor).await?
         && !group_ids.iter().all(|g| allowed.contains(g))
     {
         return Err(group_error(store::GroupError::UnknownGroup));
@@ -110,10 +110,11 @@ pub(super) async fn list_groups(
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<store::PoolGroup>>, ApiError> {
     let groups = match actor.scope() {
-        Scope::All => state.store.list_groups().map_err(internal)?,
+        Scope::All => state.store.list_groups().await.map_err(internal)?,
         Scope::Owner(_) => {
-            let user = state.store.user_by_id(actor.id).map_err(internal)?.ok_or_else(not_found)?;
-            state.store.visible_groups(&user).map_err(internal)?
+            let user =
+                state.store.user_by_id(actor.id).await.map_err(internal)?.ok_or_else(not_found)?;
+            state.store.visible_groups(&user).await.map_err(internal)?
         }
     };
     Ok(Json(groups))
@@ -127,8 +128,12 @@ pub(super) async fn create_group(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     admin_only(&actor)?;
     let name = check_group_name(&req.name)?;
-    let id =
-        state.store.create_group(name, req.note.trim()).map_err(internal)?.map_err(group_error)?;
+    let id = state
+        .store
+        .create_group(name, req.note.trim())
+        .await
+        .map_err(internal)?
+        .map_err(group_error)?;
     tracing::info!(group_id = id, name, "pool group created");
     Ok(Json(serde_json::json!({ "id": id })))
 }
@@ -142,7 +147,12 @@ pub(super) async fn update_group(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     admin_only(&actor)?;
     let name = check_group_name(&req.name)?;
-    state.store.update_group(id, name, req.note.trim()).map_err(internal)?.map_err(group_error)?;
+    state
+        .store
+        .update_group(id, name, req.note.trim())
+        .await
+        .map_err(internal)?
+        .map_err(group_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -153,7 +163,7 @@ pub(super) async fn delete_group(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     admin_only(&actor)?;
-    state.store.delete_group(id).map_err(internal)?.map_err(group_error)?;
+    state.store.delete_group(id).await.map_err(internal)?.map_err(group_error)?;
     tracing::info!(group_id = id, "pool group deleted");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -166,7 +176,12 @@ pub(super) async fn set_group_grants(
     Json(req): Json<GrantsReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     admin_only(&actor)?;
-    state.store.set_group_grants(id, &req.user_ids).map_err(internal)?.map_err(group_error)?;
+    state
+        .store
+        .set_group_grants(id, &req.user_ids)
+        .await
+        .map_err(internal)?
+        .map_err(group_error)?;
     tracing::info!(group_id = id, users = ?req.user_ids, "pool group grants updated");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -177,7 +192,7 @@ pub(super) async fn set_group_grants(
 pub(super) async fn list_api_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<store::ApiKey>>, ApiError> {
-    Ok(Json(state.store.list_api_keys().map_err(internal)?))
+    Ok(Json(state.store.list_api_keys().await.map_err(internal)?))
 }
 
 /// 新建一把接入 Key，回它的明文（之后也能用「查看」再取）。
@@ -193,8 +208,12 @@ pub(super) async fn create_api_key(
     let groups: &[i64] = if all { &[] } else { &req.group_ids };
     let key = store::generate_api_key();
     let label = req.label.trim();
-    let id =
-        state.store.create_api_key(label, &key, groups).map_err(internal)?.map_err(group_error)?;
+    let id = state
+        .store
+        .create_api_key(label, &key, groups)
+        .await
+        .map_err(internal)?
+        .map_err(group_error)?;
     tracing::info!(key_id = id, label, groups = ?req.group_ids, "API key created");
     Ok(Json(KeySecret { id, key }))
 }
@@ -208,6 +227,7 @@ pub(super) async fn update_api_key(
     state
         .store
         .update_api_key(id, req.label.trim(), req.disabled, &req.group_ids, req.all_groups)
+        .await
         .map_err(internal)?
         .map_err(group_error)?;
     tracing::info!(key_id = id, disabled = req.disabled, groups = ?req.group_ids, "API key updated");
@@ -219,7 +239,7 @@ pub(super) async fn delete_api_key(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.store.delete_api_key(id).map_err(internal)? {
+    if !state.store.delete_api_key(id).await.map_err(internal)? {
         return Err((StatusCode::NOT_FOUND, "API key not found".into()));
     }
     tracing::info!(key_id = id, "API key deleted");
@@ -234,6 +254,7 @@ pub(super) async fn reveal_api_key(
     let key = state
         .store
         .reveal_api_key(id)
+        .await
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "API key not found".to_string()))?;
     Ok(Json(KeySecret { id, key }))

@@ -45,16 +45,22 @@ pub(super) async fn list_provision_keys(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<store::ProvisionKey>>, ApiError> {
-    let mut keys = state.store.list_provision_keys(owner_filter(&actor)).map_err(internal)?;
+    let mut keys = state.store.list_provision_keys(owner_filter(&actor)).await.map_err(internal)?;
+    let mut revoked = Vec::new();
     keys.retain(|k| {
         let current = k.owner.as_ref().is_some_and(|(role, hash)| {
             auth::provision_key_current(&state, *role, hash, &k.pw_tag)
         });
-        if !current && let Err(e) = state.store.delete_provision_key(k.id, None) {
-            tracing::warn!(error = %e, key_id = k.id, "failed to delete a revoked provision key");
+        if !current {
+            revoked.push(k.id);
         }
         current
     });
+    for id in revoked {
+        if let Err(e) = state.store.delete_provision_key(id, None).await {
+            tracing::warn!(error = %e, key_id = id, "failed to delete a revoked provision key");
+        }
+    }
     Ok(Json(keys))
 }
 
@@ -65,13 +71,15 @@ pub(super) async fn create_provision_key(
     Json(req): Json<CreateProvisionKeyReq>,
 ) -> Result<Json<ProvisionKeySecret>, ApiError> {
     let label = check_label(&req.label)?;
-    let hash = state.store.user_password_hash(actor.id).map_err(internal)?.unwrap_or_default();
+    let hash =
+        state.store.user_password_hash(actor.id).await.map_err(internal)?.unwrap_or_default();
     let pw_tag = auth::password_tag(&state, actor.role, &hash);
     if pw_tag.is_empty() {
         return Err(bad_request("set a password for this account before creating a provision key"));
     }
     let key = store::generate_provision_key();
-    let id = state.store.create_provision_key(actor.id, label, &key, &pw_tag).map_err(internal)?;
+    let id =
+        state.store.create_provision_key(actor.id, label, &key, &pw_tag).await.map_err(internal)?;
     tracing::info!(key_id = id, label, owner = %actor.username, "provision key created");
     Ok(Json(ProvisionKeySecret { id, key }))
 }
@@ -87,6 +95,7 @@ pub(super) async fn update_provision_key(
     if !state
         .store
         .update_provision_key(id, owner_filter(&actor), label, req.disabled)
+        .await
         .map_err(internal)?
     {
         return Err((StatusCode::NOT_FOUND, "provision key not found".into()));
@@ -101,7 +110,7 @@ pub(super) async fn delete_provision_key(
     Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.store.delete_provision_key(id, owner_filter(&actor)).map_err(internal)? {
+    if !state.store.delete_provision_key(id, owner_filter(&actor)).await.map_err(internal)? {
         return Err((StatusCode::NOT_FOUND, "provision key not found".into()));
     }
     tracing::info!(key_id = id, "provision key deleted");

@@ -25,7 +25,7 @@ pub(super) struct LearnedRejectionView {
 pub(super) async fn list_learned_rejections(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<LearnedRejectionView>>, ApiError> {
-    let rows = state.store.learned_rejections_with_time().map_err(internal)?;
+    let rows = state.store.learned_rejections_with_time().await.map_err(internal)?;
     Ok(Json(
         rows.into_iter()
             .rev()
@@ -44,9 +44,12 @@ pub(super) async fn list_learned_rejections(
 
 /// 把回填时挑出来的过期旧行（[`proxy::SeededMemories::stale`]）从库里删掉，逐条打 warn。
 /// 启动回填与每小时重建两处共用；删失败只告警，下次再试。
-pub(super) fn drop_stale_learned_rules(store: &CredentialStore, stale: &[store::LearnedRejection]) {
+pub(super) async fn drop_stale_learned_rules(
+    store: &CredentialStore,
+    stale: &[store::LearnedRejection],
+) {
     for r in stale {
-        match store.forget_learned_rejection(r) {
+        match store.forget_learned_rejection(r).await {
             Ok(_) => tracing::warn!(
                 kind = %r.kind, model = %r.model, field = %r.field, value = %r.value,
                 "dropped a stale learned rule written by an older version: a refusal recorded as a request class (v0.3.89), or a refusal rule without the upstream reply to replay (before 0.3.98); it is relearned on the next hit"
@@ -79,7 +82,7 @@ pub(super) async fn forget_learned_rejection(
         message: String::new(),
         reply: None,
     };
-    let in_db = state.store.forget_learned_rejection(&row).map_err(internal)?;
+    let in_db = state.store.forget_learned_rejection(&row).await.map_err(internal)?;
     let in_mem = proxy::forget_learned_memory(
         &state.shape_rejections,
         &state.deprecated_fields,
@@ -118,13 +121,13 @@ pub(super) async fn forget_learned_group(
             .and_then(|m| m.strip_prefix(']'))
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)),
     };
-    let rows = state.store.learned_rejections().map_err(internal)?;
+    let rows = state.store.learned_rejections().await.map_err(internal)?;
     let mut deleted = 0usize;
     for r in rows
         .iter()
         .filter(|r| r.kind == req.kind && r.model == req.model && in_category(&r.message))
     {
-        let in_db = state.store.forget_learned_rejection(r).map_err(internal)?;
+        let in_db = state.store.forget_learned_rejection(r).await.map_err(internal)?;
         let in_mem = proxy::forget_learned_memory(
             &state.shape_rejections,
             &state.deprecated_fields,
@@ -171,7 +174,7 @@ pub(super) async fn clear_learned_rejections(
     let deleted = match q.kind.as_deref() {
         // 没带 `kind` 才是清全部；带了但是空串按未知种类 400，免得 `?kind=` 手滑成全清。
         None => {
-            let deleted = state.store.clear_learned_rejections().map_err(internal)?;
+            let deleted = state.store.clear_learned_rejections().await.map_err(internal)?;
             state.shape_rejections.write().clear();
             state.deprecated_fields.write().clear();
             *state.empty_replies.write() = Default::default();
@@ -183,7 +186,8 @@ pub(super) async fn clear_learned_rejections(
             if !proxy::LEARNED_KINDS.contains(&kind) {
                 return Err(bad_request(format!("unknown rule kind: {kind:?}")));
             }
-            let deleted = state.store.clear_learned_rejections_of_kind(kind).map_err(internal)?;
+            let deleted =
+                state.store.clear_learned_rejections_of_kind(kind).await.map_err(internal)?;
             proxy::clear_learned_memory_kind(
                 &state.shape_rejections,
                 &state.deprecated_fields,
@@ -221,8 +225,11 @@ struct RecentModel {
 pub(super) async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsResp>, ApiError> {
-    let recent = blocking(move || state.store.recent_models(7).map_err(internal))
-        .await?
+    let recent = state
+        .store
+        .recent_models(7)
+        .await
+        .map_err(internal)?
         .into_iter()
         .map(|(model, last_ts)| RecentModel { model, last_ts })
         .collect();

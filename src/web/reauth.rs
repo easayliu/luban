@@ -7,10 +7,16 @@ pub(super) async fn refresh_credential(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
-    // 手动刷新同样走这个号自己的代理；代理坏掉时如实报错，不退回直连（见 ClientPool）。
-    let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
-    let tokens = match oauth::refresh(&http, &cred.refresh_token).await {
+    // 走与自动刷新同一条路：拿刷新锁、按库里最新的凭证刷（refresh_token 与出站代理都在拿到锁
+    // 之后重读），刷新与落库在脱离请求的任务里做完（见 `store::force_refresh`），浏览器断开也
+    // 不会丢掉轮换后的新 token。手动刷新同样走这个号自己的代理；代理坏掉时如实报错，不退回直连。
+    let (label, http, result) =
+        match store::force_refresh(&state.store, &state.clients, id).await.map_err(internal)? {
+            store::ManualRefresh::Gone => return Err(not_found()),
+            store::ManualRefresh::Proxy(e) => return Err(bad_request(format!("{e:#}"))),
+            store::ManualRefresh::Refreshed { label, http, result } => (label, http, result),
+        };
+    let tokens = match result {
         Ok(t) => t,
         Err(e) => {
             // refresh_token 被永久作废（invalid_grant）→ 标记封禁，与 keepalive / 转发路径口径一致。
@@ -18,23 +24,24 @@ pub(super) async fn refresh_credential(
                 && te.is_grant_revoked()
             {
                 let reason = te.ban_reason();
-                tracing::warn!(cred_id = id, cred = %cred.label, %reason, "manual refresh: grant revoked, disabling");
-                let _ = state.store.record_ban(id, &store::refresh_ban(&reason));
+                tracing::warn!(cred_id = id, cred = %label, %reason, "manual refresh: grant revoked, disabling");
+                let _ = state
+                    .store
+                    .detached(
+                        |s| async move { s.record_ban(id, &store::refresh_ban(&reason)).await },
+                    )
+                    .await;
             }
             return Err(bad_request(e.to_string()));
         }
     };
-    state
-        .store
-        .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
-        .map_err(internal)?;
     // 顺带把 profile 那几列写回（等级、账号 UUID、组织类型、额度档、组织 UUID、订阅创建时刻）：
     // 旧库里的号是在这些列存在之前加的，只有刷新才补得上。失败忽略、不影响 token 刷新结果，
     // 但要留一行——否则「刷新成功了但等级还是旧的」在日志里毫无痕迹。
     match oauth::fetch_profile(&http, &tokens.access_token).await {
         Ok(profile) => {
             if let Err(e) =
-                state.store.apply_profile(id, &profile, tokens.organization_uuid.as_deref())
+                state.store.apply_profile(id, &profile, tokens.organization_uuid.as_deref()).await
             {
                 tracing::warn!(cred_id = id, error = %e, "failed to write back the profile fields (the refresh itself succeeded)");
             }
@@ -128,14 +135,14 @@ pub(super) async fn reauthorize_credential(
     Path(id): Path<i64>,
     Json(req): Json<ReauthorizeReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
 
     // 先拿锁再读号：等锁期间自动刷新可能刚把号停掉、或刚换了代理，下面的启用判断与出口
     // 都得按拿锁之后的状态来。
     let lock = state.store.refresh_lock(id);
     let _guard = lock.lock().await;
-    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let cred = state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     // 代理建不出来放在取挑战之前：挑战取出即作废，代理错了改好再试还能用同一个授权结果。
     let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
     let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
@@ -164,16 +171,18 @@ pub(super) async fn reauthorize_credential(
     state
         .store
         .update_tokens(id, &tokens.access_token, &tokens.refresh_token, tokens.expires_at)
+        .await
         .map_err(internal)?;
     if let Some(profile) = &profile
-        && let Err(e) = state.store.apply_profile(id, profile, tokens.organization_uuid.as_deref())
+        && let Err(e) =
+            state.store.apply_profile(id, profile, tokens.organization_uuid.as_deref()).await
     {
         tracing::warn!(cred_id = id, error = %e, "reauthorize: failed to store the profile fields");
     }
     let token_pause = cred.disabled
         && cred.ban_reason.as_deref().is_some_and(|r| is_token_pause(r, cred.resume_at.is_some()));
     if token_pause {
-        state.store.set_disabled(id, false).map_err(internal)?;
+        state.store.set_disabled(id, false).await.map_err(internal)?;
     }
     tracing::info!(cred_id = id, cred = %cred.label, re_enabled = token_pause, "credential reauthorized");
     view_of(&state, id).await
@@ -244,7 +253,7 @@ pub(super) async fn test_credential(
     if model.is_empty() {
         return Err(bad_request("specify the model name to test"));
     }
-    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let cred = state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     Ok(Json(proxy::probe(&state, &cred, model).await))
 }
 
@@ -258,9 +267,9 @@ pub(super) async fn clear_cooldown(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     state.store.clear_rate_limited(id, None);
-    state.store.clear_model_denials(id, None).map_err(internal)?;
-    state.store.resume_if_rate_limited(id).map_err(internal)?;
+    state.store.clear_model_denials(id, None).await.map_err(internal)?;
+    state.store.resume_if_rate_limited(id).await.map_err(internal)?;
     view_of(&state, id).await
 }

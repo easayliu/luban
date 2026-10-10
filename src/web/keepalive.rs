@@ -33,8 +33,8 @@ pub(super) enum KeepaliveRejection {
 /// 其余的（`permission_error`、区域限制、网关页面……）仍只记日志。
 ///
 /// 返回怎么处置的，见 [`KeepaliveRejection`]。
-pub(super) fn handle_keepalive_rejection(
-    store: &CredentialStore,
+pub(super) async fn handle_keepalive_rejection(
+    store: &std::sync::Arc<CredentialStore>,
     cred: &Credential,
     rej: &oauth::AuthRejection,
 ) -> KeepaliveRejection {
@@ -46,7 +46,7 @@ pub(super) fn handle_keepalive_rejection(
         // `park_org_oauth_disallowed` 自己记 warn；已暂停的号保活不再发这些端点（只刷 token），
         // 走不到这里。
         AccountRejection::SubscriptionInactive => {
-            if !proxy::park_org_oauth_disallowed(store, cred, rej.status, "keepalive") {
+            if !proxy::park_org_oauth_disallowed(store, cred, rej.status, "keepalive").await {
                 tracing::debug!(
                     cred_id = cred.id, cred = %cred.label,
                     endpoint = rej.endpoint, status = rej.status,
@@ -75,7 +75,7 @@ pub(super) fn handle_keepalive_rejection(
         reason = %ctx.reason,
         "keepalive: account-level error from upstream, marking as banned"
     );
-    match store.record_ban(cred.id, &ctx) {
+    match store.record_ban(cred.id, &ctx).await {
         Ok(true) => KeepaliveRejection::Banned,
         Ok(false) => {
             tracing::warn!(cred_id = cred.id, cred = %cred.label, "keepalive: credential vanished before it could be disabled");

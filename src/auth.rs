@@ -182,7 +182,8 @@ async fn verify_user_password(
         return Ok(constant_time_eq(env.as_bytes(), pw.as_bytes())
             .then(|| Verified { tag: password_tag(state, user.role, ""), expected_hash: None }));
     }
-    let stored = state.store.user_password_hash(user.id).map_err(internal)?.unwrap_or_default();
+    let stored =
+        state.store.user_password_hash(user.id).await.map_err(internal)?.unwrap_or_default();
     if stored.is_empty() {
         return Ok(None);
     }
@@ -203,7 +204,7 @@ async fn verify_user_password(
     if stored.starts_with(LEGACY_SHA256_PREFIX) {
         let upgraded = hash_password(pw).await?;
         // 只在库里还是这份旧哈希时才换：与并发的改密码交错时不把新密码盖回旧的。
-        match state.store.set_user_password_hash(user.id, &upgraded, Some(&stored)) {
+        match state.store.set_user_password_hash(user.id, &upgraded, Some(&stored)).await {
             Ok(true) => current = upgraded,
             Ok(false) => {}
             Err(e) => {
@@ -222,14 +223,14 @@ async fn verify_user_password(
 /// 给那些「开着鉴权才允许」的接口用。未设密码时 [`require_login`] 已经一律拒绝，这层是
 /// 兜底：个别接口给出去的东西比「能改配置」更重（如导出含明文 token 的迁移文件），不把
 /// 安全全押在中间件的装配上，它们自己再确认一次这道门锁着。
-pub fn admin_configured(state: &AppState) -> bool {
-    state.admin_env.is_some() || state.store.admin_user().is_ok_and(|u| u.password_set)
+pub async fn admin_configured(state: &AppState) -> bool {
+    state.admin_env.is_some() || state.store.admin_user().await.is_ok_and(|u| u.password_set)
 }
 
 /// 访客能不能登录：环境接管了访客密码，或库里有设过密码的访客行。
-fn viewer_enabled(state: &AppState) -> bool {
+async fn viewer_enabled(state: &AppState) -> bool {
     state.viewer_env.is_some()
-        || state.store.viewer_user().ok().flatten().is_some_and(|u| u.password_set)
+        || state.store.viewer_user().await.ok().flatten().is_some_and(|u| u.password_set)
 }
 
 /// 启动时对齐环境接管的账号：
@@ -237,10 +238,10 @@ fn viewer_enabled(state: &AppState) -> bool {
 ///   会话才有地方挂；
 /// - 两个环境密码各与上次启动时记下的 argon2 哈希比对，换了、撤了或新设了，版本号加一
 ///   （[`password_tag`] 只记版本号），按旧密码签的会话随即失效。
-pub(crate) fn sync_env_accounts(state: &AppState) {
+pub(crate) async fn sync_env_accounts(state: &AppState) {
     if state.viewer_env.is_some()
-        && matches!(state.store.viewer_user(), Ok(None))
-        && let Err(e) = state.store.upsert_viewer("")
+        && matches!(state.store.viewer_user().await, Ok(None))
+        && let Err(e) = state.store.upsert_viewer("").await
     {
         tracing::warn!(error = %format!("{e:#}"), "failed to create the viewer account for LUBAN_VIEWER_PASSWORD");
     }
@@ -248,14 +249,16 @@ pub(crate) fn sync_env_accounts(state: &AppState) {
         (UserRole::Admin, store::ADMIN_ENV_PASSWORD_HASH, store::ADMIN_ENV_PASSWORD_VERSION),
         (UserRole::Viewer, store::VIEWER_ENV_PASSWORD_HASH, store::VIEWER_ENV_PASSWORD_VERSION),
     ] {
-        if let Err(e) = sync_env_password(state, env_password(state, role), hash_key, version_key) {
+        if let Err(e) =
+            sync_env_password(state, env_password(state, role), hash_key, version_key).await
+        {
             tracing::warn!(error = %format!("{e:#}"), ?role, "failed to record the environment password version");
         }
     }
 }
 
 /// 比对一个环境密码与上次记下的哈希，变了就把版本号加一、换上新哈希（撤了就删掉哈希）。
-fn sync_env_password(
+async fn sync_env_password(
     state: &AppState,
     env: Option<&str>,
     hash_key: &str,
@@ -272,10 +275,10 @@ fn sync_env_password(
     }
     let version: u64 =
         state.store.get_setting(version_key)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-    state.store.set_setting(version_key, &(version + 1).to_string())?;
+    state.store.set_setting(version_key, &(version + 1).to_string()).await?;
     match env {
-        Some(pw) => state.store.set_setting(hash_key, &hash_password_blocking(pw)?)?,
-        None => state.store.delete_setting(hash_key)?,
+        Some(pw) => state.store.set_setting(hash_key, &hash_password_blocking(pw)?).await?,
+        None => state.store.delete_setting(hash_key).await?,
     }
     Ok(())
 }
@@ -293,7 +296,7 @@ fn bearer(headers: &header::HeaderMap) -> Option<&str> {
 
 /// 签发一个会话 token（32 字节随机数的十六进制），库里只存它的 sha256 与密码指纹。
 /// 库里的密码在校验之后被改掉了（`expected_hash` 对不上）回 None，不签。
-fn issue_session(
+async fn issue_session(
     state: &AppState,
     user_id: i64,
     verified: &Verified,
@@ -309,6 +312,7 @@ fn issue_session(
             &verified.tag,
             verified.expected_hash.as_deref(),
         )
+        .await
         .map_err(internal)?;
     Ok(created.then_some(token))
 }
@@ -526,7 +530,7 @@ async fn check_owned(
         Owned::Nothing => Ok(req),
         Owned::CredentialPath => {
             let id = path_id(&req, 1).ok_or_else(|| not_found("credential"))?;
-            match state.store.credential_owner(id) {
+            match state.store.credential_owner(id).await {
                 Ok(Some(o)) if o == owner => Ok(req),
                 Ok(_) => Err(not_found("credential")),
                 Err(e) => Err(internal(e).into_response()),
@@ -534,7 +538,7 @@ async fn check_owned(
         }
         Owned::ProxyPath => {
             let id = path_id(&req, 1).ok_or_else(|| not_found("proxy"))?;
-            match state.store.proxy_owner(id) {
+            match state.store.proxy_owner(id).await {
                 Ok(Some(o)) if o == owner => Ok(req),
                 Ok(_) => Err(not_found("proxy")),
                 Err(e) => Err(internal(e).into_response()),
@@ -542,13 +546,13 @@ async fn check_owned(
         }
         Owned::BanEventPath => {
             let id = path_id(&req, 1).ok_or_else(|| not_found("ban event"))?;
-            let owner_of = |id| -> anyhow::Result<Option<i64>> {
-                match state.store.ban_event_credential(id)? {
-                    Some(cred) => state.store.credential_owner(cred),
-                    None => Ok(None),
+            let owner_of = async {
+                match state.store.ban_event_credential(id).await? {
+                    Some(cred) => state.store.credential_owner(cred).await,
+                    None => Ok::<_, anyhow::Error>(None),
                 }
             };
-            match owner_of(id) {
+            match owner_of.await {
                 Ok(Some(o)) if o == owner => Ok(req),
                 Ok(_) => Err(not_found("ban event")),
                 Err(e) => Err(internal(e).into_response()),
@@ -567,9 +571,9 @@ async fn check_owned(
             // 解不出来的交给 handler 去回它自己的 400，这里只管「解得出的 id 是不是本人的」。
             let ids = serde_json::from_slice::<Ids>(&bytes).map(|b| b.ids).unwrap_or_default();
             let all_owned = if owned == Owned::CredentialIds {
-                state.store.credentials_owned_by(&ids, owner)
+                state.store.credentials_owned_by(&ids, owner).await
             } else {
-                state.store.proxies_owned_by(&ids, owner)
+                state.store.proxies_owned_by(&ids, owner).await
             };
             match all_owned {
                 Ok(true) => Ok(Request::from_parts(parts, axum::body::Body::from(bytes))),
@@ -590,7 +594,7 @@ async fn check_owned(
 /// 见 401 就重新拉一次鉴权状态，未设密码的来访由此落到初始化页。登录了但权限不够回 403：
 /// 回 401 会让前端以为登录失效、清掉会话踢回登录页。
 pub async fn require_login(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if !admin_configured(&state) {
+    if !admin_configured(&state).await {
         return (StatusCode::UNAUTHORIZED, SETUP_REQUIRED).into_response();
     }
     let Some(token) = bearer(req.headers()) else {
@@ -600,7 +604,7 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
         return provision_key_request(&state, token.to_owned(), req, next).await;
     }
     let token_hash = sha256_hex(token);
-    let row = match state.store.session_lookup(&token_hash) {
+    let row = match state.store.session_lookup(&token_hash).await {
         Ok(Some(row)) => row,
         Ok(None) => return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
         Err(e) => return internal(e).into_response(),
@@ -608,13 +612,13 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
     // 密码指纹对不上（改过密码、环境变量里的密码换了或撤了）：这条会话作废。
     let current_tag = password_tag(&state, row.user.role, &row.password_hash);
     if current_tag.is_empty() || !constant_time_eq(current_tag.as_bytes(), row.pw_tag.as_bytes()) {
-        let _ = state.store.delete_session(&token_hash);
+        let _ = state.store.delete_session(&token_hash).await;
         return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
     }
     if row.user.effectively_disabled() {
         return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
     }
-    if let Err(e) = state.store.renew_session_if_due(&token_hash, row.remaining_secs) {
+    if let Err(e) = state.store.renew_session_if_due(&token_hash, row.remaining_secs).await {
         tracing::warn!(error = %e, "failed to renew a console session");
     }
     let actor = Actor::from(row.user);
@@ -691,14 +695,14 @@ async fn provision_key_request(
     next: Next,
 ) -> Response {
     let invalid = || (StatusCode::UNAUTHORIZED, "invalid provision key").into_response();
-    let hit = match state.store.provision_key_lookup(&token) {
+    let hit = match state.store.provision_key_lookup(&token).await {
         Ok(Some(hit)) => hit,
         Ok(None) => return invalid(),
         Err(e) => return internal(e).into_response(),
     };
     // 密码指纹对不上（改过密码、被重置、环境变量里的密码换了或撤了）：这把 Key 作废、删掉。
     if !provision_key_current(state, hit.user.role, &hit.password_hash, &hit.pw_tag) {
-        if let Err(e) = state.store.delete_provision_key(hit.id, None) {
+        if let Err(e) = state.store.delete_provision_key(hit.id, None).await {
             tracing::warn!(error = %e, key_id = hit.id, "failed to delete a revoked provision key");
         }
         return invalid();
@@ -707,7 +711,7 @@ async fn provision_key_request(
     if user.effectively_disabled() || user.role == UserRole::Viewer {
         return invalid();
     }
-    if let Err(e) = state.store.touch_provision_key(hit.id) {
+    if let Err(e) = state.store.touch_provision_key(hit.id).await {
         tracing::warn!(error = %e, "failed to record provision key use");
     }
     let path = req
@@ -741,12 +745,12 @@ pub struct StateResp {
 
 /// 鉴权状态（公开）。
 pub async fn state(State(state): State<AppState>) -> Json<StateResp> {
-    let configured = admin_configured(&state);
+    let configured = admin_configured(&state).await;
     Json(StateResp {
         configured,
         env_managed: state.admin_env.is_some(),
         setup_required: !configured,
-        viewer_enabled: configured && viewer_enabled(&state),
+        viewer_enabled: configured && viewer_enabled(&state).await,
     })
 }
 
@@ -773,7 +777,7 @@ pub async fn login(
 ) -> Result<Json<LoginResp>, ApiError> {
     // 这是全项目唯一能看出「有人在猜密码」的地方，不带来源等于记了个寂寞。
     let ip = client_ip(&headers, peer);
-    if !admin_configured(&state) {
+    if !admin_configured(&state).await {
         return Err((StatusCode::BAD_REQUEST, "no admin password has been set yet".into()));
     }
     let username = req.username.trim();
@@ -781,7 +785,7 @@ pub async fn login(
         return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     }
     let key = username.to_lowercase();
-    let user = state.store.user_by_username(username).map_err(internal)?;
+    let user = state.store.user_by_username(username).await.map_err(internal)?;
     if !reserve_login_attempt(&key, user.is_some()) {
         tracing::warn!(%ip, username, "console login rejected: too many failed attempts");
         return Err((
@@ -803,7 +807,7 @@ pub async fn login(
         return Err((StatusCode::FORBIDDEN, "this account is disabled".into()));
     }
     // 校验到签发之间密码被重置了：按旧密码校验通过的这次登录不签会话。
-    let Some(token) = issue_session(&state, user.id, &verified)? else {
+    let Some(token) = issue_session(&state, user.id, &verified).await? else {
         tracing::warn!(%ip, username, "console login rejected: the password changed during sign-in");
         return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     };
@@ -817,7 +821,7 @@ pub async fn logout(
     headers: header::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(token) = bearer(&headers) {
-        state.store.delete_session(&sha256_hex(token)).map_err(internal)?;
+        state.store.delete_session(&sha256_hex(token)).await.map_err(internal)?;
     }
     Ok(ok_json())
 }
@@ -880,7 +884,7 @@ pub async fn setup(
 ) -> Result<Json<LoginResp>, ApiError> {
     let ip = client_ip(&headers, peer);
     let _guard = SETUP_LOCK.lock().await;
-    if admin_configured(&state) {
+    if admin_configured(&state).await {
         return Err((StatusCode::BAD_REQUEST, "an admin password is already set".into()));
     }
     let given = req.token.as_deref().map(str::trim).unwrap_or("");
@@ -890,13 +894,14 @@ pub async fn setup(
     }
     let pw = check_new_password(&req.password)?;
     let hash = hash_password(pw).await?;
-    let admin = state.store.admin_user().map_err(internal)?;
-    state.store.set_user_password_hash(admin.id, &hash, None).map_err(internal)?;
+    let admin = state.store.admin_user().await.map_err(internal)?;
+    state.store.set_user_password_hash(admin.id, &hash, None).await.map_err(internal)?;
     // 谁在什么时候把密码定下来的，比任何一项设置变更都更该留痕。
     tracing::info!(%ip, "admin password set for the first time");
     let verified =
         Verified { tag: password_tag(&state, admin.role, &hash), expected_hash: Some(hash) };
-    let token = issue_session(&state, admin.id, &verified)?
+    let token = issue_session(&state, admin.id, &verified)
+        .await?
         .ok_or_else(|| internal("the admin password changed while it was being set"))?;
     Ok(Json(LoginResp { ok: true, token, role: admin.role, username: admin.username }))
 }
@@ -928,7 +933,8 @@ pub async fn change_password(
     let token_hash = bearer(&headers)
         .map(sha256_hex)
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED.to_string()))?;
-    let old_hash = state.store.user_password_hash(actor.id).map_err(internal)?.unwrap_or_default();
+    let old_hash =
+        state.store.user_password_hash(actor.id).await.map_err(internal)?.unwrap_or_default();
     let new_hash = if cleared {
         String::new()
     } else {
@@ -938,14 +944,15 @@ pub async fn change_password(
     let written = state
         .store
         .change_own_password(actor.id, &token_hash, &old_hash, &new_hash, &new_tag)
+        .await
         .map_err(internal)?;
     if !written {
         return Err((StatusCode::UNAUTHORIZED, LOGIN_REQUIRED.into()));
     }
     if cleared {
         // 访客跟着清：否则下回重设管理密码时，早先发出去的访客密码悄悄又能用了。
-        state.store.delete_viewer().map_err(internal)?;
-        state.store.delete_all_sessions().map_err(internal)?;
+        state.store.delete_viewer().await.map_err(internal)?;
+        state.store.delete_all_sessions().await.map_err(internal)?;
     }
     tracing::info!(
         ip = %client_ip(&headers, peer),
@@ -981,7 +988,7 @@ pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor
         username: actor.username,
         role: actor.role,
         admin_env_managed: admin && state.admin_env.is_some(),
-        viewer_configured: admin && viewer_enabled(&state),
+        viewer_configured: admin && viewer_enabled(&state).await,
         viewer_env_managed: admin && state.viewer_env.is_some(),
     })
 }
@@ -999,13 +1006,17 @@ pub async fn set_viewer_password(
     }
     let cleared = req.password.trim().is_empty();
     if cleared {
-        state.store.delete_viewer().map_err(internal)?;
+        state.store.delete_viewer().await.map_err(internal)?;
     } else {
         let hash = hash_password(check_new_password(&req.password)?).await?;
-        state.store.upsert_viewer(&hash).map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        state
+            .store
+            .upsert_viewer(&hash)
+            .await
+            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
         // 换了密码，拿旧密码登进来的访客全部下线。
-        if let Some(v) = state.store.viewer_user().map_err(internal)? {
-            state.store.delete_user_sessions(v.id, None).map_err(internal)?;
+        if let Some(v) = state.store.viewer_user().await.map_err(internal)? {
+            state.store.delete_user_sessions(v.id, None).await.map_err(internal)?;
         }
     }
     tracing::info!(ip = %client_ip(&headers, peer), cleared, "viewer password changed");

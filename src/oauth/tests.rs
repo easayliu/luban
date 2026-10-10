@@ -41,22 +41,26 @@ fn release_body_must_be_a_bare_three_part_version() {
 }
 
 /// 缓存只升不降；库同步（启动/导入/手动改删）则以库为准，能升也能降、能清空。
-#[test]
-fn release_cache_learns_upward_and_syncs_from_store_both_ways() {
+#[tokio::test]
+async fn release_cache_learns_upward_and_syncs_from_store_both_ways() {
     let c = super::ReleaseCache::new();
     assert_eq!(c.get(), None);
-    assert!(c.learn((2, 1, 260)), "空缓存学到就记");
-    assert!(!c.learn((2, 1, 258)), "更旧的忽略");
-    assert!(!c.learn((2, 1, 260)), "相同的不算变");
-    assert!(c.learn((2, 1, 265)), "更新的记");
+    assert!(c.learn((2, 1, 260)).await, "空缓存学到就记");
+    assert!(!c.learn((2, 1, 258)).await, "更旧的忽略");
+    assert!(!c.learn((2, 1, 260)).await, "相同的不算变");
+    assert!(c.learn((2, 1, 265)).await, "更新的记");
     assert_eq!(c.get(), Some((2, 1, 265)));
 
-    c.sync_from_store(|| Ok::<_, ()>(Some((2, 1, 261)))).unwrap();
+    c.sync_from_store(async { Ok::<_, ()>(Some((2, 1, 261))) }).await.unwrap();
     assert_eq!(c.get(), Some((2, 1, 261)), "库为准，能降");
-    c.sync_from_store(|| Ok::<_, ()>(None)).unwrap();
+    c.sync_from_store(async { Ok::<_, ()>(None) }).await.unwrap();
     assert_eq!(c.get(), None, "库里删了缓存也清");
     assert!(!c.has_pending(), "库同步之后不欠落库");
-    assert_eq!(c.sync_from_store(|| Err::<Option<_>, _>("io")), Err("io"), "写库失败原样交回");
+    assert_eq!(
+        c.sync_from_store(async { Err::<Option<_>, _>("io") }).await,
+        Err("io"),
+        "写库失败原样交回"
+    );
     assert_eq!(c.get(), None, "写库失败缓存不动");
 }
 
@@ -64,35 +68,38 @@ fn release_cache_learns_upward_and_syncs_from_store_both_ways() {
 ///
 /// 复现的正是那条竞态：后台拿到锁 → 管理员写库并同步缓存 → 后台那笔迟到的写入盖掉管理员
 /// 的值。把管理员的写库也放进同一把锁，顺序就变成后台写完 → 管理员写。
-#[test]
-fn an_admin_write_lands_after_an_in_flight_background_persist() {
-    use std::sync::mpsc;
+#[tokio::test]
+async fn an_admin_write_lands_after_an_in_flight_background_persist() {
     let c = std::sync::Arc::new(super::ReleaseCache::new());
     // 「库」：按落地顺序记下每一笔写入。
     let db = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let (started_tx, started_rx) = mpsc::channel();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
     let db_bg = db.clone();
     c.install_persister(move |v| {
-        started_tx.send(()).unwrap();
-        // 写库很慢：给管理员留出在这期间动手的窗口。
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        db_bg.lock().push(("bg", v));
-        Ok(())
+        let (started_tx, db_bg) = (started_tx.clone(), db_bg.clone());
+        Box::pin(async move {
+            started_tx.send(()).unwrap();
+            // 写库很慢：给管理员留出在这期间动手的窗口。
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            db_bg.lock().push(("bg", v));
+            Ok(())
+        })
     });
 
     let c_bg = c.clone();
-    let bg = std::thread::spawn(move || {
-        c_bg.learn((2, 1, 260));
+    let bg = tokio::spawn(async move {
+        c_bg.learn((2, 1, 260)).await;
     });
-    started_rx.recv().unwrap();
+    started_rx.recv().await.unwrap();
     // 后台正在锁内写库；管理员此刻改成 2.1.265。
     let db_admin = db.clone();
-    c.sync_from_store(|| {
+    c.sync_from_store(async {
         db_admin.lock().push(("admin", (2, 1, 265)));
         Ok::<_, ()>(Some((2, 1, 265)))
     })
+    .await
     .unwrap();
-    bg.join().unwrap();
+    bg.await.unwrap();
 
     assert_eq!(&*db.lock(), &[("bg", (2, 1, 260)), ("admin", (2, 1, 265))], "管理员的写入最后落地");
     assert_eq!(c.get(), Some((2, 1, 265)));
@@ -100,8 +107,8 @@ fn an_admin_write_lands_after_an_in_flight_background_persist() {
 }
 
 /// 写库失败不丢：欠着，下次 `persist_pending` 补上；写成之后不再重复写。
-#[test]
-fn release_cache_retries_a_failed_persist() {
+#[tokio::test]
+async fn release_cache_retries_a_failed_persist() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let c = super::ReleaseCache::new();
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -109,42 +116,46 @@ fn release_cache_retries_a_failed_persist() {
     let (calls2, written2) = (calls.clone(), written.clone());
     c.install_persister(move |v| {
         // 头一次写失败，之后都成功。
-        if calls2.fetch_add(1, Ordering::SeqCst) == 0 {
-            anyhow::bail!("disk full");
-        }
-        written2.lock().push(v);
-        Ok(())
+        let failed = calls2.fetch_add(1, Ordering::SeqCst) == 0;
+        let written2 = written2.clone();
+        Box::pin(async move {
+            if failed {
+                anyhow::bail!("disk full");
+            }
+            written2.lock().push(v);
+            Ok(())
+        })
     });
 
-    assert!(c.learn((2, 1, 260)));
+    assert!(c.learn((2, 1, 260)).await);
     assert!(c.has_pending(), "第一次写失败，欠着");
     assert!(written.lock().is_empty());
 
     // 下一轮拉到同一个版本：缓存没变，但欠的那次要补。
-    assert!(!c.learn((2, 1, 260)));
+    assert!(!c.learn((2, 1, 260)).await);
     assert!(!c.has_pending(), "补写成功");
     assert_eq!(&*written.lock(), &[(2, 1, 260)]);
 
-    c.persist_pending();
+    c.persist_pending().await;
     assert_eq!(written.lock().len(), 1, "已落库的不重复写");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 /// 并发学到两个版本时库里落的是较新的那个：落库写的是缓存值，缓存只升不降。
-#[test]
-fn release_cache_persists_the_newest_value_not_the_callers() {
+#[tokio::test]
+async fn release_cache_persists_the_newest_value_not_the_callers() {
     let c = super::ReleaseCache::new();
     let written = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let w = written.clone();
     c.install_persister(move |v| {
         w.lock().push(v);
-        Ok(())
+        Box::pin(async { Ok(()) })
     });
     // 模拟「A 学到 2.5.0、B 学到 2.6.0 并写库、A 最后才去写」：A 那次落库写的是当时的
     // 缓存值 2.6.0，而且因为 B 已经写过、根本不欠，A 什么都不写。
-    assert!(c.learn((2, 6, 0)));
-    assert!(!c.learn((2, 5, 0)));
-    c.persist_pending();
+    assert!(c.learn((2, 6, 0)).await);
+    assert!(!c.learn((2, 5, 0)).await);
+    c.persist_pending().await;
     assert_eq!(&*written.lock(), &[(2, 6, 0)]);
     assert_eq!(super::release_string((2, 6, 0)), "2.6.0");
 }
@@ -339,11 +350,11 @@ fn a_recent_handshake_is_visible_to_the_keepalive_loop() {
 
 /// 有近期真实会话时，保活事件与 Datadog 日志挂在那个会话的身份上：同一个 session_id /
 /// device_id / 版本 / 模型 / beta 串，`auth` 块带组织 id。没有时退回按账号派生的身份。
-#[test]
-fn keepalive_attaches_to_the_real_session_when_there_is_one() {
+#[sqlx::test]
+async fn keepalive_attaches_to_the_real_session_when_there_is_one(pool: sqlx::PgPool) {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+    let store = crate::store::CredentialStore::for_test(pool.clone()).await;
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let snapshot = crate::telemetry::SessionSnapshot {
         session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
         device_id: "b9".repeat(32),
@@ -399,12 +410,12 @@ fn keepalive_attaches_to_the_real_session_when_there_is_one() {
 /// 官方那份的键序（`cap/2.1.260-2/00003`）：
 /// `… userType, subscriptionType, rateLimitTier, organizationRole,
 ///    subscriptionCreatedAt, firstTokenTime, appVersion, entrypoint`。
-#[test]
-fn eval_attributes_carry_the_raw_rate_limit_tier() {
-    let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("t", None, "a", "r", 0, None, Some("claude_team"), 1).unwrap();
-    store.set_rate_limit_tier(cred.id, Some("default_claude_max_5x")).unwrap();
-    let cred = store.get(cred.id).unwrap().unwrap();
+#[sqlx::test]
+async fn eval_attributes_carry_the_raw_rate_limit_tier(pool: sqlx::PgPool) {
+    let store = crate::store::CredentialStore::for_test(pool.clone()).await;
+    let cred = store.insert("t", None, "a", "r", 0, None, Some("claude_team"), 1).await.unwrap();
+    store.set_rate_limit_tier(cred.id, Some("default_claude_max_5x")).await.unwrap();
+    let cred = store.get(cred.id).await.unwrap().unwrap();
 
     let attrs = KeepaliveCtx::new(&cred, 1.0, None, None).eval_body();
     let attrs = &attrs["attributes"];
@@ -428,9 +439,9 @@ fn eval_attributes_carry_the_raw_rate_limit_tier() {
 
     // profile 存下来之后：subscriptionCreatedAt 是毫秒数、夹在 organizationRole 与
     // firstTokenTime 之间（`cap/2.1.260-2/00003` 的键序）；organizationUUID 用凭证上那份垫底。
-    store.set_subscription_created_at(cred.id, Some("2026-04-15T13:03:55.239Z")).unwrap();
-    store.set_org_uuid(cred.id, Some("09520b85-f6b6-432f-97e2-6ecb804a083f")).unwrap();
-    let cred = store.get(cred.id).unwrap().unwrap();
+    store.set_subscription_created_at(cred.id, Some("2026-04-15T13:03:55.239Z")).await.unwrap();
+    store.set_org_uuid(cred.id, Some("09520b85-f6b6-432f-97e2-6ecb804a083f")).await.unwrap();
+    let cred = store.get(cred.id).await.unwrap().unwrap();
     let attrs = KeepaliveCtx::new(&cred, 1.0, None, None).eval_body();
     let attrs = &attrs["attributes"];
     assert_eq!(attrs["subscriptionCreatedAt"], 1776258235239i64);
@@ -448,8 +459,8 @@ fn eval_attributes_carry_the_raw_rate_limit_tier() {
         "11111111-2222-3333-4444-555555555555"
     );
     // 解析不了的串按没有处理。
-    store.set_subscription_created_at(cred.id, Some("garbage")).unwrap();
-    let cred = store.get(cred.id).unwrap().unwrap();
+    store.set_subscription_created_at(cred.id, Some("garbage")).await.unwrap();
+    let cred = store.get(cred.id).await.unwrap().unwrap();
     assert!(
         KeepaliveCtx::new(&cred, 1.0, None, None).eval_body()["attributes"]
             .get("subscriptionCreatedAt")
@@ -457,7 +468,7 @@ fn eval_attributes_carry_the_raw_rate_limit_tier() {
     );
 
     // 旧库里没回填过的号：这一项整个不发，而不是发一个空串。
-    let bare = store.insert("t2", None, "a2", "r2", 0, None, None, 1).unwrap();
+    let bare = store.insert("t2", None, "a2", "r2", 0, None, None, 1).await.unwrap();
     let bare = KeepaliveCtx::new(&bare, 1.0, None, None).eval_body();
     assert!(bare["attributes"].get("rateLimitTier").is_none());
 }

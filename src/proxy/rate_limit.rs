@@ -175,8 +175,8 @@ pub(super) fn rate_limit_scope_for(
 ///   [`store::CredentialStore::mark_rate_limited`]，但 cooldown 用 ladder 退避值（2s 起步），
 ///   远短于额度那一档。短 gate 阻止同一个号被立刻再选中、反复打出 429，同时因为持续时间短，
 ///   不会像长 gate 那样级联封死整池。
-pub(super) fn park_rate_limited(
-    store: &store::CredentialStore,
+pub(super) async fn park_rate_limited(
+    store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     scope: &LimitScope,
     cooldown: std::time::Duration,
@@ -190,7 +190,11 @@ pub(super) fn park_rate_limited(
             "upstream rate limit: account quota exhausted, scheduling resumes automatically in about {}",
             human_secs(cooldown)
         );
-        match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
+        let (id, why) = (cred.id, reason.clone());
+        match store
+            .detached(|s| async move { s.pause_for_rate_limit(id, &why, resume_at).await })
+            .await
+        {
             Ok(true) => tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 resume_at,
@@ -255,8 +259,8 @@ pub(super) fn park_rate_limited(
 ///
 /// 返回是否已经把号停在池外，调用方据此决定要不要再走「测试通过就恢复」那条路——否则一次
 /// 手动探活会把刚按阈值停掉的号放回去，下一条请求再停一次，来回拉锯。
-pub(super) fn park_if_quota_nearly_exhausted(
-    store: &store::CredentialStore,
+pub(super) async fn park_if_quota_nearly_exhausted(
+    store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     info: &RateLimitInfo,
 ) -> bool {
@@ -276,7 +280,7 @@ pub(super) fn park_if_quota_nearly_exhausted(
     let pct = thresholds.pct_for(window);
     // 同一批限流头会被这个号所有在途请求各看一遍：已经停在池外的就别再写库、也别再刷屏。
     // 读一次库的代价只在真越阈值时付，正常流量走不到这里。
-    if matches!(store.get(cred.id), Ok(Some(c)) if c.disabled) {
+    if matches!(store.get(cred.id).await, Ok(Some(c)) if c.disabled) {
         return true;
     }
     let cooldown = info.quota_pause_cooldown(&thresholds);
@@ -286,7 +290,9 @@ pub(super) fn park_if_quota_nearly_exhausted(
         used * 100.0,
         human_secs(cooldown)
     );
-    match store.pause_for_rate_limit(cred.id, &reason, resume_at) {
+    let (id, why) = (cred.id, reason.clone());
+    match store.detached(|s| async move { s.pause_for_rate_limit(id, &why, resume_at).await }).await
+    {
         // 没写入 = 号已经被封 / 人工停用 / 按订阅停了：同样已在池外，只是不必再记一遍。
         Ok(false) => true,
         Ok(true) => {

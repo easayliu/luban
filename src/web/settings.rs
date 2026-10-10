@@ -226,13 +226,15 @@ pub(super) fn read_latest_release_setting(
 ///
 /// 导入设置、网页手动改/删**不走这个**：那两处要在同一把锁里先写库再同步，见
 /// [`oauth::ReleaseCache::sync_from_store`]。
-pub(super) fn sync_latest_release_from_store(store: &CredentialStore) {
-    if let Err(e) = oauth::LATEST_RELEASE.sync_from_store(|| read_latest_release_setting(store)) {
+pub(super) async fn sync_latest_release_from_store(store: &CredentialStore) {
+    if let Err(e) =
+        oauth::LATEST_RELEASE.sync_from_store(async { read_latest_release_setting(store) }).await
+    {
         tracing::warn!(error = %e, "failed to read settings.latest_cc_release");
     }
 }
 
-pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
+pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
     let device_binding_ttl_secs = state.store.device_binding_ttl();
     let device_binding_retention_secs = state.store.device_binding_retention();
     let session_binding_ttl_secs = state.store.session_binding_ttl();
@@ -296,7 +298,7 @@ pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
     SettingsResp {
         api_key,
         env_managed: false,
-        api_keys_required: state.store.api_keys_required().unwrap_or(true),
+        api_keys_required: state.store.api_keys_required().await.unwrap_or(true),
         device_binding_ttl_secs,
         device_binding_retention_secs,
         session_binding_ttl_secs,
@@ -326,5 +328,5 @@ pub(super) fn settings_resp(state: &AppState) -> SettingsResp {
 
 /// 读取接入设置。
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<SettingsResp> {
-    Json(settings_resp(&state))
+    Json(settings_resp(&state).await)
 }

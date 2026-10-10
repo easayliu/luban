@@ -247,16 +247,19 @@ pub async fn probe(
             Ok(c) => c,
             Err(e) => {
                 let reason = format!("[proxy] {e:#}");
-                let _ = state.store.record_ban(
-                    cred.id,
-                    &store::BanContext {
-                        reason: reason.clone(),
-                        source: "proxy",
-                        error_message: Some(format!("{e:#}")),
-                        request_id: Some(probe_request_id.clone()),
-                        ..Default::default()
-                    },
-                );
+                let _ = state
+                    .store
+                    .record_ban(
+                        cred.id,
+                        &store::BanContext {
+                            reason: reason.clone(),
+                            source: "proxy",
+                            error_message: Some(format!("{e:#}")),
+                            request_id: Some(probe_request_id.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                 return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}"));
             }
         },
@@ -342,7 +345,8 @@ pub async fn probe(
                     ratelimit = %info.raw,
                     "connectivity test: this account's plan does not include the model, remembering that"
                 );
-                if let Err(e) = state.store.deny_model(cred.id, model, &reason, info.unified_reset)
+                if let Err(e) =
+                    state.store.deny_model(cred.id, model, &reason, info.unified_reset).await
                 {
                     tracing::error!(cred_id = cred.id, error = %e, "persisting the model denial failed");
                 }
@@ -361,12 +365,12 @@ pub async fn probe(
                 );
                 // 连通性测试是人在网页上点出来的**单发**探活，不参与连撞计数：一次手动
                 // 探活撞上一阵拥堵，不该把这个号判成「这条路线走不通」。
-                park_rate_limited(&state.store, cred, &scope, cooldown, false);
+                park_rate_limited(&state.store, cred, &scope, cooldown, false).await;
             // 200 也可能是「就差最后一点额度」：阈值机制在这里先过一道（见
             // [`park_if_quota_nearly_exhausted`]）。它把号停下时整条恢复分支**都不走**
             // ——否则一次手动探活会把刚按阈值停掉的号放回池子，下一条真实请求再停一次。
             } else if status.is_success()
-                && !park_if_quota_nearly_exhausted(&state.store, cred, &info)
+                && !park_if_quota_nearly_exhausted(&state.store, cred, &info).await
             {
                 // 恢复留到整条回复读完、报告确实 ok 之后，见下面 `report.ok` 那段。
                 resume_rate_limited = true;
@@ -438,12 +442,13 @@ pub async fn probe(
                             &plog.request_id,
                             upstream_request_id.as_deref(),
                         );
-                        if let Err(e) = state.store.record_ban(cred.id, &ctx) {
+                        if let Err(e) = state.store.record_ban(cred.id, &ctx).await {
                             tracing::warn!(error = %e, "failed to auto-disable the credential");
                         }
                     } else if verdict == AccountRejection::SubscriptionInactive {
                         // 与转发同一口径：订阅还没生效，暂停调度（已暂停的不重写）。
-                        park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "probe");
+                        park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "probe")
+                            .await;
                     }
                     let report = probe_report(
                         status,
@@ -453,7 +458,8 @@ pub async fn probe(
                         quota,
                     );
                     if report.ok {
-                        settle_passing_probe(&state.store, cred, model, &info, resume_rate_limited);
+                        settle_passing_probe(&state.store, cred, model, &info, resume_rate_limited)
+                            .await;
                     }
                     report
                 }
@@ -1101,15 +1107,15 @@ fn probe_report(
 ///   sonnet 通了证明不了 fable 通。之前学到的「套餐不含这个模型」也作废。
 /// - 订阅未生效暂停：测试通过即已续费 / 订阅，放回池子。放回来之后补过一遍额度那道——按头判的
 ///   时候号还停着，那道见号已停用就当「已在池外」什么都没做；真快满了，这里照常按额度再停一次。
-fn settle_passing_probe(
-    store: &store::CredentialStore,
+async fn settle_passing_probe(
+    store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     model: &str,
     info: &RateLimitInfo,
     resume_rate_limited: bool,
 ) {
     if resume_rate_limited {
-        match store.resume_if_rate_limited(cred.id) {
+        match store.resume_if_rate_limited(cred.id).await {
             Ok(true) => tracing::info!(
                 cred_id = cred.id, cred = %cred.label,
                 model,
@@ -1123,7 +1129,7 @@ fn settle_passing_probe(
             ),
         }
         store.clear_rate_limited(cred.id, Some(model));
-        match store.clear_model_denials(cred.id, Some(model)) {
+        match store.clear_model_denials(cred.id, Some(model)).await {
             Ok(n) if n > 0 => tracing::info!(
                 cred_id = cred.id, cred = %cred.label,
                 model,
@@ -1137,14 +1143,14 @@ fn settle_passing_probe(
             ),
         }
     }
-    match store.resume_if_subscription_suspended(cred.id) {
+    match store.resume_if_subscription_suspended(cred.id).await {
         Ok(true) => {
             tracing::info!(
                 cred_id = cred.id, cred = %cred.label,
                 model,
                 "connectivity test passed, the subscription is active again; credential is back in the pool"
             );
-            park_if_quota_nearly_exhausted(store, cred, info);
+            park_if_quota_nearly_exhausted(store, cred, info).await;
         }
         Ok(false) => {}
         Err(e) => tracing::error!(

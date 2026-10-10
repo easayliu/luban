@@ -637,11 +637,12 @@ impl ReqLog {
         } else if let Some((model, max_tokens)) = self.empty_reply_key.take() {
             learned.extend(remember_empty_reply(&self.empty_replies, &model, max_tokens, &excerpt));
         }
-        if !learned.is_empty()
-            && let Err(e) = self.store.remember_rejections(&learned)
-        {
-            // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
-            tracing::warn!(error = %e, "persisting the learned reply rule failed (kept in memory)");
+        // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
+        if !learned.is_empty() {
+            let store = self.store.clone();
+            self.store.spawn_write("learned reply rule", async move {
+                store.remember_rejections(&learned).await
+            });
         }
     }
 }
@@ -949,31 +950,13 @@ pub(super) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
     }
 }
 
-/// 把一条用量日志交给阻塞线程池落库。
-///
-/// **为什么不能就地写**：调用方是 [`ReqLog::drop`]，而它是在响应流跑完（或客户端断开）时
-/// 由 tokio 的工作线程执行的。`insert_usage_log` 是同步 SQLite 写，还要抢那把全局 `conn`
-/// 锁——就地写等于在异步工作线程上做阻塞 IO，并发流一多就会把 worker 堵住，连带拖慢所有
-/// 在途转发。日志裁剪那条路早就走 `spawn_blocking` 了（见 [`crate::web::run`]），这里同理。
-///
-/// 运行时退出时会等阻塞任务跑完（`#[tokio::main]` 结束时 drop runtime 即如此），故正常
-/// 关停不会丢日志。拿不到运行时句柄的场合（单元测试里直接 drop 一个 `ReqLog`）退回就地写，
-/// 那种场景本来就没有 worker 可堵。
+/// 把一条用量日志交给后台任务落库，见 [`store::CredentialStore::spawn_write`]。
 pub(super) fn spawn_usage_log(
     store: std::sync::Arc<store::CredentialStore>,
     rec: store::UsageRecord,
 ) {
-    let write = move || {
-        if let Err(e) = store.insert_usage_log(&rec) {
-            tracing::warn!(error = %e, "failed to write the usage log");
-        }
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn_blocking(write);
-        }
-        Err(_) => write(),
-    }
+    let s = store.clone();
+    store.spawn_write("usage log", async move { s.insert_usage_log(&rec).await });
 }
 
 /// 从上游响应中增量嗅探 token 用量。

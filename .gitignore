@@ -23,6 +23,9 @@
 # env file
 .env
 
+# 本地配置文件（含连库地址与密码，见 src/config_file.rs）
+/luban.toml
+
 # HTTPS 隧道抓包（对齐官方客户端形态时的基准样本，含真实请求头与 token，不入库）
 /cap/
 

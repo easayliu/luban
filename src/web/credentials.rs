@@ -11,27 +11,43 @@ pub(super) async fn list_credentials(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    blocking(move || credential_views(&state, actor.scope())).await
-}
-
-/// [`list_credentials`] 的同步部分：十几条聚合查询，须在阻塞线程池里跑，见 [`blocking`]。
-fn credential_views(state: &AppState, scope: Scope) -> Result<Json<Vec<CredentialView>>, ApiError> {
-    let list = state.store.list_scoped(scope).map_err(internal)?;
-    let owners = match scope {
-        Scope::All => Some(state.store.owner_names().map_err(internal)?),
-        Scope::Owner(_) => None,
+    let scope = actor.scope();
+    let store = &state.store;
+    // 额度快照那条最重（逐号加 7 天窗口内的流水），和其余各项并发跑；其余的都是小表或走索引的
+    // 窄查询，照旧逐个跑——全部并发会一下占掉连接池的十几条连接，和转发路径抢。
+    let rest = async {
+        Ok::<_, anyhow::Error>((
+            store.list_scoped(scope).await?,
+            match scope {
+                Scope::All => Some(store.owner_names().await?),
+                Scope::Owner(_) => None,
+            },
+            store.credential_group_map().await?,
+            store.device_counts().await?,
+            store.session_counts().await?,
+            store.last_used().await?,
+            store.cost_by_cred().await?,
+            store.recent_rpm().await?,
+            store.all_model_denials().await?,
+            store.ban_counts().await?,
+            store.proxy_ids_by_owner().await?,
+        ))
     };
-    let mut groups = state.store.credential_group_map().map_err(internal)?;
-    let counts = state.store.device_counts().map_err(internal)?;
-    let session_counts = state.store.session_counts().map_err(internal)?;
-    let quotas = state.store.latest_quotas().map_err(internal)?;
-    let last_used = state.store.last_used().map_err(internal)?;
-    let costs = state.store.cost_by_cred().map_err(internal)?;
-    let rpm = state.store.recent_rpm().map_err(internal)?;
-    let mut denials = state.store.all_model_denials().map_err(internal)?;
-    let bans = state.store.ban_counts().map_err(internal)?;
+    let (quotas, rest) = tokio::try_join!(store.latest_quotas_cached(), rest).map_err(internal)?;
+    let (
+        list,
+        owners,
+        mut groups,
+        counts,
+        session_counts,
+        last_used,
+        costs,
+        rpm,
+        mut denials,
+        bans,
+        proxy_ids,
+    ) = rest;
     let defaults = DefaultLimits::of(&state.store);
-    let proxy_ids = saved_proxy_ids(state)?;
     let views = list
         .iter()
         .map(|c| {
@@ -63,10 +79,10 @@ fn credential_views(state: &AppState, scope: Scope) -> Result<Json<Vec<Credentia
 }
 
 /// 代理池 (主人, URL) → id：同一个地址不同的人各存一条，号对应的是它主人池里那条。
-fn saved_proxy_ids(
+async fn saved_proxy_ids(
     state: &AppState,
 ) -> Result<std::collections::HashMap<(i64, String), i64>, ApiError> {
-    state.store.proxy_ids_by_owner().map_err(internal)
+    state.store.proxy_ids_by_owner().await.map_err(internal)
 }
 
 /// 列出某凭证当前绑定的设备明细（按最近活跃倒序）。
@@ -77,10 +93,10 @@ pub(super) async fn list_credential_devices(
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<store::DeviceBinding>>, ApiError> {
     // 凭证不存在时给 404：否则前端会把「账号已被删掉」显示成「该账号没有设备」。
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let devices = blocking(move || state.store.list_devices(id).map_err(internal)).await?;
+    let devices = state.store.list_devices(id).await.map_err(internal)?;
     Ok(Json(devices))
 }
 
@@ -95,10 +111,10 @@ pub(super) async fn unbind_credential_device(
     State(state): State<AppState>,
     Path((id, device_id)): Path<(i64, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    if !state.store.unbind_device(id, &device_id).map_err(internal)? {
+    if !state.store.unbind_device(id, &device_id).await.map_err(internal)? {
         return Err((
             StatusCode::NOT_FOUND,
             "device binding not found (it may have expired or moved to another credential)".into(),
@@ -117,10 +133,10 @@ pub(super) async fn list_credential_sessions(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<store::SessionBinding>>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let sessions = blocking(move || state.store.list_sessions(id).map_err(internal)).await?;
+    let sessions = state.store.list_sessions(id).await.map_err(internal)?;
     Ok(Json(sessions))
 }
 
@@ -133,28 +149,25 @@ pub(super) async fn list_session_events(
     Extension(actor): Extension<Actor>,
     Path((id, session_key)): Path<(i64, String)>,
 ) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let events = blocking(move || {
-        let events = state.store.session_events(&session_key).map_err(internal)?;
-        events_for(&state, actor.scope(), events)
-    })
-    .await?;
+    let events = state.store.session_events(&session_key).await.map_err(internal)?;
+    let events = events_for(&state, actor.scope(), events).await?;
     Ok(Json(events))
 }
 
 /// 按可见范围收窄会话事件：事件跨账号（改绑前后记在两个号上），同一个会话可能先后落在
 /// 不同人的号上。代理和用户只留至少有一端是本人号的事件，另一端若是别人的号，id 与名称
 /// 一并抹掉——只告诉他「换到了别处 / 从别处换来」，不告诉是谁的哪个号。
-fn events_for(
+async fn events_for(
     state: &AppState,
     scope: Scope,
     events: Vec<store::SessionEvent>,
 ) -> Result<Vec<store::SessionEvent>, ApiError> {
     let Scope::Owner(_) = scope else { return Ok(events) };
     let owned: std::collections::HashSet<i64> =
-        state.store.list_scoped(scope).map_err(internal)?.iter().map(|c| c.id).collect();
+        state.store.list_scoped(scope).await.map_err(internal)?.iter().map(|c| c.id).collect();
     let mine = |id: Option<i64>| id.is_some_and(|id| owned.contains(&id));
     Ok(events
         .into_iter()
@@ -180,14 +193,11 @@ pub(super) async fn list_slot_events(
     Extension(actor): Extension<Actor>,
     Path((id, slot)): Path<(i64, i64)>,
 ) -> Result<Json<Vec<store::SessionEvent>>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let events = blocking(move || {
-        let events = state.store.slot_events(id, slot).map_err(internal)?;
-        events_for(&state, actor.scope(), events)
-    })
-    .await?;
+    let events = state.store.slot_events(id, slot).await.map_err(internal)?;
+    let events = events_for(&state, actor.scope(), events).await?;
     Ok(Json(events))
 }
 
@@ -197,10 +207,10 @@ pub(super) async fn clear_credential_sessions(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let removed = state.store.unbind_all_sessions(id).map_err(internal)?;
+    let removed = state.store.unbind_all_sessions(id).await.map_err(internal)?;
     tracing::info!(cred_id = id, removed, "all session bindings removed manually");
     Ok(Json(serde_json::json!({ "ok": true, "removed": removed })))
 }
@@ -211,10 +221,10 @@ pub(super) async fn unbind_credential_session(
     State(state): State<AppState>,
     Path((id, session_key)): Path<(i64, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    if !state.store.unbind_session(id, &session_key).map_err(internal)? {
+    if !state.store.unbind_session(id, &session_key).await.map_err(internal)? {
         return Err((
             StatusCode::NOT_FOUND,
             "session binding not found (it may have expired or moved to another credential)".into(),
@@ -230,7 +240,7 @@ pub(super) async fn delete_credential(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = state.store.clone();
-    let removed = blocking(move || store.remove(&[id]).map_err(internal)).await?;
+    let removed = store.remove(&[id]).await.map_err(internal)?;
     if removed == 0 {
         return Err(not_found());
     }
@@ -249,7 +259,7 @@ pub(super) async fn set_disabled(
     Path(id): Path<i64>,
     Json(req): Json<SetDisabledReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    if !state.store.set_disabled(id, req.disabled).map_err(internal)? {
+    if !state.store.set_disabled(id, req.disabled).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -267,7 +277,7 @@ pub(super) async fn set_priority(
     Json(req): Json<SetPriorityReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     check_priority(req.priority)?;
-    if !state.store.set_priority(id, req.priority).map_err(internal)? {
+    if !state.store.set_priority(id, req.priority).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -304,7 +314,7 @@ pub(super) async fn set_priorities(
     match (req.priority, req.delta) {
         (Some(priority), None) => {
             check_priority(priority)?;
-            let n = state.store.set_priorities(&req.ids, priority).map_err(internal)?;
+            let n = state.store.set_priorities(&req.ids, priority).await.map_err(internal)?;
             tracing::info!(count = n, priority, "priority set in bulk");
         }
         (None, Some(delta)) => {
@@ -312,7 +322,7 @@ pub(super) async fn set_priorities(
             if delta == 0 || !(-span..=span).contains(&delta) {
                 return Err(bad_request(format!("delta must be non-zero and within ±{span}")));
             }
-            let n = state.store.shift_priorities(&req.ids, delta).map_err(internal)?;
+            let n = state.store.shift_priorities(&req.ids, delta).await.map_err(internal)?;
             tracing::info!(count = n, delta, "priority shifted in bulk");
         }
         _ => return Err(bad_request("provide exactly one of priority or delta")),
@@ -350,7 +360,7 @@ pub(super) async fn set_device_limits(
     check_ids(&req.ids)?;
     // 负值统一收敛为 -1，与单账号接口保持一致。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
-    let n = state.store.set_device_limits(&req.ids, limit).map_err(internal)?;
+    let n = state.store.set_device_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
 }
@@ -370,7 +380,7 @@ pub(super) async fn set_session_limits(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
-    let n = state.store.set_session_limits(&req.ids, limit).map_err(internal)?;
+    let n = state.store.set_session_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, session_limit = limit, "session limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
 }
@@ -390,7 +400,7 @@ pub(super) async fn set_rpm_limits(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
-    let n = state.store.set_rpm_limits(&req.ids, limit).map_err(internal)?;
+    let n = state.store.set_rpm_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, rpm_limit = limit, "rpm limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
 }
@@ -415,7 +425,7 @@ pub(super) async fn set_quota_pause_pcts_many(
     check_ids(&req.ids)?;
     let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
     let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
-    let n = state.store.set_quota_pause_pcts_many(&req.ids, short, long).map_err(internal)?;
+    let n = state.store.set_quota_pause_pcts_many(&req.ids, short, long).await.map_err(internal)?;
     tracing::info!(
         count = n,
         quota_pause_pct = ?short,
@@ -438,7 +448,7 @@ pub(super) async fn set_disabled_many(
     Json(req): Json<SetDisabledManyReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
-    let n = state.store.set_disabled_many(&req.ids, req.disabled).map_err(internal)?;
+    let n = state.store.set_disabled_many(&req.ids, req.disabled).await.map_err(internal)?;
     tracing::info!(count = n, disabled = req.disabled, "enabled/disabled in bulk");
     list_credentials(State(state), Extension(actor)).await
 }
@@ -453,7 +463,7 @@ pub(super) async fn delete_credentials(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let store = state.store.clone();
-    let n = blocking(move || store.remove(&req.ids).map_err(internal)).await?;
+    let n = store.remove(&req.ids).await.map_err(internal)?;
     tracing::info!(count = n, "credentials deleted in bulk");
     list_credentials(State(state), Extension(actor)).await
 }
@@ -473,7 +483,7 @@ pub(super) async fn set_label(
     if label.is_empty() {
         return Err(bad_request("the name must not be empty"));
     }
-    if !state.store.set_label(id, label).map_err(internal)? {
+    if !state.store.set_label(id, label).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -493,7 +503,7 @@ pub(super) async fn set_device_limit(
 ) -> Result<Json<CredentialView>, ApiError> {
     // 负值统一收敛为 -1，避免库里出现各式各样的“不限”取值。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
-    if !state.store.set_device_limit(id, limit).map_err(internal)? {
+    if !state.store.set_device_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -512,7 +522,7 @@ pub(super) async fn set_session_limit(
     Json(req): Json<SetSessionLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
-    if !state.store.set_session_limit(id, limit).map_err(internal)? {
+    if !state.store.set_session_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -534,7 +544,7 @@ pub(super) async fn set_rpm_limit(
     Json(req): Json<SetRpmLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
-    if !state.store.set_rpm_limit(id, limit).map_err(internal)? {
+    if !state.store.set_rpm_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     tracing::info!(cred_id = id, rpm_limit = limit, "rpm limit set");
@@ -564,7 +574,7 @@ pub(super) async fn set_credential_quota_pause_pct(
 ) -> Result<Json<CredentialView>, ApiError> {
     let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
     let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
-    if !state.store.set_quota_pause_pcts(id, short, long).map_err(internal)? {
+    if !state.store.set_quota_pause_pcts(id, short, long).await.map_err(internal)? {
         return Err(not_found());
     }
     tracing::info!(
@@ -593,14 +603,14 @@ pub(super) async fn set_proxy(
     Path(id): Path<i64>,
     Json(req): Json<SetProxyReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
+    let cred = state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     let proxy = match req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
             Some(crate::clients::validate_proxy(raw).map_err(|e| bad_request(format!("{e:#}")))?)
         }
         None => None,
     };
-    if !state.store.set_proxy(id, proxy.as_deref()).map_err(internal)? {
+    if !state.store.set_proxy(id, proxy.as_deref()).await.map_err(internal)? {
         return Err(not_found());
     }
     // 丢掉旧代理那份缓存客户端，否则它的连接池还会继续把请求送去老代理——改完之后
@@ -610,7 +620,7 @@ pub(super) async fn set_proxy(
     }
     // 新代理自动入池（号主人的池子）：下次其他账号能直接从池里选，不必再手打。
     if let Some(ref url) = proxy {
-        state.store.ensure_proxy_in_pool(cred.owner_id.unwrap_or(actor.id), url);
+        state.store.ensure_proxy_in_pool(cred.owner_id.unwrap_or(actor.id), url).await;
     }
     tracing::info!(
         cred_id = id, cred = %cred.label,
@@ -620,28 +630,22 @@ pub(super) async fn set_proxy(
     view_of(&state, id).await
 }
 
-/// 读取单条并转为脱敏视图（含已绑定设备数）。额度与 RPM 读的是只读连接，故经 [`blocking`]。
+/// 读取单条并转为脱敏视图（含已绑定设备数）。
 pub(super) async fn view_of(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
-    let state = state.clone();
-    blocking(move || credential_view(&state, id)).await
-}
-
-/// [`view_of`] 的同步部分。
-pub(super) fn credential_view(state: &AppState, id: i64) -> Result<Json<CredentialView>, ApiError> {
-    let cred = state.store.get(id).map_err(internal)?.ok_or_else(not_found)?;
-    let count = state.store.device_count(id).map_err(internal)?;
-    let session_count = state.store.session_count(id).map_err(internal)?;
+    let cred = state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
+    let count = state.store.device_count(id).await.map_err(internal)?;
+    let session_count = state.store.session_count(id).await.map_err(internal)?;
     // 单账号视图只查这一个 id：此前调的是三个「全库聚合」再 remove 一条，改一次开关就要把
     // usage_logs 整表聚合三遍。
-    let quota = state.store.latest_quota(id).map_err(internal)?;
-    let last_used = state.store.last_used_at(id).map_err(internal)?;
-    let cost_total = state.store.cost_of(id).map_err(internal)?;
-    let rpm = state.store.recent_rpm_of(id).map_err(internal)?;
-    let denials = state.store.denied_models(id).map_err(internal)?;
-    let groups = state.store.credential_groups(id).map_err(internal)?;
+    let quota = state.store.latest_quota(id).await.map_err(internal)?;
+    let last_used = state.store.last_used_at(id).await.map_err(internal)?;
+    let cost_total = state.store.cost_of(id).await.map_err(internal)?;
+    let rpm = state.store.recent_rpm_of(id).await.map_err(internal)?;
+    let denials = state.store.denied_models(id).await.map_err(internal)?;
+    let groups = state.store.credential_groups(id).await.map_err(internal)?;
     Ok(Json(
         CredentialView::new(&cred, count, session_count, DefaultLimits::of(&state.store))
-            .with_proxy_ids(&saved_proxy_ids(state)?)
+            .with_proxy_ids(&saved_proxy_ids(state).await?)
             .with_groups(groups)
             .with_cooldown(
                 state.store.rate_limited_secs(cred.id),
@@ -670,13 +674,14 @@ pub(super) async fn set_credential_groups(
     Path(id): Path<i64>,
     Json(req): Json<SetGroupsReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    check_selectable(&state, &actor, &req.group_ids)?;
+    check_selectable(&state, &actor, &req.group_ids).await?;
     state
         .store
         .set_credential_groups(&[id], &req.group_ids)
+        .await
         .map_err(internal)?
         .map_err(group_error)?;
     tracing::info!(cred_id = id, groups = ?req.group_ids, by = %actor.username, "credential groups updated");
@@ -690,10 +695,11 @@ pub(super) async fn set_credentials_groups(
     Json(req): Json<SetGroupsManyReq>,
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
-    check_selectable(&state, &actor, &req.group_ids)?;
+    check_selectable(&state, &actor, &req.group_ids).await?;
     state
         .store
         .set_credential_groups(&req.ids, &req.group_ids)
+        .await
         .map_err(internal)?
         .map_err(group_error)?;
     tracing::info!(count = req.ids.len(), groups = ?req.group_ids, by = %actor.username, "credential groups updated in bulk");

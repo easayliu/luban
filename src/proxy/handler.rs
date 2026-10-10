@@ -110,7 +110,7 @@ pub(super) async fn handle_inner(
     // 解析完体放下 `parsed`；仍没人写的 4xx/5xx 由 [`handle`] 按本地拒绝补一条。
     log_state: &RequestLogState,
 ) -> Response {
-    let (inb, guards) = match admit::admit(&state, method, &uri, headers, body, log_state) {
+    let (inb, guards) = match admit::admit(&state, method, &uri, headers, body, log_state).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

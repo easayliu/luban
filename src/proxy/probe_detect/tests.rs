@@ -134,11 +134,27 @@ fn probe_signature_matches_probes_and_spares_official_shapes() {
     let sig_beta = |body: &str, cc: bool, dev: Option<&str>, known: bool, beta: &[&str]| {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         let beta: Vec<String> = beta.iter().map(|b| b.to_string()).collect();
-        crate::proxy::probe_signature(Some(&v), dev, &beta, cc, false, || known)
+        futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
+            Some(&v),
+            dev,
+            &beta,
+            cc,
+            false,
+            async { known },
+        ))
+        .expect("probe_signature does no IO here")
     };
     let strict = |body: &str| {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        crate::proxy::probe_signature(Some(&v), None, &[], false, true, || false)
+        futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
+            Some(&v),
+            None,
+            &[],
+            false,
+            true,
+            async { false },
+        ))
+        .expect("probe_signature does no IO here")
     };
     let sig =
         |body: &str, cc: bool, dev: Option<&str>, known: bool| sig_beta(body, cc, dev, known, &[]);

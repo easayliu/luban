@@ -203,6 +203,21 @@ impl Telemetry {
             })
     }
 
+    /// 测试用：等 [`Self::record`] 交出去的调用都处理完（队列空、消费者已退出）。有运行时的
+    /// 测试里 `record` 走阻塞线程池，`Drop` 返回时事件还没生成。
+    #[cfg(test)]
+    pub(crate) async fn settle(&self) {
+        for _ in 0..300 {
+            if self.0.ingest.calls.lock().is_empty()
+                && !self.0.ingest.draining.load(Ordering::Acquire)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("telemetry ingest did not settle");
+    }
+
     /// 就地处理一条调用（测试用）。转发路径走 [`Self::record`]——那条要经队列才能保住
     /// 顺序，而测试本来就是单线程按序调用，直接进 `process` 少一层异步。
     #[cfg(test)]

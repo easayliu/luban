@@ -59,7 +59,7 @@ fn forbidden_view() -> ApiError {
 }
 
 /// 按身份算出这次能看哪些号主，并核对拆分维度与筛选是否允许。
-fn scope_owners(
+async fn scope_owners(
     state: &AppState,
     actor: &Actor,
     q: &BillingQuery,
@@ -80,7 +80,7 @@ fn scope_owners(
             if matches!(q.by, D::Key) || q.key_id.is_some() {
                 return Err(forbidden_view());
             }
-            let children = state.store.child_user_ids(actor.id).map_err(internal)?;
+            let children = state.store.child_user_ids(actor.id).await.map_err(internal)?;
             match q.owner_id {
                 None => {
                     // 自己与下属合在一起时只能按人或按日看：再往下拆就会把下属的号与模型带出来。
@@ -129,7 +129,7 @@ pub(super) async fn get_billing(
     if from >= to {
         return Err(bad_request("the start of the range must be before its end"));
     }
-    let owners = scope_owners(&state, &actor, &q)?;
+    let owners = scope_owners(&state, &actor, &q).await?;
     let filter = store::BillingFilter {
         // 起点向下对齐到小时桶：桶记的是整点，`[from, to)` 落在桶中间时把那一小时算进来。
         since: from.div_euclid(3600) * 3600,
@@ -142,15 +142,12 @@ pub(super) async fn get_billing(
         tz_offset_secs: q.tz_offset_secs.clamp(-14 * 3600, 14 * 3600),
     };
     let by = q.by;
-    let rows = blocking({
-        let state = state.clone();
-        move || state.store.billing_breakdown(&filter, by).map_err(internal)
-    })
-    .await?;
+    let rows = state.store.billing_breakdown(&filter, by).await.map_err(internal)?;
     let labels: std::collections::HashMap<String, String> = match by {
         store::BillingDim::Owner => state
             .store
             .owner_names()
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -158,6 +155,7 @@ pub(super) async fn get_billing(
         store::BillingDim::Cred => state
             .store
             .credential_labels()
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
@@ -165,6 +163,7 @@ pub(super) async fn get_billing(
         store::BillingDim::Key => state
             .store
             .list_api_keys()
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|k| (k.id.to_string(), k.label))
@@ -172,6 +171,7 @@ pub(super) async fn get_billing(
         store::BillingDim::Group => state
             .store
             .list_groups()
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|g| (g.id.to_string(), g.name))

@@ -37,14 +37,17 @@ WORKDIR /app
 # 把全部依赖连同 BoringSSL 重编一遍——换 wreq 之后这个代价明显变大，故补上。
 #
 # 空 main 编译不需要 admin-ui/dist：rust-embed 的宏在**我们自己的 crate** 里才展开，
-# 这一层还没有真实的 src，轮不到它读目录。
-COPY Cargo.toml Cargo.lock ./
+# 这一层还没有真实的 src，轮不到它读目录。build.rs 也得在这一层：cargo 编空 main 时
+# 同样要跑它。
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release \
     && rm -rf src
 
 # ---- 真实构建 ----
 COPY src ./src
+# sqlx::migrate! 在编译期把 migrations/ 下的 SQL 编进二进制（同样相对 crate 根）。
+COPY migrations ./migrations
 # rust-embed 在编译期读取 admin-ui/dist（相对 crate 根 /app）。
 COPY --from=frontend /app/admin-ui/dist ./admin-ui/dist
 # 先删掉空 main 留下的产物：crate 名没变，不删的话有让 cargo 误判为「已是最新」的余地，

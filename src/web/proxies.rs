@@ -24,9 +24,9 @@ pub(super) async fn list_saved_proxies(
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<SavedProxyView>>, ApiError> {
     let scope = actor.scope();
-    let proxies = state.store.list_proxies(scope).map_err(internal)?;
-    let counts = state.store.proxy_usage_counts(scope).map_err(internal)?;
-    let mut labels = state.store.proxy_usage_labels(scope).map_err(internal)?;
+    let proxies = state.store.list_proxies(scope).await.map_err(internal)?;
+    let counts = state.store.proxy_usage_counts(scope).await.map_err(internal)?;
+    let mut labels = state.store.proxy_usage_labels(scope).await.map_err(internal)?;
     let views = proxies
         .into_iter()
         .map(|p| {
@@ -91,6 +91,7 @@ pub(super) async fn add_saved_proxy(
             let existing: Vec<String> = state
                 .store
                 .list_proxies(Scope::Owner(actor.id))
+                .await
                 .map_err(internal)?
                 .into_iter()
                 .map(|p| p.label)
@@ -99,7 +100,7 @@ pub(super) async fn add_saved_proxy(
         }
         given => given.to_string(),
     };
-    let p = state.store.add_proxy(actor.id, &label, &url).map_err(internal)?;
+    let p = state.store.add_proxy(actor.id, &label, &url).await.map_err(internal)?;
     tracing::info!(proxy_id = p.id, label = %p.label, url = %p.url, "proxy added to pool");
     Ok(Json(SavedProxyView {
         id: p.id,
@@ -165,7 +166,7 @@ pub(super) async fn add_saved_proxies(
         return Err(bad_request(format!("at most {MAX_PROXY_BATCH} proxies per import")));
     }
     // 查重只看本人的池子：不同的人各存一条同样的地址是允许的。
-    let pool = state.store.list_proxies(Scope::Owner(actor.id)).map_err(internal)?;
+    let pool = state.store.list_proxies(Scope::Owner(actor.id)).await.map_err(internal)?;
     let pool_urls: std::collections::HashSet<&str> = pool.iter().map(|p| p.url.as_str()).collect();
     let mut labels: Vec<String> = pool.iter().map(|p| p.label.clone()).collect();
     let mut seen: std::collections::HashMap<String, usize> = Default::default();
@@ -212,7 +213,7 @@ pub(super) async fn add_saved_proxies(
     if !req.dry_run && !to_insert.is_empty() {
         let pairs: Vec<(String, String)> =
             to_insert.iter().map(|(_, l, u)| (l.clone(), u.clone())).collect();
-        let inserted = state.store.add_proxies(actor.id, &pairs).map_err(internal)?;
+        let inserted = state.store.add_proxies(actor.id, &pairs).await.map_err(internal)?;
         for ((i, _, _), row) in to_insert.iter().zip(inserted) {
             match row {
                 Some(p) => results[*i].id = Some(p.id),
@@ -248,17 +249,19 @@ pub(super) async fn update_saved_proxy(
     }
     let url =
         crate::clients::validate_proxy(&req.url).map_err(|e| bad_request(format!("{e:#}")))?;
-    if !state.store.update_proxy(id, label, &url).map_err(internal)? {
+    if !state.store.update_proxy(id, label, &url).await.map_err(internal)? {
         return Err((StatusCode::NOT_FOUND, "proxy not found".into()));
     }
     let p = state
         .store
         .get_proxy(id)
+        .await
         .map_err(internal)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "proxy not found".to_string()))?;
     let count = state
         .store
         .proxy_usage_counts(actor.scope())
+        .await
         .map_err(internal)?
         .get(&p.url)
         .copied()
@@ -266,6 +269,7 @@ pub(super) async fn update_saved_proxy(
     let credential_labels = state
         .store
         .proxy_usage_labels(actor.scope())
+        .await
         .map_err(internal)?
         .remove(&p.url)
         .unwrap_or_default();
@@ -285,7 +289,7 @@ pub(super) async fn delete_saved_proxy(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.store.delete_proxy(id).map_err(internal)? {
+    if !state.store.delete_proxy(id).await.map_err(internal)? {
         return Err((StatusCode::NOT_FOUND, "proxy not found".into()));
     }
     tracing::info!(proxy_id = id, "proxy deleted from pool");
@@ -305,7 +309,7 @@ pub(super) async fn delete_saved_proxies(
     if req.ids.is_empty() {
         return Err(bad_request("select at least one proxy"));
     }
-    let deleted = state.store.delete_proxies(&req.ids).map_err(internal)?;
+    let deleted = state.store.delete_proxies(&req.ids).await.map_err(internal)?;
     tracing::info!(requested = req.ids.len(), deleted, "proxies deleted from pool in bulk");
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
@@ -417,7 +421,7 @@ pub(super) async fn set_proxies(
         }
         None => None,
     };
-    let n = state.store.set_proxies(&req.ids, proxy.as_deref()).map_err(internal)?;
+    let n = state.store.set_proxies(&req.ids, proxy.as_deref()).await.map_err(internal)?;
     tracing::info!(
         count = n,
         proxy = %proxy.as_deref().unwrap_or("<direct>"),

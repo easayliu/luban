@@ -552,10 +552,13 @@ export async function listCredentialDevices(id: number): Promise<DeviceBinding[]
 
 /** 一页请求明细 + 整个集合的口径（总条数、总花费、翻页锚点）。 */
 export interface UsagePage {
-  /** 锚点之下的总条数，用来算页数。 */
-  total: number
-  /** 同一集合的花费合计（USD）。 */
-  total_cost: number
+  /**
+   * 锚点之下的总条数，用来算页数。带了 `until`（翻后续页）时为 null：同一锚点下集合不变，
+   * 沿用第一页拿到的，后端不再每页重算。
+   */
+  total: number | null
+  /** 同一集合的花费合计（USD）；何时为 null 同 `total`。 */
+  total_cost: number | null
   /** 本轮翻页的锚点 id；空集为 null。 */
   anchor: number | null
   logs: UsageLog[]

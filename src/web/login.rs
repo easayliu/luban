@@ -122,10 +122,10 @@ where
         (Some(raw), None) => Ok((Some(validate(raw)?), None)),
         (None, Some(id)) => {
             let not_found = || (StatusCode::NOT_FOUND, "proxy not found".to_string());
-            if state.store.proxy_owner(id).map_err(internal)? != Some(actor.id) {
+            if state.store.proxy_owner(id).await.map_err(internal)? != Some(actor.id) {
                 return Err(not_found());
             }
-            let saved = state.store.get_proxy(id).map_err(internal)?.ok_or_else(not_found)?;
+            let saved = state.store.get_proxy(id).await.map_err(internal)?.ok_or_else(not_found)?;
             Ok((Some(validate(&saved.url)?), None))
         }
         (None, None) if auto => {
@@ -135,7 +135,7 @@ where
             let mut pool: Vec<(i64, String)> = state
                 .store
                 .list_proxies(Scope::Owner(actor.id))
-                .map_err(internal)?
+                .await.map_err(internal)?
                 .into_iter()
                 .filter_map(|p| match crate::clients::validate_proxy(&p.url) {
                     Ok(url) => Some((p.id, url)),
@@ -148,7 +148,7 @@ where
             if pool.is_empty() {
                 return Ok((None, None));
             }
-            let used = state.store.proxy_usage_counts(Scope::All).map_err(internal)?;
+            let used = state.store.proxy_usage_counts(Scope::All).await.map_err(internal)?;
             {
                 let in_flight = PROXY_IN_FLIGHT.lock();
                 let load = |url: &str| {
@@ -214,9 +214,9 @@ pub(super) async fn exchange(
     // 那个」，否则并发登录会互相顶掉（见 [`AppState::pkce`]）。取出即移除：一次挑战只能用一次。
     // 分组先核对：换码会作废这次授权，等换完才发现分组选错了就得让用户重新授权一遍。
     let group_ids = if req.group_ids.is_empty() {
-        vec![state.store.default_group_id().map_err(internal)?]
+        vec![state.store.default_group_id().await.map_err(internal)?]
     } else {
-        check_selectable(&state, &actor, &req.group_ids)?;
+        check_selectable(&state, &actor, &req.group_ids).await?;
         req.group_ids.clone()
     };
     // 代理也在取挑战之前定：选错了代理（不是本人池里的、地址不合法）、池里的代理都不通时，
@@ -257,15 +257,18 @@ pub(super) async fn exchange(
     // 显示名优先级：用户填写 > profile 邮箱 > profile 姓名 > 交换响应邮箱 > 「账号 N」。
     let label = match req.label.map(|s| s.trim().to_string()) {
         Some(s) if !s.is_empty() => s,
-        _ => profile
+        _ => match profile
             .email
             .clone()
             .or_else(|| profile.name.clone())
             .or_else(|| tokens.account.clone())
-            .unwrap_or_else(|| {
-                let n = state.store.list().map(|v| v.len()).unwrap_or(0) + 1;
+        {
+            Some(s) => s,
+            None => {
+                let n = state.store.list().await.map(|v| v.len()).unwrap_or(0) + 1;
                 format!("Account {}", n)
-            }),
+            }
+        },
     };
 
     let cred = state
@@ -280,6 +283,7 @@ pub(super) async fn exchange(
             profile.org_type.as_deref(),
             actor.id,
         )
+        .await
         .map_err(|e| {
             if e.downcast_ref::<store::OwnerGone>().is_some() {
                 bad_request("the account adding this credential no longer exists")
@@ -290,7 +294,7 @@ pub(super) async fn exchange(
 
     // 新号落库时先进了默认分组（触发器），这里换成所选的分组。分组在核对之后被删了的话
     // 号就留在默认分组里，不回滚这次上号。
-    match state.store.set_credential_groups(&[cred.id], &group_ids) {
+    match state.store.set_credential_groups(&[cred.id], &group_ids).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             tracing::warn!(cred_id = cred.id, error = %e, "add credential: kept in the default group")
@@ -304,7 +308,7 @@ pub(super) async fn exchange(
     // 走与刷新同一份 `apply_profile` 写；profile 拉不到时组织 id 退回交换响应里那个
     // （官方也是这个兜底次序：profile → tokenAccount）。
     if let Err(e) =
-        state.store.apply_profile(cred.id, &profile, tokens.organization_uuid.as_deref())
+        state.store.apply_profile(cred.id, &profile, tokens.organization_uuid.as_deref()).await
     {
         tracing::warn!(cred_id = cred.id, error = %e, "failed to store the profile fields");
     }
@@ -312,10 +316,10 @@ pub(super) async fn exchange(
     // 登录时带了代理的，入库后顺手存上——后续刷新、转发自动走它，不用再手动配一次。
     // 凭证已入库，代理存不进去时不回滚凭证（手动配一次也行），但必须如实报错让人知道。
     if let Some(ref url) = proxy {
-        state.store.set_proxy(cred.id, Some(url)).map_err(internal)?;
+        state.store.set_proxy(cred.id, Some(url)).await.map_err(internal)?;
         // 顺手把代理加进代理池——下次添加账号时直接从池里选，不必再手打一遍。
         // 已存在的自动忽略（URL 有唯一索引）。
-        state.store.ensure_proxy_in_pool(actor.id, url);
+        state.store.ensure_proxy_in_pool(actor.id, url).await;
     }
 
     // 用掉的挑战在取出时就已经从表里移除了，这里无需再清——其余进行中的登录不受影响。

@@ -1,12 +1,12 @@
 //! 库内机密的静态加密：号的 access / refresh token、接入 Key 的明文。
 //!
 //! AES-256-GCM，每次加密随机 96 位 nonce，存成 `enc1:` + base64(nonce ‖ 密文)。没有这个前缀的
-//! 值按明文读（老库升级前的存量，[`encrypt_plaintext_tokens`] 启动时会把它们补加密）。
+//! 值按明文读（SQLite 时代加密之前的存量格式，留着兼容）。
 //!
 //! **密钥**：环境变量 `LUBAN_SECRET_KEY`（64 位十六进制）优先，否则用数据目录下的
-//! `secret.key`，不存在就生成一份（权限 0600）。它防的是「只拿到了库文件」——导出的备份、
-//! 拷走的 `luban.db`、库文件被别的进程读到；密钥文件与库放在一起时，拿到整个目录的人照样能
-//! 解开，要防这一层就把密钥放进环境变量。
+//! `secret.key`，不存在就生成一份（权限 0600）。它防的是「只拿到了库」——数据库的备份与转储、
+//! 能连库的别的账号；密钥文件与库备份放在一起时，拿到两者的人照样能解开，要防这一层就把密钥
+//! 放进环境变量。
 //!
 //! **密钥丢了，已加密的 token 就全部作废**（号得重新授权）。所以启动时先拿密钥试解一条已加密
 //! 的记录，解不开直接拒绝启动——绝不能带着一把错的密钥跑起来，把每个号都当成 token 失效去
@@ -39,6 +39,13 @@ fn key() -> &'static [u8; 32] {
     {
         KEY.get().expect("the secret key must be initialized before the store is opened")
     }
+}
+
+/// 按 [`key`] 建好的 AES-GCM 实例，建一次反复用：每次加解密都 `Aes256Gcm::new` 会重做一遍
+/// 密钥扩展，而列表、选号一次要解密成百上千个 token。
+fn cipher() -> &'static Aes256Gcm {
+    static CIPHER: std::sync::OnceLock<Aes256Gcm> = std::sync::OnceLock::new();
+    CIPHER.get_or_init(|| Aes256Gcm::new(key().into()))
 }
 
 fn parse_hex_key(s: &str) -> Result<[u8; 32]> {
@@ -74,7 +81,7 @@ pub fn init_key(data_dir: &std::path::Path) -> Result<()> {
                 tracing::warn!(
                     path = %path.display(),
                     "generated a new secret key for encrypting stored tokens; back it up together \
-                     with luban.db (losing it means every account must be re-authorized), or set \
+                     with the database (losing it means every account must be re-authorized), or set \
                      LUBAN_SECRET_KEY to keep it outside the data directory"
                 );
                 bytes
@@ -105,10 +112,9 @@ fn write_key_file(path: &std::path::Path, hex: &str) -> Result<()> {
 
 /// 加密一个值。
 pub(crate) fn seal(plain: &str) -> String {
-    let cipher = Aes256Gcm::new(key().into());
     let mut nonce = [0u8; 12];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
-    let ct = cipher
+    let ct = cipher()
         .encrypt(Nonce::from_slice(&nonce), plain.as_bytes())
         .expect("AES-GCM encryption does not fail for in-memory inputs");
     let mut buf = Vec::with_capacity(12 + ct.len());
@@ -125,7 +131,7 @@ pub(crate) fn open(stored: &str) -> Result<String> {
     let buf = B64.decode(b64).context("a sealed value is not valid base64")?;
     anyhow::ensure!(buf.len() > 12, "a sealed value is too short");
     let (nonce, ct) = buf.split_at(12);
-    let plain = Aes256Gcm::new(key().into())
+    let plain = cipher()
         .decrypt(Nonce::from_slice(nonce), ct)
         .map_err(|_| anyhow::anyhow!("failed to decrypt a stored secret (wrong secret key?)"))?;
     Ok(String::from_utf8(plain)?)
@@ -135,14 +141,6 @@ pub(crate) fn open(stored: &str) -> Result<String> {
 pub(crate) fn token_fingerprint(token: &str) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// 给 `row_to_cred` 用：解不开时报成 rusqlite 的转换错误。启动时已经验过密钥（见
-/// [`encrypt_plaintext_tokens`]），走到这里解不开只会是库被外部改坏了。
-pub(super) fn open_column(stored: String, col: usize) -> rusqlite::Result<String> {
-    open(&stored).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, e.into())
-    })
 }
 
 /// 密钥校验值：库里存一份用当前密钥加密的它，启动时解开比对——跟库里有没有号、有没有接入
@@ -157,163 +155,74 @@ pub(super) fn mismatch(what: &str) -> anyhow::Error {
     )
 }
 
-/// 建表之后、任何迁移之前：核对密钥校验值，并试解接入 Key 的密文。解不开就拒绝启动。
-pub(super) fn verify_secret_key(conn: &Connection) -> Result<()> {
-    let check: Option<String> = conn
-        .query_row("SELECT value FROM settings WHERE key = ?1", [SECRET_CHECK_KEY], |r| r.get(0))
-        .optional()?;
-    if let Some(check) = check
-        && open(&check).ok().as_deref() != Some(SECRET_CHECK_PLAINTEXT)
-    {
-        return Err(mismatch("key check"));
-    }
-    let has_keys_table: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys')",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_keys_table {
-        let mut stmt = conn.prepare("SELECT id, key_sealed FROM api_keys")?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
-            let (id, sealed) = row?;
-            if open(&sealed).is_err() {
-                return Err(mismatch(&format!("access key #{id}")));
+use anyhow::Result;
+use sqlx::PgConnection;
+
+/// 核对密钥：库里已有校验值就解开比对，并试解每一把接入 Key 的密文；解不开就拒绝启动——
+/// 绝不能带着一把错的密钥跑起来，把每个号都当成 token 失效去停用。还没有校验值（新库）
+/// 就用当前密钥写一份。
+pub(super) async fn verify_secret_key(conn: &mut PgConnection) -> Result<()> {
+    let check: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+        .bind(SECRET_CHECK_KEY)
+        .fetch_optional(&mut *conn)
+        .await?;
+    match check {
+        Some(check) => {
+            if open(&check).ok().as_deref() != Some(SECRET_CHECK_PLAINTEXT) {
+                return Err(mismatch("key check"));
             }
         }
-    }
-    Ok(())
-}
-
-/// 全部迁移跑完之后：还没有校验值就用当前密钥写一份。
-///
-/// 「这次才写」也意味着这个库第一次被带清理的版本打开：更早的开发版加密 token 时没清空闲页，
-/// 那次留下的明文残留要借这一次清掉。校验值与清理标记同一个事务落盘：只写了校验值、后面的
-/// 迁移失败的话，下次启动看到校验值已在就再也不会补这次清理。
-pub(super) fn ensure_secret_check(conn: &Connection) -> Result<()> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let n = tx.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-        params![SECRET_CHECK_KEY, seal(SECRET_CHECK_PLAINTEXT)],
-    )?;
-    if n > 0 {
-        mark_scrub_pending(&tx)?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-/// 还欠着一次空闲页清理的标记：与留下明文残留的那次写入同一个事务落下，确认 WAL 截断干净、
-/// 整库重写完才删。没清完（另一个连接拿着读快照挡住了 checkpoint，或中途有迁移失败、进程
-/// 退出）就留着，下次启动与后台每小时的任务都会重试。
-pub(super) const SCRUB_PENDING_KEY: &str = "secret_scrub_pending";
-
-/// 落下 [`SCRUB_PENDING_KEY`]。调用方要把它放进改写机密的同一个事务里。
-pub(super) fn mark_scrub_pending(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
-        [SCRUB_PENDING_KEY],
-    )?;
-    Ok(())
-}
-
-/// 截断 WAL，回是否**真的**截断干净了：checkpoint 被别的连接的读快照挡住时 SQLite 回 busy
-/// （第一列非 0），或只搬了一部分帧（第二、三列不等），旧帧还留在 WAL 里。非 WAL 库回
-/// `(0, -1, -1)`，按干净算。
-fn truncate_wal(conn: &Connection) -> Result<bool> {
-    let (busy, log, done): (i64, i64, i64) =
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?;
-    Ok(busy == 0 && log == done)
-}
-
-/// 机密从明文改成密文之后清掉旧明文的残留：UPDATE / DELETE 只是让旧内容所在的页变成空闲页，
-/// 字节还在库文件里（WAL 里也可能还有旧帧），直接读文件就能捞出来。截断 WAL、VACUUM 整库
-/// 重写一遍，再截断一次 WAL；每一步都核对结果，几次都没成就留下 [`SCRUB_PENDING_KEY`] 等重试。
-///
-/// 回是否清干净了。清不干净不让启动失败（号照样要能用），只记警告、留标记。
-pub(super) fn scrub_freed_pages(conn: &Connection) -> Result<bool> {
-    mark_scrub_pending(conn)?;
-    let started = std::time::Instant::now();
-    for attempt in 1..=3 {
-        let done =
-            truncate_wal(conn)? && conn.execute_batch("VACUUM;").is_ok() && truncate_wal(conn)?;
-        if done {
-            conn.execute("DELETE FROM settings WHERE key = ?1", [SCRUB_PENDING_KEY])?;
-            // 删标记本身也是一次写：再截断一次，WAL 里只剩这一帧也不留。
-            let _ = truncate_wal(conn)?;
-            tracing::info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "rewrote the database to drop plaintext leftovers"
-            );
-            return Ok(true);
-        }
-        if attempt < 3 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        None => {
+            sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
+                .bind(SECRET_CHECK_KEY)
+                .bind(seal(SECRET_CHECK_PLAINTEXT))
+                .execute(&mut *conn)
+                .await?;
         }
     }
-    tracing::warn!(
-        "could not fully rewrite the database (another connection is holding a read snapshot); \
-         plaintext leftovers may remain in luban.db-wal until the next retry"
-    );
-    Ok(false)
-}
-
-/// 上次没清完（[`SCRUB_PENDING_KEY`] 还在）就再清一次。
-pub(super) fn scrub_if_pending(conn: &Connection) -> Result<()> {
-    let pending: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM settings WHERE key = ?1)",
-        [SCRUB_PENDING_KEY],
-        |r| r.get(0),
-    )?;
-    if pending {
-        scrub_freed_pages(conn)?;
+    let keys: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, key_sealed FROM api_keys").fetch_all(&mut *conn).await?;
+    for (id, sealed) in keys {
+        if open(&sealed).is_err() {
+            return Err(mismatch(&format!("access key #{id}")));
+        }
+    }
+    let creds: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, access_token, refresh_token FROM credentials")
+            .fetch_all(&mut *conn)
+            .await?;
+    for (id, access, refresh) in creds {
+        if open(&access).is_err() || open(&refresh).is_err() {
+            return Err(mismatch(&format!("credential #{id}")));
+        }
     }
     Ok(())
 }
 
-/// 启动迁移：先拿密钥试解所有已加密的 token（解不开就拒绝启动），再把明文的补加密、补上
-/// refresh_token 指纹。幂等，每次启动都跑。
-///
-/// 加密过明文就在同一个事务里落下 [`SCRUB_PENDING_KEY`]，迁移跑完由调用方清空闲页。
-pub(super) fn encrypt_plaintext_tokens(conn: &Connection) -> Result<()> {
-    let _ = conn.execute("ALTER TABLE credentials ADD COLUMN refresh_token_hash TEXT", []);
-    // 唯一约束从 refresh_token 本身挪到它的指纹上：密文随机，对它做唯一约束形同虚设。
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS uq_credentials_refresh_token;
-         CREATE UNIQUE INDEX IF NOT EXISTS uq_credentials_refresh_hash
-             ON credentials(refresh_token_hash);",
-    )?;
-    let rows: Vec<(i64, String, String, Option<String>)> = conn
-        .prepare("SELECT id, access_token, refresh_token, refresh_token_hash FROM credentials")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut pending = Vec::new();
-    for (id, access, refresh, hash) in rows {
-        let (a, r) = match (open(&access), open(&refresh)) {
-            (Ok(a), Ok(r)) => (a, r),
-            _ => return Err(mismatch(&format!("credential #{id}"))),
-        };
-        let sealed = access.starts_with(SEALED_PREFIX) && refresh.starts_with(SEALED_PREFIX);
-        if !sealed || hash.is_none() {
-            pending.push((id, a, r));
-        }
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::super::CredentialStore;
+    use super::*;
+
+    /// 新库打开时写下校验值；校验值被换成别的密钥加密的东西时拒绝打开。
+    #[sqlx::test]
+    async fn rejects_a_mismatched_key_check(pool: PgPool) {
+        CredentialStore::for_test(pool.clone()).await;
+        let stored: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
+            .bind(SECRET_CHECK_KEY)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(open(&stored).unwrap(), SECRET_CHECK_PLAINTEXT);
+        sqlx::query(
+            "UPDATE settings SET value = 'enc1:AAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE key = $1",
+        )
+        .bind(SECRET_CHECK_KEY)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(CredentialStore::open(pool).await.is_err());
     }
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    {
-        let mut stmt = tx.prepare(
-            "UPDATE credentials SET access_token = ?2, refresh_token = ?3, \
-                    refresh_token_hash = ?4 WHERE id = ?1",
-        )?;
-        for (id, access, refresh) in &pending {
-            stmt.execute(params![id, seal(access), seal(refresh), token_fingerprint(refresh)])?;
-        }
-    }
-    mark_scrub_pending(&tx)?;
-    tx.commit()?;
-    tracing::info!(count = pending.len(), "encrypted stored credential tokens");
-    Ok(())
 }

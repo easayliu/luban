@@ -416,8 +416,8 @@ fn snapshot_windows_merge_every_reported_window() {
 /// 同一账号的 sonnet/opus 照常 200。把这种 429 判成账号级，等于因为一个模型没容量就把整个
 /// 号从调度池里摘掉——现在账号级还会**落库停用**，误伤代价比以前的进程内冷却大得多，
 /// 所以这里直接钉住 [`crate::proxy::park_rate_limited`] 的落点，而不只是钉判定函数。
-#[test]
-fn model_level_429_never_disables_the_account() {
+#[sqlx::test]
+async fn model_level_429_never_disables_the_account(pool: sqlx::PgPool) {
     let hdr = |kv: &[(&str, &str)]| {
         let mut h = crate::proxy::HeaderMap::new();
         for (k, v) in kv {
@@ -428,8 +428,8 @@ fn model_level_429_never_disables_the_account() {
         }
         crate::proxy::RateLimitInfo::from_headers(&h)
     };
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).await.unwrap();
     let fable = Some("claude-fable-5");
 
     // 实测形态：只有超额池满，基础窗口都有余量。
@@ -446,17 +446,21 @@ fn model_level_429_never_disables_the_account() {
     ]);
     let scope = crate::proxy::rate_limit_scope(&oi_full, fable);
     assert_eq!(scope.model(), fable, "超额池满只该判模型级");
-    crate::proxy::park_rate_limited(&store, &cred, &scope, oi_full.cooldown(false), false);
+    crate::proxy::park_rate_limited(&store, &cred, &scope, oi_full.cooldown(false), false).await;
 
-    let after = store.get(cred.id).unwrap().unwrap();
+    let after = store.get(cred.id).await.unwrap().unwrap();
     assert!(!after.disabled, "fable 撞 429 不该停用整个账号");
     assert!(after.resume_at.is_none(), "更不该写恢复时刻——账号压根没被停");
     assert_eq!(after.ban_reason, None, "卡片上不该显示成这个号出了问题");
     // 但 fable 自己确实要让位，而 sonnet 照常可用。
-    let pick =
-        |m| store.select_for_device(store::Select { model: Some(m), ..Default::default() }).is_ok();
-    assert!(!pick("claude-fable-5"), "fable 应被模型级冷却挡下");
-    assert!(pick("claude-sonnet-5"), "同一个号的 sonnet 不该被牵连");
+    let pick = async |m| {
+        store
+            .select_for_device(store::Select { model: Some(m), ..Default::default() })
+            .await
+            .is_ok()
+    };
+    assert!(!pick("claude-fable-5").await, "fable 应被模型级冷却挡下");
+    assert!(pick("claude-sonnet-5").await, "同一个号的 sonnet 不该被牵连");
 
     // 对照组：基础窗口真耗尽才落库停用，并写下到点自动恢复的时刻。
     let base_gone = hdr(&[
@@ -467,9 +471,9 @@ fn model_level_429_never_disables_the_account() {
     ]);
     let scope = crate::proxy::rate_limit_scope(&base_gone, fable);
     assert!(scope.account_level(), "基础窗口耗尽才是账号级");
-    crate::proxy::park_rate_limited(&store, &cred, &scope, base_gone.cooldown(true), false);
+    crate::proxy::park_rate_limited(&store, &cred, &scope, base_gone.cooldown(true), false).await;
 
-    let after = store.get(cred.id).unwrap().unwrap();
+    let after = store.get(cred.id).await.unwrap().unwrap();
     assert!(after.disabled, "额度真耗尽才关调度开关");
     let resume_at = after.resume_at.expect("应写下自动恢复时刻");
     let wait = resume_at as i64 - crate::credentials::now_secs() as i64;
@@ -481,37 +485,41 @@ fn model_level_429_never_disables_the_account() {
 ///
 /// 两档行为差别只在最后那个参数上，故放在一个用例里对照：没吞够时只留展示标记、这个号照常
 /// 参与选号；吞够了就走硬门禁，后续请求改走别的号。
-#[test]
-fn a_transient_rate_limit_only_leaves_the_pool_after_the_attempt_cap() {
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
+#[sqlx::test]
+async fn a_transient_rate_limit_only_leaves_the_pool_after_the_attempt_cap(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).await.unwrap();
     let scope = crate::proxy::LimitScope::Transient("claude-opus-5".into());
     let wait = std::time::Duration::from_secs(30);
-    let pick =
-        |m| store.select_for_device(store::Select { model: Some(m), ..Default::default() }).is_ok();
+    let pick = async |m| {
+        store
+            .select_for_device(store::Select { model: Some(m), ..Default::default() })
+            .await
+            .is_ok()
+    };
 
     // 没 exhaust：短 gate——阻止同一个号被立刻再选中，避免反复 429。
-    crate::proxy::park_rate_limited(&store, &cred, &scope, wait, false);
-    assert!(!pick("claude-opus-5"), "短 gate 也应阻止选号");
+    crate::proxy::park_rate_limited(&store, &cred, &scope, wait, false).await;
+    assert!(!pick("claude-opus-5").await, "短 gate 也应阻止选号");
     let models = store.rate_limited_models(cred.id);
     assert_eq!(models.len(), 1, "界面上要看得见");
     assert!(models[0].2, "瞬时限速现在也走 gate，gated 应为 true");
 
     // exhaust：退避已经涨到头还在撞，说明这条路线此刻真的走不通，让后续请求改走别的号。
-    crate::proxy::park_rate_limited(&store, &cred, &scope, wait, true);
-    assert!(!pick("claude-opus-5"), "到上限后这个模型必须被挡下");
-    assert!(pick("claude-sonnet-5"), "但只挡这一个模型，别的模型不该被牵连");
+    crate::proxy::park_rate_limited(&store, &cred, &scope, wait, true).await;
+    assert!(!pick("claude-opus-5").await, "到上限后这个模型必须被挡下");
+    assert!(pick("claude-sonnet-5").await, "但只挡这一个模型，别的模型不该被牵连");
     assert!(store.rate_limited_models(cred.id)[0].2, "此刻挂着门禁，gated 应为 true");
 
-    let after = store.get(cred.id).unwrap().unwrap();
+    let after = store.get(cred.id).await.unwrap().unwrap();
     assert!(!after.disabled, "这一档从头到尾都不该停用账号");
     assert_eq!(after.ban_reason, None, "更不该在卡片上显示成这个号出了问题");
 }
 
 /// 额度到阈值（默认 90%）就提前停调度，不必等真撞上一发 429；而超额池逼近上限时**不停**
 /// ——它满了同一账号的别的模型照常 200，与 [`crate::proxy::rate_limit_scope`] 同一条口径。
-#[test]
-fn quota_threshold_parks_the_account_before_any_429() {
+#[sqlx::test]
+async fn quota_threshold_parks_the_account_before_any_429(pool: sqlx::PgPool) {
     let hdr = |kv: &[(&str, &str)]| {
         let mut h = crate::proxy::HeaderMap::new();
         for (k, v) in kv {
@@ -524,8 +532,8 @@ fn quota_threshold_parks_the_account_before_any_429() {
     };
     let now = crate::credentials::now_secs() as i64;
     let at = |secs: i64| (now + secs).to_string();
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).await.unwrap();
 
     // 还没到阈值：一切照旧，200 就是 200。
     let plenty = hdr(&[
@@ -533,8 +541,8 @@ fn quota_threshold_parks_the_account_before_any_429() {
         ("anthropic-ratelimit-unified-5h-utilization", "0.60"),
         ("anthropic-ratelimit-unified-5h-reset", &at(2 * 3600)),
     ]);
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &plenty));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled, "60% 还远没到该停的时候");
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &plenty).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled, "60% 还远没到该停的时候");
 
     // 超额池 99%：那是「这条超额通道快走不通了」，不是账号额度耗尽，停号即误伤。
     let oi_hot = hdr(&[
@@ -542,8 +550,8 @@ fn quota_threshold_parks_the_account_before_any_429() {
         ("anthropic-ratelimit-unified-7d_oi-utilization", "0.99"),
         ("anthropic-ratelimit-unified-7d_oi-reset", &at(50 * 3600)),
     ]);
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &oi_hot));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled, "超额池快满不该停整个号");
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &oi_hot).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled, "超额池快满不该停整个号");
 
     // 5h 93%：还没被拒（status 仍是 allowed，上游也没回 429），照样提前退场。
     // 同一份头里 7d 也有 95%，但天级那档默认是关的——**只**按 5h 判、也只睡到 5h 的
@@ -558,8 +566,8 @@ fn quota_threshold_parks_the_account_before_any_429() {
         ("anthropic-ratelimit-unified-7d-utilization", "0.95"),
         ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
     ]);
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot));
-    let after = store.get(cred.id).unwrap().unwrap();
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot).await);
+    let after = store.get(cred.id).await.unwrap().unwrap();
     assert!(after.disabled, "越过阈值就该把号挪出调度池");
     let wait = after.resume_at.expect("按阈值停的号必须能到点自恢复") as i64 - now;
     assert!((2 * 3600 - 5..=2 * 3600).contains(&wait), "应睡到 5h reset，实得 {wait}");
@@ -567,26 +575,27 @@ fn quota_threshold_parks_the_account_before_any_429() {
     assert!(reason.contains("93.0%") && reason.contains("90%"), "原因文案：{reason}");
 
     // 幂等：同一批限流头被并发在途的请求各看一遍，不该反复写库。
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot));
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot).await);
 
     // 只有 7d 高位、5h 还空着：默认**不停**。这个号这 5 小时完全能干活，周用量偏高不是
     // 停它的理由——真把周额度用光了上游会自己回 429，账号级冷却那条路接手。
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
+    // （与上面共用同一个测试库：refresh_token 唯一，换一个。）
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt-weekly", u64::MAX, None, None, 1).await.unwrap();
     let weekly_hot = hdr(&[
         ("anthropic-ratelimit-unified-5h-utilization", "0.10"),
         ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
         ("anthropic-ratelimit-unified-7d-utilization", "0.97"),
         ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
     ]);
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled, "7d 那档默认关，不该停号");
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled, "7d 那档默认关，不该停号");
 
     // 单独把天级那档打开（95%）：同一份头就该停，且睡到 **7d** 的 reset——这一档的代价
     // 本来就是「停到下个周重置」，配它的人要的正是这个。
-    store.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").unwrap();
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot));
-    let after = store.get(cred.id).unwrap().unwrap();
+    store.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").await.unwrap();
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &weekly_hot).await);
+    let after = store.get(cred.id).await.unwrap().unwrap();
     let wait = after.resume_at.expect("同样要能到点自恢复") as i64 - now;
     assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到 7d reset，实得 {wait}");
     let reason = after.ban_reason.expect("原因要写清是哪个窗口、按哪个阈值");
@@ -596,19 +605,21 @@ fn quota_threshold_parks_the_account_before_any_429() {
     );
 
     // 两档互不干扰：5h 那档配成 0（关）时，7d 那档照样按自己的阈值停号。
-    let only_7d = store::CredentialStore::open_in_memory().unwrap();
-    let c = only_7d.insert("b", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
-    only_7d.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
-    only_7d.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").unwrap();
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&only_7d, &c, &weekly_hot));
-    assert!(only_7d.get(c.id).unwrap().unwrap().disabled, "5h 那档关着不影响 7d 那档");
+    let only_7d = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let c = only_7d.insert("b", None, "at", "rt-7d", u64::MAX, None, None, 1).await.unwrap();
+    only_7d.set_setting(store::QUOTA_PAUSE_PCT, "0").await.unwrap();
+    only_7d.set_setting(store::QUOTA_PAUSE_PCT_7D, "95").await.unwrap();
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&only_7d, &c, &weekly_hot).await);
+    assert!(only_7d.get(c.id).await.unwrap().unwrap().disabled, "5h 那档关着不影响 7d 那档");
 
     // 阈值配成 0 = 关掉本机制，退回「收到 429 才停」。
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
-    store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled);
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt-off", u64::MAX, None, None, 1).await.unwrap();
+    // 与上面共用同一个测试库：上面那段配的 7d 阈值还在，清掉回到默认。
+    store.delete_setting(store::QUOTA_PAUSE_PCT_7D).await.unwrap();
+    store.set_setting(store::QUOTA_PAUSE_PCT, "0").await.unwrap();
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &hot).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled);
 
     // 阈值可手调，两个方向都要成立。先调高：配 99 时上面那份 95% 的头不该再停号
     // （默认的 90 是会停的）。
@@ -616,20 +627,20 @@ fn quota_threshold_parks_the_account_before_any_429() {
         ("anthropic-ratelimit-unified-5h-utilization", "0.95"),
         ("anthropic-ratelimit-unified-5h-reset", &at(3600)),
     ]);
-    store.set_setting(store::QUOTA_PAUSE_PCT, "99").unwrap();
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &warm));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled, "阈值调高后 95% 不该停");
+    store.set_setting(store::QUOTA_PAUSE_PCT, "99").await.unwrap();
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &warm).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled, "阈值调高后 95% 不该停");
 
     // 再调低：配 80 时同一份头就该停。
-    store.set_setting(store::QUOTA_PAUSE_PCT, "80").unwrap();
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &warm));
-    assert!(store.get(cred.id).unwrap().unwrap().disabled);
+    store.set_setting(store::QUOTA_PAUSE_PCT, "80").await.unwrap();
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &warm).await);
+    assert!(store.get(cred.id).await.unwrap().unwrap().disabled);
 }
 
 /// 逐账号阈值覆盖全局：账号自己配了的那档用账号的，`Some(0)` 是「这个号这一档不停」
 /// 而不是「跟随」，`None` 才跟随；两档各自覆盖、互不串档。
-#[test]
-fn quota_threshold_is_overridable_per_credential() {
+#[sqlx::test]
+async fn quota_threshold_is_overridable_per_credential(pool: sqlx::PgPool) {
     let hdr = |kv: &[(&str, &str)]| {
         let mut h = crate::proxy::HeaderMap::new();
         for (k, v) in kv {
@@ -648,85 +659,85 @@ fn quota_threshold_is_overridable_per_credential() {
         ("anthropic-ratelimit-unified-7d-utilization", "0.97"),
         ("anthropic-ratelimit-unified-7d-reset", &at(50 * 3600)),
     ]);
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let fresh = |id: i64| store.get(id).unwrap().unwrap();
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let fresh = async |id: i64| store.get(id).await.unwrap().unwrap();
 
     // 全局 90：没配覆盖的号 95% 该停。
-    let a = store.insert("a", None, "at", "rt-a", u64::MAX, None, None, 1).unwrap();
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &a, &warm));
-    assert!(fresh(a.id).disabled, "跟随全局 90 的号 95% 该停");
+    let a = store.insert("a", None, "at", "rt-a", u64::MAX, None, None, 1).await.unwrap();
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &a, &warm).await);
+    assert!(fresh(a.id).await.disabled, "跟随全局 90 的号 95% 该停");
 
     // 账号自己配 99：同一份头不停；配回 None 又跟随全局。
-    let b = store.insert("b", None, "at", "rt-b", u64::MAX, None, None, 1).unwrap();
-    assert!(store.set_quota_pause_pcts(b.id, Some(99), None).unwrap());
-    let b = fresh(b.id);
+    let b = store.insert("b", None, "at", "rt-b", u64::MAX, None, None, 1).await.unwrap();
+    assert!(store.set_quota_pause_pcts(b.id, Some(99), None).await.unwrap());
+    let b = fresh(b.id).await;
     assert_eq!((b.quota_pause_pct, b.quota_pause_pct_7d), (Some(99), None));
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &b, &warm));
-    assert!(!fresh(b.id).disabled, "账号阈值 99 覆盖全局 90，95% 不该停");
-    assert!(store.set_quota_pause_pcts(b.id, None, None).unwrap());
-    let b = fresh(b.id);
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &b, &warm));
-    assert!(fresh(b.id).disabled, "清掉覆盖就回到全局 90");
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &b, &warm).await);
+    assert!(!fresh(b.id).await.disabled, "账号阈值 99 覆盖全局 90，95% 不该停");
+    assert!(store.set_quota_pause_pcts(b.id, None, None).await.unwrap());
+    let b = fresh(b.id).await;
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &b, &warm).await);
+    assert!(fresh(b.id).await.disabled, "清掉覆盖就回到全局 90");
 
     // 账号配 0 = 这个号这一档不停，哪怕全局开着；7d 档没配、全局也关，整个不停。
-    let c = store.insert("c", None, "at", "rt-c", u64::MAX, None, None, 1).unwrap();
-    assert!(store.set_quota_pause_pcts(c.id, Some(0), None).unwrap());
-    let c = fresh(c.id);
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &c, &warm));
-    assert!(!fresh(c.id).disabled, "账号 5h 档配 0 即不停，不是跟随全局");
+    let c = store.insert("c", None, "at", "rt-c", u64::MAX, None, None, 1).await.unwrap();
+    assert!(store.set_quota_pause_pcts(c.id, Some(0), None).await.unwrap());
+    let c = fresh(c.id).await;
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &c, &warm).await);
+    assert!(!fresh(c.id).await.disabled, "账号 5h 档配 0 即不停，不是跟随全局");
 
     // 只给这个号开 7d 档（95）而全局 7d 关着：按 7d 停、睡到 7d 的 reset。
-    let d = store.insert("d", None, "at", "rt-d", u64::MAX, None, None, 1).unwrap();
-    assert!(store.set_quota_pause_pcts(d.id, Some(0), Some(95)).unwrap());
-    let d = fresh(d.id);
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &d, &warm));
-    let after = fresh(d.id);
+    let d = store.insert("d", None, "at", "rt-d", u64::MAX, None, None, 1).await.unwrap();
+    assert!(store.set_quota_pause_pcts(d.id, Some(0), Some(95)).await.unwrap());
+    let d = fresh(d.id).await;
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &d, &warm).await);
+    let after = fresh(d.id).await;
     assert!(after.disabled);
     let wait = after.resume_at.expect("按阈值停的号要能到点自恢复") as i64 - now;
     assert!((50 * 3600 - 5..=50 * 3600).contains(&wait), "应睡到 7d reset，实得 {wait}");
     assert!(after.ban_reason.unwrap().contains("7d"));
 
     // 反过来：全局 5h 关着、账号自己开 80，95% 也停。
-    store.set_setting(store::QUOTA_PAUSE_PCT, "0").unwrap();
-    let e = store.insert("e", None, "at", "rt-e", u64::MAX, None, None, 1).unwrap();
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &e, &warm));
-    assert!(store.set_quota_pause_pcts(e.id, Some(80), None).unwrap());
-    let e = fresh(e.id);
-    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &e, &warm));
-    assert!(fresh(e.id).disabled, "全局关着不妨碍账号自己开");
+    store.set_setting(store::QUOTA_PAUSE_PCT, "0").await.unwrap();
+    let e = store.insert("e", None, "at", "rt-e", u64::MAX, None, None, 1).await.unwrap();
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &e, &warm).await);
+    assert!(store.set_quota_pause_pcts(e.id, Some(80), None).await.unwrap());
+    let e = fresh(e.id).await;
+    assert!(crate::proxy::park_if_quota_nearly_exhausted(&store, &e, &warm).await);
+    assert!(fresh(e.id).await.disabled, "全局关着不妨碍账号自己开");
 
     // 越界值夹到 0..=100；不存在的号返回 false。
-    assert!(store.set_quota_pause_pcts(e.id, Some(250), Some(-3)).unwrap());
-    let e = fresh(e.id);
+    assert!(store.set_quota_pause_pcts(e.id, Some(250), Some(-3)).await.unwrap());
+    let e = fresh(e.id).await;
     assert_eq!((e.quota_pause_pct, e.quota_pause_pct_7d), (Some(100), Some(0)));
-    assert!(!store.set_quota_pause_pcts(9999, Some(50), None).unwrap());
+    assert!(!store.set_quota_pause_pcts(9999, Some(50), None).await.unwrap());
 
     // 批量：整份覆盖所选的号（含把已有覆盖清回 None），没选的不动，返回改了几条。
-    let n = store.set_quota_pause_pcts_many(&[a.id, e.id, 9999], None, Some(120)).unwrap();
+    let n = store.set_quota_pause_pcts_many(&[a.id, e.id, 9999], None, Some(120)).await.unwrap();
     assert_eq!(n, 2);
     for id in [a.id, e.id] {
-        let c = fresh(id);
+        let c = fresh(id).await;
         assert_eq!((c.quota_pause_pct, c.quota_pause_pct_7d), (None, Some(100)));
     }
-    let d = fresh(d.id);
+    let d = fresh(d.id).await;
     assert_eq!((d.quota_pause_pct, d.quota_pause_pct_7d), (Some(0), Some(95)), "没选的不动");
-    assert_eq!(store.set_quota_pause_pcts_many(&[], Some(1), None).unwrap(), 0);
+    assert_eq!(store.set_quota_pause_pcts_many(&[], Some(1), None).await.unwrap(), 0);
 }
 
 /// 关掉「429 冷却/换号重试」总开关的人要的是完全不干预调度，那时阈值机制也必须闭嘴。
-#[test]
-fn quota_threshold_obeys_the_rate_limit_retry_switch() {
+#[sqlx::test]
+async fn quota_threshold_obeys_the_rate_limit_retry_switch(pool: sqlx::PgPool) {
     let mut h = crate::proxy::HeaderMap::new();
     h.insert(
         crate::proxy::HeaderName::from_static("anthropic-ratelimit-unified-5h-utilization"),
         HeaderValue::from_static("1.0"),
     );
     let info = crate::proxy::RateLimitInfo::from_headers(&h);
-    let store = store::CredentialStore::open_in_memory().unwrap();
-    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).unwrap();
-    store.set_setting(store::RATE_LIMIT_RETRY, "false").unwrap();
-    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &info));
-    assert!(!store.get(cred.id).unwrap().unwrap().disabled, "总开关关着就不该动调度");
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("a", None, "at", "rt", u64::MAX, None, None, 1).await.unwrap();
+    store.set_setting(store::RATE_LIMIT_RETRY, "false").await.unwrap();
+    assert!(!crate::proxy::park_if_quota_nearly_exhausted(&store, &cred, &info).await);
+    assert!(!store.get(cred.id).await.unwrap().unwrap().disabled, "总开关关着就不该动调度");
 }
 
 /// 冷却睡到**上游返回的那个重置时刻**，不是写死的 5 小时/7 天：没有 `retry-after` 时，

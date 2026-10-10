@@ -1,4 +1,26 @@
 services:
+  postgres:
+    image: postgres:17
+    container_name: luban-postgres
+    environment:
+      - POSTGRES_USER=luban
+      # 必填：在同目录的 .env 里写 POSTGRES_PASSWORD=<随机串>（install.sh 会自动生成）。
+      # 不给默认值：库只在第一次启动时按它建超级用户，落成一个人人都知道的密码就改不掉了。
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?在 .env 里设置 POSTGRES_PASSWORD}
+      - POSTGRES_DB=luban
+    # 默认 64MB 的 /dev/shm 不够并行查询用，大一点的统计查询会报 shared memory 错误。
+    shm_size: 256mb
+    volumes:
+      # 数据库文件持久化到宿主机 ./pgdata。备份别直接拷这个目录（运行中拷出来的不一致），
+      # 用 pg_dump，见 install.sh 结尾的说明。
+      - ./pgdata/:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U luban -d luban"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   luban:
     # 国内镜像可用：ghcr.nju.edu.cn/${IMAGE_OWNER:-easayliu}/luban:${IMAGE_TAG:-latest}
     image: ghcr.io/${IMAGE_OWNER:-easayliu}/luban:${IMAGE_TAG:-latest}
@@ -12,7 +34,12 @@ services:
     environment:
       # 接入 Key：留空则改由网页「接入设置」管理
       - LUBAN_API_KEY=${LUBAN_API_KEY:-}
+      - LUBAN_DATABASE_URL=postgres://luban:${POSTGRES_PASSWORD:?在 .env 里设置 POSTGRES_PASSWORD}@postgres:5432/luban
     volumes:
-      # 凭证库(SQLite)持久化到宿主机 ./config（容器内 LUBAN_HOME=/app/config）
+      # 加密库内 token 的密钥文件（secret.key）持久化到宿主机 ./config（容器内 LUBAN_HOME=/app/config）。
+      # 它与数据库要一起备份：丢了它，库里的账号全部要重新授权。
       - ./config/:/app/config/
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped

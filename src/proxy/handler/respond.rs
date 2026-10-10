@@ -124,7 +124,7 @@ async fn relay_ok(
     // 停的是**之后**的调度。429 那条路不在这儿：上面已按账号/模型分档停过了，
     // 重复停只会多写一次库、多刷一行日志。
     if status != StatusCode::TOO_MANY_REQUESTS {
-        park_if_quota_nearly_exhausted(&state.store, cred, &ratelimit);
+        park_if_quota_nearly_exhausted(&state.store, cred, &ratelimit).await;
     }
 
     // 包裹响应流：首块到达记 TTFT，边转发边嗅探用量；
@@ -333,7 +333,9 @@ async fn client_error(
             ));
         }
         // 写穿落库：进程内表已经更新，落库失败只影响重启后要不要重学，不影响本次。
-        if let Err(e) = state.store.remember_rejections(&learned) {
+        if let Err(e) =
+            state.store.detached(|s| async move { s.remember_rejections(&learned).await }).await
+        {
             tracing::warn!(error = %e, "persisting learned rejections failed (kept in memory)");
         }
     }
@@ -425,13 +427,15 @@ async fn client_error(
             request_id,
             rl.upstream_request_id.as_deref(),
         );
-        if let Err(e) = state.store.record_ban(cred.id, &ctx) {
+        let id = cred.id;
+        if let Err(e) = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await
+        {
             tracing::warn!(error = %e, "failed to auto-disable the credential");
         }
     } else if verdict == AccountRejection::SubscriptionInactive {
         // 订阅未生效：不是封号，但续费 / 订阅之前这个号的每条请求都会吃同一发：暂停调度、清绑定，
         // 下一条请求就改走别的号。这一发已经到了客户端手里，原样透传。
-        park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "forward");
+        park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "forward").await;
     }
     // thinking 签名降级重试。
     if status == StatusCode::BAD_REQUEST && !compressed && is_thinking_signature_error(&err_bytes) {
@@ -490,7 +494,8 @@ async fn client_error(
         if let Some(model) = req_model.as_deref()
             && let Some(row) =
                 remember_fallback_rejection(&state.deprecated_fields, model, &err_bytes)
-            && let Err(e) = state.store.remember_rejections(&[row])
+            && let Err(e) =
+                state.store.detached(|s| async move { s.remember_rejections(&[row]).await }).await
         {
             tracing::warn!(error = %e, "persisting the fallbacks rejection failed (kept in memory)");
         }

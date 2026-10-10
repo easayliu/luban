@@ -22,7 +22,7 @@ pub(super) async fn get_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<MetricsResp>, ApiError> {
     let store = state.store.clone();
-    let rpm = blocking(move || store.total_rpm().map_err(internal)).await?;
+    let rpm = store.total_rpm().await.map_err(internal)?;
     Ok(Json(MetricsResp {
         rpm,
         in_flight: state.in_flight.load(std::sync::atomic::Ordering::Relaxed).max(0),
@@ -81,14 +81,13 @@ const METRICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20
 /// 按键取缓存，没有或过期就算一次并存起来。算的那一步在锁外，几个标签页同时撞上会各算各的，
 /// 但接下来 20 秒都省了。回给 axum 的是 `Value` 的一份克隆：几 KB 的 JSON，比整段扫描
 /// 便宜几个数量级；`Arc<Value>` 本身不能直接序列化（serde 的 rc 特性没开）。
-/// 算的那一步是几十万行的扫描，经 [`blocking`] 放到阻塞线程池里跑。
 pub(super) async fn cached_metrics<T, F>(
     key: String,
     compute: F,
 ) -> Result<Json<serde_json::Value>, ApiError>
 where
-    T: Serialize + Send + 'static,
-    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+    T: Serialize,
+    F: std::future::Future<Output = Result<T, ApiError>>,
 {
     let now = std::time::Instant::now();
     if let Some((at, v)) = METRICS_CACHE.lock().unwrap().get(&key)
@@ -96,7 +95,7 @@ where
     {
         return Ok(Json((**v).clone()));
     }
-    let computed = blocking(compute).await?;
+    let computed = compute.await?;
     let value = Arc::new(serde_json::to_value(computed).map_err(|e| internal(anyhow::anyhow!(e)))?);
     let mut cache = METRICS_CACHE.lock().unwrap();
     if cache.len() >= 64 {
@@ -124,9 +123,9 @@ pub(super) async fn get_cache_series(
     let (since, bucket_secs, tz) = q.normalized();
     // 键里放小时数而不是 since：since 每秒都在变，放进去缓存永远命不中。
     let key = format!("cache:{}:{bucket_secs}:{tz}", q.hours);
-    cached_metrics(key, move || {
+    cached_metrics(key, async move {
         let store::CacheReport { points, summary, recent } =
-            state.store.cache_report(since, bucket_secs, tz).map_err(internal)?;
+            state.store.cache_report(since, bucket_secs, tz).await.map_err(internal)?;
         Ok(CacheSeriesResp { since, bucket_secs, points, summary, recent })
     })
     .await
@@ -149,9 +148,9 @@ pub(super) async fn get_ttft_series(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (since, bucket_secs, tz) = q.normalized();
     let key = format!("ttft:{}:{bucket_secs}:{tz}", q.hours);
-    cached_metrics(key, move || {
+    cached_metrics(key, async move {
         let store::TtftReport { points, summary, recent } =
-            state.store.ttft_report(since, bucket_secs, tz).map_err(internal)?;
+            state.store.ttft_report(since, bucket_secs, tz).await.map_err(internal)?;
         Ok(TtftSeriesResp { since, bucket_secs, points, summary, recent })
     })
     .await
@@ -211,10 +210,11 @@ pub(super) async fn get_rejections(
     let max_hours = store::USAGE_LOG_RETENTION_SECS / 3600;
     let hours = q.hours.clamp(1, max_hours);
     let since = chrono::Utc::now().timestamp() - hours * 3600;
-    cached_metrics(format!("rejections:{hours}"), move || {
+    cached_metrics(format!("rejections:{hours}"), async move {
         let rows: Vec<RejectionKind> = state
             .store
             .local_rejections(since)
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|(kind, count)| RejectionKind { kind, count })
@@ -239,9 +239,10 @@ pub(super) async fn get_usage_breakdown(
         _ => store::BreakdownBy::Model,
     };
     let by_name = if by == store::BreakdownBy::Account { "account" } else { "model" };
-    cached_metrics(format!("breakdown:{hours}:{by_name}"), move || {
+    cached_metrics(format!("breakdown:{hours}:{by_name}"), async move {
         // 合计要覆盖全部分组，先不截断；前端只拿前 12 行。
-        let mut rows = state.store.usage_breakdown(since, by, usize::MAX).map_err(internal)?;
+        let mut rows =
+            state.store.usage_breakdown(since, by, usize::MAX).await.map_err(internal)?;
         let cache_saved_usd_total = rows.iter().map(|r| r.cache_saved_usd).sum();
         rows.truncate(12);
         Ok(BreakdownResp { since, by: by_name.into(), rows, cache_saved_usd_total })

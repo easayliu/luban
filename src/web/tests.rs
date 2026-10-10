@@ -99,42 +99,42 @@ fn reauth_mismatch_messages_match_the_frontend_patterns() {
 
 /// 两条只差密码的代理，给访客打码后 URL 一模一样；账号视图带上代理池 id，前端按 id 查名称
 /// 才不会串位。
-#[tokio::test]
-async fn credential_view_carries_the_exact_proxy_id() {
-    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let pa = store.add_proxy(1, "A", "http://u:one@h:1").unwrap();
-    let pb = store.add_proxy(1, "B", "http://u:two@h:1").unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
-    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).unwrap();
-    store.set_proxy(a.id, Some("http://u:one@h:1")).unwrap();
-    store.set_proxy(b.id, Some("http://u:two@h:1")).unwrap();
-    store.set_proxy(c.id, Some("http://u:other@h:9")).unwrap();
+#[sqlx::test]
+async fn credential_view_carries_the_exact_proxy_id(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let pa = store.add_proxy(1, "A", "http://u:one@h:1").await.unwrap();
+    let pb = store.add_proxy(1, "B", "http://u:two@h:1").await.unwrap();
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).await.unwrap();
+    let c = store.insert("c", None, "tc", "rc", 0, None, None, 1).await.unwrap();
+    store.set_proxy(a.id, Some("http://u:one@h:1")).await.unwrap();
+    store.set_proxy(b.id, Some("http://u:two@h:1")).await.unwrap();
+    store.set_proxy(c.id, Some("http://u:other@h:9")).await.unwrap();
     let state = AppState::for_test(store);
-    let admin = state.store.admin_user().unwrap();
+    let admin = state.store.admin_user().await.unwrap();
     let views =
         list_credentials(State(state.clone()), Extension(Actor::from(admin))).await.unwrap().0;
     let id_of = |id: i64| views.iter().find(|v| v.id == id).unwrap().proxy_id;
     assert_eq!(id_of(a.id), Some(pa.id));
     assert_eq!(id_of(b.id), Some(pb.id));
     assert_eq!(id_of(c.id), None, "不在池里的自定义地址");
-    assert_eq!(credential_view(&state, a.id).unwrap().0.proxy_id, Some(pa.id));
+    assert_eq!(view_of(&state, a.id).await.unwrap().0.proxy_id, Some(pa.id));
 }
 
 /// 已删账号的流水留到保留期满：按号接口对它给 404（账号自己的明细弹框靠这个区分「号没了」
 /// 与「没有请求」），全局接口带 `cred_id` 照样查得到——趋势拆分表里点已删账号那一行走的
 /// 就是这条，别再把它导到按号接口去。
-#[tokio::test]
-async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id() {
-    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).await.unwrap();
     for cid in [a.id, a.id, b.id] {
         let rec =
             store::UsageRecord { cred_id: Some(cid), cred_label: "x".into(), ..Default::default() };
-        store.insert_usage_log(&rec).unwrap();
+        store.insert_usage_log(&rec).await.unwrap();
     }
-    assert!(store.delete(a.id).unwrap());
+    assert!(store.delete(a.id).await.unwrap());
     let state = AppState::for_test(store.clone());
 
     let err = list_credential_usage(State(state.clone()), Path(a.id), Query(UsageQuery::default()))
@@ -144,9 +144,9 @@ async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id() {
     assert_eq!(err.0, StatusCode::NOT_FOUND);
 
     let q = UsageQuery { cred_id: Some(a.id), ..Default::default() };
-    let admin = Actor::from(state.store.admin_user().unwrap());
+    let admin = Actor::from(state.store.admin_user().await.unwrap());
     let page = list_usage(State(state), Extension(admin), Query(q)).await.unwrap().0;
-    assert_eq!(page.total, 2, "已删账号的两条流水都还在");
+    assert_eq!(page.total, Some(2), "已删账号的两条流水都还在");
     assert!(page.logs.iter().all(|l| l.cred_id == Some(a.id)), "只给这个号的");
 }
 
@@ -242,11 +242,11 @@ fn keepalive_ban_context_keeps_status_type_message_and_request_id() {
 
 /// 返回值要如实反映「确实停用了」：账号级错误 → 停用且落事件、`true`；非账号级 → 号
 /// 原样启用、`false`；号已不存在 → `false`。
-#[test]
-fn handle_keepalive_rejection_reports_whether_the_ban_landed() {
-    let store = CredentialStore::open_in_memory().unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
-    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn handle_keepalive_rejection_reports_whether_the_ban_landed(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+    let b = store.insert("b", None, "tb", "rb", 0, None, None, 1).await.unwrap();
     let rej = |status: u16, t: &str, m: &str| oauth::AuthRejection {
         endpoint: "event_logging",
         status,
@@ -261,50 +261,56 @@ fn handle_keepalive_rejection_reports_whether_the_ban_landed() {
         "OAuth authentication is currently not allowed for this organization.",
     );
     assert_eq!(
-        handle_keepalive_rejection(&store, &a, &org_policy),
+        handle_keepalive_rejection(&store, &a, &org_policy).await,
         KeepaliveRejection::SubscriptionInactive
     );
-    let got = store.get(a.id).unwrap().unwrap();
-    assert!(store.list_ban_events(None, 10).unwrap().is_empty(), "不是封号，不落封号事件");
+    let got = store.get(a.id).await.unwrap().unwrap();
+    assert!(store.list_ban_events(None, 10).await.unwrap().is_empty(), "不是封号，不落封号事件");
     // 但订阅未生效要暂停调度：不带恢复时刻（等人工或连通性测试），不落封号事件。
     assert!(got.disabled && got.resume_at.is_none(), "订阅未生效应暂停调度");
     assert!(got.ban_reason.as_deref().unwrap().contains(store::ORG_OAUTH_SUSPEND_MARKER));
     // 其它非账号级的 403（权限 / 区域）仍只记日志，号照常启用。
     let region = rej(403, "permission_error", "This model is not available in your region");
-    assert_eq!(handle_keepalive_rejection(&store, &b, &region), KeepaliveRejection::NotBanned);
-    assert!(!store.get(b.id).unwrap().unwrap().disabled);
+    assert_eq!(
+        handle_keepalive_rejection(&store, &b, &region).await,
+        KeepaliveRejection::NotBanned
+    );
+    assert!(!store.get(b.id).await.unwrap().unwrap().disabled);
     // 人工停用的号撞上同一句：不改成暂停（保活对它照发），但结论仍是订阅未生效——调用方
     // 据此不撤握手标记，免得每轮重发一遍启动握手。
-    store.set_disabled(b.id, true).unwrap();
+    store.set_disabled(b.id, true).await.unwrap();
     assert_eq!(
-        handle_keepalive_rejection(&store, &b, &org_policy),
+        handle_keepalive_rejection(&store, &b, &org_policy).await,
         KeepaliveRejection::SubscriptionInactive
     );
-    let got = store.get(b.id).unwrap().unwrap();
+    let got = store.get(b.id).await.unwrap().unwrap();
     assert!(got.disabled && got.ban_reason.is_none(), "人工停用保持原样");
-    store.set_disabled(b.id, false).unwrap();
+    store.set_disabled(b.id, false).await.unwrap();
     // 恢复 a，下面接着测账号级那档。
-    store.set_disabled(a.id, false).unwrap();
+    store.set_disabled(a.id, false).await.unwrap();
 
     // 账号级：停用、事件带完整上下文。
     let revoked = rej(401, "authentication_error", "OAuth token has been revoked");
-    assert_eq!(handle_keepalive_rejection(&store, &a, &revoked), KeepaliveRejection::Banned);
-    let got = store.get(a.id).unwrap().unwrap();
+    assert_eq!(handle_keepalive_rejection(&store, &a, &revoked).await, KeepaliveRejection::Banned);
+    let got = store.get(a.id).await.unwrap().unwrap();
     assert!(got.is_banned());
     assert_eq!(
         got.ban_reason.as_deref(),
         Some("[keepalive/event_logging 401] authentication_error: OAuth token has been revoked")
     );
-    let ev = &store.list_ban_events(None, 10).unwrap()[0];
+    let ev = &store.list_ban_events(None, 10).await.unwrap()[0];
     assert_eq!(ev.source, "keepalive");
     assert_eq!(ev.status, Some(401));
     assert_eq!(ev.error_type.as_deref(), Some("authentication_error"));
     assert_eq!(ev.upstream_request_id.as_deref(), Some("req_k"));
 
     // 号已经被删：没有主体，`false`，b 不受影响。
-    store.delete(a.id).unwrap();
-    assert_eq!(handle_keepalive_rejection(&store, &a, &revoked), KeepaliveRejection::NotBanned);
-    assert!(!store.get(b.id).unwrap().unwrap().is_banned());
+    store.delete(a.id).await.unwrap();
+    assert_eq!(
+        handle_keepalive_rejection(&store, &a, &revoked).await,
+        KeepaliveRejection::NotBanned
+    );
+    assert!(!store.get(b.id).await.unwrap().unwrap().is_banned());
 }
 
 /// 保活的 401/403 不再一律停用：只有账号级错误才算，判据与转发路径同一套。
@@ -458,9 +464,9 @@ fn pkce_table_is_bounded_and_drops_the_oldest() {
 }
 
 /// 整数设置一律按非负存：负数落成 0（不限），正数原样。
-#[tokio::test]
-async fn nonneg_int_settings_clamp_negatives_to_zero() {
-    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
+#[sqlx::test]
+async fn nonneg_int_settings_clamp_negatives_to_zero(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
     let state = AppState::for_test(store.clone());
     let req = |v: i64| {
         Json(serde_json::from_value(serde_json::json!({ "default_rpm_limit": v })).unwrap())
@@ -478,9 +484,9 @@ async fn nonneg_int_settings_clamp_negatives_to_zero() {
 }
 
 /// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
-#[tokio::test]
-async fn series_endpoints_report_the_bucket_width_actually_used() {
-    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
+#[sqlx::test]
+async fn series_endpoints_report_the_bucket_width_actually_used(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
     let state = AppState::for_test(store);
     for (asked, used) in [(60, 900), (1000, 1800), (3600, 3600)] {
         let q = |hours: i64| {
@@ -498,16 +504,17 @@ async fn series_endpoints_report_the_bucket_width_actually_used() {
 }
 
 /// 代理和用户只能把号放进开放给自己的分组（不能选的按不存在回）；建分组只有 admin。
-#[tokio::test]
-async fn members_can_only_use_groups_opened_to_them() {
-    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let admin = store.admin_user().unwrap();
-    let user_id = store.create_user("u1", "", store::UserRole::User, admin.id).unwrap().unwrap().id;
-    let user = store.user_by_id(user_id).unwrap().unwrap();
-    let cred = store.insert("c", None, "t", "r", 0, None, None, user_id).unwrap().id;
-    let opened = store.create_group("opened", "").unwrap().unwrap();
-    let closed = store.create_group("closed", "").unwrap().unwrap();
-    store.set_group_grants(opened, &[user_id]).unwrap().unwrap();
+#[sqlx::test]
+async fn members_can_only_use_groups_opened_to_them(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = store.admin_user().await.unwrap();
+    let user_id =
+        store.create_user("u1", "", store::UserRole::User, admin.id).await.unwrap().unwrap().id;
+    let user = store.user_by_id(user_id).await.unwrap().unwrap();
+    let cred = store.insert("c", None, "t", "r", 0, None, None, user_id).await.unwrap().id;
+    let opened = store.create_group("opened", "").await.unwrap().unwrap();
+    let closed = store.create_group("closed", "").await.unwrap().unwrap();
+    store.set_group_grants(opened, &[user_id]).await.unwrap().unwrap();
     let state = AppState::for_test(store.clone());
     let as_user = || Extension(Actor::from(user.clone()));
 
@@ -539,16 +546,19 @@ async fn members_can_only_use_groups_opened_to_them() {
 
 /// 账单可见范围：用户只看自己、不能按人拆；代理默认看自己与下属的人头汇总，看下属只到人这
 /// 一级（只能按日），看不到别的代理名下的人；admin 看全部。
-#[tokio::test]
-async fn billing_scope_follows_the_hierarchy() {
-    let store = Arc::new(CredentialStore::open_in_memory().unwrap());
-    let admin = store.admin_user().unwrap();
-    let agent = store.create_user("ag", "", store::UserRole::Agent, admin.id).unwrap().unwrap();
-    let other = store.create_user("ag2", "", store::UserRole::Agent, admin.id).unwrap().unwrap();
-    let sub = store.create_user("sub", "", store::UserRole::User, agent.id).unwrap().unwrap();
+#[sqlx::test]
+async fn billing_scope_follows_the_hierarchy(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = store.admin_user().await.unwrap();
+    let agent =
+        store.create_user("ag", "", store::UserRole::Agent, admin.id).await.unwrap().unwrap();
+    let other =
+        store.create_user("ag2", "", store::UserRole::Agent, admin.id).await.unwrap().unwrap();
+    let sub = store.create_user("sub", "", store::UserRole::User, agent.id).await.unwrap().unwrap();
     for (i, owner) in [admin.id, agent.id, other.id, sub.id].into_iter().enumerate() {
         let c = store
             .insert(&format!("c{i}"), None, "t", &format!("r{i}"), 0, None, None, owner)
+            .await
             .unwrap()
             .id;
         store
@@ -558,6 +568,7 @@ async fn billing_scope_follows_the_hierarchy() {
                 cost_usd: Some(1.0 + i as f64),
                 ..Default::default()
             })
+            .await
             .unwrap();
     }
     let state = AppState::for_test(store.clone());
@@ -609,18 +620,21 @@ fn serde_urlencoded_query(s: &str) -> BillingQuery {
 
 /// 上号代理：给地址就用地址，给 id 只认本人池里的，两个都给拒；都不给时网页直连、上号 Key
 /// 从本人池里按挂号从少到多（在途的也算）测试、用第一条通的，都不通回 502，池子空了直连。
-#[tokio::test]
-async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
-    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
-    let admin = store.admin_user().unwrap().id;
+#[sqlx::test]
+async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = store.admin_user().await.unwrap().id;
     let hash = "x".to_string();
-    let agent = store.create_user("agent1", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
-    let other = store.create_user("agent2", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
-    let pa = store.add_proxy(agent, "A", "http://u:a@h:1").unwrap();
-    let pb = store.add_proxy(agent, "B", "http://u:b@h:2").unwrap();
-    let foreign = store.add_proxy(other, "C", "http://u:c@h:3").unwrap();
-    let busy = store.insert("busy", None, "at", "rt-busy", u64::MAX, None, None, other).unwrap();
-    store.set_proxy(busy.id, Some(&pa.url)).unwrap();
+    let agent =
+        store.create_user("agent1", &hash, UserRole::Agent, admin).await.unwrap().unwrap().id;
+    let other =
+        store.create_user("agent2", &hash, UserRole::Agent, admin).await.unwrap().unwrap().id;
+    let pa = store.add_proxy(agent, "A", "http://u:a@h:1").await.unwrap();
+    let pb = store.add_proxy(agent, "B", "http://u:b@h:2").await.unwrap();
+    let foreign = store.add_proxy(other, "C", "http://u:c@h:3").await.unwrap();
+    let busy =
+        store.insert("busy", None, "at", "rt-busy", u64::MAX, None, None, other).await.unwrap();
+    store.set_proxy(busy.id, Some(&pa.url)).await.unwrap();
     let state = AppState::for_test(store.clone());
     let actor = Actor { id: agent, username: "agent1".into(), role: UserRole::Agent };
     let all_up = |_url: String| async { Ok::<(), String>(()) };
@@ -672,13 +686,13 @@ async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
     assert_eq!(third.as_deref(), Some(pb.url.as_str()));
 
     // 导入进来的条目不经校验：建不出客户端的跳过；归一化前的写法按归一化后的地址数挂号。
-    let odd = store.create_user("agent4", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let odd = store.create_user("agent4", &hash, UserRole::Agent, admin).await.unwrap().unwrap().id;
     let odd_actor = Actor { id: odd, username: "agent4".into(), role: UserRole::Agent };
-    store.add_proxy(odd, "bad", "ftp://h:21").unwrap();
-    let legacy = store.add_proxy(odd, "legacy", "socks5://u:l@h:5").unwrap();
-    let fresh = store.add_proxy(odd, "fresh", "socks5h://u:f@h:6").unwrap();
-    let on_legacy = store.insert("l", None, "at", "rt-l", u64::MAX, None, None, odd).unwrap();
-    store.set_proxy(on_legacy.id, Some("socks5h://u:l@h:5")).unwrap();
+    store.add_proxy(odd, "bad", "ftp://h:21").await.unwrap();
+    let legacy = store.add_proxy(odd, "legacy", "socks5://u:l@h:5").await.unwrap();
+    let fresh = store.add_proxy(odd, "fresh", "socks5h://u:f@h:6").await.unwrap();
+    let on_legacy = store.insert("l", None, "at", "rt-l", u64::MAX, None, None, odd).await.unwrap();
+    store.set_proxy(on_legacy.id, Some("socks5h://u:l@h:5")).await.unwrap();
     let (url, _) = resolve_proxy(&state, &odd_actor, &req(None, None), true, all_up).await.unwrap();
     assert_eq!(url.as_deref(), Some(fresh.url.as_str()), "legacy #{} 已挂一个号", legacy.id);
 
@@ -700,7 +714,8 @@ async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
         resolve_proxy(&state, &actor, &req(None, Some(pb.id)), true, all_down).await.unwrap();
     assert_eq!(url.as_deref(), Some(pb.url.as_str()));
 
-    let lonely = store.create_user("agent3", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let lonely =
+        store.create_user("agent3", &hash, UserRole::Agent, admin).await.unwrap().unwrap().id;
     let lonely = Actor { id: lonely, username: "agent3".into(), role: UserRole::Agent };
     assert_eq!(
         resolve_proxy(&state, &lonely, &req(None, None), true, all_up).await.unwrap().0,

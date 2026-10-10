@@ -63,7 +63,7 @@ struct Facts {
 }
 
 /// 依次过完全部闸门。任何一道拒绝都就地返回那条响应。
-pub(super) fn admit(
+pub(super) async fn admit(
     state: &AppState,
     method: Method,
     uri: &Uri,
@@ -81,7 +81,7 @@ pub(super) fn admit(
     // 在途计数：入口就 +1，随后 move 进 ReqLog 活到响应流结束，见 [`InFlightGuard`]。
     let in_flight = InFlightGuard::new(state.in_flight.clone());
 
-    let key_access = client_gates(state, &method, &path_and_query, &client_ua, &headers)?;
+    let key_access = client_gates(state, &method, &path_and_query, &client_ua, &headers).await?;
     *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
@@ -97,7 +97,8 @@ pub(super) fn admit(
         concurrency_limit,
         &mut session_concurrency_guard,
         log_state,
-    )?;
+    )
+    .await?;
 
     // 这条请求声明的输出上限。只为日志：裸 429 那一档要拿它对上游那套「每分钟输出 token」
     // 限额，见 [`UpstreamLoad`]。算在这里是因为 `body_json` 只解析一次（见上面 2 那段），
@@ -213,7 +214,7 @@ pub(super) fn admit(
 }
 
 /// 1～1.5：来访 API key 与最低客户端版本，只看头。回这把 Key 能用哪些号。
-fn client_gates(
+async fn client_gates(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
@@ -221,7 +222,7 @@ fn client_gates(
     headers: &HeaderMap,
 ) -> Result<store::KeyAccess, Response> {
     // 1) 校验来访 API Key（一把都没配则放行），见 [`client_access`]。
-    let access = match client_access(state, headers) {
+    let access = match client_access(state, headers).await {
         Ok(Some(access)) => access,
         Ok(None) => {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
@@ -422,7 +423,7 @@ fn parse_facts(
 
 #[allow(clippy::too_many_arguments)]
 /// 2.1a～2.2c：探针就地作答、没有设备身份的拒掉，再按体里的会话 id 补判会话 RPM 与并发。
-fn identity_gates(
+async fn identity_gates(
     state: &AppState,
     method: &Method,
     path_and_query: &str,
@@ -471,8 +472,14 @@ fn identity_gates(
             &inbound_beta_list(headers),
             from_cc_client,
             state.store.forward_flags().reject_probes_strict,
-            || device_id.as_deref().is_some_and(|d| state.store.device_is_known(d)),
+            async {
+                match device_id.as_deref() {
+                    Some(d) => state.store.device_is_known(d).await,
+                    None => false,
+                }
+            },
         )
+        .await
     {
         // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
         // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。

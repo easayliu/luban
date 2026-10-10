@@ -257,9 +257,9 @@ pub(super) async fn prepare<'a>(
                 cred_id = cred.id, cred = %cred.label, error = %reason,
                 "proxy unusable, disabling the credential"
             );
-            let _ = state.store.record_ban(
+            let (id, ctx) = (
                 cred.id,
-                &store::BanContext {
+                store::BanContext {
                     reason: reason.clone(),
                     source: "proxy",
                     error_message: Some(format!("{e:#}")),
@@ -267,6 +267,7 @@ pub(super) async fn prepare<'a>(
                     ..Default::default()
                 },
             );
+            let _ = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await;
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",

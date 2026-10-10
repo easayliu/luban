@@ -1691,14 +1691,15 @@ fn official_passthrough_report_at(
         if let Some(r) = reason {
             bad.push(format!("{name} {model}: 被送进模拟（{}）", r.tag()));
         }
-        let probe = crate::proxy::probe_signature(
+        let probe = futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
             Some(&v),
             crate::proxy::extract_device_id(Some(&v)).as_deref(),
             &beta,
             true,
             false,
-            || false,
-        );
+            async { false },
+        ))
+        .expect("probe_signature does no IO here");
         if let Some(p) = probe {
             bad.push(format!("{name} {model}: 被当探针（{p:?}）"));
         }
@@ -2289,14 +2290,15 @@ fn thread_continuation_is_recognized_only_with_a_previous_message() {
     assert!(detect_with(&cont, &cc_ua, all_on()).is_none(), "官方续轮不该被重建成主线程");
     // 也不该被当成一次性探针（有 system、没 tools、一条消息、新设备）。
     assert!(
-        crate::proxy::probe_signature(
+        futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
             Some(&official),
             Some("b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d"),
             &threads_beta,
             true,
             false,
-            || false,
-        )
+            async { false },
+        ))
+        .expect("probe_signature does no IO here")
         .is_none(),
         "官方续轮不是探针"
     );

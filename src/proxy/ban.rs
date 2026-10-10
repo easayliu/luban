@@ -192,8 +192,8 @@ fn is_org_oauth_status(status: StatusCode) -> bool {
 /// `source` 只进日志，标明是哪条路撞上的（forward / keepalive / probe）。
 ///
 /// 返回是否确有写入；落库失败退回进程内账号级冷却，本进程内至少一段时间不再选它。
-pub(crate) fn park_org_oauth_disallowed(
-    store: &crate::store::CredentialStore,
+pub(crate) async fn park_org_oauth_disallowed(
+    store: &std::sync::Arc<crate::store::CredentialStore>,
     cred: &crate::credentials::Credential,
     status: u16,
     source: &str,
@@ -203,7 +203,11 @@ pub(crate) fn park_org_oauth_disallowed(
         crate::store::SUBSCRIPTION_PAUSE_TAG,
         crate::store::ORG_OAUTH_SUSPEND_MARKER
     );
-    match store.suspend_for_inactive_subscription(cred.id, &reason) {
+    let (id, why) = (cred.id, reason.clone());
+    match store
+        .detached(|s| async move { s.suspend_for_inactive_subscription(id, &why).await })
+        .await
+    {
         Ok(true) => {
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,

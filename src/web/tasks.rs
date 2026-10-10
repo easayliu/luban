@@ -3,10 +3,10 @@
 use super::*;
 
 /// 启动时回填学到的规则，并拉起各个后台循环。每个循环各自克隆要用的 `state` 字段。
-pub(super) fn spawn_background_tasks(state: &AppState) {
+pub(super) async fn spawn_background_tasks(state: &AppState) {
     // 把上次运行学到的上游规则读回来（形态拒绝 / 已废弃字段 / 零输出请求类），免得每种组合
     // 重启后再白撞一次。读失败只告警：这是优化，不是启动的前提。
-    match state.store.learned_rejections() {
+    match state.store.learned_rejections().await {
         Ok(rows) => {
             let seeded = proxy::seed_learned_memories(
                 &state.shape_rejections,
@@ -15,7 +15,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                 rows,
             );
             // 按新逻辑不该存在的旧行：不回填，顺手从库里删掉。
-            drop_stale_learned_rules(&state.store, &seeded.stale);
+            drop_stale_learned_rules(&state.store, &seeded.stale).await;
             let proxy::SeededMemories {
                 shape, deprecated, empty_reply, refusal, app_refusal, ..
             } = seeded;
@@ -35,19 +35,32 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
         }
     }
 
-    // 每天裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
-    // 流水只需保留近期。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务，
-    // 走 spawn_blocking 避免拿着 SQLite 锁占住异步线程。
+    // 每小时裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
+    // 流水只需保留近期。按小时而不是按天：一天一次会让表最多撑到保留期再加一整天，删除也全挤在
+    // 同一时段。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务。
+    // 冻结流水（封号取证）按自己的保留期一起清；裁之前先把没做完的封号取证补上。
     {
         let store = state.store.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let store = store.clone();
-                match tokio::task::spawn_blocking(move || store.prune_usage_logs()).await {
-                    Ok(Ok(n)) if n > 0 => tracing::info!(rows = n, "pruned expired usage logs"),
-                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to prune usage logs"),
+                // 先补没落成的封号取证（上次中途出错或进程退出），再裁流水：补得上的趁流水还在补完；
+                // 补不上的，裁剪会留着它要冻结的那段窗口（见 `prune_usage_logs`）。
+                match store.finish_pending_ban_forensics().await {
+                    Ok(n) if n > 0 => tracing::info!(events = n, "finished pending ban forensics"),
+                    Err(e) => tracing::warn!(error = %e, "failed to finish pending ban forensics"),
+                    _ => {}
+                }
+                match store.prune_usage_logs().await {
+                    Ok(n) if n > 0 => tracing::info!(rows = n, "pruned expired usage logs"),
+                    Err(e) => tracing::warn!(error = %e, "failed to prune usage logs"),
+                    _ => {}
+                }
+                match store.prune_frozen_usage_logs().await {
+                    Ok(n) if n > 0 => tracing::info!(rows = n, "pruned expired frozen usage logs"),
+                    Err(e) => tracing::warn!(error = %e, "failed to prune frozen usage logs"),
                     _ => {}
                 }
             }
@@ -64,7 +77,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
     // 要多挂好几分钟才真正删掉。两条 DELETE 都走 last_seen_at 索引，没有到期行时只是一次
     // 索引探查，一分钟一次压不到锁。选号侧已按保留期自己过滤，所以这个间隔只影响行什么时候
     // 真正删掉，不影响任何判定——跑得晚一点选出来的号完全一样。
-    // 首个 tick 立即触发，兼作启动清理；同样走 spawn_blocking 不占异步线程。
+    // 首个 tick 立即触发，兼作启动清理。
     {
         let store = state.store.clone();
         tokio::spawn(async move {
@@ -72,12 +85,11 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let store = store.clone();
-                match tokio::task::spawn_blocking(move || store.prune_expired_bindings()).await {
-                    Ok(Ok((devices, sessions))) if devices + sessions > 0 => {
+                match store.prune_expired_bindings().await {
+                    Ok((devices, sessions)) if devices + sessions > 0 => {
                         tracing::info!(devices, sessions, "pruned bindings past their retention")
                     }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "failed to prune expired bindings"),
+                    Err(e) => tracing::warn!(error = %e, "failed to prune expired bindings"),
                     _ => {}
                 }
             }
@@ -93,14 +105,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let store = store.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    store.prune_sessions()?;
-                    // 启动时没清完的明文残留（被别的连接的读快照挡住了），在这里重试。
-                    store.retry_pending_scrub()
-                })
-                .await;
-                if let Ok(Err(e)) = result {
+                if let Err(e) = store.prune_sessions().await {
                     tracing::warn!(error = %e, "hourly console maintenance failed");
                 }
             }
@@ -121,16 +126,13 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                let store = state.store.clone();
-                let rows =
-                    match tokio::task::spawn_blocking(move || store.learned_rejections()).await {
-                        Ok(Ok(rows)) => rows,
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "failed to reload learned rules for expiry");
-                            continue;
-                        }
-                        Err(_) => continue,
-                    };
+                let rows = match state.store.learned_rejections().await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to reload learned rules for expiry");
+                        continue;
+                    }
+                };
                 let before = proxy::learned_memory_len(
                     &state.shape_rejections,
                     &state.deprecated_fields,
@@ -143,7 +145,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                     rows,
                 );
                 // 启动时删过一遍，这里一般是空的；库被旧版本进程并行写过才会再有。
-                drop_stale_learned_rules(&state.store, &seeded.stale);
+                drop_stale_learned_rules(&state.store, &seeded.stale).await;
                 let after = seeded.shape + seeded.deprecated + seeded.empty_reply + seeded.refusal;
                 if after != before {
                     tracing::info!(
@@ -160,10 +162,13 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
     // 保活循环每 30min 学一次（下面），模拟会话的握手也会学。这样官方发新版后 luban 不用改
     // 代码，重启也不退回写死的 `CC_LATEST_KNOWN_RELEASE`。
     {
-        sync_latest_release_from_store(&state.store);
+        sync_latest_release_from_store(&state.store).await;
         let store = state.store.clone();
         oauth::LATEST_RELEASE.install_persister(move |v| {
-            store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v))
+            let store = store.clone();
+            Box::pin(async move {
+                store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v)).await
+            })
         });
     }
 
@@ -204,7 +209,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
 
                 // 开关每 tick 重读：网页上拨了下一轮就生效。
                 let send_telemetry = store.forward_flags().keepalive_telemetry;
-                let creds = match store.list() {
+                let creds = match store.list().await {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(error = %e, "keepalive: failed to list credentials");
@@ -234,15 +239,17 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                             tracing::warn!(cred_id = cred.id, cred = %cred.label, error = %reason, "keepalive: proxy unusable, disabling the credential");
                             // 与转发路径的同一分支（`proxy::handle`）口径一致：来源 `proxy`、
                             // 完整错误进 error_message。保活没有来访请求，request_id 留空。
-                            let _ = store.record_ban(
-                                cred.id,
-                                &store::BanContext {
-                                    reason,
-                                    source: "proxy",
-                                    error_message: Some(format!("{e:#}")),
-                                    ..Default::default()
-                                },
-                            );
+                            let _ = store
+                                .record_ban(
+                                    cred.id,
+                                    &store::BanContext {
+                                        reason,
+                                        source: "proxy",
+                                        error_message: Some(format!("{e:#}")),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
                             continue;
                         }
                     };
@@ -267,7 +274,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                         Ok(store::TokenAttempt::Ready(t)) => t,
                         Ok(store::TokenAttempt::Revoked(reason)) => {
                             tracing::warn!(cred_id = cred.id, cred = %cred.label, %reason, "keepalive: refresh_token revoked, disabling");
-                            let _ = store.record_ban(cred.id, &store::refresh_ban(&reason));
+                            let _ = store.record_ban(cred.id, &store::refresh_ban(&reason)).await;
                             continue;
                         }
                         Err(e) => {
@@ -312,7 +319,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                             // 完了」。唯一不撤的是订阅未生效：重来一遍只会再吃同样的 403——停成
                             // 了的号下一轮只刷 token（且被 `seen.retain` 忘掉），没停成的（人工
                             // 停用的号，保活照发）也不该每轮重发一遍启动握手。
-                            if handle_keepalive_rejection(&store, &cred, rej)
+                            if handle_keepalive_rejection(&store, &cred, rej).await
                                 != KeepaliveRejection::SubscriptionInactive
                             {
                                 seen.remove(&cred.id);
@@ -344,7 +351,7 @@ pub(super) fn spawn_background_tasks(state: &AppState) {
                         .await;
                         if let oauth::KeepaliveResult::AuthRejected(rej) = &bo {
                             // 同上：订阅未生效不撤标记。
-                            if handle_keepalive_rejection(&store, &cred, rej)
+                            if handle_keepalive_rejection(&store, &cred, rej).await
                                 != KeepaliveRejection::SubscriptionInactive
                             {
                                 seen.remove(&cred.id);

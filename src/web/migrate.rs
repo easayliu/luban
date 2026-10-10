@@ -56,16 +56,16 @@ const EXPORT_VERSION: u32 = 3;
 /// 未设密码时 [`auth::require_admin`] 已经拦下所有管理接口，这里是兜底：其余管理接口顶多
 /// 是改配置，这条不一样，所以它自己再确认一次门锁着。
 pub(super) async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
-    if !auth::admin_configured(&state) {
+    if !auth::admin_configured(&state).await {
         return Err((
             StatusCode::FORBIDDEN,
             "set an admin password before exporting: this file contains plaintext account tokens"
                 .into(),
         ));
     }
-    let credentials = state.store.export_credentials().map_err(internal)?;
-    let proxies = state.store.export_proxies().map_err(internal)?;
-    let api_keys = state.store.export_api_keys().map_err(internal)?;
+    let credentials = state.store.export_credentials().await.map_err(internal)?;
+    let proxies = state.store.export_proxies().await.map_err(internal)?;
+    let api_keys = state.store.export_api_keys().await.map_err(internal)?;
     let exported_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -168,7 +168,7 @@ pub(super) async fn import(
     // 清空放在导入之前、且只在 replace 下做：先清后导意味着导入失败时库是空的，
     // 所以这个模式在界面上要单独确认（见前端的 ImportDialog）。
     let cleared = if req.mode == ImportMode::Replace {
-        let n = state.store.clear().map_err(internal)?;
+        let n = state.store.clear().await.map_err(internal)?;
         tracing::warn!(cleared = n, "import: cleared all existing credentials first");
         n
     } else {
@@ -185,7 +185,7 @@ pub(super) async fn import(
     };
     // 代理池先于凭证导入：凭证的 `proxy` 字段引用池里的 URL，先建好池条目在管理界面上更直观。
     for (i, p) in req.payload.proxies.iter().enumerate() {
-        match state.store.import_proxy(p) {
+        match state.store.import_proxy(p).await {
             Ok(store::ImportOutcome::Added) => resp.proxies_added += 1,
             Ok(store::ImportOutcome::Updated) => resp.proxies_updated += 1,
             Err(e) => {
@@ -215,7 +215,7 @@ pub(super) async fn import(
             }
             None => c,
         };
-        match state.store.import_credential(c) {
+        match state.store.import_credential(c).await {
             Ok(store::ImportOutcome::Added) => resp.added += 1,
             Ok(store::ImportOutcome::Updated) => resp.updated += 1,
             Err(e) => {
@@ -226,7 +226,7 @@ pub(super) async fn import(
     }
     if req.import_settings {
         for (i, k) in req.payload.api_keys.iter().enumerate() {
-            match state.store.import_api_key(k) {
+            match state.store.import_api_key(k).await {
                 Ok(store::ImportOutcome::Added) => resp.settings_applied += 1,
                 Ok(store::ImportOutcome::Updated) => {}
                 Err(e) => {
@@ -241,14 +241,15 @@ pub(super) async fn import(
         resp.settings_applied += if settings.contains_key(store::LATEST_CC_RELEASE) {
             let mut applied = 0;
             oauth::LATEST_RELEASE
-                .sync_from_store(|| {
-                    applied = state.store.import_settings(&settings)?;
+                .sync_from_store(async {
+                    applied = state.store.import_settings(&settings).await?;
                     read_latest_release_setting(&state.store)
                 })
+                .await
                 .map_err(internal)?;
             applied
         } else {
-            state.store.import_settings(&settings).map_err(internal)?
+            state.store.import_settings(&settings).await.map_err(internal)?
         };
     }
     tracing::info!(

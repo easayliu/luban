@@ -3,9 +3,9 @@
 use super::*;
 
 /// 写一项非负整数设置（负数按 0 存，0 一律表示「不限 / 永不过期」），返回实际写入的值。
-fn save_nonneg(state: &AppState, key: &str, value: i64) -> Result<i64, ApiError> {
+async fn save_nonneg(state: &AppState, key: &str, value: i64) -> Result<i64, ApiError> {
     let value = value.max(0);
-    state.store.set_setting(key, &value.to_string()).map_err(internal)?;
+    state.store.set_setting(key, &value.to_string()).await.map_err(internal)?;
     Ok(value)
 }
 
@@ -20,8 +20,8 @@ pub(super) async fn set_device_ttl(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceTtlReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    save_nonneg(&state, crate::store::DEVICE_BINDING_TTL, req.device_binding_ttl_secs)?;
-    Ok(Json(settings_resp(&state)))
+    save_nonneg(&state, crate::store::DEVICE_BINDING_TTL, req.device_binding_ttl_secs).await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -38,8 +38,9 @@ pub(super) async fn set_device_retention(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceRetentionReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    save_nonneg(&state, crate::store::DEVICE_BINDING_RETENTION, req.device_binding_retention_secs)?;
-    Ok(Json(settings_resp(&state)))
+    save_nonneg(&state, crate::store::DEVICE_BINDING_RETENTION, req.device_binding_retention_secs)
+        .await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -53,8 +54,8 @@ pub(super) async fn set_session_ttl(
     State(state): State<AppState>,
     Json(req): Json<SetSessionTtlReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    save_nonneg(&state, crate::store::SESSION_BINDING_TTL, req.session_binding_ttl_secs)?;
-    Ok(Json(settings_resp(&state)))
+    save_nonneg(&state, crate::store::SESSION_BINDING_TTL, req.session_binding_ttl_secs).await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -72,8 +73,9 @@ pub(super) async fn set_session_retention(
         &state,
         crate::store::SESSION_BINDING_RETENTION,
         req.session_binding_retention_secs,
-    )?;
-    Ok(Json(settings_resp(&state)))
+    )
+    .await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -87,8 +89,8 @@ pub(super) async fn set_default_device_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultDeviceLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    save_nonneg(&state, crate::store::DEFAULT_DEVICE_LIMIT, req.default_device_limit)?;
-    Ok(Json(settings_resp(&state)))
+    save_nonneg(&state, crate::store::DEFAULT_DEVICE_LIMIT, req.default_device_limit).await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -102,8 +104,8 @@ pub(super) async fn set_default_session_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultSessionLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    save_nonneg(&state, crate::store::DEFAULT_SESSION_LIMIT, req.default_session_limit)?;
-    Ok(Json(settings_resp(&state)))
+    save_nonneg(&state, crate::store::DEFAULT_SESSION_LIMIT, req.default_session_limit).await?;
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -117,9 +119,9 @@ pub(super) async fn set_default_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDefaultRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = save_nonneg(&state, crate::store::DEFAULT_RPM_LIMIT, req.default_rpm_limit)?;
+    let limit = save_nonneg(&state, crate::store::DEFAULT_RPM_LIMIT, req.default_rpm_limit).await?;
     tracing::info!(limit, "default rpm limit changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -135,9 +137,9 @@ pub(super) async fn set_device_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetDeviceRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = save_nonneg(&state, crate::store::DEVICE_RPM_LIMIT, req.device_rpm_limit)?;
+    let limit = save_nonneg(&state, crate::store::DEVICE_RPM_LIMIT, req.device_rpm_limit).await?;
     tracing::info!(limit, "per-device rpm limit changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -155,9 +157,9 @@ pub(super) async fn set_session_rpm_limit(
     State(state): State<AppState>,
     Json(req): Json<SetSessionRpmLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = save_nonneg(&state, crate::store::SESSION_RPM_LIMIT, req.session_rpm_limit)?;
+    let limit = save_nonneg(&state, crate::store::SESSION_RPM_LIMIT, req.session_rpm_limit).await?;
     tracing::info!(limit, "per-session rpm limit changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -169,13 +171,11 @@ pub(super) async fn set_session_concurrency_limit(
     State(state): State<AppState>,
     Json(req): Json<SetSessionConcurrencyLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
-    let limit = save_nonneg(
-        &state,
-        crate::store::SESSION_CONCURRENCY_LIMIT,
-        req.session_concurrency_limit,
-    )?;
+    let limit =
+        save_nonneg(&state, crate::store::SESSION_CONCURRENCY_LIMIT, req.session_concurrency_limit)
+            .await?;
     tracing::info!(limit, "per-session concurrency limit changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -195,15 +195,20 @@ pub(super) async fn set_bare_rate_limit(
     Json(req): Json<SetBareRateLimitReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let limit = req.bare_rate_limit.max(0);
-    state.store.set_setting(crate::store::BARE_RATE_LIMIT, &limit.to_string()).map_err(internal)?;
+    state
+        .store
+        .set_setting(crate::store::BARE_RATE_LIMIT, &limit.to_string())
+        .await
+        .map_err(internal)?;
     if let Some(window) = req.bare_rate_window_secs.filter(|w| *w > 0) {
         state
             .store
             .set_setting(crate::store::BARE_RATE_WINDOW_SECS, &window.to_string())
+            .await
             .map_err(internal)?;
     }
     tracing::info!(limit, window = ?req.bare_rate_window_secs, "bare-request rate limit changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -221,9 +226,10 @@ pub(super) async fn set_rate_limit_retry_max(
     state
         .store
         .set_setting(crate::store::RATE_LIMIT_RETRY_MAX, &n.to_string())
+        .await
         .map_err(internal)?;
     tracing::info!(retry_max = n, "upstream-429 credential-swap retry cap changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -248,13 +254,18 @@ pub(super) async fn set_quota_pause_pct(
     Json(req): Json<SetQuotaPausePctReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let pct = req.quota_pause_pct.clamp(0, 100);
-    state.store.set_setting(crate::store::QUOTA_PAUSE_PCT, &pct.to_string()).map_err(internal)?;
+    state
+        .store
+        .set_setting(crate::store::QUOTA_PAUSE_PCT, &pct.to_string())
+        .await
+        .map_err(internal)?;
     // 7d 那档只在传了的时候写：两档各存各的，前端拨一档不该顺手把另一档也覆盖成默认值。
     let pct_7d = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
     if let Some(p) = pct_7d {
         state
             .store
             .set_setting(crate::store::QUOTA_PAUSE_PCT_7D, &p.to_string())
+            .await
             .map_err(internal)?;
     }
     tracing::info!(
@@ -262,7 +273,7 @@ pub(super) async fn set_quota_pause_pct(
         quota_pause_pct_7d = ?pct_7d,
         "quota-threshold scheduling pause changed"
     );
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -278,9 +289,9 @@ pub(super) async fn set_require_device_id(
     Json(req): Json<SetRequireDeviceIdReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     let value = if req.required { "true" } else { "false" };
-    state.store.set_setting(crate::store::REQUIRE_DEVICE_ID, value).map_err(internal)?;
+    state.store.set_setting(crate::store::REQUIRE_DEVICE_ID, value).await.map_err(internal)?;
     tracing::info!(required = req.required, "device identity check toggled");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -299,18 +310,18 @@ pub(super) async fn set_min_client_version(
 ) -> Result<Json<SettingsResp>, ApiError> {
     let version = req.min_client_version.trim();
     if version.is_empty() {
-        state.store.delete_setting(crate::store::MIN_CLIENT_VERSION).map_err(internal)?;
+        state.store.delete_setting(crate::store::MIN_CLIENT_VERSION).await.map_err(internal)?;
         tracing::info!("minimum client version cleared");
-        return Ok(Json(settings_resp(&state)));
+        return Ok(Json(settings_resp(&state).await));
     }
     if crate::proxy::parse_version(version).is_none() {
         return Err(bad_request(
             "the minimum client version must look like 2.1.220 (2 and 2.1 are accepted too)",
         ));
     }
-    state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).map_err(internal)?;
+    state.store.set_setting(crate::store::MIN_CLIENT_VERSION, version).await.map_err(internal)?;
     tracing::info!(version, "minimum client version changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -335,25 +346,27 @@ pub(super) async fn set_latest_cc_release(
     // 写库放进缓存的串行锁里（闭包），别先写库再同步：后台一笔迟到的落库会把这里刚写的盖掉。
     if version.is_empty() {
         oauth::LATEST_RELEASE
-            .sync_from_store(|| {
-                state.store.delete_setting(store::LATEST_CC_RELEASE)?;
+            .sync_from_store(async {
+                state.store.delete_setting(store::LATEST_CC_RELEASE).await?;
                 Ok::<_, anyhow::Error>(None)
             })
+            .await
             .map_err(internal)?;
         tracing::info!("latest Claude Code release cleared; will relearn on the next check");
-        return Ok(Json(settings_resp(&state)));
+        return Ok(Json(settings_resp(&state).await));
     }
     let Some(v) = oauth::parse_release_body(version) else {
         return Err(bad_request("the latest Claude Code release must look like 2.1.260"));
     };
     oauth::LATEST_RELEASE
-        .sync_from_store(|| {
-            state.store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v))?;
+        .sync_from_store(async {
+            state.store.set_setting(store::LATEST_CC_RELEASE, &oauth::release_string(v)).await?;
             Ok::<_, anyhow::Error>(Some(v))
         })
+        .await
         .map_err(internal)?;
     tracing::info!(version = %oauth::release_string(v), "latest Claude Code release set manually");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -378,13 +391,13 @@ pub(super) async fn set_oauth_scopes(
 ) -> Result<Json<SettingsResp>, ApiError> {
     let scopes = crate::config::normalize_scopes(&req.oauth_scopes);
     if scopes.is_empty() {
-        state.store.delete_setting(crate::store::OAUTH_SCOPES).map_err(internal)?;
+        state.store.delete_setting(crate::store::OAUTH_SCOPES).await.map_err(internal)?;
         tracing::info!(scopes = %crate::config::SCOPES, "oauth scopes reset to the default");
-        return Ok(Json(settings_resp(&state)));
+        return Ok(Json(settings_resp(&state).await));
     }
-    state.store.set_setting(crate::store::OAUTH_SCOPES, &scopes).map_err(internal)?;
+    state.store.set_setting(crate::store::OAUTH_SCOPES, &scopes).await.map_err(internal)?;
     tracing::info!(scopes = %scopes, "oauth scopes changed");
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }
 
 /// 转发形态开关的改动请求：**只有出现的字段会被写入**，其余保持原值。
@@ -495,8 +508,12 @@ pub(super) async fn set_forwarding(
         (OPUS_REFUSAL_FALLBACK, req.opus_refusal_fallback),
     ];
     for (key, value) in items.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))) {
-        state.store.set_setting(key, if value { "true" } else { "false" }).map_err(internal)?;
+        state
+            .store
+            .set_setting(key, if value { "true" } else { "false" })
+            .await
+            .map_err(internal)?;
         tracing::info!(key, enabled = value, "forwarding shape toggle changed");
     }
-    Ok(Json(settings_resp(&state)))
+    Ok(Json(settings_resp(&state).await))
 }

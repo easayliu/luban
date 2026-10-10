@@ -1096,6 +1096,9 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
     placeholderData: keepPreviousData,
   })
   const rows = usage.data?.logs ?? []
+  // 不带锚点取的，统计恒有值。
+  const total = usage.data?.total ?? 0
+  const totalCost = usage.data?.total_cost ?? 0
   const noteId = `credential-detail-usage-note-${cred.id}`
 
   return (
@@ -1104,14 +1107,14 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
       title={t('最近请求', 'Recent requests')}
       description={usage.data
         ? t(
-            `近 8 天共 ${usage.data.total.toLocaleString(locale)} 条，费用 ${formatUsd(usage.data.total_cost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
-            `${usage.data.total.toLocaleString(locale)} requests costing ${formatUsd(usage.data.total_cost)} in the last 8 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
+            `近 8 天共 ${total.toLocaleString(locale)} 条，费用 ${formatUsd(totalCost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
+            `${total.toLocaleString(locale)} requests costing ${formatUsd(totalCost)} in the last 8 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
           )
         : t('流水仅保留最近 8 天。', 'Logs are retained for 8 days.')}
       mobileDescription={usage.data
         ? t(
-            `近 8 天 ${usage.data.total.toLocaleString(locale)} 条 · ${formatUsd(usage.data.total_cost)}`,
-            `${usage.data.total.toLocaleString(locale)} in 8 days · ${formatUsd(usage.data.total_cost)}`,
+            `近 8 天 ${total.toLocaleString(locale)} 条 · ${formatUsd(totalCost)}`,
+            `${total.toLocaleString(locale)} in 8 days · ${formatUsd(totalCost)}`,
           )
         : undefined}
       action={(

@@ -54,8 +54,8 @@ fn user_not_found() -> ApiError {
 }
 
 /// 取一个 `actor` 管得着的账号：admin 管全部代理和用户，代理只管自己名下的用户。
-fn manageable(state: &AppState, actor: &Actor, id: i64) -> Result<store::User, ApiError> {
-    let user = state.store.user_by_id(id).map_err(internal)?.ok_or_else(user_not_found)?;
+async fn manageable(state: &AppState, actor: &Actor, id: i64) -> Result<store::User, ApiError> {
+    let user = state.store.user_by_id(id).await.map_err(internal)?.ok_or_else(user_not_found)?;
     let ok = match actor.role {
         UserRole::Admin => matches!(user.role, UserRole::Agent | UserRole::User),
         UserRole::Agent => user.role == UserRole::User && user.parent_id == Some(actor.id),
@@ -90,6 +90,7 @@ pub(super) async fn list_users(
         UserRole::Admin => state.store.list_users(None, true),
         _ => state.store.list_users(Some(actor.id), false),
     }
+    .await
     .map_err(internal)?;
     Ok(Json(list))
 }
@@ -108,7 +109,7 @@ pub(super) async fn create_user(
             UserRole::User => {
                 let parent = req.parent_id.unwrap_or(actor.id);
                 if parent != actor.id {
-                    let p = state.store.user_by_id(parent).map_err(internal)?;
+                    let p = state.store.user_by_id(parent).await.map_err(internal)?;
                     if !p.is_some_and(|p| p.role == UserRole::Agent) {
                         return Err(bad_request("a user can only belong to the admin or an agent"));
                     }
@@ -130,6 +131,7 @@ pub(super) async fn create_user(
     let user = state
         .store
         .create_user(username, &hash, role, parent_id)
+        .await
         .map_err(parent_error)?
         .ok_or_else(|| (StatusCode::CONFLICT, "the username is already taken".to_string()))?;
     tracing::info!(
@@ -146,11 +148,16 @@ pub(super) async fn set_user_password(
     Path(id): Path<i64>,
     Json(req): Json<SetUserPasswordReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = manageable(&state, &actor, id)?;
+    let user = manageable(&state, &actor, id).await?;
     let hash = auth::hash_password(auth::check_new_password(&req.password)?).await?;
     // 写哈希、作废会话与核对管理关系在同一个事务里：算哈希这几十毫秒里用户被转走了的话，
     // 这里写不进去，回 404。
-    if !state.store.reset_managed_user_password(id, &hash, manager_of(&actor)).map_err(internal)? {
+    if !state
+        .store
+        .reset_managed_user_password(id, &hash, manager_of(&actor))
+        .await
+        .map_err(internal)?
+    {
         return Err(user_not_found());
     }
     tracing::info!(by = %actor.username, user_id = id, username = %user.username, "console password reset");
@@ -164,8 +171,13 @@ pub(super) async fn set_user_disabled(
     Path(id): Path<i64>,
     Json(req): Json<SetUserDisabledReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = manageable(&state, &actor, id)?;
-    if !state.store.set_user_disabled(id, req.disabled, manager_of(&actor)).map_err(internal)? {
+    let user = manageable(&state, &actor, id).await?;
+    if !state
+        .store
+        .set_user_disabled(id, req.disabled, manager_of(&actor))
+        .await
+        .map_err(internal)?
+    {
         return Err(user_not_found());
     }
     tracing::info!(
@@ -185,17 +197,17 @@ pub(super) async fn set_user_parent(
     if !actor.is_admin() {
         return Err((StatusCode::FORBIDDEN, "only the admin can move users".into()));
     }
-    let user = manageable(&state, &actor, id)?;
+    let user = manageable(&state, &actor, id).await?;
     if user.role != UserRole::User {
         return Err(bad_request("only users can be moved"));
     }
     if req.parent_id != actor.id {
-        let p = state.store.user_by_id(req.parent_id).map_err(internal)?;
+        let p = state.store.user_by_id(req.parent_id).await.map_err(internal)?;
         if !p.is_some_and(|p| p.role == UserRole::Agent) {
             return Err(bad_request("a user can only belong to the admin or an agent"));
         }
     }
-    state.store.set_user_parent(id, req.parent_id).map_err(parent_error)?;
+    state.store.set_user_parent(id, req.parent_id).await.map_err(parent_error)?;
     tracing::info!(
         by = %actor.username, user_id = id, username = %user.username,
         parent_id = req.parent_id, "console user moved"
@@ -209,8 +221,8 @@ pub(super) async fn delete_user(
     Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = manageable(&state, &actor, id)?;
-    match state.store.delete_user(id, manager_of(&actor)).map_err(internal)? {
+    let user = manageable(&state, &actor, id).await?;
+    match state.store.delete_user(id, manager_of(&actor)).await.map_err(internal)? {
         Ok(()) => {}
         Err(store::DeleteUserError::NotFound | store::DeleteUserError::Protected) => {
             return Err(user_not_found());

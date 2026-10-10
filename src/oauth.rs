@@ -1453,7 +1453,11 @@ pub type ReleaseVersion = (u64, u64, u64);
 
 /// 学到新版本时的落库钩子，见 [`ReleaseCache::install_persister`]。返回 `Err` 表示这次没写成，
 /// 缓存会记着「欠一次落库」，下次拉完 `latest` 再补（[`ReleaseCache::persist_pending`]）。
-type ReleasePersister = Box<dyn Fn(ReleaseVersion) -> anyhow::Result<()> + Send + Sync>;
+type ReleasePersister = Box<
+    dyn Fn(ReleaseVersion) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>>
+        + Send
+        + Sync,
+>;
 
 /// 官方最新 Claude Code 发布版的进程内缓存，与 settings 里的 `latest_cc_release` 互为镜像。
 ///
@@ -1473,9 +1477,9 @@ type ReleasePersister = Box<dyn Fn(ReleaseVersion) -> anyhow::Result<()> + Send 
 ///   缓存值**，而缓存只升不降，所以库里最终就是缓存里的。
 pub struct ReleaseCache {
     state: parking_lot::Mutex<ReleaseState>,
-    /// 串行化落库。拿着它写 SQLite 没问题——它不是 `state` 那把锁，每条请求读上限走的是
-    /// `state`，不会被写库卡住。
-    persist_lock: parking_lot::Mutex<()>,
+    /// 串行化落库，写库期间一直拿着（跨 await，故是 tokio 的锁）。它不是 `state` 那把锁，每条
+    /// 请求读上限走的是 `state`，不会被写库卡住。
+    persist_lock: tokio::sync::Mutex<()>,
     persister: std::sync::OnceLock<ReleasePersister>,
 }
 
@@ -1501,7 +1505,7 @@ impl ReleaseCache {
     pub const fn new() -> Self {
         Self {
             state: parking_lot::Mutex::new(ReleaseState { current: None, persisted: None }),
-            persist_lock: parking_lot::Mutex::new(()),
+            persist_lock: tokio::sync::Mutex::const_new(()),
             persister: std::sync::OnceLock::new(),
         }
     }
@@ -1514,7 +1518,10 @@ impl ReleaseCache {
     /// 装上落库钩子。只装一次，之后的调用忽略。
     pub fn install_persister(
         &self,
-        f: impl Fn(ReleaseVersion) -> anyhow::Result<()> + Send + Sync + 'static,
+        f: impl Fn(ReleaseVersion) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>>
+        + Send
+        + Sync
+        + 'static,
     ) {
         let _ = self.persister.set(Box::new(f));
     }
@@ -1529,12 +1536,12 @@ impl ReleaseCache {
     /// `write` 返回**库里现在的值**（写成什么就返回什么；只读的场景直接读出来返回）。库是权威：
     /// 这一步之后 `current == persisted == v`，不欠落库。会**降**也会清空：导入了一份旧设置、或
     /// 网页上把值删了，缓存就该跟着回去。`write` 失败则缓存不动，错误原样交回。
-    pub fn sync_from_store<E>(
+    pub async fn sync_from_store<E>(
         &self,
-        write: impl FnOnce() -> Result<Option<ReleaseVersion>, E>,
+        write: impl std::future::Future<Output = Result<Option<ReleaseVersion>, E>>,
     ) -> Result<(), E> {
-        let _serial = self.persist_lock.lock();
-        let v = write()?;
+        let _serial = self.persist_lock.lock().await;
+        let v = write.await?;
         let prev = {
             let mut st = self.state.lock();
             let prev = st.current;
@@ -1557,7 +1564,7 @@ impl ReleaseCache {
 
     /// 从网上学到一个版本。**只升不降**：低于或等于当前值的忽略。返回是否更新了缓存。
     /// 无论更新与否都顺手补一次欠着的落库。
-    pub fn learn(&self, v: ReleaseVersion) -> bool {
+    pub async fn learn(&self, v: ReleaseVersion) -> bool {
         let changed = {
             let mut st = self.state.lock();
             match st.current {
@@ -1585,7 +1592,7 @@ impl ReleaseCache {
         if changed {
             note_profile_lag(v);
         }
-        self.persist_pending();
+        self.persist_pending().await;
         changed
     }
 
@@ -1595,9 +1602,9 @@ impl ReleaseCache {
     /// 缓存只升不降，后写的那个写的一定是较新的。写成之后再核一遍缓存没变才标 `persisted`。
     /// 管理员改/删（[`Self::sync_from_store`]）也在这把锁里写库，所以不会有一笔迟到的后台写入
     /// 盖掉管理员刚落的值。
-    pub fn persist_pending(&self) {
+    pub async fn persist_pending(&self) {
         let Some(persist) = self.persister.get() else { return };
-        let _serial = self.persist_lock.lock();
+        let _serial = self.persist_lock.lock().await;
         let target = {
             let st = self.state.lock();
             if st.current == st.persisted {
@@ -1608,7 +1615,7 @@ impl ReleaseCache {
         // `current` 为 `None` 只会来自 `sync_from_store(None)`，那一步已经把 `persisted` 一并
         // 清了，不会走到这儿；防御性地不写「空」。
         let Some(v) = target else { return };
-        match persist(v) {
+        match persist(v).await {
             Ok(()) => {
                 let mut st = self.state.lock();
                 if st.current == Some(v) {
@@ -1676,7 +1683,7 @@ fn note_profile_lag(v: ReleaseVersion) {
 /// 不论结果如何都补一次欠着的落库。
 pub async fn fetch_latest_release(client: &wreq::Client) -> KeepaliveResult {
     let result = fetch_latest_release_inner(client).await;
-    LATEST_RELEASE.persist_pending();
+    LATEST_RELEASE.persist_pending().await;
     result
 }
 
@@ -1694,7 +1701,7 @@ async fn fetch_latest_release_inner(client: &wreq::Client) -> KeepaliveResult {
         match resp.text().await {
             Ok(body) => match parse_release_body(&body) {
                 Some(v) => {
-                    LATEST_RELEASE.learn(v);
+                    LATEST_RELEASE.learn(v).await;
                 }
                 None => tracing::warn!(
                     body = %body.chars().take(80).collect::<String>(),

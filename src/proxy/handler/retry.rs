@@ -251,11 +251,12 @@ async fn on_401(
                 request_id,
                 up_request_id.as_deref(),
             );
-            let _ = state.store.record_ban(cred.id, &ctx);
+            let id = cred.id;
+            let _ = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await;
             true
         }
         AccountRejection::SubscriptionInactive => {
-            park_org_oauth_disallowed(&state.store, cred, 401, "forward_401");
+            park_org_oauth_disallowed(&state.store, cred, 401, "forward_401").await;
             true
         }
         AccountRejection::Other => false,
@@ -451,11 +452,14 @@ async fn on_403(
                 request_id,
                 up_request_id.as_deref(),
             );
-            if let Err(e) = state.store.record_ban(cred.id, &ctx) {
+            let id = cred.id;
+            if let Err(e) =
+                state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await
+            {
                 tracing::warn!(error = %e, "failed to auto-disable the credential");
             }
         } else {
-            park_org_oauth_disallowed(&state.store, cred, 403, "forward_403");
+            park_org_oauth_disallowed(&state.store, cred, 403, "forward_403").await;
         }
         // 换号出去的这一发绕开了 `ReqLog::drop`，失败遥测就地补，报在吃到 403 的号上；
         // 与 401 换号同一口径。
@@ -542,7 +546,13 @@ async fn on_429(
             ratelimit = %info.raw,
             "upstream 429 with no quota window for this model: this account's plan does not include it, remembering that and switching accounts"
         );
-        if let Err(e) = state.store.deny_model(cred.id, model, &reason, info.unified_reset) {
+        let (id, model_owned, reset) = (cred.id, model.to_string(), info.unified_reset);
+        let denial = reason.clone();
+        if let Err(e) = state
+            .store
+            .detached(|s| async move { s.deny_model(id, &model_owned, &denial, reset).await })
+            .await
+        {
             tracing::error!(
                 cred_id = cred.id, cred = %cred.label,
                 error = %e,
@@ -699,7 +709,7 @@ async fn on_429(
         );
         return Flow::Done(resp, upstream_limit);
     }
-    park_rate_limited(&state.store, cred, &scope, cooldown, transient_exhausted);
+    park_rate_limited(&state.store, cred, &scope, cooldown, transient_exhausted).await;
     // 谁的额度都没满（容量/请求速率限制）→ **就此打住，不换号**：这一发 429 不是这个号的
     // 问题，换到下一个号上重发只会撞同一堵墙，并把同一个模型的冷却一路盖到整池——一条客户端
     // 请求最多能盖 swaps.max_retry+1 个号，客户端再自己重试几轮，全部账号的卡片上就都挂着这个模型

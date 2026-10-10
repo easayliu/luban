@@ -106,8 +106,8 @@ async fn upstream_client_decodes_gzip_and_keeps_official_accept_encoding() {
 
 /// 回复里的 `fallback` 块：嗅探器记下作答模型；Drop 时打标签 `served_by_fallback`。
 /// 输出前就被拒的（refusal + 零输出）花费记 0；流到一半被掐的照常计价。
-#[test]
-fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
+#[sqlx::test]
+async fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing(pool: sqlx::PgPool) {
     let mut s = crate::proxy::UsageSniffer::new(false, false);
     s.feed(br#"{"id":"msg_1","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"}},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}"#);
     s.finish();
@@ -115,8 +115,8 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
     assert_eq!(s.model.as_deref(), Some("claude-opus-4-8"), "计价按作答的模型");
     assert!(!s.refused());
 
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let log = |body: &[u8]| {
         let mut sniffer = crate::proxy::UsageSniffer::new(false, false);
         sniffer.feed(body);
@@ -160,11 +160,15 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
     };
     // 1) 输出前被拒：花费 0，标签 refusal。
     log(br#"{"id":"msg_r","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":1200,"output_tokens":0}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 2) fallback 作答：正常计价（按 4.8），标签 served_by_fallback。
     log(br#"{"id":"msg_f","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"}},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":100}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 3) 流到一半被掐（refusal 但有输出）：照常计价。
     log(br#"{"id":"msg_m","model":"claude-opus-5","content":[{"type":"text","text":"part"}],"stop_reason":"refusal","usage":{"input_tokens":1000,"output_tokens":40}}"#);
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 3);
     assert_eq!(logs[2].cost_usd, Some(0.0), "输出前被拒不计费");
     assert_eq!(logs[2].forensics.rewrites.as_deref(), Some("refusal"));
@@ -176,15 +180,20 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
     // 4) 流到一半被掐、但 usage 里没有 output_tokens：正文已经流出来了，不能当「输出前」
     //    记 0——官方口径是已流出的输出与输入都计费。
     log(br#"{"id":"msg_n","model":"claude-opus-5","content":[{"type":"text","text":"part"}],"stop_reason":"refusal","usage":{"input_tokens":1000}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 5) 输出前被拒、usage 里同样没有 output_tokens：仍是 0。
     log(br#"{"id":"msg_z","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":1000}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 6) 半截被掐、正文只有不认识的块类型（服务端工具结果）、usage 缺 output_tokens：
     //    见过内容块就不是「输出前」，照常计价。
     log(br#"{"id":"msg_u","model":"claude-opus-5","content":[{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]}],"stop_reason":"refusal","usage":{"input_tokens":1000}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 7) 主模型与 fallback 都在输出前被拒：正文里只有 `fallback` 切换标记，它不是产出，
     //    仍按「输出前」记 0。
     log(br#"{"id":"msg_ff","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"}}],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"},"usage":{"input_tokens":1000,"output_tokens":0}}"#);
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 7);
     assert_eq!(logs[0].cost_usd, Some(0.0), "只有 fallback 切换标记：仍是输出前被拒");
     assert!(
@@ -201,10 +210,10 @@ fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing() {
 /// 上游回 200 却零输出：收尾时响应体开头落进流水的 `response_excerpt`、标签 `empty_reply`，
 /// 这一类（模型 + max_tokens）学进记忆表并写穿落库；半截流（没等到 `message_stop`）与
 /// 正常回复都不算。
-#[test]
-fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let mem = crate::proxy::EmptyReplyMemory::default();
     let log = |is_stream: bool,
                body: &[u8],
@@ -254,12 +263,14 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
     let empty = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":425,"output_tokens":0}}"#;
     // 1) 非流式零输出：学到 + 落库 + 流水带原文；不是拒答，不按提示词学。
     log(false, empty, Some(("claude-fable-5", 16)), Some(("claude-fable-5", "aa")));
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert_eq!(
         mem.read().classes.get(&("claude-fable-5".to_string(), 16)).map(String::as_str),
         Some(std::str::from_utf8(empty).unwrap())
     );
     assert!(mem.read().prompts.is_empty(), "零输出不是拒答，不按提示词学");
-    let rows = store.learned_rejections().unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let rows = store.learned_rejections().await.unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(
         (
@@ -278,6 +289,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
             Some(("claude-fable-5-1", 1)),
             Some(("claude-fable-5-1", "bb")),
         );
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(!mem.read().classes.contains_key(&("claude-fable-5-1".to_string(), 1)));
     assert!(mem.read().prompts.is_empty());
     // 3) 流式：`message_start` 报 0 但没等到 `message_stop`——半截流，不算零输出。
@@ -287,6 +299,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
             Some(("claude-fable-5", 4)),
             None,
         );
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(!mem.read().classes.contains_key(&("claude-fable-5".to_string(), 4)), "半截流不学");
     // 4) 流式且完整收尾、最终 output_tokens = 0：学。
     log(
@@ -295,14 +308,17 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
             Some(("claude-fable-5", 4)),
             None,
         );
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(mem.read().classes.contains_key(&("claude-fable-5".to_string(), 4)));
     // 5) 不属于任何一类（带 tools 的请求）却回了零输出：流水照记原文，记忆表不动。
     log(false, empty, None, None);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert_eq!(mem.read().classes.len(), 2);
     // 6) 拒答（`stop_reason: "refusal"`，实测 opus-5 + max_tokens 65536 的 cyber 拒答）：
     //    按提示词哈希学，**不**按请求类学——否则一条内容连坐同形态的所有正常请求。
     let refusal = br#"{"model":"claude-opus-5","id":"msg_2","type":"message","role":"assistant","content":[],"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"blocked"},"usage":{"input_tokens":1200,"output_tokens":0}}"#;
     log(false, refusal, Some(("claude-opus-5", 65536)), Some(("claude-opus-5", "deadbeef")));
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(
         !mem.read().classes.contains_key(&("claude-opus-5".to_string(), 65536)),
         "拒答不能学成请求类"
@@ -321,7 +337,8 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
         mem.read().app_counters.get(&("claude-opus-5".to_string(), "app-deadbeef".to_string())),
         Some(&crate::proxy::AppCounter { total: 1, refused: 1 })
     );
-    let rows = store.learned_rejections().unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let rows = store.learned_rejections().await.unwrap();
     assert!(rows.iter().all(|r| r.kind != "app_refusal"));
     let refused_row = rows.iter().find(|r| r.kind == "refusal").expect("拒答规则落库");
     assert_eq!(
@@ -337,11 +354,13 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
             Some(("claude-opus-5", 65536)),
             Some(("claude-opus-5", "cafe")),
         );
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "cafe".to_string())));
     assert!(!mem.read().classes.contains_key(&("claude-opus-5".to_string(), 65536)));
 
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 流水（倒序）：7、6、5、4、1 带原文，2、3 不带；标签按种类分。
-    let logs = store.list_usage_logs(10).unwrap();
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 7);
     let excerpted: Vec<bool> =
         logs.iter().map(|l| l.forensics.response_excerpt.is_some()).collect();
@@ -404,6 +423,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
     assert!(
         store
             .learned_rejections()
+            .await
             .unwrap()
             .iter()
             .any(|r| r.kind == "refusal" && r.value == "cafe" && r.message == cafe),
@@ -414,6 +434,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
     //    **不学**。
     let model_refusal = br#"{"model":"claude-opus-5","id":"msg_3","type":"message","role":"assistant","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":null,"explanation":null},"usage":{"input_tokens":1200,"output_tokens":0}}"#;
     log(false, model_refusal, Some(("claude-opus-5", 65536)), Some(("claude-opus-5", "f00d")));
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(
         !mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "f00d".to_string())),
         "模型自己的拒绝不能锁提示词"
@@ -421,6 +442,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
     // 9) 带 recommended_model 的拒答：fallback 模型限流没跑成，直接重试可能就成——不学。
     let unserved = br#"{"model":"claude-opus-5","id":"msg_4","type":"message","role":"assistant","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","recommended_model":"claude-opus-4-8"},"usage":{"input_tokens":1200,"output_tokens":0}}"#;
     log(false, unserved, Some(("claude-opus-5", 65536)), Some(("claude-opus-5", "beef")));
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(
         !mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "beef".to_string())),
         "fallback 没跑成的拒答不能锁提示词"
@@ -434,6 +456,7 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
             None,
             Some(("claude-opus-5", "m1d")),
         );
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     assert!(
         !mem.read().prompts.contains_key(&("claude-opus-5".to_string(), "m1d".to_string())),
         "流到一半才被掐的拒答没有可回放的响应，不学"
@@ -447,14 +470,16 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
         mem.read().app_counters.get(&("claude-opus-5".to_string(), "app-m1d".to_string())),
         Some(&crate::proxy::AppCounter { total: 1, refused: 0 })
     );
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 10);
     assert_eq!(logs[0].forensics.rewrites.as_deref(), Some("refusal"));
     assert_eq!(logs[1].forensics.rewrites.as_deref(), Some("refusal"));
     assert_eq!(logs[2].forensics.rewrites.as_deref(), Some("refusal"));
     assert!(logs[0].forensics.response_excerpt.is_some());
     assert!(logs[1].forensics.response_excerpt.is_some());
-    let rows = store.learned_rejections().unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let rows = store.learned_rejections().await.unwrap();
     assert!(
         rows.iter().all(|r| r.kind != "refusal" || matches!(r.value.as_str(), "deadbeef" | "cafe")),
         "落库的拒答规则只有分类器判决那两条"
@@ -463,10 +488,10 @@ fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop() {
 
 /// 两份 UA 各存各的：入站记来访那份、出站记实际发出去那份，`-` 占位一律还原成 NULL
 /// （存进去就成了一个真实存在的 UA，按 UA 分组时会凭空多出一类）。
-#[test]
-fn client_ua_lands_in_the_usage_log() {
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn client_ua_lands_in_the_usage_log(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let log = |ua: &str, ua_out: &str| {
         drop(crate::proxy::ReqLog {
             started: std::time::Instant::now(),
@@ -508,13 +533,17 @@ fn client_ua_lands_in_the_usage_log() {
     };
     // 非模拟路径：来访那份原样转发，两列相同。
     log(config::CC_USER_AGENT, config::CC_USER_AGENT);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 模拟路径：来访是第三方客户端，出站换成官方那串——正是分两列才看得见的东西。
     log("python-httpx/0.27.0", config::CC_USER_AGENT);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 两边都没有（裸请求且开关关到不补头）。
     log("-", "-");
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
 
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 倒序：后写的那条在前。
-    let logs = store.list_usage_logs(10).unwrap();
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 3);
     assert_eq!(logs[0].ua, None, "没带 UA 的请求不该存成 `-`");
     assert_eq!(logs[0].ua_out, None);
@@ -529,10 +558,10 @@ fn client_ua_lands_in_the_usage_log() {
 /// 标签。客户端会收到一个自己不认识的 tool_use，这是注入策略的已知代价；此前只在文档里
 /// 写着「概率低」，没有任何一处量过——流水的 `shape` 只记 tool_use 个数，遥测那张表又把
 /// 名字归了类。调的是客户端自己的工具（假名 `mcp__luban__*`）或没注过的名字，不打标签。
-#[test]
-fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log() {
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let build = |injected: Vec<&'static str>| crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,
@@ -590,26 +619,32 @@ data: {\"type\":\"message_stop\"}
     let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
     rl.sniffer.feed(&reply("Bash"));
     drop(rl);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 调的是客户端自己的工具（假名）→ 不打。
     let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
     rl.sniffer.feed(&reply("mcp__luban__query_bas00"));
     drop(rl);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 非模拟路径（没注过）调 Bash → 不打：那是客户端自己声明的 Bash。
     let mut rl = build(Vec::new());
     rl.sniffer.feed(&reply("Bash"));
     drop(rl);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 来访没带工具、替它补了（`fill_absent_tools`）：打 `tools_filled`；模型真调了注入的
     // 工具再加一个 `injected_tool_called`。
     let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
     rl.tools_filled = true;
     rl.sniffer.feed(&reply("mcp__luban__query_bas00"));
     drop(rl);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     let mut rl = build(vec!["Bash", "Edit", "Read", "Write"]);
     rl.tools_filled = true;
     rl.sniffer.feed(&reply("Bash"));
     drop(rl);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
 
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 5);
     // list 按时间倒序：最后写入的在前。
     let tags: Vec<Option<&str>> =
@@ -634,10 +669,10 @@ data: {\"type\":\"message_stop\"}
 /// 随后上游发 `event: error`，我们原样透传，客户端报错，而服务端只留下一行
 /// `forwarded status=200 has_usage=true`，还照常算了花费——唯一的线索是
 /// `output_tokens` 小得离谱（实测那次是 2）。
-#[test]
-fn mid_stream_error_is_billed_as_the_mapped_status() {
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+#[sqlx::test]
+async fn mid_stream_error_is_billed_as_the_mapped_status(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let mut rl = crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,
@@ -683,7 +718,8 @@ fn mid_stream_error_is_billed_as_the_mapped_status() {
         );
     drop(rl);
 
-    let logs = store.list_usage_logs(10).unwrap();
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status, 529, "流中途报错不能记成 200——失败会从成功率里消失");
     assert_eq!(logs[0].model.as_deref(), Some("claude-opus-5"), "用量照旧嗅探，不受影响");
@@ -696,11 +732,11 @@ fn mid_stream_error_is_billed_as_the_mapped_status() {
 /// ——于是同一条 `tengu_api_success` 里，`requestId`/token 来自重试那一发，而
 /// `messageCount`/`inputTextCharLength`/`toolsCount` 算的是**一条被上游拒了的请求**。
 /// prefill 那条尤其明显：[`crate::proxy::strip_assistant_prefill`] 直接弹掉末尾的 assistant 轮。
-#[test]
-fn a_successful_retry_reports_the_body_it_actually_sent() {
+#[sqlx::test]
+async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool) {
     use base64::Engine as _;
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     let sink = crate::telemetry::Telemetry::default();
     // 首发：3 条消息，末条是 assistant prefill。重试：剥掉它，只剩 2 条。
     let body = |msgs: &str| -> Bytes {
@@ -776,6 +812,7 @@ fn a_successful_retry_reports_the_body_it_actually_sent() {
     rl.note_retry("no_prefill", &h, &retried, None);
     assert_eq!(rl.upstream_request_id.as_deref(), Some("req_retry"));
     drop(rl);
+    sink.settle().await;
 
     // 取走这一批（把「到期」时间推远，攒批规则就不拦着了）。
     let flushes = sink.take_due(std::time::Instant::now() + std::time::Duration::from_secs(3_600));
@@ -799,8 +836,9 @@ fn a_successful_retry_reports_the_body_it_actually_sent() {
         "体长度也得是实际发出去那份"
     );
 
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
     // 取证的形态摘要同理——它要回答的是「发出去的到底长什么样」。
-    let logged = &store.list_usage_logs(1).unwrap()[0];
+    let logged = &store.list_usage_logs(1).await.unwrap()[0];
     let shape: serde_json::Value =
         serde_json::from_str(logged.forensics.shape.as_deref().unwrap()).unwrap();
     assert_eq!(shape["messages"]["count"], 2, "shape 列也要是重试那份");
@@ -1068,8 +1106,8 @@ fn mid_stream_error_maps_to_the_non_streaming_status() {
 }
 
 /// 端到端：上游在流中报 overloaded → 客户端拿到 529 + 那份错误 JSON 原文。
-#[tokio::test]
-async fn mid_stream_error_reaches_the_client_with_a_mapped_status() {
+#[sqlx::test]
+async fn mid_stream_error_reaches_the_client_with_a_mapped_status(pool: sqlx::PgPool) {
     let sse = concat!(
         r#"data: {"type":"message_start","message":{"id":"msg_err","content":[],"usage":{}}}"#,
         "\n\n",
@@ -1077,7 +1115,7 @@ async fn mid_stream_error_reaches_the_client_with_a_mapped_status() {
         r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         "\n\n",
     );
-    let (status, ctype, body) = relay_sse(sse).await;
+    let (status, ctype, body) = relay_sse(pool.clone(), sse).await;
 
     assert_eq!(status.as_u16(), 529, "上游那个 200 不能照搬——它其实是一次失败");
     assert_eq!(ctype.as_deref(), Some("application/json"));
@@ -1108,8 +1146,8 @@ fn truncated_stream_is_incomplete_not_a_partial_message() {
 /// 端到端走一遍聚合回程：起一个吐 SSE 的本地上游，`aggregate_sse` 必须回一条
 /// `content-type: application/json` 的整段 Message——客户端本来就是按非流式发的，
 /// 它认的是这个形态。
-#[tokio::test]
-async fn aggregated_response_is_a_single_json_message() {
+#[sqlx::test]
+async fn aggregated_response_is_a_single_json_message(pool: sqlx::PgPool) {
     let sse = concat!(
         "event: message_start\n",
         r#"data: {"type":"message_start","message":{"id":"msg_e2e","type":"message","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":9}}}"#,
@@ -1126,7 +1164,7 @@ async fn aggregated_response_is_a_single_json_message() {
         r#"data: {"type":"message_stop"}"#,
         "\n\n",
     );
-    let (status, ctype, body) = relay_sse(sse).await;
+    let (status, ctype, body) = relay_sse(pool.clone(), sse).await;
 
     assert_eq!(status, crate::proxy::StatusCode::OK);
     assert_eq!(ctype.as_deref(), Some("application/json"), "上游那份 text/event-stream 必须被替掉");
@@ -1140,8 +1178,8 @@ async fn aggregated_response_is_a_single_json_message() {
 
 /// 流断在半路 → 502，且**不带**攒了一半的内容：截断的 Message 会被客户端当成模型的
 /// 真实输出写进会话历史，比一个明确的错误糟得多。
-#[tokio::test]
-async fn truncated_upstream_stream_yields_502() {
+#[sqlx::test]
+async fn truncated_upstream_stream_yields_502(pool: sqlx::PgPool) {
     let sse = concat!(
         r#"data: {"type":"message_start","message":{"id":"msg_cut","content":[],"usage":{}}}"#,
         "\n\n",
@@ -1150,7 +1188,7 @@ async fn truncated_upstream_stream_yields_502() {
         r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半句"}}"#,
         "\n\n",
     );
-    let (status, _, body) = relay_sse(sse).await;
+    let (status, _, body) = relay_sse(pool.clone(), sse).await;
 
     assert_eq!(status, crate::proxy::StatusCode::BAD_GATEWAY);
     assert!(!String::from_utf8_lossy(&body).contains("半句"), "截断的内容不该回给客户端");
@@ -1158,7 +1196,10 @@ async fn truncated_upstream_stream_yields_502() {
 
 /// 起一个吐 `sse` 的本地上游，取回响应交给 [`crate::proxy::aggregate_sse`]，
 /// 返回 (状态码, content-type, 响应体)。
-async fn relay_sse(sse: &str) -> (crate::proxy::StatusCode, Option<String>, Bytes) {
+async fn relay_sse(
+    pool: sqlx::PgPool,
+    sse: &str,
+) -> (crate::proxy::StatusCode, Option<String>, Bytes) {
     let mut resp = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
         sse.len()
@@ -1173,7 +1214,7 @@ async fn relay_sse(sse: &str) -> (crate::proxy::StatusCode, Option<String>, Byte
         .await
         .unwrap();
 
-    let out = crate::proxy::aggregate_sse(up, req_log(), None).await;
+    let out = crate::proxy::aggregate_sse(up, req_log(pool.clone()).await, None).await;
     server.join().unwrap();
     let status = out.status();
     let ctype =
@@ -1183,9 +1224,9 @@ async fn relay_sse(sse: &str) -> (crate::proxy::StatusCode, Option<String>, Byte
 }
 
 /// 聚合路径要一份 `ReqLog`（它在 Drop 里落日志与用量）；这里给一份最小可用的。
-fn req_log() -> crate::proxy::ReqLog {
-    let store = std::sync::Arc::new(crate::store::CredentialStore::open_in_memory().unwrap());
-    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).unwrap();
+async fn req_log(pool: sqlx::PgPool) -> crate::proxy::ReqLog {
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
     crate::proxy::ReqLog {
         started: std::time::Instant::now(),
         ttft_ms: None,

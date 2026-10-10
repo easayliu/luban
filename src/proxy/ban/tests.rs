@@ -211,13 +211,13 @@ fn detects_org_oauth_disallowed() {
 
 /// 暂停写进库：号出池、不带恢复时刻、原因可读且带固定片段，不落封号事件；连通性测试
 /// 那条恢复认得出它。
-#[test]
-fn park_org_oauth_disallowed_pauses_until_resumed() {
+#[sqlx::test]
+async fn park_org_oauth_disallowed_pauses_until_resumed(pool: sqlx::PgPool) {
     use crate::proxy::park_org_oauth_disallowed;
-    let store = crate::store::CredentialStore::open_in_memory().unwrap();
-    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).unwrap();
-    assert!(park_org_oauth_disallowed(&store, &a, 403, "forward"));
-    let got = store.get(a.id).unwrap().unwrap();
+    let store = std::sync::Arc::new(crate::store::CredentialStore::for_test(pool.clone()).await);
+    let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+    assert!(park_org_oauth_disallowed(&store, &a, 403, "forward").await);
+    let got = store.get(a.id).await.unwrap().unwrap();
     assert!(got.disabled && got.resume_at.is_none());
     assert_eq!(
         got.ban_reason.as_deref(),
@@ -225,10 +225,10 @@ fn park_org_oauth_disallowed_pauses_until_resumed() {
             "[subscription-inactive 403] organization does not allow OAuth authentication (subscription lapsed, or a Free plan without one); paused until enabled manually or a connectivity test passes"
         )
     );
-    assert!(store.list_ban_events(None, 10).unwrap().is_empty(), "暂停不是封号，不落事件");
+    assert!(store.list_ban_events(None, 10).await.unwrap().is_empty(), "暂停不是封号，不落事件");
     assert!(got.is_subscription_paused() && !got.is_banned());
-    assert!(!park_org_oauth_disallowed(&store, &a, 403, "keepalive"), "已暂停的不重写");
-    assert!(store.resume_if_subscription_suspended(a.id).unwrap());
+    assert!(!park_org_oauth_disallowed(&store, &a, 403, "keepalive").await, "已暂停的不重写");
+    assert!(store.resume_if_subscription_suspended(a.id).await.unwrap());
 }
 
 /// 「被判成第三方应用」的那条 400 要认出来，普通 400 不能误认。

@@ -229,9 +229,9 @@ fn reads_speed_from_request_body() {
 /// 也明确允许 `device_id` 为 `None`——两段一旦调了个个儿，这类探活又会拿到 403，下游照旧把
 /// 整个 key 摘下去；二、本地以 200 收尾的请求不标 `local_replay` 就会从流水、请求查询与
 /// 统计里整个消失（0.3.98 把本地 403 改成回放 200 时正是这样漏掉的）。
-#[tokio::test]
-async fn a_device_less_probe_is_answered_locally_and_logged() {
-    let store = std::sync::Arc::new(store::CredentialStore::open_in_memory().unwrap());
+#[sqlx::test]
+async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
     assert!(store.require_device_id(), "这条用例的前提是设备身份闸开着");
     assert!(store.forward_flags().reject_probes, "这条用例的前提是探针开关开着");
     let state = crate::web::AppState::for_test(store.clone());
@@ -267,7 +267,7 @@ async fn a_device_less_probe_is_answered_locally_and_logged() {
     // 流水是 `spawn_blocking` 写的，等它落下来（最多 2 秒，正常几毫秒）。
     let mut rows = Vec::new();
     for _ in 0..200 {
-        rows = store.list_usage_logs(10).unwrap();
+        rows = store.list_usage_logs(10).await.unwrap();
         if !rows.is_empty() {
             break;
         }
@@ -286,12 +286,12 @@ async fn a_device_less_probe_is_answered_locally_and_logged() {
 
 /// 开关关掉之后同一条探活照常往下走（走到没有可用账号那步），确认上面那条 200 是
 /// `reject_probes` 给的，而不是别的什么早退路径顺手回的。
-#[tokio::test]
-async fn the_same_probe_goes_on_when_the_switch_is_off() {
-    let store = std::sync::Arc::new(store::CredentialStore::open_in_memory().unwrap());
+#[sqlx::test]
+async fn the_same_probe_goes_on_when_the_switch_is_off(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
     // `"0"` / `"false"` 才算关，别的取值一律算开，见 `store::setting_is_on`。
-    store.set_setting(store::REJECT_PROBES, "0").unwrap();
-    store.set_setting(store::REQUIRE_DEVICE_ID, "0").unwrap();
+    store.set_setting(store::REJECT_PROBES, "0").await.unwrap();
+    store.set_setting(store::REQUIRE_DEVICE_ID, "0").await.unwrap();
     let state = crate::web::AppState::for_test(store.clone());
     let body = serde_json::json!({
             "model": "claude-opus-5",

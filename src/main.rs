@@ -7,6 +7,7 @@ mod admin_ui;
 mod auth;
 mod clients;
 mod config;
+mod config_file;
 mod credentials;
 mod oauth;
 mod pricing;
@@ -17,11 +18,13 @@ mod web;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use store::CredentialStore;
 
+/// 命令行参数。每一项也能写在数据目录的 `config.toml` 里（见 [`config_file`]），
+/// 命令行 > 环境变量 > 配置文件。
 #[derive(Parser)]
 #[command(name = "luban", version, about = "Claude Code authorization proxy")]
 struct Cli {
@@ -31,18 +34,22 @@ struct Cli {
     /// Web service port (used when running without a subcommand).
     #[arg(long, default_value_t = 4600)]
     port: u16,
-    /// API key used by clients such as Claude Code; also available through LUBAN_API_KEY.
+    /// PostgreSQL connection URL, e.g. postgres://user:password@localhost/luban; also available
+    /// through LUBAN_DATABASE_URL or `database_url` in the config file.
+    #[arg(long, env = "LUBAN_DATABASE_URL")]
+    database_url: Option<String>,
+    /// API key used by clients such as Claude Code; also available through LUBAN_API_KEY or `api_key` in the config file.
     /// If unset, the proxy does not authenticate callers; use it only on a trusted local network.
     #[arg(long, env = "LUBAN_API_KEY")]
     api_key: Option<String>,
-    /// Admin console password; also available through LUBAN_ADMIN_PASSWORD.
+    /// Admin console password; also available through LUBAN_ADMIN_PASSWORD or `admin_password` in the config file.
     /// Admin APIs reject every request until a password is set, either here or in the console with the setup token printed in the log.
-    /// A CLI or environment value takes precedence and makes the web setting read-only.
+    /// A value set here, in the environment or in the config file takes precedence and makes the web setting read-only.
     #[arg(long, env = "LUBAN_ADMIN_PASSWORD")]
     admin_password: Option<String>,
-    /// Read-only viewer password; also available through LUBAN_VIEWER_PASSWORD.
+    /// Read-only viewer password; also available through LUBAN_VIEWER_PASSWORD or `viewer_password` in the config file.
     /// Viewers can browse the console but cannot change anything. Only takes effect once an admin password is set.
-    /// A CLI or environment value takes precedence and makes the web setting read-only.
+    /// A value set here, in the environment or in the config file takes precedence and makes the web setting read-only.
     #[arg(long, env = "LUBAN_VIEWER_PASSWORD")]
     viewer_password: Option<String>,
     /// Open a browser after startup (off by default).
@@ -64,19 +71,34 @@ enum Command {
 async fn main() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
-    let store = Arc::new(CredentialStore::open_default()?);
+    let file = config_file::ConfigFile::load()?;
+    let non_blank = |v: Option<String>| v.filter(|k| !k.trim().is_empty());
+    let database_url =
+        non_blank(cli.database_url).or(non_blank(file.database_url)).with_context(|| {
+            format!(
+                "no PostgreSQL connection URL: set database_url in ./luban.toml or {} (e.g. \
+             database_url = \"postgres://user:password@localhost/luban\"), or pass \
+             --database-url / LUBAN_DATABASE_URL. With Docker, use the docker-compose.yml from \
+             the repository (or rerun install.sh), which adds a postgres service",
+                config_file::ConfigFile::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )
+        })?;
+    let store = Arc::new(store::db::open(&database_url).await?);
 
     match cli.command {
         // 不带子命令：直接启动网页服务 + 转发代理。
         None => {
-            let api_key = cli.api_key.filter(|k| !k.trim().is_empty());
-            let admin_password = cli.admin_password.filter(|k| !k.trim().is_empty());
-            let viewer_password = cli.viewer_password.filter(|k| !k.trim().is_empty());
+            let api_key = non_blank(cli.api_key).or(non_blank(file.api_key));
+            let admin_password = non_blank(cli.admin_password).or(non_blank(file.admin_password));
+            let viewer_password =
+                non_blank(cli.viewer_password).or(non_blank(file.viewer_password));
             web::run(&cli.host, cli.port, cli.open, store, api_key, admin_password, viewer_password)
                 .await
         }
-        Some(Command::Status) => status(&store),
-        Some(Command::Logout) => logout(&store),
+        Some(Command::Status) => status(&store, &database_url).await,
+        Some(Command::Logout) => logout(&store).await,
     }
 }
 
@@ -96,8 +118,8 @@ fn init_logging() {
 }
 
 /// 列出所有凭证。
-fn status(store: &CredentialStore) -> Result<()> {
-    let list = store.list()?;
+async fn status(store: &CredentialStore, database_url: &str) -> Result<()> {
+    let list = store.list().await?;
     if list.is_empty() {
         println!(
             "No credentials saved. Run `luban` without a subcommand to open the web UI and add an account."
@@ -107,7 +129,7 @@ fn status(store: &CredentialStore) -> Result<()> {
     println!(
         "Saved credentials ({}; database: {}):",
         list.len(),
-        CredentialStore::db_path()?.display()
+        store::db::describe_url(database_url)
     );
     for c in &list {
         let state = if c.disabled {
@@ -123,8 +145,8 @@ fn status(store: &CredentialStore) -> Result<()> {
 }
 
 /// 清空所有凭证。
-fn logout(store: &CredentialStore) -> Result<()> {
-    let n = store.clear()?;
+async fn logout(store: &CredentialStore) -> Result<()> {
+    let n = store.clear().await?;
     if n > 0 {
         let noun = if n == 1 { "credential" } else { "credentials" };
         println!("Cleared {n} {noun}, including associated device bindings and usage history.");

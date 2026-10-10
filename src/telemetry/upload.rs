@@ -251,7 +251,7 @@ pub async fn run_flusher(
             continue;
         }
         for f in due {
-            let Ok(Some(cred)) = store.get(f.cred_id) else { continue };
+            let Ok(Some(cred)) = store.get(f.cred_id).await else { continue };
             // 订阅未生效暂停中的号同样不发：上游对它每一发都是 403。
             if cred.is_banned() || cred.is_subscription_paused() {
                 continue;

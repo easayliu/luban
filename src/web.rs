@@ -176,7 +176,7 @@ pub async fn run(
     let state = AppState {
         clients,
         pkce: Arc::new(parking_lot::Mutex::new(Vec::new())),
-        store,
+        store: store.clone(),
         client_key: client_key.clone(),
         admin_env: admin_password.map(Arc::new),
         viewer_env: viewer_password.map(Arc::new),
@@ -193,12 +193,12 @@ pub async fn run(
         upstream_base: crate::config::UPSTREAM_BASE_URL.into(),
     };
 
-    spawn_background_tasks(&state);
+    spawn_background_tasks(&state).await;
 
-    auth::sync_env_accounts(&state);
+    auth::sync_env_accounts(&state).await;
 
     // 未设管理密码时，启动日志里要给出初始化口令（`state` 下面会被 move 进路由）。
-    let setup_token = (!auth::admin_configured(&state)).then(|| state.setup_token.clone());
+    let setup_token = (!auth::admin_configured(&state).await).then(|| state.setup_token.clone());
 
     let app = router(state);
 
@@ -241,6 +241,8 @@ pub async fn run(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("the web server exited unexpectedly")?;
+    // 在途请求都结束了，它们的流水还在后台往库里写，等写完再退出。
+    store.drain_writes(std::time::Duration::from_secs(5)).await;
     Ok(())
 }
 
@@ -310,22 +312,6 @@ async fn log_api_failures(
         tracing::warn!(%method, %path, status = status.as_u16(), "admin api failed");
     }
     resp
-}
-
-/// 把一段同步的 store 调用挪到阻塞线程池里跑。
-///
-/// 后台的统计查询走只读连接（`store::CredentialStore::read_conn`），一次可能几百毫秒；
-/// 直接在 handler 里调，占着（或等着那把锁的）就是 tokio 工作线程，恰好驱动定时器与 IO 的
-/// 那个一卡，所有在途的 SSE 都跟着停。**凡是会碰只读连接的 handler 都要经过这里**——
-/// 哪怕它自己的查询很便宜，也可能排在别人的慢查询后面等锁。
-async fn blocking<T, F>(f: F) -> Result<T, ApiError>
-where
-    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| internal(format!("admin query task failed: {e}")))?
 }
 
 fn internal(e: impl std::fmt::Display) -> ApiError {

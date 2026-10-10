@@ -45,10 +45,11 @@ pub(super) struct UsageQuery {
 /// 一页流水 + 整个集合的口径。前端要靠 `total` 算页数、靠 `anchor` 把整轮翻页钉在同一快照上。
 #[derive(serde::Serialize)]
 pub(super) struct UsagePage {
-    /// 满足筛选（含 `until` 上界）的总条数。
-    pub(super) total: i64,
-    /// 同一集合的花费合计（USD）。
-    total_cost: f64,
+    /// 满足筛选（含 `until` 上界）的总条数。请求带了 `until`（翻后续页）时为 null：同一个锚点
+    /// 下集合不变，沿用第一页拿到的即可，不再每翻一页把整个集合重新数一遍、加一遍。
+    pub(super) total: Option<i64>,
+    /// 同一集合的花费合计（USD），何时为 null 同 `total`。
+    total_cost: Option<f64>,
     /// 本轮翻页的锚点：请求里带了 `until` 就是它，否则是当前最大 id；空集为 null。
     anchor: Option<i64>,
     pub(super) logs: Vec<store::UsageLog>,
@@ -65,11 +66,11 @@ pub(super) async fn list_usage(
 ) -> Result<Json<UsagePage>, ApiError> {
     let owner = actor.scope().owner();
     if let (Some(owner), Some(cred)) = (owner, q.cred_id)
-        && state.store.credential_owner(cred).map_err(internal)? != Some(owner)
+        && state.store.credential_owner(cred).await.map_err(internal)? != Some(owner)
     {
         return Err(not_found());
     }
-    blocking(move || usage_page(&state, q.cred_id, owner, &q, 100, 1000)).await
+    usage_page(&state, q.cred_id, owner, &q, 100, 1000).await
 }
 
 /// 列出某凭证的请求流水（按时间倒序，页码翻页）。
@@ -84,10 +85,10 @@ pub(super) async fn list_credential_usage(
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsagePage>, ApiError> {
     // 与设备明细同口径：凭证不存在给 404，免得前端把「账号已被删」显示成「没有请求」。
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    blocking(move || usage_page(&state, Some(id), None, &q, 25, 200)).await
+    usage_page(&state, Some(id), None, &q, 25, 200).await
 }
 
 #[derive(Serialize)]
@@ -106,14 +107,12 @@ pub(super) async fn get_credential_stats(
     Path(id): Path<i64>,
     Query(q): Query<SeriesQuery>,
 ) -> Result<Json<CredentialStatsResp>, ApiError> {
-    if state.store.get(id).map_err(internal)?.is_none() {
+    if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
     let (since, bucket_secs, tz) = q.normalized();
-    let stats = blocking(move || {
-        state.store.credential_stats(id, since, bucket_secs, tz, 20).map_err(internal)
-    })
-    .await?;
+    let stats =
+        state.store.credential_stats(id, since, bucket_secs, tz, 20).await.map_err(internal)?;
     Ok(Json(CredentialStatsResp { since, bucket_secs, stats }))
 }
 
@@ -122,7 +121,7 @@ pub(super) async fn get_credential_stats(
 ///
 /// **统计与记录必须同锚点**：先算 total 再另取一次 max(id) 当锚点的话，两次之间新写入的
 /// 请求会让 total 比锚点下真正翻得到的条数多，最后一页于是空着。
-fn usage_page(
+async fn usage_page(
     state: &AppState,
     cred_id: Option<i64>,
     owner_id: Option<i64>,
@@ -148,12 +147,19 @@ fn usage_page(
         session_id: q.session_id.clone(),
         owner_id,
     };
-    let stats = state.store.usage_log_stats(filter.clone()).map_err(internal)?;
-    // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
-    filter.until_id = q.until.or(stats.max_id);
+    // 带了锚点就是在翻同一轮的后续页：集合没变，统计沿用第一页的（前端留着），不重算——
+    // 无筛选时这是一次全表的 COUNT/SUM，每翻一页都扫一遍不值当。
+    let (total, total_cost) = if q.until.is_some() {
+        (None, None)
+    } else {
+        let stats = state.store.usage_log_stats(filter.clone()).await.map_err(internal)?;
+        // 首次请求没有锚点，就用这一刻的最大 id 当锚点——统计与记录都在它之下，两者自洽。
+        filter.until_id = stats.max_id;
+        (Some(stats.total), Some(stats.cost_usd))
+    };
     let anchor = filter.until_id;
-    let logs = state.store.query_usage_logs(filter).map_err(internal)?;
-    Ok(Json(UsagePage { total: stats.total, total_cost: stats.cost_usd, anchor, logs }))
+    let logs = state.store.query_usage_logs(filter).await.map_err(internal)?;
+    Ok(Json(UsagePage { total, total_cost, anchor, logs }))
 }
 
 #[derive(Deserialize)]
@@ -177,7 +183,7 @@ pub(super) async fn list_ban_events(
 ) -> Result<Json<Vec<store::BanEvent>>, ApiError> {
     if let Scope::Owner(owner) = actor.scope() {
         let owned = match q.cred_id {
-            Some(id) => state.store.credential_owner(id).map_err(internal)? == Some(owner),
+            Some(id) => state.store.credential_owner(id).await.map_err(internal)? == Some(owner),
             None => false,
         };
         if !owned {
@@ -185,8 +191,7 @@ pub(super) async fn list_ban_events(
         }
     }
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let events =
-        blocking(move || state.store.list_ban_events(q.cred_id, limit).map_err(internal)).await?;
+    let events = state.store.list_ban_events(q.cred_id, limit).await.map_err(internal)?;
     Ok(Json(events))
 }
 
@@ -219,8 +224,6 @@ pub(super) async fn list_ban_event_logs(
 ) -> Result<Json<FrozenLogPage>, ApiError> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let offset = q.offset.unwrap_or(0).max(0);
-    let (total, logs) =
-        blocking(move || state.store.frozen_usage_logs(id, limit, offset).map_err(internal))
-            .await?;
+    let (total, logs) = state.store.frozen_usage_logs(id, limit, offset).await.map_err(internal)?;
     Ok(Json(FrozenLogPage { total, logs }))
 }

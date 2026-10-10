@@ -1045,7 +1045,7 @@ for (const cred of previewCredentials) {
   queryClient.setQueryData(['credential-sessions', cred.id], queryClient.getQueryData(['credential-sessions', cred.id]) ?? [])
 }
 queryClient.setQueryData<BanEvent[]>(['ban-events'], queryClient.getQueryData<BanEvent[]>(['ban-events', 1, previewCredentials.find((c) => c.id === 1)?.ban_count ?? 0]) ?? [])
-queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 25], {
+queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 'first', 25], {
   total: 37,
   total_cost: 1.2846,
   anchor: previewUsageLogs[0]?.id ?? null,

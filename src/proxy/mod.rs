@@ -98,7 +98,7 @@ use body::{
     sim_device_id, sim_session_key, stream_requested, strip_extra_fields, sync_metadata_session,
     trusted_cc_version, trusted_cc_version_against, with_outbound_identity,
 };
-pub(crate) use body::{SESSION_KEY_VERSION, has_cache_ttl_1h, parse_version};
+pub(crate) use body::{has_cache_ttl_1h, parse_version};
 
 mod upstream;
 use upstream::Upstream;
@@ -584,7 +584,7 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
 /// - `--api-key` / `LUBAN_API_KEY` 设的那把：用全部号；
 /// - 库里启用中的接入 Key：用它绑定的分组（没绑 = 全部号）；
 /// - 两边都没有配置任何 Key：不校验，用全部号——与老版本「没配接入 Key 就放行」一致。
-fn client_access(
+async fn client_access(
     state: &AppState,
     headers: &HeaderMap,
 ) -> anyhow::Result<Option<store::KeyAccess>> {
@@ -596,11 +596,11 @@ fn client_access(
         return Ok(Some(all()));
     }
     if let Some(k) = key
-        && let Some(access) = state.store.api_key_access(k)?
+        && let Some(access) = state.store.api_key_access(k).await?
     {
         return Ok(Some(access));
     }
-    if state.client_key.is_none() && !state.store.api_keys_required()? {
+    if state.client_key.is_none() && !state.store.api_keys_required().await? {
         return Ok(Some(all()));
     }
     Ok(None)
