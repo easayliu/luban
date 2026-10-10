@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { GlobeIcon, MapPinIcon, PlayIcon, XIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
@@ -176,8 +176,19 @@ export function ProxyPickerCombobox({
   placeholder?: string
 }) {
   const { t } = useI18n()
-  const byId = (id: number) => proxies.find((p) => p.id === id)
-  const ids = proxies.map((p) => p.id)
+  // 按 id 建索引并预先拼好小写检索串：filter 每次按键对每一项都要跑一遍，
+  // 逐项 find + 现拼字符串是 O(n²)，代理池一大输入就卡。
+  const { byIdMap, ids } = useMemo(() => {
+    const map = new Map<number, { proxy: SavedProxy; haystack: string }>()
+    for (const p of proxies) {
+      map.set(p.id, {
+        proxy: p,
+        haystack: `${p.label} ${p.url} ${p.credential_labels.join(' ')}`.toLowerCase(),
+      })
+    }
+    return { byIdMap: map, ids: proxies.map((p) => p.id) }
+  }, [proxies])
+  const byId = (id: number) => byIdMap.get(id)?.proxy
 
   return (
     <Combobox
@@ -195,9 +206,7 @@ export function ProxyPickerCombobox({
       filter={(id, query) => {
         const q = query.trim().toLowerCase()
         if (!q) return true
-        const p = byId(id as number)
-        if (!p) return false
-        return `${p.label} ${p.url} ${p.credential_labels.join(' ')}`.toLowerCase().includes(q)
+        return byIdMap.get(id as number)?.haystack.includes(q) ?? false
       }}
     >
       <ComboboxTrigger aria-label={ariaLabel} className="w-full min-w-0 flex-1">
@@ -215,8 +224,8 @@ export function ProxyPickerCombobox({
             <ComboboxItem key={p.id} value={p.id}>
               <Hint
                 label={p.credential_labels.length > 0
-                  ? `${p.url}\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}`
-                  : p.url}
+                  ? `${proxyMaskedUrl(p.url)}\n${t('使用账号', 'Used by')}: ${p.credential_labels.join(', ')}`
+                  : proxyMaskedUrl(p.url)}
               >
                 <div className="min-w-0">
                   <div className="flex items-baseline gap-2">

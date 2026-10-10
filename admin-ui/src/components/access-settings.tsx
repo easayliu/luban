@@ -215,10 +215,15 @@ export function DeviceSettingsContent() {
       <SettingsGroup
         icon={GaugeIcon}
         title={t('设备绑定与容量', 'Device bindings & capacity')}
-        description={t(
-          '适用于带设备身份的客户端请求：设置设备占用账号名额的时长、名额释放后优先使用原账号的期限，以及每个账号默认可容纳的设备数。转发设置中「设备指纹归一化」与「改写设备 ID」均启用时，上游看到的设备数已经收敛，名额改按会话计算，设备上限不生效；设备绑定只用于让同一台设备的新会话优先使用原账号。',
-          'For client requests with a device identity: how long a device holds its slot, how long it keeps preferring its original account, and how many devices each account holds by default. When both "Normalize device fingerprint" and "Rewrite device ID" are on in forwarding settings, upstream sees only a few devices per account, so slots are counted per session and the device limit does not apply; device bindings then only steer a device\'s new sessions back to its original account.',
-        )}
+        description={settingsQuery.data?.devices_by_session
+          ? t(
+              '带设备身份的请求：名额释放时长与原账号保留期。转发策略已开启「设备指纹归一化」与「改写设备 ID」，名额改按会话计算，设备上限不生效。',
+              'Requests with a device identity: slot lifetime and account affinity. "Normalize device fingerprint" and "Rewrite device ID" are on, so slots are counted per session and the device limit does not apply.',
+            )
+          : t(
+              '带设备身份的请求：名额释放时长、原账号保留期与设备上限。',
+              'Requests with a device identity: slot lifetime, account affinity, and device limit.',
+            )}
       >
         <DeviceBindingTtl />
         <DeviceBindingRetention />
@@ -230,8 +235,8 @@ export function DeviceSettingsContent() {
         icon={MessagesSquareIcon}
         title={t('会话绑定与容量', 'Session bindings & capacity')}
         description={t(
-          '客户端请求按对话占用会话名额：设备上限不生效时的真实客户端，以及经模拟路径、没有设备身份的请求。设置对话闲置多久后释放名额、名额释放后优先使用原账号的期限，以及每个账号默认可同时活跃的会话数。',
-          'Client requests take one session slot per conversation: real clients whenever the device limit does not apply, and requests on the simulation path without a device identity. Set how long an idle conversation keeps its slot, how long it keeps preferring its original account, and how many sessions each account may keep active by default.',
+          '按对话计名额的请求：名额释放时长、原账号保留期与会话上限。',
+          'Requests counted per conversation: slot lifetime, account affinity, and session limit.',
         )}
       >
         <SessionBindingTtl />
@@ -243,8 +248,8 @@ export function DeviceSettingsContent() {
         icon={TimerIcon}
         title={t('转发速率', 'Request rate')}
         description={t(
-          '限制单个账号、单台设备和单个会话每分钟可转发的请求数，以及单个会话的最大并发数。RPM 与账号列表中 RPM 列的统计口径一致；并发上限用于防止 Claude Desktop 缓存预热时的突发请求超出上游速率限制。',
-          'Cap how many requests a single account, device, or session forwards per minute, and the maximum concurrency per session. RPM is counted the same way as the RPM column in the account list; the concurrency cap keeps Claude Desktop\'s cache-warming burst from exceeding upstream rate limits.',
+          '按账号、设备、会话限制每分钟请求数与并发数。',
+          'Per-minute request and concurrency caps by account, device, and session.',
         )}
       >
         <DefaultRpmLimit />
@@ -269,8 +274,8 @@ export function DeviceSettingsContent() {
         icon={TerminalIcon}
         title={t('客户端版本', 'Client version')}
         description={t(
-          '依据 User-Agent 中声明的 claude-cli 版本进行判断：拦截版本过旧的 Claude Code，并将声明版本高于官方最新版的客户端识别为非官方客户端；其他客户端不受影响。',
-          'Based on the claude-cli version self-reported in the User-Agent: block outdated Claude Code builds, and treat clients claiming a version newer than the latest official release as unofficial. Other clients are unaffected.',
+          '按 User-Agent 中的 claude-cli 版本拦截旧版、识别非官方客户端。',
+          'Block outdated builds and spot unofficial clients by the claude-cli version in the User-Agent.',
         )}
       >
         <MinClientVersion />
@@ -299,8 +304,8 @@ export function SecuritySettingsContent() {
         icon={EyeIcon}
         title={t('访客密码', 'Viewer password')}
         description={t(
-          '以访客密码登录后可查看控制台的全部页面，但无法进行任何修改；接入 Key 与代理密码对访客打码显示，且不可导出数据。',
-          'Signing in with the viewer password gives read-only access to every page of the console; nothing can be changed. Access keys and proxy passwords are masked for viewers, and export is unavailable.',
+          '访客只读查看控制台：接入 Key 与代理密码打码，不能修改或导出。',
+          'Viewers get read-only access: keys and proxy passwords are masked, and nothing can be changed or exported.',
         )}
       >
         <ViewerPassword />
@@ -556,8 +561,8 @@ function DefaultRpmLimit() {
       invalidateCredentials
       label={t('默认 RPM 上限', 'Default RPM limit')}
       description={t(
-        '未单独配置的账号使用此上限；账号独立设置优先。达到上限后新请求分流到其他账号，已绑定的设备收到 429 与 retry-after。',
-        'Accounts without an individual limit use this value; account-specific settings take priority. Once the limit is reached, new requests go to another account and already-bound devices get a 429 with retry-after.',
+        '未单独配置的账号使用此上限；账号独立设置优先。达到上限后新请求分流到其他账号，已绑定的设备收到 429 与 retry-after。统计口径与账号列表的 RPM 列一致。',
+        'Accounts without an individual limit use this value; account-specific settings take priority. Once the limit is reached, new requests go to another account and already-bound devices get a 429 with retry-after. Counted the same way as the RPM column in the account list.',
       )}
       note={(parsed) => (
         <Badge variant="secondary" size="sm">

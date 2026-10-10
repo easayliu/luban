@@ -238,10 +238,13 @@ function DurationField({
   // 数值框与单位下拉拼成一个整体（Group 收掉相接处的圆角与重复边框）：两者说的是同一个量，
   // 分开摆读起来像两项设置。Group 只认直接子元素，而数值框的边框画在里层的 NumberFieldGroup
   // 上，所以右侧圆角得在那一层自己收。
+  // Group 给直接子元素挂 before: 工具类，会顺带生成 ::before（content: ""）。数值框根是
+  // flex-col gap-2，这个 ::before 成了占位子项，多出一截 gap，把整组撑高 8px：数值框下沉、
+  // 单位下拉被拉高。根上的 ::before 本就不画东西（斜面阴影在 NumberFieldGroup 上），直接隐藏。
   return (
     <Group className="min-w-0 flex-1 sm:flex-none">
       <NumberField
-        className="min-w-0 flex-1 sm:w-32 sm:flex-none"
+        className="min-w-0 flex-1 before:hidden sm:w-32 sm:flex-none"
         min={0}
         step={1}
         smallStep={0.5}

@@ -195,8 +195,8 @@ export function ProxyPoolSettingsContent() {
         icon={GlobeIcon}
         title={t('代理池', 'Proxy pool')}
         description={t(
-          '集中管理可复用的出站代理地址。添加后可在各账号的代理设置中快速选取，也可通过批量操作一次性分配给多个账号。',
-          'Manage reusable outbound proxy addresses. Once added, they can be quickly selected in each account’s proxy settings or assigned to multiple accounts via batch actions.',
+          '可复用的出站代理地址，可在账号代理设置中选取或批量分配。',
+          'Reusable outbound proxies to pick per account or assign in bulk.',
         )}
       >
         {/* 手机上名称独占一行、地址与「添加」同一行：三样硬挤一行时两个输入框各只剩 90 来 px，
