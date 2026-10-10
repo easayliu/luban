@@ -1112,14 +1112,18 @@ function AdminPassword() {
   const authQuery = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const { data } = authQuery
   const [password, setPassword] = useState('')
+  // 当前密码：修改与清除都要带（后端核对，答错回 403）。清除确认框里另有一栏，互不串用。
+  const [current, setCurrent] = useState('')
+  const [clearCurrent, setClearCurrent] = useState('')
   const [clearOpen, setClearOpen] = useState(false)
 
   const save = useMutation({
-    mutationFn: changePassword,
-    onSuccess: (_result, nextPassword) => {
+    mutationFn: ({ next, current }: { next: string; current: string }) => changePassword(next, current),
+    onSuccess: (_result, { next: nextPassword }) => {
       setClearOpen(false)
       if (nextPassword) {
         setPassword('')
+        setCurrent('')
         toastManager.add({
           title: t('管理密码已设置', 'Admin password set'),
           description: t('新的管理密码已生效，其他设备上的登录已退出。', 'The new admin password is active; sign-ins on other devices were signed out.'),
@@ -1196,7 +1200,13 @@ function AdminPassword() {
           </FieldDescription>
         ) : (
           <>
-            <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+            <div className="grid w-full gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]">
+              <PasswordInput
+                ariaLabel={t('当前管理密码', 'Current admin password')}
+                onChange={setCurrent}
+                placeholder={t('当前密码', 'Current password')}
+                value={current}
+              />
               <PasswordInput
                 ariaLabel={t('新管理密码', 'New admin password')}
                 onChange={setPassword}
@@ -1205,8 +1215,8 @@ function AdminPassword() {
               />
               <Button
                 loading={save.isPending}
-                disabled={password.trim().length < MIN_PASSWORD_LENGTH}
-                onClick={() => save.mutate(password.trim())}
+                disabled={password.trim().length < MIN_PASSWORD_LENGTH || current.trim().length === 0}
+                onClick={() => save.mutate({ next: password.trim(), current: current.trim() })}
               >
                 <KeyRoundIcon />
                 {t('修改', 'Change')}
@@ -1214,7 +1224,7 @@ function AdminPassword() {
               <Button
                 variant="destructive-outline"
                 disabled={save.isPending}
-                onClick={() => setClearOpen(true)}
+                onClick={() => { setClearCurrent(''); setClearOpen(true) }}
               >
                 <Trash2Icon />
                 {t('清除', 'Clear')}
@@ -1240,6 +1250,14 @@ function AdminPassword() {
               )}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="px-4 pb-4 sm:px-6">
+            <PasswordInput
+              ariaLabel={t('当前管理密码', 'Current admin password')}
+              onChange={setClearCurrent}
+              placeholder={t('输入当前密码以确认', 'Enter the current password to confirm')}
+              value={clearCurrent}
+            />
+          </div>
           <AlertDialogFooter>
             <AlertDialogClose render={<Button disabled={save.isPending} variant="ghost" />}>
               {t('取消', 'Cancel')}
@@ -1247,7 +1265,8 @@ function AdminPassword() {
             <Button
               loading={save.isPending}
               variant="destructive"
-              onClick={() => save.mutate('')}
+              disabled={clearCurrent.trim().length === 0}
+              onClick={() => save.mutate({ next: '', current: clearCurrent.trim() })}
             >
               {t('确认清除', 'Clear password')}
             </Button>

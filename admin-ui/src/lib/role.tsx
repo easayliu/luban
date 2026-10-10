@@ -1,5 +1,6 @@
+import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getMe, type Me, type Role } from '@/api/auth'
+import { getMe, type Me, type MemberCaps, type Role } from '@/api/auth'
 import { ROLE_KEY, getToken } from '@/api/client'
 
 const ROLES: readonly Role[] = ['admin', 'viewer', 'agent', 'user']
@@ -40,6 +41,7 @@ export function useMe() {
             admin_env_managed: false,
             viewer_configured: false,
             viewer_env_managed: false,
+            member_caps: null,
           }
         : undefined
     },
@@ -93,4 +95,55 @@ export function useCanManageUsers(): boolean {
 export function useConfirmedRole(): Role | null {
   const me = useMe()
   return me.isPlaceholderData ? null : (me.data?.role ?? null)
+}
+
+/**
+ * 代理和用户改自己号的调度参数时能到的边（见 [MemberCaps]）；管理员与访客为 null（不受限）。
+ * 界面据此收窄可选项，免得点了保存才收到 403。
+ *
+ * **单独一个查询，不用 [useMe] 那份**：身份缓存是 `staleTime: Infinity`（身份在会话期间不变），
+ * 而这几个边跟着全局设置走，管理员一改就变。
+ *
+ * **`active` 由编辑控件传「此刻是否打开」**：对话框关着时组件也常驻挂载，`staleTime` 只把
+ * 数据标成过期、不会自己去取，全局又关了切回标签页时重取——只靠这两样，管理员放宽之后号主
+ * 重开对话框看到的还是旧的边。所以在打开的那一刻（数据已过期时）主动重取一次；切回标签页
+ * 时这个查询也单独开了重取。
+ *
+ * 默认 `false`：账号列表每一行的菜单、详情页的优先级下拉也在用它（只读 P2 这一档，不会变），
+ * 那些地方挂载时 React Query 自己会按过期重取，不必再各自主动取。
+ */
+export function useMemberCaps(active = false): MemberCaps | null {
+  const me = useMe().data
+  const role = me?.role ?? roleHint()
+  const member = role === 'agent' || role === 'user'
+  const { data, isStale, refetch } = useQuery({
+    queryKey: ['member-caps'],
+    queryFn: async () => (await getMe()).member_caps ?? null,
+    enabled: member && !!getToken(),
+    staleTime: 10_000,
+    refetchOnWindowFocus: true,
+  })
+  // 只在「打开」这一下判一次；把 isStale 也放进依赖的话，开着的对话框每 10 秒就重取一次。
+  // `cancelRefetch: false`：已有一次在途就跟着它，不取消重发——默认会取消在途的那次再发一次，
+  // 而被取消的 HTTP 请求其实照跑，几个控件同时打开就是几倍的请求。
+  useEffect(() => {
+    if (active && member && isStale) void refetch({ cancelRefetch: false })
+  }, [active, member]) // eslint-disable-line react-hooks/exhaustive-deps
+  // 还没取回来时先用登录时那份，免得刚打开时选项先放开、再收回去。
+  return member ? (data ?? me?.member_caps ?? null) : null
+}
+
+/**
+ * 三态上限（跟随默认 / 不限 / 独立上限）在天花板 `cap` 下的约束：`cap` 为 null 或 0 不设边。
+ * 有边时「不限」不能选、自定义值最大到 `cap`。管理员给的宽限（这个号现在就是「不限」，或
+ * 独立上限高过 `cap`）例外：原样保留不算放宽，后端不写也不拦，所以「不限」照留、输入框的
+ * 上限放到现值（`max`），否则一打开编辑就被改成别的、保存时把宽限悄悄收掉。介于 `cap`
+ * 与现值之间的数后端会拒。批量设置不传 `current`。
+ */
+export function limitCap(
+  cap: number | null | undefined,
+  current?: number,
+): { allowUnlimited: boolean; cap?: number; max?: number } {
+  if (!cap) return { allowUnlimited: true }
+  return { allowUnlimited: (current ?? 0) < 0, cap, max: Math.max(cap, current ?? 0) }
 }

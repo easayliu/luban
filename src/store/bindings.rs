@@ -20,7 +20,11 @@ pub struct DeviceBinding {
     /// 所以这个数覆盖的时间范围可能比 `request_count` 更长。
     pub cost_usd: f64,
     /// 该设备在**所有凭证**上的累计费用（USD）；用来看清换号后仍在烧钱的同一台设备。
-    pub cost_usd_all: f64,
+    ///
+    /// 给代理和用户看的明细里为 `None`、不出这个字段：它把别人名下的号上的花销也算进来了，
+    /// 号主看到等于看到全池在这台设备上的用量。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_all: Option<f64>,
 }
 
 /// 一条**模拟会话**绑定（`session_bindings` 的一行），供后台列表用。口径与
@@ -149,7 +153,7 @@ impl CredentialStore {
                     created_at: r.try_get(3)?,
                     last_seen_at: r.try_get(4)?,
                     cost_usd: r.try_get(5)?,
-                    cost_usd_all: r.try_get(6)?,
+                    cost_usd_all: Some(r.try_get(6)?),
                     simulated: r.try_get::<i32, _>(0)? == 1,
                 })
             })
@@ -427,7 +431,8 @@ mod tests {
         assert_eq!(d.device_id, sim);
         assert_eq!(d.request_count, 3, "没有 usage 的那条也要计数");
         assert!((d.cost_usd - 0.03).abs() < 1e-9, "本账号费用: {}", d.cost_usd);
-        assert!((d.cost_usd_all - 0.08).abs() < 1e-9, "跨账号合计: {}", d.cost_usd_all);
+        let all = d.cost_usd_all.unwrap();
+        assert!((all - 0.08).abs() < 1e-9, "跨账号合计: {all}");
         assert_eq!(d.created_at, None, "没有绑定就没有绑定时刻");
         assert_eq!(d.last_seen_at, None);
 
@@ -648,7 +653,8 @@ mod tests {
         let d = &store.list_devices(a).await.unwrap()[0];
         assert_eq!(d.device_id, "dev-1");
         assert!((d.cost_usd - 0.75).abs() < 1e-9, "本账号只算 a 上的花费：{}", d.cost_usd);
-        assert!((d.cost_usd_all - 1.75).abs() < 1e-9, "合计要含 b 上的：{}", d.cost_usd_all);
+        let all = d.cost_usd_all.unwrap();
+        assert!((all - 1.75).abs() < 1e-9, "合计要含 b 上的：{all}");
 
         // 没有任何用量日志的设备给 0，而不是 NULL 取值失败。
         assert_eq!(

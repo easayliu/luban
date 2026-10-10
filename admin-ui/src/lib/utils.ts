@@ -95,6 +95,8 @@ const FIXED_BACKEND_MESSAGES: readonly LocalizedBackendMessage[] = [
   ['用户名须为 2～32 个字符', 'the username must be 2 to 32 characters'],
   ['用户名只能包含字母、数字和 _ - . @', 'the username may only contain letters, digits and _ - . @'],
   ['用户名已被占用', 'the username is already taken'],
+  ['当前密码不正确', 'the current password is incorrect'],
+  ['密码错误次数过多，请稍后再试', 'too many failed password attempts; try again in a few minutes'],
   ['用户不存在', 'user not found'],
   ['只能新建代理或用户', 'only agents and users can be created'],
   ['代理只能新建用户', 'agents can only create users'],
@@ -162,6 +164,35 @@ function localizeKnownBackendMessage(message: string, language: Language, depth:
   const owned = message.match(/^this account still owns (\d+) credentials; delete them first$/)
   if (owned) {
     return language === 'zh-CN' ? `该账号名下还有 ${owned[1]} 个号，请先删除` : message
+  }
+  const stricter = message.match(/^(priority|device limit|session limit|rpm limit|quota pause threshold): agents and users can only set values stricter than the global default$/)
+  if (stricter) {
+    const field: Record<string, string> = {
+      priority: '优先级最高只能设到 P2',
+      'device limit': '设备上限',
+      'session limit': '会话上限',
+      'rpm limit': 'RPM 上限',
+      'quota pause threshold': '提前暂停调度阈值',
+    }
+    return language === 'zh-CN'
+      ? stricter[1] === 'priority'
+        ? `${field.priority}，且不能比当前更高`
+        : `${field[stricter[1]]}只能设得比全局默认更严`
+      : message
+  }
+  const internalProxy = message.match(/^the proxy host (.+) points to a local or private address \((.+)\); only the admin can use such proxies$/)
+  if (internalProxy) {
+    return language === 'zh-CN'
+      ? `代理主机 ${internalProxy[1]} 指向本机或内网地址（${internalProxy[2]}），只有管理员可以使用此类代理`
+      : message
+  }
+  const unresolved = message.match(/^could not resolve the proxy host (.+?): (.+)$/)
+  if (unresolved) {
+    return language === 'zh-CN' ? `无法解析代理主机 ${unresolved[1]}：${unresolved[2]}` : message
+  }
+  const resolveTimeout = message.match(/^resolving the proxy host (.+) timed out$/)
+  if (resolveTimeout) {
+    return language === 'zh-CN' ? `解析代理主机 ${resolveTimeout[1]} 超时` : message
   }
 
   const localizeDetail = (detail: string) => depth < 3

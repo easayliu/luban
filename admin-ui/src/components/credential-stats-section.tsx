@@ -8,6 +8,7 @@ import {
   type CredentialStatsGroup,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
+import { useSeesWholePool } from '@/lib/role'
 import {
   cn,
   extractError,
@@ -189,6 +190,7 @@ function legendOf(metric: Metric, t: Translate): ChartLegendItem[] {
  */
 export function CredentialStatsSection({ cred }: { cred: Credential }) {
   const { t, locale } = useI18n()
+  const full = useSeesWholePool()
   const [range, setRange] = useState<RangeKey>('7d')
   const [metric, setMetric] = useState<Metric>('requests')
   const [view, setView] = useState<'chart' | 'table'>('chart')
@@ -218,10 +220,15 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
     <DetailSection
       icon={ChartColumnIcon}
       title={t('用量统计', 'Usage statistics')}
-      description={t(
-        `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 30 天。`,
-        `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 30 days.`,
-      )}
+      description={full
+        ? t(
+            `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 30 天。`,
+            `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 30 days.`,
+          )
+        : t(
+            `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、状态码的拆分。流水只保留 30 天。`,
+            `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model and status. Logs are kept for 30 days.`,
+          )}
       action={(
         <>
           {refetching && <Spinner />}
@@ -593,6 +600,10 @@ function StatsBreakdown({
   refetching: boolean
 }) {
   const { t, language } = useI18n()
+  // 代理和用户：按设备、按客户端是下游使用者的身份，后端不给（见 `web::usage::get_credential_stats`），
+  // 两个切换项一并不出。
+  const full = useSeesWholePool()
+  const dimensions: Dimension[] = full ? ['model', 'device', 'client', 'status'] : ['model', 'status']
   const [by, setBy] = useState<Dimension>('model')
   const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
   const rows = data?.[`by_${by}`] ?? []
@@ -625,12 +636,12 @@ function StatsBreakdown({
           value={[by]}
           onValueChange={(values) => {
             const next = values[values.length - 1]
-            if (next === 'model' || next === 'device' || next === 'client' || next === 'status') setBy(next)
+            if (dimensions.includes(next as Dimension)) setBy(next as Dimension)
           }}
           variant="outline"
           aria-label={t('拆分维度', 'Breakdown dimension')}
         >
-          {(['model', 'device', 'client', 'status'] as Dimension[]).map((key, i) => (
+          {dimensions.map((key, i) => (
             <Fragment key={key}>
               {i > 0 && <ToggleGroupSeparator />}
               <ToggleGroupItem value={key} aria-label={byLabel[key]}>{byLabel[key]}</ToggleGroupItem>

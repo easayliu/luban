@@ -28,7 +28,7 @@ import {
 } from '@/api/credentials'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useMemberCaps, useReadOnly } from '@/lib/role'
 import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
@@ -1318,6 +1318,9 @@ function ScheduleSection({
   const edit = (onClick: () => void) => readOnly ? null : (
     <Button type="button" size="sm" variant="outline" onClick={onClick}>{t('修改', 'Edit')}</Button>
   )
+  // 代理和用户最高只能调到 P2、已经更高的只能往下调（见 MemberCaps）；更高的档留在列表里但
+  // 不可选——管理员给的 P0 照样显示得出来。
+  const minPriority = Math.min(useMemberCaps()?.min_priority ?? 0, cred.priority)
   const priorityItems = PRIORITY_TIERS.map((_, p) => ({ value: String(p), label: `P${p} ${priorityTierName(p, t)}` }))
   // 访客只看档位，不给下拉。
   const priorityControl = readOnly ? (
@@ -1333,7 +1336,7 @@ function ScheduleSection({
       {/* 行内控件：弹层在下方展开，不盖住触发器与同一行的说明。 */}
       <SelectPopup alignItemWithTrigger={false}>
         {priorityItems.map((item) => (
-          <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+          <SelectItem key={item.value} value={item.value} disabled={Number(item.value) < minPriority}>{item.label}</SelectItem>
         ))}
       </SelectPopup>
     </Select>

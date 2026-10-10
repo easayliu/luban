@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { PercentIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useMemberCaps, useReadOnly } from '@/lib/role'
 import { displayCredentialLabel } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { type CredentialActions } from '@/components/credential-shared'
@@ -40,16 +40,34 @@ function policyFromPct(pct: number | null): QuotaPolicy {
   return 'custom'
 }
 
-function pctFromPolicy(policy: QuotaPolicy, custom: number): number | null {
-  if (policy === 'default') return null
-  if (policy === 'off') return 0
-  return Math.min(100, Math.max(1, Math.floor(custom)))
+/**
+ * 「该窗口停用」能不能选。`cap` 是代理和用户能设的最高阈值（见 [MemberCaps]），`0` 为不设边
+ * （管理员，或全局这一档本来就不停）。有边时一般不能选——除非这一档现在就是「停用」（管理员
+ * 给的）：两档是整份提交的，号主只改另一档时得能把它原样带回去，后端也放行原值。
+ */
+function allowOff(cap: number, current: number | null): boolean {
+  return cap === 0 || current === 0
 }
 
-/** 自定义值的初值：本来就是独立阈值就沿用它，否则拿生效值起步（多半就是想在它附近调），再兜底 90。 */
-function customSeed(pct: number | null, effective: number): number {
-  if (pct !== null && pct > 0) return pct
-  return effective > 0 ? effective : 90
+/**
+ * 自定义阈值输入框能到的最大值：不设边（`cap` 为 0）是 100；有边是 `cap`，但这一档现在就是
+ * 高过 `cap` 的独立阈值（管理员给的）时放到现值——原样保留后端不写也不拦，压到 `cap` 就等于
+ * 只改另一档时把这一档的宽限悄悄收掉。介于 `cap` 与现值之间的数后端会拒。
+ */
+function customMax(cap: number, current: number | null): number {
+  return cap ? Math.max(cap, current ?? 0) : 100
+}
+
+function pctFromPolicy(policy: QuotaPolicy, custom: number, max: number): number | null {
+  if (policy === 'default') return null
+  if (policy === 'off') return 0
+  return Math.min(max, Math.max(1, Math.floor(custom)))
+}
+
+/** 自定义值的初值：本来就是独立阈值就沿用它，否则拿生效值起步（多半就是想在它附近调），再兜底 90；不超过 `max`。 */
+function customSeed(pct: number | null, effective: number, max: number): number {
+  const seed = pct !== null && pct > 0 ? pct : effective > 0 ? effective : 90
+  return Math.min(seed, max)
 }
 
 /**
@@ -69,35 +87,41 @@ export function CredentialQuotaDialog({
 }) {
   const { t, language } = useI18n()
   const readOnly = useReadOnly()
+  const caps = useMemberCaps(open)
+  const shortCap = caps?.quota_pause_pct ?? 0
+  const longCap = caps?.quota_pause_pct_7d ?? 0
+  const shortMax = customMax(shortCap, cred.quota_pause_pct)
+  const longMax = customMax(longCap, cred.quota_pause_pct_7d)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [shortPolicy, setShortPolicy] = useState<QuotaPolicy>(() => policyFromPct(cred.quota_pause_pct))
   const [shortCustom, setShortCustom] = useState(() =>
-    customSeed(cred.quota_pause_pct, cred.quota_pause_pct_effective))
+    customSeed(cred.quota_pause_pct, cred.quota_pause_pct_effective, shortMax))
   const [longPolicy, setLongPolicy] = useState<QuotaPolicy>(() => policyFromPct(cred.quota_pause_pct_7d))
   const [longCustom, setLongCustom] = useState(() =>
-    customSeed(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective))
+    customSeed(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective, longMax))
 
   // 每次打开都从服务端那份重置：上次改了一半没保存就关掉的残留留到下次，会让人以为它已经生效。
   useEffect(() => {
     if (!open) return
     setShortPolicy(policyFromPct(cred.quota_pause_pct))
-    setShortCustom(customSeed(cred.quota_pause_pct, cred.quota_pause_pct_effective))
+    setShortCustom(customSeed(cred.quota_pause_pct, cred.quota_pause_pct_effective, shortMax))
     setLongPolicy(policyFromPct(cred.quota_pause_pct_7d))
-    setLongCustom(customSeed(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective))
+    setLongCustom(customSeed(cred.quota_pause_pct_7d, cred.quota_pause_pct_7d_effective, longMax))
   }, [
     open,
     cred.quota_pause_pct,
     cred.quota_pause_pct_effective,
     cred.quota_pause_pct_7d,
     cred.quota_pause_pct_7d_effective,
+    shortMax,
+    longMax,
   ])
 
-  const policyItems = POLICY_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
-  const nextShort = pctFromPolicy(shortPolicy, shortCustom)
-  const nextLong = pctFromPolicy(longPolicy, longCustom)
+  const policyItemsFor = (cap: number, current: number | null) => POLICY_ITEMS
+    .filter((item) => item.value !== 'off' || allowOff(cap, current))
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
+  const nextShort = pctFromPolicy(shortPolicy, shortCustom, shortMax)
+  const nextLong = pctFromPolicy(longPolicy, longCustom, longMax)
   const dirty = nextShort !== cred.quota_pause_pct || nextLong !== cred.quota_pause_pct_7d
   const describeEffective = (pct: number) =>
     pct > 0 ? `${pct}%` : t('停用', 'off')
@@ -113,7 +137,12 @@ export function CredentialQuotaDialog({
     custom: number,
     setCustom: (n: number) => void,
     effective: number,
-  ) => (
+    cap: number,
+    current: number | null,
+  ) => {
+    const policyItems = policyItemsFor(cap, current)
+    const max = customMax(cap, current)
+    return (
     <div className="grid gap-4 sm:grid-cols-2" key={key}>
       <Field>
         <FieldLabel>{label}</FieldLabel>
@@ -146,9 +175,9 @@ export function CredentialQuotaDialog({
             disabled={readOnly}
             value={custom}
             min={1}
-            max={100}
+            max={max}
             step={1}
-            onValueChange={(value) => setCustom(Math.min(100, Math.max(1, Math.floor(value ?? 1))))}
+            onValueChange={(value) => setCustom(Math.min(max, Math.max(1, Math.floor(value ?? 1))))}
           >
             <NumberFieldGroup>
               <NumberFieldDecrement />
@@ -157,12 +186,15 @@ export function CredentialQuotaDialog({
             </NumberFieldGroup>
           </NumberField>
           <FieldDescription>
-            {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
+            {cap
+              ? t(`该设置只影响当前账号，最高 ${cap}%（不高于全局）。`, `This setting only affects the current account; at most ${cap}% (no higher than the global setting).`)
+              : t('该设置只影响当前账号。', 'This setting only affects the current account.')}
           </FieldDescription>
         </Field>
       )}
     </div>
-  )
+    )
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -185,6 +217,8 @@ export function CredentialQuotaDialog({
             shortCustom,
             setShortCustom,
             cred.quota_pause_pct_effective,
+            shortCap,
+            cred.quota_pause_pct,
           )}
           {window(
             'long',
@@ -194,6 +228,8 @@ export function CredentialQuotaDialog({
             longCustom,
             setLongCustom,
             cred.quota_pause_pct_7d_effective,
+            longCap,
+            cred.quota_pause_pct_7d,
           )}
 
           <Alert>

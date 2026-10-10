@@ -132,6 +132,7 @@ pub(super) struct ReauthorizeReq {
 /// 订阅未生效、手动停用、额度暂停与 token 无关，保持原状。
 pub(super) async fn reauthorize_credential(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<ReauthorizeReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
@@ -145,7 +146,7 @@ pub(super) async fn reauthorize_credential(
     let cred = state.store.get(id).await.map_err(internal)?.ok_or_else(not_found)?;
     // 代理建不出来放在取挑战之前：挑战取出即作废，代理错了改好再试还能用同一个授权结果。
     let http = state.clients.for_credential(&cred).map_err(|e| bad_request(format!("{e:#}")))?;
-    let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
+    let pkce = take_pkce(&mut state.pkce.lock(), actor.id, &returned_state, std::time::Instant::now())
         .ok_or_else(|| bad_request("this login attempt expired or was not found; generate a new authorization link and try again"))?;
 
     let tokens = oauth::exchange_code(&http, &pkce, &req.code)

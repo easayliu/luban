@@ -1718,7 +1718,7 @@ pub(super) mod tests {
         store.set_disabled(max, true).await.unwrap();
         assert_eq!(pick("claude-fable-5-1").await, unknown, "Max 不在时等级未知的排在 Pro 前面");
         store.set_disabled(max, false).await.unwrap();
-        store.set_priority(pro, 1).await.unwrap();
+        store.set_priority(pro, 1, PRIORITY_MIN).await.unwrap();
         assert_eq!(pick("claude-fable-5-1").await, pro, "优先级是主键，等级只在同档内排");
     }
 

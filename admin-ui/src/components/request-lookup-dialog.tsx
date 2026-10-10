@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { SearchIcon } from 'lucide-react'
 import { listUsage, type UsageLog } from '@/api/credentials'
+import { useSeesWholePool } from '@/lib/role'
 import { useI18n } from '@/lib/i18n'
 import {
   cn, displayCredentialLabel, extractError, formatFullTime, formatMs, formatUsd, parseSessionKey, sideClassLabel,
@@ -206,6 +207,8 @@ function sessionTitle(log: UsageLog): string | undefined {
 
 function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
   const { t, language } = useI18n()
+  // 代理和用户：设备、会话这几格后端已抹掉（见 `web::usage::for_owner`），整格不出。
+  const full = useSeesWholePool()
   const num = (v: number | null) => (v == null ? '—' : v.toLocaleString(locale))
   const deviceShort = log.device_id
     ? log.device_id.startsWith('sim:') ? `sim:${log.device_id.slice(4, 12)}` : log.device_id.slice(0, 8)
@@ -238,11 +241,12 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
             {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
           </span>
         </Fact>
-        <Fact label={t('设备（入站）', 'Device (inbound)')}><Hint label={log.device_id}><span className="font-mono">{deviceShort}</span></Hint></Fact>
-        <Fact label={t('设备（出站）', 'Device (outbound)')}><Hint label={log.device_id_out}><span className="font-mono">{log.device_id_out?.slice(0, 8) ?? '—'}</span></Hint></Fact>
+        {full && <Fact label={t('设备（入站）', 'Device (inbound)')}><Hint label={log.device_id}><span className="font-mono">{deviceShort}</span></Hint></Fact>}
+        {full && <Fact label={t('设备（出站）', 'Device (outbound)')}><Hint label={log.device_id_out}><span className="font-mono">{log.device_id_out?.slice(0, 8) ?? '—'}</span></Hint></Fact>}
         <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
         <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
         <Fact label={t('路径', 'Path')}><Hint label={log.path}><span className="font-mono">{log.path}</span></Hint></Fact>
+        {full && (<>
         <Fact label={t('会话（入站 → 出站）', 'Session (inbound → outbound)')}>
           <Hint label={sessionTitle(log)}>
             <span className="font-mono">
@@ -259,6 +263,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
             </span>
           </Hint>
         </Fact>
+        </>)}
       </dl>
       {(log.ua || log.ua_out) && (
         <Hint label={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : log.ua}>

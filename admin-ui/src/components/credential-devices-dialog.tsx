@@ -24,7 +24,7 @@ import {
   type SessionEvent,
 } from '@/api/credentials'
 import { useI18n, type Language } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { limitCap, useMemberCaps, useReadOnly } from '@/lib/role'
 import {
   cn,
   displayCredentialLabel,
@@ -114,6 +114,25 @@ function policyFromLimit(limit: number): LimitPolicy {
   return 'custom'
 }
 
+/**
+ * 编辑态的起点：代理和用户选不了「不限」时（见 [limitCap]），管理员给的「不限」从「跟随默认」
+ * 起步；自定义值也压到天花板以内。
+ */
+function editSeed(limit: number, cap: ReturnType<typeof limitCap>): { policy: LimitPolicy; custom: number } {
+  const policy = policyFromLimit(limit)
+  return {
+    policy: policy === 'unlimited' && !cap.allowUnlimited ? 'default' : policy,
+    custom: Math.min(Math.max(1, limit), cap.max ?? Infinity),
+  }
+}
+
+/** 自定义上限那一栏的说明：有天花板时写明最多到多少。 */
+function customLimitHint(cap: ReturnType<typeof limitCap>, t: (zh: string, en: string) => string): string {
+  return cap.cap
+    ? t(`该设置只影响当前账号，最多 ${cap.cap}（不高于全局默认）。`, `This setting only affects the current account; at most ${cap.cap} (no higher than the global default).`)
+    : t('该设置只影响当前账号。', 'This setting only affects the current account.')
+}
+
 function policyVariant(deviceLimit: number): BadgeProps['variant'] {
   if (deviceLimit === 0) return 'secondary'
   if (deviceLimit < 0) return 'outline'
@@ -135,6 +154,7 @@ export function CredentialDevicesDialog({
 }) {
   const { t, language, locale } = useI18n()
   const readOnly = useReadOnly()
+  const deviceCap = limitCap(useMemberCaps(open)?.device_limit, cred.device_limit)
   const credentialLabel = displayCredentialLabel(cred.label, language)
   const [editingLimit, setEditingLimit] = useState(false)
   const [limitPolicy, setLimitPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.device_limit))
@@ -171,10 +191,9 @@ export function CredentialDevicesDialog({
     devices.data?.filter((device) => !device.simulated).length ?? cred.device_count
   const formattedCurrentDeviceCount = currentDeviceCount.toLocaleString(locale)
   const currentDeviceNoun = currentDeviceCount === 1 ? 'device' : 'devices'
-  const limitPolicyItems = LIMIT_POLICY_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
+  const limitPolicyItems = LIMIT_POLICY_ITEMS
+    .filter((item) => item.value !== 'unlimited' || deviceCap.allowUnlimited)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
   const effectiveLimit = cred.device_limit_effective > 0
     ? t(
       `${cred.device_limit_effective.toLocaleString(locale)} 台`,
@@ -221,14 +240,15 @@ export function CredentialDevicesDialog({
   }
 
   const startEditingLimit = () => {
-    setLimitPolicy(policyFromLimit(cred.device_limit))
-    setCustomLimit(Math.max(1, cred.device_limit))
+    const seed = editSeed(cred.device_limit, deviceCap)
+    setLimitPolicy(seed.policy)
+    setCustomLimit(seed.custom)
     setEditingLimit(true)
   }
 
   const saveLimit = () => {
     const normalizedCustomLimit = Number.isFinite(customLimit)
-      ? Math.max(1, Math.floor(customLimit))
+      ? Math.min(Math.max(1, Math.floor(customLimit)), deviceCap.max ?? Infinity)
       : 1
     const nextLimit = limitPolicy === 'default'
       ? 0
@@ -327,6 +347,7 @@ export function CredentialDevicesDialog({
                       <NumberField
                         value={customLimit}
                         min={1}
+                        max={deviceCap.max}
                         step={1}
                         onValueChange={(value) => setCustomLimit(value ?? 1)}
                       >
@@ -336,9 +357,7 @@ export function CredentialDevicesDialog({
                           <NumberFieldIncrement />
                         </NumberFieldGroup>
                       </NumberField>
-                      <FieldDescription>
-                        {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
-                      </FieldDescription>
+                      <FieldDescription>{customLimitHint(deviceCap, t)}</FieldDescription>
                     </Field>
                   )}
                 </CardPanel>
@@ -646,12 +665,14 @@ export function DeviceList({
                       valueClass="w-14"
                       hint={t('该设备经本账号产生的等价 API 费用', 'Equivalent API cost this device incurred through this account')}
                     />
-                    <DeviceStat
-                      label={t('全部账号', 'All accounts')}
-                      value={formatUsd(device.cost_usd_all)}
-                      valueClass="w-14"
-                      hint={t('该设备在本网关所有账号上的累计费用', "This device's total cost across every account on this gateway")}
-                    />
+                    {device.cost_usd_all != null && (
+                      <DeviceStat
+                        label={t('全部账号', 'All accounts')}
+                        value={formatUsd(device.cost_usd_all)}
+                        valueClass="w-14"
+                        hint={t('该设备在本网关所有账号上的累计费用', "This device's total cost across every account on this gateway")}
+                      />
+                    )}
                   </div>
                 </div>
               </li>
@@ -930,6 +951,7 @@ function SessionCapacityCard({
   const { t, locale } = useI18n()
   const readOnly = useReadOnly()
   const [editing, setEditing] = useState(false)
+  const cap = limitCap(useMemberCaps(editing)?.session_limit, cred.session_limit)
   const [policy, setPolicy] = useState<LimitPolicy>(() => policyFromLimit(cred.session_limit))
   const [custom, setCustom] = useState(Math.max(1, cred.session_limit))
   const count = sessions.data?.length ?? cred.session_count
@@ -937,7 +959,7 @@ function SessionCapacityCard({
   const effective = cred.session_limit_effective
   const policyItems = [
     { value: 'default' as const, label: t('跟随全局默认', 'Use global default') },
-    { value: 'unlimited' as const, label: t('不限会话数', 'Unlimited sessions') },
+    ...(cap.allowUnlimited ? [{ value: 'unlimited' as const, label: t('不限会话数', 'Unlimited sessions') }] : []),
     { value: 'custom' as const, label: t('自定义上限', 'Custom limit') },
   ]
   const effectiveLabel = effective > 0
@@ -957,7 +979,9 @@ function SessionCapacityCard({
     setCustom(Math.max(1, cred.session_limit))
   }
   const save = () => {
-    const normalized = Number.isFinite(custom) ? Math.max(1, Math.floor(custom)) : 1
+    const normalized = Number.isFinite(custom)
+      ? Math.min(Math.max(1, Math.floor(custom)), cap.max ?? Infinity)
+      : 1
     const next = policy === 'default' ? 0 : policy === 'unlimited' ? -1 : normalized
     sessionLimit.mutate(next, { onSuccess: () => setEditing(false) })
   }
@@ -983,8 +1007,9 @@ function SessionCapacityCard({
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  setPolicy(policyFromLimit(cred.session_limit))
-                  setCustom(Math.max(1, cred.session_limit))
+                  const seed = editSeed(cred.session_limit, cap)
+                  setPolicy(seed.policy)
+                  setCustom(seed.custom)
                   setEditing(true)
                 }}
               >
@@ -1028,6 +1053,7 @@ function SessionCapacityCard({
                   <NumberField
                     value={custom}
                     min={1}
+                    max={cap.max}
                     step={1}
                     onValueChange={(value) => setCustom(value ?? 1)}
                   >
@@ -1037,9 +1063,7 @@ function SessionCapacityCard({
                       <NumberFieldIncrement />
                     </NumberFieldGroup>
                   </NumberField>
-                  <FieldDescription>
-                    {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
-                  </FieldDescription>
+                  <FieldDescription>{customLimitHint(cap, t)}</FieldDescription>
                 </Field>
               )}
             </div>

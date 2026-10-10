@@ -335,14 +335,18 @@ impl CredentialStore {
         .await
     }
 
-    /// 设置优先级。范围由调用方（admin API）校验，这里不再截断。
-    pub async fn set_priority(&self, id: i64, priority: i64) -> Result<bool> {
+    /// 设置优先级（范围由调用方校验，这里不截断），但不许比 `floor` 更高——原本就比 `floor`
+    /// 高的号只许往下调（不比现值更高）。判断与写入在同一条语句里。返回是否写了：号不存在或
+    /// 越界都是 false，由调用方区分。admin 给 [`PRIORITY_MIN`]，等于不设限。
+    pub async fn set_priority(&self, id: i64, priority: i64, floor: i64) -> Result<bool> {
         self.update_one(
             sqlx::query(
-                "UPDATE credentials SET priority = $2, updated_at = unixepoch() WHERE id = $1",
+                "UPDATE credentials SET priority = $2, updated_at = unixepoch() \
+                  WHERE id = $1 AND ($2 >= $3 OR $2 >= priority)",
             )
             .bind(id)
-            .bind(priority),
+            .bind(priority)
+            .bind(floor),
         )
         .await
     }
@@ -354,20 +358,23 @@ impl CredentialStore {
     }
 
     /// 批量平移优先级：`ids` 里的账号各自在原值上加 `delta`（负数 = 提高），超出
-    /// [`PRIORITY_MIN`]..=[`PRIORITY_MAX`] 的截到边界。选中账号之间的先后顺序不变
+    /// `floor`..=[`PRIORITY_MAX`] 的截到边界。选中账号之间的先后顺序不变
     /// （碰到边界的除外）。单条语句，返回实际更新的条数。`ids` 里重复的只平移一次。
-    pub async fn shift_priorities(&self, ids: &[i64], delta: i64) -> Result<usize> {
+    ///
+    /// `floor` 是往上调能到的最高档：admin 给 [`PRIORITY_MIN`]，代理和用户给 P2。原本就在
+    /// `floor` 之上的号往上调时原地不动、不会被压回 `floor`。
+    pub async fn shift_priorities(&self, ids: &[i64], delta: i64, floor: i64) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
         // `= ANY` 对重复的 id 只命中一行，天然只平移一次。
         Ok(sqlx::query(
-            "UPDATE credentials SET priority = LEAST(GREATEST(priority + $2, $3), $4), \
+            "UPDATE credentials SET priority = LEAST(GREATEST(priority + $2, LEAST(priority, $3)), $4), \
                  updated_at = unixepoch() WHERE id = ANY($1)",
         )
         .bind(ids)
         .bind(delta)
-        .bind(PRIORITY_MIN)
+        .bind(floor.max(PRIORITY_MIN))
         .bind(PRIORITY_MAX)
         .execute(&self.pool)
         .await?
@@ -549,7 +556,9 @@ impl CredentialStore {
 
     /// 设置该账号自己的「额度用到多少就提前停调度」阈值（5h / 7d 两档，百分比）。
     /// 每档 `None` = 跟随全局、`Some(0)` = 本账号这一档不停、`Some(1..=100)` = 独立阈值；
-    /// 取值夹到 `0..=100`。生效值见 `effective_quota_pause_pct`。
+    /// 取值夹到 `0..=100`。生效值见 `effective_quota_pause_pct`。两档整份覆盖；接口里用的是
+    /// 只改给了的那几档的 [`Self::set_quota_pause_pcts_partial`]，这个只剩测试用。
+    #[cfg(test)]
     pub async fn set_quota_pause_pcts(
         &self,
         id: i64,
@@ -557,6 +566,30 @@ impl CredentialStore {
         long_pct: Option<i64>,
     ) -> Result<bool> {
         Ok(self.set_quota_pause_pcts_many(&[id], short_pct, long_pct).await? > 0)
+    }
+
+    /// 只改两档提前停调度阈值里给了的那几档（外层 `None` 的那档原样不动），单条语句。
+    /// 号主只改一档时用它：另一档不写，就不会把这期间 admin 刚改的值盖回去。
+    pub async fn set_quota_pause_pcts_partial(
+        &self,
+        id: i64,
+        short_pct: Option<Option<i64>>,
+        long_pct: Option<Option<i64>>,
+    ) -> Result<bool> {
+        self.update_one(
+            sqlx::query(
+                "UPDATE credentials SET \
+                   quota_pause_pct = CASE WHEN $2 THEN $3 ELSE quota_pause_pct END, \
+                   quota_pause_pct_7d = CASE WHEN $4 THEN $5 ELSE quota_pause_pct_7d END, \
+                   updated_at = unixepoch() WHERE id = $1",
+            )
+            .bind(id)
+            .bind(short_pct.is_some())
+            .bind(short_pct.flatten().map(|p| p.clamp(0, 100)))
+            .bind(long_pct.is_some())
+            .bind(long_pct.flatten().map(|p| p.clamp(0, 100))),
+        )
+        .await
     }
 
     /// 写回组织类型（`claude_team` 等）。与 [`Self::set_tier`] 分开：等级会随额度档变，
@@ -932,23 +965,30 @@ mod tests {
     async fn shift_priorities_keeps_order_and_clamps(pool: PgPool) {
         let (store, ids) = store_with(pool, &["a", "b", "c"]).await;
         let (a, b, c) = (ids[0], ids[1], ids[2]);
-        store.set_priority(a, 0).await.unwrap();
-        store.set_priority(b, 1).await.unwrap();
-        store.set_priority(c, 3).await.unwrap();
+        store.set_priority(a, 0, PRIORITY_MIN).await.unwrap();
+        store.set_priority(b, 1, PRIORITY_MIN).await.unwrap();
+        store.set_priority(c, 3, PRIORITY_MIN).await.unwrap();
         let prio = async |id| store.get(id).await.unwrap().unwrap().priority;
 
-        assert_eq!(store.shift_priorities(&[a, b], 1).await.unwrap(), 2);
+        assert_eq!(store.shift_priorities(&[a, b], 1, PRIORITY_MIN).await.unwrap(), 2);
         assert_eq!(
             (prio(a).await, prio(b).await, prio(c).await),
             (1, 2, 3),
             "只动选中的，各自降一档"
         );
-        store.shift_priorities(&[a, b, c], -2).await.unwrap();
+        store.shift_priorities(&[a, b, c], -2, PRIORITY_MIN).await.unwrap();
         assert_eq!((prio(a).await, prio(b).await, prio(c).await), (0, 0, 1), "提高到顶截在 P0");
-        store.shift_priorities(&[c], 4).await.unwrap();
+        store.shift_priorities(&[c], 4, PRIORITY_MIN).await.unwrap();
         assert_eq!(prio(c).await, 4, "降低到底截在 P4");
-        assert_eq!(store.shift_priorities(&[b, b], 1).await.unwrap(), 1);
+        assert_eq!(store.shift_priorities(&[b, b], 1, PRIORITY_MIN).await.unwrap(), 1);
         assert_eq!(prio(b).await, 1, "重复的 id 只升降一次");
+
+        // 带 floor（代理和用户）：往上最多到 floor，原本就在 floor 之上的不动、也不被压下去。
+        store.set_priority(c, 4, PRIORITY_MIN).await.unwrap();
+        store.shift_priorities(&[a, b, c], -3, 2).await.unwrap();
+        assert_eq!((prio(a).await, prio(b).await, prio(c).await), (0, 1, 2), "截在 floor");
+        store.shift_priorities(&[a], 1, 2).await.unwrap();
+        assert_eq!(prio(a).await, 1, "往下调照常");
     }
 
     /// 批量启停 / 设备上限 / 删除：只作用于选中的 id，且各自保持单账号接口的语义。

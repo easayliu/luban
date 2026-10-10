@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::admin_ui;
 use crate::auth::{self, Actor};
-use crate::credentials::{Credential, PRIORITY_MAX, PRIORITY_MIN, priority_tiers_by_rank};
+use crate::credentials::{
+    Credential, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN, priority_tiers_by_rank,
+};
 use crate::oauth::{self, PkceChallenge};
 use crate::proxy;
 use crate::proxy::AccountRejection;
@@ -42,6 +44,7 @@ mod users;
 mod views;
 
 use billing::*;
+pub(crate) use credentials::MemberCaps;
 use credentials::*;
 use groups::*;
 use keepalive::*;
@@ -76,7 +79,7 @@ pub struct AppState {
     ///
     /// 用 `parking_lot::Mutex` 而非 `std::sync::Mutex`：后者要 `.unwrap()` 解毒化，
     /// 而这里每条临界区都只是查表/插表，毒化本就无从谈起。
-    pkce: Arc<parking_lot::Mutex<Vec<(String, PkceChallenge, std::time::Instant)>>>,
+    pkce: Arc<parking_lot::Mutex<PendingPkce>>,
     /// 凭证存储。
     pub store: Arc<CredentialStore>,
     /// 接入用的 API Key（None 表示不校验来访身份）。

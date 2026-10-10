@@ -10,6 +10,7 @@ import { listProxies } from '@/api/proxies'
 import { useDevicesBySession } from '@/components/credential-shared'
 import { SetGroupsDialog } from '@/components/group-picker'
 import { useI18n } from '@/lib/i18n'
+import { limitCap, useMemberCaps } from '@/lib/role'
 import { cn, extractError } from '@/lib/utils'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -66,10 +67,11 @@ const QUOTA_MODE_ITEMS = [
 ] as const
 type QuotaMode = (typeof QUOTA_MODE_ITEMS)[number]['value']
 
-function quotaPctOf(mode: QuotaMode, custom: number): number | null {
+/** `cap` 为代理和用户能设的最高阈值（`0` 不设边），见 [MemberCaps]。 */
+function quotaPctOf(mode: QuotaMode, custom: number, cap: number): number | null {
   if (mode === 'default') return null
   if (mode === 'off') return 0
-  return Math.min(100, Math.max(1, Math.floor(custom)))
+  return Math.min(cap || 100, Math.max(1, Math.floor(custom)))
 }
 
 function describeQuotaPct(pct: number | null, t: (zh: string, en: string) => string): string {
@@ -148,6 +150,15 @@ export function BatchActionsBar({
 
   // 设备按会话占名额时设备上限不生效，批量设置设备上限那一行一并隐去。
   const devicesBySession = useDevicesBySession()
+  // 代理和用户只能往紧里调（见 MemberCaps）：P0/P1 不可选，有天花板时「不限」「停用」不出现、
+  // 自定义值压到天花板以内。
+  const caps = useMemberCaps(advancedOpen)
+  const minPriority = caps?.min_priority ?? 0
+  const deviceCap = limitCap(caps?.device_limit)
+  const sessionCap = limitCap(caps?.session_limit)
+  const rpmCap = limitCap(caps?.rpm_limit)
+  const quotaShortCap = caps?.quota_pause_pct ?? 0
+  const quotaLongCap = caps?.quota_pause_pct_7d ?? 0
   const proxiesQuery = useQuery({
     queryKey: ['proxies'],
     queryFn: listProxies,
@@ -180,22 +191,18 @@ export function BatchActionsBar({
     value: String(p),
     label: `P${p} ${priorityTierName(p, t)}`,
   }))
-  const limitModeItems = LIMIT_MODE_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
-  const sessionLimitModeItems = SESSION_LIMIT_MODE_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
-  const rpmModeItems = RPM_MODE_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
-  const quotaModeItems = QUOTA_MODE_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
+  const limitModeItems = LIMIT_MODE_ITEMS
+    .filter((item) => item.value !== 'unlimited' || deviceCap.allowUnlimited)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
+  const sessionLimitModeItems = SESSION_LIMIT_MODE_ITEMS
+    .filter((item) => item.value !== 'unlimited' || sessionCap.allowUnlimited)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
+  const rpmModeItems = RPM_MODE_ITEMS
+    .filter((item) => item.value !== 'unlimited' || rpmCap.allowUnlimited)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
+  const quotaModeItemsFor = (cap: number) => QUOTA_MODE_ITEMS
+    .filter((item) => item.value !== 'off' || cap === 0)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
   const notify = (msg: string) => {
     toastManager.add({ title: msg, type: 'success' })
     qc.invalidateQueries({ queryKey: ['credentials'] })
@@ -339,11 +346,13 @@ export function BatchActionsBar({
     applyQuotaPause.isPending || applyProxy.isPending || applyDisabled.isPending ||
     applyDelete.isPending
   const allSelected = all.length > 0 && all.every((item) => selected.has(item.id))
-  const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customLimit))
-  const sessionLimit = sessionLimitMode === 'default' ? 0 : sessionLimitMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customSessionLimit))
-  const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : Math.max(1, Math.floor(customRpm))
-  const quotaPct = quotaPctOf(quotaShortMode, quotaShortCustom)
-  const quotaPct7d = quotaPctOf(quotaLongMode, quotaLongCustom)
+  const capped = (n: number, cap: ReturnType<typeof limitCap>) =>
+    Math.min(Math.max(1, Math.floor(n)), cap.max ?? Infinity)
+  const deviceLimit = limitMode === 'default' ? 0 : limitMode === 'unlimited' ? -1 : capped(customLimit, deviceCap)
+  const sessionLimit = sessionLimitMode === 'default' ? 0 : sessionLimitMode === 'unlimited' ? -1 : capped(customSessionLimit, sessionCap)
+  const rpmLimit = rpmMode === 'default' ? 0 : rpmMode === 'unlimited' ? -1 : capped(customRpm, rpmCap)
+  const quotaPct = quotaPctOf(quotaShortMode, quotaShortCustom, quotaShortCap)
+  const quotaPct7d = quotaPctOf(quotaLongMode, quotaLongCustom, quotaLongCap)
   const proxyUrl = proxyMode === 'direct' ? null : proxyMode === 'pool' ? selectedProxyUrl : customProxyUrl.trim()
   const proxyModeItems = [
     { value: 'direct', label: t('直连', 'Direct') },
@@ -440,7 +449,7 @@ export function BatchActionsBar({
                 <SelectTrigger aria-label={t('批量设置优先级', 'Set priority for selected accounts')} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                 <SelectPopup alignItemWithTrigger={false}>
                   {priorityTierItems.map((item) => (
-                    <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
+                    <SelectItem key={item.value} value={item.value} disabled={Number(item.value) < minPriority}>{item.label}</SelectItem>
                   ))}
                 </SelectPopup>
               </Select>
@@ -466,7 +475,7 @@ export function BatchActionsBar({
               </SelectPopup>
             </Select>
             {limitMode === 'custom' && (
-              <NumberField value={customLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
+              <NumberField value={deviceLimit > 0 ? deviceLimit : customLimit} min={1} max={deviceCap.max} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomLimit(Math.max(1, Math.floor(value ?? 1)))}>
                 <NumberFieldGroup>
                   <NumberFieldDecrement />
                   <NumberFieldInput aria-label={t('批量设置独立设备上限', 'Set a custom device limit for selected accounts')} />
@@ -495,7 +504,7 @@ export function BatchActionsBar({
               </SelectPopup>
             </Select>
             {sessionLimitMode === 'custom' && (
-              <NumberField value={customSessionLimit} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
+              <NumberField value={sessionLimit > 0 ? sessionLimit : customSessionLimit} min={1} max={sessionCap.max} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomSessionLimit(Math.max(1, Math.floor(value ?? 1)))}>
                 <NumberFieldGroup>
                   <NumberFieldDecrement />
                   <NumberFieldInput aria-label={t('批量设置独立会话上限', 'Set a custom session limit for selected accounts')} />
@@ -523,7 +532,7 @@ export function BatchActionsBar({
               </SelectPopup>
             </Select>
             {rpmMode === 'custom' && (
-              <NumberField value={customRpm} min={1} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
+              <NumberField value={rpmLimit > 0 ? rpmLimit : customRpm} min={1} max={rpmCap.max} step={1} size="sm" className="w-32" onValueChange={(value) => setCustomRpm(Math.max(1, Math.floor(value ?? 1)))}>
                 <NumberFieldGroup>
                   <NumberFieldDecrement />
                   <NumberFieldInput aria-label={t('批量设置独立 RPM 上限', 'Set a custom RPM limit for selected accounts')} />
@@ -545,26 +554,26 @@ export function BatchActionsBar({
             stacked
           >
             {([
-              ['short', t('5 小时', '5h'), quotaShortMode, setQuotaShortMode, quotaShortCustom, setQuotaShortCustom,
+              ['short', t('5 小时', '5h'), quotaShortMode, setQuotaShortMode, quotaShortCustom, setQuotaShortCustom, quotaShortCap,
                 t('批量设置 5 小时窗口阈值策略', 'Set the 5h window threshold policy for selected accounts'),
                 t('批量设置 5 小时窗口阈值（%）', 'Set a custom 5h window threshold (%) for selected accounts')],
-              ['long', t('7 天', '7d'), quotaLongMode, setQuotaLongMode, quotaLongCustom, setQuotaLongCustom,
+              ['long', t('7 天', '7d'), quotaLongMode, setQuotaLongMode, quotaLongCustom, setQuotaLongCustom, quotaLongCap,
                 t('批量设置 7 天窗口阈值策略', 'Set the 7d window threshold policy for selected accounts'),
                 t('批量设置 7 天窗口阈值（%）', 'Set a custom 7d window threshold (%) for selected accounts')],
-            ] as const).map(([key, label, mode, setMode, custom, setCustom, modeAria, customAria]) => (
+            ] as const).map(([key, label, mode, setMode, custom, setCustom, cap, modeAria, customAria]) => (
               <div key={key} className="flex flex-wrap items-center gap-2">
                 <span className="w-12 shrink-0 text-xs text-muted-foreground">{label}</span>
-                <Select items={quotaModeItems} value={mode} onValueChange={(value) => value && setMode(value as QuotaMode)}>
+                <Select items={quotaModeItemsFor(cap)} value={mode} onValueChange={(value) => value && setMode(value as QuotaMode)}>
                   <SelectTrigger aria-label={modeAria} size="sm" className={MODE_SELECT_CLASS}><SelectValue /></SelectTrigger>
                   <SelectPopup alignItemWithTrigger={false}>
-                    {quotaModeItems.map((item) => (
+                    {quotaModeItemsFor(cap).map((item) => (
                       <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>
                     ))}
                   </SelectPopup>
                 </Select>
                 {mode === 'custom' && (
                   <>
-                    <NumberField value={custom} min={1} max={100} step={1} size="sm" className="w-32" onValueChange={(value) => setCustom(Math.min(100, Math.max(1, Math.floor(value ?? 1))))}>
+                    <NumberField value={Math.min(custom, cap || 100)} min={1} max={cap || 100} step={1} size="sm" className="w-32" onValueChange={(value) => setCustom(Math.min(cap || 100, Math.max(1, Math.floor(value ?? 1))))}>
                       <NumberFieldGroup>
                         <NumberFieldDecrement />
                         <NumberFieldInput aria-label={customAria} />

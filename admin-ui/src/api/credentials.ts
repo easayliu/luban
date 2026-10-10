@@ -239,7 +239,8 @@ export interface DeviceBinding {
    */
   cost_usd: number
   /** 该设备在**所有账号**上的累计费用（USD）；用于识别换号后仍在烧钱的同一台设备。 */
-  cost_usd_all: number
+  /** 全池合计；代理和用户看的明细里没有（后端不给）。 */
+  cost_usd_all?: number | null
 }
 
 /**

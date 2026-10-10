@@ -18,7 +18,7 @@ import {
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
-import { useIsAdmin, useReadOnly } from '@/lib/role'
+import { useIsAdmin, useMemberCaps, useReadOnly } from '@/lib/role'
 import { getSettings } from '@/api/settings'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -966,6 +966,8 @@ function useCredentialMenuGroups(
   const { refresh, prio, cooldown } = actions
   const reauthorize = useReauthorize()
   const readOnly = useReadOnly()
+  // 代理和用户最高只能调到 P2（见 MemberCaps）。
+  const minPriority = useMemberCaps()?.min_priority ?? PRIORITY_MIN
   const detail: CredentialMenuItem[] = h.showDetail === false
     ? []
     : [{
@@ -1026,7 +1028,7 @@ function useCredentialMenuGroups(
       icon: <ChevronUpIcon />,
       label: t('提高优先级', 'Increase priority'),
       onSelect: () => prio.mutate(cred.priority - 1),
-      disabled: prio.isPending || cred.priority <= PRIORITY_MIN,
+      disabled: prio.isPending || cred.priority <= minPriority,
       shortcut: `P${cred.priority - 1}`,
       title: t(`提高到 P${cred.priority - 1} ${priorityTierName(cred.priority - 1, t)}`, `Raise to P${cred.priority - 1} ${priorityTierName(cred.priority - 1, t)}`),
     },

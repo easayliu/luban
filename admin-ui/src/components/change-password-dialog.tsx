@@ -32,18 +32,20 @@ export function ChangePasswordDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const { t, language } = useI18n()
+  const [current, setCurrent] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
 
   // 每次打开都清空：上次输了一半的密码不该留到下次。
   useEffect(() => {
     if (!open) return
+    setCurrent('')
     setPassword('')
     setConfirm('')
   }, [open])
 
   const save = useMutation({
-    mutationFn: () => changePassword(password.trim()),
+    mutationFn: () => changePassword(password.trim(), current.trim()),
     onSuccess: () => {
       onOpenChange(false)
       toastManager.add({
@@ -56,7 +58,9 @@ export function ChangePasswordDialog({
 
   const tooShort = password.trim().length > 0 && password.trim().length < MIN_PASSWORD_LENGTH
   const mismatch = confirm.length > 0 && confirm.trim() !== password.trim()
-  const canSubmit = password.trim().length >= MIN_PASSWORD_LENGTH && confirm.trim() === password.trim()
+  const canSubmit = current.trim().length > 0
+    && password.trim().length >= MIN_PASSWORD_LENGTH
+    && confirm.trim() === password.trim()
 
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!save.isPending) onOpenChange(next) }}>
@@ -75,9 +79,13 @@ export function ChangePasswordDialog({
           }}
         >
           <DialogPanel className="space-y-4">
+            <Field>
+              <FieldLabel>{t('当前密码', 'Current password')}</FieldLabel>
+              <PasswordInput autoFocus onChange={setCurrent} value={current} />
+            </Field>
             <Field invalid={tooShort}>
               <FieldLabel>{t('新密码', 'New password')}</FieldLabel>
-              <PasswordInput autoFocus invalid={tooShort} onChange={setPassword} value={password} />
+              <PasswordInput invalid={tooShort} onChange={setPassword} value={password} />
               <FieldDescription>
                 {t(`至少 ${MIN_PASSWORD_LENGTH} 个字符。`, `At least ${MIN_PASSWORD_LENGTH} characters.`)}
               </FieldDescription>

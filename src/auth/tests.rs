@@ -182,6 +182,11 @@ async fn members_are_scoped_to_their_own_things(pool: sqlx::PgPool) {
         s(Method::POST, "/api/credentials/disabled".into(), &a, body(&[mine, theirs])).await,
         StatusCode::NOT_FOUND
     );
+    // 解不出 ids 的不放过去（空列表会被判成「全是本人的」）。
+    assert_eq!(
+        s(Method::POST, "/api/credentials/disabled".into(), &a, r#"{"ids":"x"}"#.into()).await,
+        StatusCode::BAD_REQUEST
+    );
     // 出口代理同理。
     assert_eq!(
         s(Method::POST, format!("/api/proxies/{my_proxy}"), &a, "{}".into()).await,
@@ -625,4 +630,134 @@ async fn provision_keys_only_reach_the_add_account_routes(pool: sqlx::PgPool) {
     // 删掉账号连带删 Key。
     state.store.delete_user(user, None).await.unwrap().unwrap();
     assert!(state.store.list_provision_keys(None).await.unwrap().is_empty());
+}
+
+/// 代理和用户能打的路由快照：与真实路由表逐条对上。新加一条对他们开放的路由、或某条下线了，
+/// 都得在这里显式改一笔——开放面不会随手扩大；`MEMBER_ROUTES` 里写错的路径（它会悄悄变成
+/// 只给 admin）也在这里现形。
+#[test]
+fn member_routes_match_the_router() {
+    let src = include_str!("../web/routes.rs");
+    let mut routed = std::collections::BTreeSet::new();
+    let mut rest = src;
+    while let Some(i) = rest.find(".route(") {
+        rest = &rest[i + ".route(".len()..];
+        let lit = rest.trim_start();
+        if let Some(lit) = lit.strip_prefix('"') {
+            routed.insert(&lit[..lit.find('"').unwrap()]);
+        }
+    }
+    assert!(routed.contains("/credentials/{id}/label"), "解析路由表失败：{routed:?}");
+    for (path, _) in super::MEMBER_ROUTES {
+        assert!(routed.contains(path), "MEMBER_ROUTES 里的 {path} 不在路由表里");
+    }
+    let open: Vec<_> =
+        routed.iter().copied().filter(|p| super::access_of(p) != super::Access::Admin).collect();
+    let expected = [
+        "/auth/logout",
+        "/auth/me",
+        "/auth/password",
+        "/authorize",
+        "/billing",
+        "/credentials",
+        "/credentials/delete",
+        "/credentials/device-limit",
+        "/credentials/disabled",
+        "/credentials/groups",
+        "/credentials/priority",
+        "/credentials/proxy",
+        "/credentials/quota-pause-pct",
+        "/credentials/rpm-limit",
+        "/credentials/session-limit",
+        "/credentials/{id}",
+        "/credentials/{id}/cooldown",
+        "/credentials/{id}/device-limit",
+        "/credentials/{id}/devices",
+        "/credentials/{id}/devices/{device_id}",
+        "/credentials/{id}/disabled",
+        "/credentials/{id}/groups",
+        "/credentials/{id}/label",
+        "/credentials/{id}/priority",
+        "/credentials/{id}/proxy",
+        "/credentials/{id}/quota-pause-pct",
+        "/credentials/{id}/reauthorize",
+        "/credentials/{id}/refresh",
+        "/credentials/{id}/rpm-limit",
+        "/credentials/{id}/session-limit",
+        "/credentials/{id}/sessions",
+        "/credentials/{id}/sessions/{session_key}",
+        "/credentials/{id}/sessions/{session_key}/events",
+        "/credentials/{id}/slots/{slot}/events",
+        "/credentials/{id}/stats",
+        "/credentials/{id}/test",
+        "/credentials/{id}/usage",
+        "/exchange",
+        "/groups",
+        "/metrics",
+        "/models",
+        "/provision-keys",
+        "/provision-keys/{id}",
+        "/proxies",
+        "/proxies/batch",
+        "/proxies/delete",
+        "/proxies/test",
+        "/proxies/{id}",
+        "/usage",
+        "/users",
+        "/users/{id}",
+        "/users/{id}/disabled",
+        "/users/{id}/parent",
+        "/users/{id}/password",
+    ];
+    assert_eq!(open, expected, "对代理和用户开放的路由变了，确认是有意的再改快照");
+}
+
+/// 改密码要带对当前密码：不带或带错回 403（不回 401，免得前端把人踢回登录页），带对才改得了。
+#[sqlx::test]
+async fn changing_the_password_needs_the_current_one(pool: sqlx::PgPool) {
+    let state = test_state(pool.clone()).await;
+    let admin_id = set_admin_password(&state, "pw1234").await;
+    let user = create(&state, "pw-user", UserRole::User, admin_id).await;
+    let tok = session_for(&state, user).await;
+    let app = Router::new().nest(
+        "/api",
+        Router::new()
+            .route("/auth/password", post(super::change_password))
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_login))
+            .with_state(state.clone()),
+    );
+    let change = |body: &'static str| {
+        let (app, tok) = (app.clone(), tok.clone());
+        async move {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/password")
+                .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(change(r#"{"password":"new-pw1"}"#).await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        change(r#"{"password":"new-pw1","current_password":"wrong"}"#).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        change(r#"{"password":"new-pw1","current_password":"pw1234"}"#).await,
+        StatusCode::OK
+    );
+    let hash = state.store.user_password_hash(user).await.unwrap().unwrap();
+    assert!(super::verify_hash_blocking(&hash, "new-pw1"));
+
+    // 在这里一直答错会被锁（429），但锁的是改密码，不连带锁住本人的登录。
+    let mut last = StatusCode::OK;
+    for _ in 0..=super::LOGIN_FAIL_MAX {
+        last = change(r#"{"password":"x-pw-2","current_password":"wrong"}"#).await;
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    assert!(super::reserve_login_attempt("pw-user", true), "登录计数不受影响");
 }

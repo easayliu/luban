@@ -3,6 +3,7 @@ import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-quer
 import { RefreshCwIcon, ScrollTextIcon } from 'lucide-react'
 import { listCredentialUsage, type Credential, type UsageLog } from '@/api/credentials'
 import { useI18n, type Language } from '@/lib/i18n'
+import { useSeesWholePool } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
   cn,
@@ -355,6 +356,9 @@ export function UsageCards({
   onLookup: (id: string) => void
 }) {
   const { t, language, locale } = useI18n()
+  // 代理和用户看的是自己号的流水，后端已把下游的设备、会话、UA 抹掉（见 `web::usage::for_owner`），
+  // 这几格整格不出，免得一列「—」。
+  const full = useSeesWholePool()
   const ms = (v: number | null) => (v == null ? '—' : `${v.toLocaleString(locale)}ms`)
 
   return (
@@ -409,6 +413,7 @@ export function UsageCards({
                   </span>
                 )}
               </LogFact>
+              {full && (
               <LogFact label={t('设备', 'Device')}>
                 <Hint label={deviceTitle(log)}>
                   <span className="font-mono">
@@ -417,11 +422,13 @@ export function UsageCards({
                   </span>
                 </Hint>
               </LogFact>
+              )}
               <LogFact label={t('请求 ID', 'Request ID')}>
                 <RequestIdChip id={log.request_id} onOpen={onLookup} />
               </LogFact>
               {/* 会话：模拟路径且没有设备身份的请求才有对话键，其余退到上游那个 session_id
                   （按槽位派生、对话之间复用），两者都在悬浮提示里。 */}
+              {full && (
               <LogFact label={t('会话', 'Session')}>
                 <Hint label={sessionTitle(log)}>
                   <span className="font-mono">
@@ -429,8 +436,9 @@ export function UsageCards({
                   </span>
                 </Hint>
               </LogFact>
+              )}
             </dl>
-            {(log.ua || log.ua_out) && (
+            {full && (log.ua || log.ua_out) && (
               <Hint label={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : log.ua}>
                 <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground">
                   {log.ua ?? t('无（luban 自身发起）', 'None (sent by luban itself)')}
@@ -468,6 +476,8 @@ export function UsageTable({
   onLookup: (id: string) => void
 }) {
   const { t, language, locale } = useI18n()
+  // 代理和用户：设备、UA 三列整列不出，理由同 UsageCards。
+  const full = useSeesWholePool()
   return (
     <Table
       render={(
@@ -479,7 +489,7 @@ export function UsageTable({
           tabIndex={0}
         />
       )}
-      className="min-w-[87rem] table-fixed text-xs"
+      className={cn(full ? 'min-w-[87rem]' : 'min-w-[56rem]', 'table-fixed text-xs')}
       aria-describedby={descriptionId}
     >
       <TableCaption className="sr-only">
@@ -494,12 +504,12 @@ export function UsageTable({
         <col className="w-[6.5rem]" />
         <col className="w-[7.25rem]" />
         <col className="w-[5rem]" />
-        <col className="w-[6.5rem]" />
+        {full && <col className="w-[6.5rem]" />}
         {/* 出站设备：上游实际看到的 device_id 前 8 位。 */}
-        <col className="w-[6.5rem]" />
+        {full && <col className="w-[6.5rem]" />}
         {/* 请求 ID：尾 8 位加复制图标。固定布局下每列都得在这里登记，漏一列会把后面的列挤成 0 宽。 */}
         <col className="w-[8rem]" />
-        <col className="w-[18rem]" />
+        {full && <col className="w-[18rem]" />}
       </colgroup>
       <TableHeader className="sticky top-0 z-10 bg-surface-subtle">
         <TableRow className="bg-muted/72 [&>th]:border-b [&>th]:text-2xs">
@@ -507,7 +517,7 @@ export function UsageTable({
           <TableHead scope="colgroup" colSpan={3} className="h-7 text-center">Token</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('性能', 'Performance')}</TableHead>
           <TableHead scope="colgroup" className="h-7 text-center">{t('费用', 'Billing')}</TableHead>
-          <TableHead scope="colgroup" colSpan={4} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
+          <TableHead scope="colgroup" colSpan={full ? 4 : 1} className="h-7 text-center">{t('来源', 'Source')}</TableHead>
         </TableRow>
         <TableRow className="bg-muted/96">
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
@@ -518,6 +528,7 @@ export function UsageTable({
           <TableHead className="whitespace-nowrap text-right">{t('缓存写/读', 'Cache w/r')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
+          {full && (<>
           <Hint label={t('客户端请求自带的 device_id（设备绑定与设备上限均据此计算）', 'device_id carried by the inbound client request (device bindings and device limits are based on it)')}>
             <TableHead className="whitespace-nowrap">
               {t('入站设备', 'Inbound device')}
@@ -533,6 +544,7 @@ export function UsageTable({
               {t('出站设备', 'Outbound device')}
             </TableHead>
           </Hint>
+          </>)}
           <Hint
             label={t(
               'luban 在响应头 X-Oneapi-Request-Id 中返回的请求 ID，New API 日志中称为 upstream_request_id；点击 ID 可查看该请求，点击旁边的图标可复制',
@@ -545,6 +557,7 @@ export function UsageTable({
           </Hint>
           {/* 两份 UA 合在一列：绝大多数请求原样转发，两者是同一串，占两列纯浪费宽度。
               只在被改写时才多显示一行出站那份，见 UaCell。 */}
+          {full && (
           <Hint
             label={t(
               '客户端自报的 User-Agent；被改写时，另起一行显示实际发给上游的 User-Agent',
@@ -555,6 +568,7 @@ export function UsageTable({
               {t('客户端 UA', 'Client UA')}
             </TableHead>
           </Hint>
+          )}
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -623,6 +637,7 @@ export function UsageTable({
                   {log.cost_usd == null ? '—' : formatUsd(log.cost_usd)}
                 </TableCell>
               </Hint>
+              {full && (<>
               <Hint label={log.device_id}>
                 <TableCell className="whitespace-nowrap font-mono text-xs">
                   {deviceShort}
@@ -633,10 +648,11 @@ export function UsageTable({
                   {log.device_id_out?.slice(0, 8) ?? '—'}
                 </TableCell>
               </Hint>
+              </>)}
               <TableCell className="whitespace-nowrap">
                 <RequestIdChip id={log.request_id} onOpen={onLookup} />
               </TableCell>
-              <UaCell ua={log.ua} uaOut={log.ua_out} />
+              {full && <UaCell ua={log.ua} uaOut={log.ua_out} />}
             </TableRow>
           )
         })}

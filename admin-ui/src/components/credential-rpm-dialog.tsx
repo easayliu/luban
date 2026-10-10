@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { GaugeIcon } from 'lucide-react'
 import { type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { limitCap, useMemberCaps, useReadOnly } from '@/lib/role'
 import { displayCredentialLabel } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { type CredentialActions } from '@/components/credential-shared'
@@ -34,9 +34,10 @@ const POLICY_ITEMS = [
   { value: 'custom', chinese: '独立上限', english: 'Custom limit' },
 ] as const
 
-function policyFromLimit(limit: number): RpmPolicy {
+function policyFromLimit(limit: number, allowUnlimited = true): RpmPolicy {
   if (limit === 0) return 'default'
-  if (limit < 0) return 'unlimited'
+  // 代理和用户选不了「不限」（见 [limitCap]）：管理员给的「不限」从「跟随默认」起步。
+  if (limit < 0) return allowUnlimited ? 'unlimited' : 'default'
   return 'custom'
 }
 
@@ -59,25 +60,32 @@ export function CredentialRpmDialog({
 }) {
   const { t, language, locale } = useI18n()
   const readOnly = useReadOnly()
+  const cap = limitCap(useMemberCaps(open)?.rpm_limit, cred.rpm_limit)
   const credentialLabel = displayCredentialLabel(cred.label, language)
-  const [policy, setPolicy] = useState<RpmPolicy>(() => policyFromLimit(cred.rpm_limit))
+  const [policy, setPolicy] = useState<RpmPolicy>(() => policyFromLimit(cred.rpm_limit, cap.allowUnlimited))
   // 自定义值的初值：本来就是独立上限就沿用它，否则拿生效值起步（多半就是想在它附近调），
-  // 再兜底一个 60。
-  const [custom, setCustom] = useState(() =>
-    Math.max(1, cred.rpm_limit > 0 ? cred.rpm_limit : cred.rpm_limit_effective || 60))
+  // 再兜底一个 60；有天花板时压到它以内。
+  const customSeed = Math.min(
+    Math.max(1, cred.rpm_limit > 0 ? cred.rpm_limit : cred.rpm_limit_effective || 60),
+    cap.max ?? Infinity,
+  )
+  const [custom, setCustom] = useState(customSeed)
 
   // 每次打开都从服务端那份重置：上次改了一半没保存就关掉的残留留到下次，会让人以为它已经生效。
   useEffect(() => {
     if (!open) return
-    setPolicy(policyFromLimit(cred.rpm_limit))
-    setCustom(Math.max(1, cred.rpm_limit > 0 ? cred.rpm_limit : cred.rpm_limit_effective || 60))
-  }, [open, cred.rpm_limit, cred.rpm_limit_effective])
+    setPolicy(policyFromLimit(cred.rpm_limit, cap.allowUnlimited))
+    setCustom(customSeed)
+  }, [open, cred.rpm_limit, cap.allowUnlimited, customSeed])
 
-  const policyItems = POLICY_ITEMS.map((item) => ({
-    value: item.value,
-    label: t(item.chinese, item.english),
-  }))
-  const next = policy === 'default' ? 0 : policy === 'unlimited' ? -1 : Math.max(1, Math.floor(custom))
+  const policyItems = POLICY_ITEMS
+    .filter((item) => item.value !== 'unlimited' || cap.allowUnlimited)
+    .map((item) => ({ value: item.value, label: t(item.chinese, item.english) }))
+  const next = policy === 'default'
+    ? 0
+    : policy === 'unlimited'
+      ? -1
+      : Math.min(Math.max(1, Math.floor(custom)), cap.max ?? Infinity)
   const dirty = next !== cred.rpm_limit
   const effective = cred.rpm_limit_effective > 0
     ? t(
@@ -145,6 +153,7 @@ export function CredentialRpmDialog({
                   disabled={readOnly}
                   value={custom}
                   min={1}
+                  max={cap.max}
                   step={1}
                   onValueChange={(value) => setCustom(Math.max(1, Math.floor(value ?? 1)))}
                 >
@@ -155,7 +164,9 @@ export function CredentialRpmDialog({
                   </NumberFieldGroup>
                 </NumberField>
                 <FieldDescription>
-                  {t('该设置只影响当前账号。', 'This setting only affects the current account.')}
+                  {cap.cap
+                    ? t(`该设置只影响当前账号，最多 ${cap.cap}（不高于全局默认）。`, `This setting only affects the current account; at most ${cap.cap} (no higher than the global default).`)
+                    : t('该设置只影响当前账号。', 'This setting only affects the current account.')}
                 </FieldDescription>
               </Field>
             )}

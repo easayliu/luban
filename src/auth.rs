@@ -414,7 +414,10 @@ enum Owned {
 }
 
 /// 代理和用户能打的路由（路径不带 `/api` 前缀，与 `MatchedPath` 对应）。
-/// `/credentials/{id}` 开头的另由 [`access_of`] 统一放行并按路径 id 核对。
+///
+/// **逐条列，不按前缀放行**：号底下以后新加的接口（看明文 token、转号主之类）不该因为挂在
+/// `/credentials/{id}/` 下面就自动对代理和用户开放。测试里另有一份快照对着路由表核对，
+/// 见 `auth::tests::member_routes_match_the_router`。
 const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/auth/me", Owned::Nothing),
     ("/auth/password", Owned::Nothing),
@@ -423,6 +426,29 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/exchange", Owned::Nothing),
     ("/models", Owned::Nothing),
     ("/credentials", Owned::Nothing),
+    // 某一个号底下的操作：核对路径里的号 id 是本人的。
+    ("/credentials/{id}", Owned::CredentialPath),
+    ("/credentials/{id}/disabled", Owned::CredentialPath),
+    ("/credentials/{id}/priority", Owned::CredentialPath),
+    ("/credentials/{id}/label", Owned::CredentialPath),
+    ("/credentials/{id}/proxy", Owned::CredentialPath),
+    ("/credentials/{id}/groups", Owned::CredentialPath),
+    ("/credentials/{id}/device-limit", Owned::CredentialPath),
+    ("/credentials/{id}/session-limit", Owned::CredentialPath),
+    ("/credentials/{id}/rpm-limit", Owned::CredentialPath),
+    ("/credentials/{id}/quota-pause-pct", Owned::CredentialPath),
+    ("/credentials/{id}/devices", Owned::CredentialPath),
+    ("/credentials/{id}/devices/{device_id}", Owned::CredentialPath),
+    ("/credentials/{id}/usage", Owned::CredentialPath),
+    ("/credentials/{id}/stats", Owned::CredentialPath),
+    ("/credentials/{id}/sessions", Owned::CredentialPath),
+    ("/credentials/{id}/sessions/{session_key}", Owned::CredentialPath),
+    ("/credentials/{id}/sessions/{session_key}/events", Owned::CredentialPath),
+    ("/credentials/{id}/slots/{slot}/events", Owned::CredentialPath),
+    ("/credentials/{id}/refresh", Owned::CredentialPath),
+    ("/credentials/{id}/reauthorize", Owned::CredentialPath),
+    ("/credentials/{id}/test", Owned::CredentialPath),
+    ("/credentials/{id}/cooldown", Owned::CredentialPath),
     ("/credentials/priority", Owned::CredentialIds),
     ("/credentials/device-limit", Owned::CredentialIds),
     ("/credentials/session-limit", Owned::CredentialIds),
@@ -454,10 +480,6 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
 fn access_of(path: &str) -> Access {
     if let Some((_, owned)) = MEMBER_ROUTES.iter().find(|(p, _)| *p == path) {
         return Access::Member(*owned);
-    }
-    // 某一个号底下的所有操作都只关乎这个号，核对路径里的 id 是本人的就够了。
-    if path == "/credentials/{id}" || path.starts_with("/credentials/{id}/") {
-        return Access::Member(Owned::CredentialPath);
     }
     if path == "/users" || path.starts_with("/users/") {
         return Access::Manager;
@@ -550,8 +572,12 @@ async fn check_owned(
                 #[serde(default)]
                 ids: Vec<i64>,
             }
-            // 解不出来的交给 handler 去回它自己的 400，这里只管「解得出的 id 是不是本人的」。
-            let ids = serde_json::from_slice::<Ids>(&bytes).map(|b| b.ids).unwrap_or_default();
+            // 解不出来就当场回 400，不放过去：「解不出 → 空列表 → 判成全是本人的」是放行，
+            // 万一哪天 handler 那边的解析比这里宽松，那就是越权。
+            let ids = match serde_json::from_slice::<Ids>(&bytes) {
+                Ok(b) => b.ids,
+                Err(e) => return Err((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+            };
             let all_owned = if owned == Owned::CredentialIds {
                 state.store.credentials_owned_by(&ids, owner).await
             } else {
@@ -814,6 +840,15 @@ pub struct PwReq {
 }
 
 #[derive(Deserialize)]
+pub struct ChangePwReq {
+    /// 新密码；admin 传空串 = 清除管理密码。
+    password: String,
+    /// 当前密码，必填（见 [`change_password`]）。
+    #[serde(default)]
+    current_password: String,
+}
+
+#[derive(Deserialize)]
 pub struct SetupReq {
     password: String,
     /// 启动日志里的初始化口令。
@@ -891,13 +926,18 @@ pub async fn setup(
 /// 改自己的密码（已鉴权，访客不行）。admin 传空串 = 清除管理密码，控制台回到初始化状态
 /// （访客跟着清掉、所有会话作废）；环境接管的 admin 不能在网页上改。
 ///
+/// **要带当前密码**：只凭会话就能改的话，会话 token 一漏就等于账号被接管（改掉密码、把本人
+/// 踢下线）；admin 还能把管理密码清空、让控制台退回初始化状态。当前密码的核对有自己的
+/// 失败计数（与登录同一套窗口和上限，但不共用），拿偷来的会话在这里猜密码一样会被锁，
+/// 却锁不到本人的登录。答错回 403 不回 401：401 会让前端以为会话失效、把人踢回登录页。
+///
 /// 改成功后作废本人的其它会话，当前这个保留。
 pub async fn change_password(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: header::HeaderMap,
-    Json(req): Json<PwReq>,
+    Json(req): Json<ChangePwReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if actor.is_viewer() {
         return Err((StatusCode::FORBIDDEN, "the viewer password is set by the admin".into()));
@@ -909,6 +949,30 @@ pub async fn change_password(
     if cleared && !actor.is_admin() {
         check_new_password("")?;
     }
+    // 与登录**分开计数**：共用一份的话，偷到会话的人在这里故意答错几次，就能把本人锁在
+    // 登录页外，而自己手里的会话照用不误。`:` 不是合法的用户名字符，撞不上真实用户名。
+    let key = format!("password-change:{}", actor.username.to_lowercase());
+    if !reserve_login_attempt(&key, true) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed password attempts; try again in a few minutes".into(),
+        ));
+    }
+    let me = state
+        .store
+        .user_by_id(actor.id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED.to_string()))?;
+    if verify_user_password(&state, &me, req.current_password.trim()).await?.is_none() {
+        tracing::warn!(
+            ip = %client_ip(&headers, peer),
+            username = %actor.username,
+            "console password change rejected: wrong current password"
+        );
+        return Err((StatusCode::FORBIDDEN, "the current password is incorrect".into()));
+    }
+    clear_login_attempts(&key);
     // 先记下此刻的哈希与当前会话，算完新哈希再按它们条件写入（见
     // `store::CredentialStore::change_own_password`）：算哈希期间被管理员重置了密码、撤了会话
     // 的话，这条在途请求写不进去。
@@ -960,6 +1024,9 @@ pub struct MeResp {
     viewer_configured: bool,
     /// 访客密码是否由环境变量接管（true = 网页不可改）。仅 admin 可见。
     viewer_env_managed: bool,
+    /// 代理和用户改自己号的调度参数时能到的边（admin 与访客为 null），前端据此收窄可选项。
+    /// 见 [`crate::web::MemberCaps`]。
+    member_caps: Option<crate::web::MemberCaps>,
 }
 
 /// 当前登录身份（已鉴权）。前端据此决定显示哪些页面、藏掉哪些按钮。
@@ -972,6 +1039,8 @@ pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor
         admin_env_managed: admin && state.admin_env.is_some(),
         viewer_configured: admin && viewer_enabled(&state).await,
         viewer_env_managed: admin && state.viewer_env.is_some(),
+        member_caps: matches!(actor.role, UserRole::Agent | UserRole::User)
+            .then(|| crate::web::MemberCaps::of(&state.store)),
     })
 }
 

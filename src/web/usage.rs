@@ -70,7 +70,7 @@ pub(super) async fn list_usage(
     {
         return Err(not_found());
     }
-    usage_page(&state, q.cred_id, owner, &q, 100, 1000).await
+    usage_page(&state, q.cred_id, owner, &q, 100, 1000, owner.is_some()).await
 }
 
 /// 列出某凭证的请求流水（按时间倒序，页码翻页）。
@@ -81,6 +81,7 @@ pub(super) async fn list_usage(
 /// 不是哪一边算错了。
 pub(super) async fn list_credential_usage(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<UsagePage>, ApiError> {
@@ -88,7 +89,7 @@ pub(super) async fn list_credential_usage(
     if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    usage_page(&state, Some(id), None, &q, 25, 200).await
+    usage_page(&state, Some(id), None, &q, 25, 200, actor.scope().owner().is_some()).await
 }
 
 #[derive(Serialize)]
@@ -104,6 +105,7 @@ pub(super) struct CredentialStatsResp {
 /// 只扫一个号的流水，而且只有详情页打开时才会被拉。
 pub(super) async fn get_credential_stats(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Query(q): Query<SeriesQuery>,
 ) -> Result<Json<CredentialStatsResp>, ApiError> {
@@ -111,9 +113,39 @@ pub(super) async fn get_credential_stats(
         return Err(not_found());
     }
     let (since, bucket_secs, tz) = q.normalized();
-    let stats =
+    let mut stats =
         state.store.credential_stats(id, since, bucket_secs, tz, 20).await.map_err(internal)?;
+    // 按设备、按客户端的拆分是下游使用者的设备 id 与 UA，号主不该看到，理由见 [`for_owner`]。
+    if actor.scope().owner().is_some() {
+        stats.by_device.clear();
+        stats.by_client.clear();
+    }
     Ok(Json(CredentialStatsResp { since, bucket_secs, stats }))
+}
+
+/// 给号主（代理和用户）看的流水：只留这个号自己的事——时间、模型、状态、用量、费用、
+/// 额度头、走的出口、上游错误类型。
+///
+/// 抹掉的两类：一是**下游使用者**的身份——来访 UA、设备 id、会话 id，以及出站那份派生的
+/// 设备 / 会话 id；二是 **luban 的改写细节**——走没走模拟、为什么走、请求体结构摘要、改写
+/// 标签。上游错误原文与零输出的回复片段也抹掉：前者个别会把请求体回显进来，后者就是模型
+/// 输出，都是下游的内容。号主是外部的人，这些看到了既泄露下游，也泄露手法。
+fn for_owner(mut log: store::UsageLog) -> store::UsageLog {
+    log.device_id = None;
+    log.ua = None;
+    log.ua_out = None;
+    let f = &mut log.forensics;
+    f.simulated = false;
+    f.sim_reason = None;
+    f.shape = None;
+    f.session_id = None;
+    f.session_id_in = None;
+    f.session_key = None;
+    f.device_id_out = None;
+    f.error_message = None;
+    f.rewrites = None;
+    f.response_excerpt = None;
+    log
 }
 
 /// 两条流水接口共用的取页逻辑：先按 `until`（没有就现取一个）钉住快照，再在同一条件下
@@ -128,6 +160,7 @@ async fn usage_page(
     q: &UsageQuery,
     default_limit: i64,
     max_limit: i64,
+    owner_view: bool,
 ) -> Result<Json<UsagePage>, ApiError> {
     let limit = q.limit.unwrap_or(default_limit).clamp(1, max_limit);
     let offset = q.offset.unwrap_or(0).max(0);
@@ -158,6 +191,9 @@ async fn usage_page(
         (Some(stats.total), Some(stats.cost_usd))
     };
     let anchor = filter.until_id;
-    let logs = state.store.query_usage_logs(filter).await.map_err(internal)?;
+    let mut logs = state.store.query_usage_logs(filter).await.map_err(internal)?;
+    if owner_view {
+        logs = logs.into_iter().map(for_owner).collect();
+    }
     Ok(Json(UsagePage { total, total_cost, anchor, logs }))
 }

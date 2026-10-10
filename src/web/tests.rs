@@ -137,14 +137,19 @@ async fn usage_of_a_deleted_credential_stays_reachable_by_cred_id(pool: sqlx::Pg
     assert!(store.delete(a.id).await.unwrap());
     let state = AppState::for_test(store.clone());
 
-    let err = list_credential_usage(State(state.clone()), Path(a.id), Query(UsageQuery::default()))
-        .await
-        .err()
-        .expect("按号接口对已删账号给 404");
+    let admin = Actor::from(state.store.admin_user().await.unwrap());
+    let err = list_credential_usage(
+        State(state.clone()),
+        Extension(admin.clone()),
+        Path(a.id),
+        Query(UsageQuery::default()),
+    )
+    .await
+    .err()
+    .expect("按号接口对已删账号给 404");
     assert_eq!(err.0, StatusCode::NOT_FOUND);
 
     let q = UsageQuery { cred_id: Some(a.id), ..Default::default() };
-    let admin = Actor::from(state.store.admin_user().await.unwrap());
     let page = list_usage(State(state), Extension(admin), Query(q)).await.unwrap().0;
     assert_eq!(page.total, Some(2), "已删账号的两条流水都还在");
     assert!(page.logs.iter().all(|l| l.cred_id == Some(a.id)), "只给这个号的");
@@ -410,17 +415,17 @@ fn concurrent_logins_do_not_clobber_each_other() {
     let (va, vb) = (a.verifier.clone(), b.verifier.clone());
     assert_ne!(sa, sb, "两次生成的 state 必须不同");
 
-    remember_pkce(&mut pending, a, now);
-    remember_pkce(&mut pending, b, now);
+    remember_pkce(&mut pending, 1, a, now);
+    remember_pkce(&mut pending, 1, b, now);
 
     // 先发起的那次照样能换回**自己**的 verifier，而不是被后一次顶掉。
-    let got_a = take_pkce(&mut pending, &sa, now).expect("先发起的那次登录不该被顶掉");
+    let got_a = take_pkce(&mut pending, 1, &sa, now).expect("先发起的那次登录不该被顶掉");
     assert_eq!(got_a.verifier, va);
-    let got_b = take_pkce(&mut pending, &sb, now).expect("后发起的那次也要在");
+    let got_b = take_pkce(&mut pending, 1, &sb, now).expect("后发起的那次也要在");
     assert_eq!(got_b.verifier, vb);
 
     // 取出即移除：一次挑战只能用一次，重放拿不到东西。
-    assert!(take_pkce(&mut pending, &sa, now).is_none(), "挑战不得被重复使用");
+    assert!(take_pkce(&mut pending, 1, &sa, now).is_none(), "挑战不得被重复使用");
     assert!(pending.is_empty());
 }
 
@@ -431,31 +436,42 @@ fn pkce_entries_expire_and_unknown_state_misses() {
     let mut pending = PendingPkce::new();
     let p = PkceChallenge::generate();
     let s = p.state.clone();
-    remember_pkce(&mut pending, p, now);
+    remember_pkce(&mut pending, 1, p, now);
 
-    assert!(take_pkce(&mut pending, "someone-elses-state", now).is_none());
+    assert!(take_pkce(&mut pending, 1, "someone-elses-state", now).is_none());
     // 刚好到 TTL 就算过期（条件是严格小于）。
-    remember_pkce(&mut pending, PkceChallenge::generate(), now);
+    remember_pkce(&mut pending, 1, PkceChallenge::generate(), now);
     let expired_at = now + PKCE_TTL;
-    assert!(take_pkce(&mut pending, &s, expired_at).is_none(), "过期的应被清掉");
+    assert!(take_pkce(&mut pending, 1, &s, expired_at).is_none(), "过期的应被清掉");
     assert!(pending.is_empty(), "过期项不该留在表里");
 }
 
-/// 反复点「添加账号」不能把内存撑起来：超量时丢最旧的，最新的那次必须留下。
+/// 反复点「添加账号」不能把内存撑起来，也不能挤掉别人的：每人超量时只丢自己最旧的，
+/// 最新的那次必须留下；全站超量时丢最旧的。
 #[test]
 fn pkce_table_is_bounded_and_drops_the_oldest() {
     let now = std::time::Instant::now();
     let mut pending = PendingPkce::new();
+    let admins = PkceChallenge::generate();
+    let admin_state = admins.state.clone();
+    remember_pkce(&mut pending, 1, admins, now);
     let mut states = Vec::new();
-    for _ in 0..(PKCE_MAX_PENDING + 5) {
+    for _ in 0..(PKCE_MAX_PER_OWNER + 5) {
         let p = PkceChallenge::generate();
         states.push(p.state.clone());
-        remember_pkce(&mut pending, p, now);
+        remember_pkce(&mut pending, 2, p, now);
     }
-    assert_eq!(pending.len(), PKCE_MAX_PENDING);
-    assert!(take_pkce(&mut pending, &states[0], now).is_none(), "最旧的应被丢弃");
+    assert_eq!(pending.len(), PKCE_MAX_PER_OWNER + 1);
+    assert!(take_pkce(&mut pending, 2, &states[0], now).is_none(), "最旧的应被丢弃");
     let newest = states.last().unwrap();
-    assert!(take_pkce(&mut pending, newest, now).is_some(), "最新的一次必须还在");
+    assert!(take_pkce(&mut pending, 1, newest, now).is_none(), "别人发起的取不到");
+    assert!(take_pkce(&mut pending, 2, newest, now).is_some(), "最新的一次必须还在");
+    assert!(take_pkce(&mut pending, 1, &admin_state, now).is_some(), "别人刷不掉 admin 的");
+
+    for owner in 0..(PKCE_MAX_PENDING as i64 + 5) {
+        remember_pkce(&mut pending, 100 + owner, PkceChallenge::generate(), now);
+    }
+    assert_eq!(pending.len(), PKCE_MAX_PENDING, "全站总量有上限");
 }
 
 /// 整数设置一律按非负存：负数落成 0（不限），正数原样。
@@ -716,4 +732,227 @@ async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys(pool: sq
         resolve_proxy(&state, &lonely, &req(None, None), true, all_up).await.unwrap().0,
         None
     );
+}
+
+/// 代理和用户改自己号的调度参数只能比全局更紧：优先级最高 P2，上限不能放开也不能高过全局，
+/// 提前停调度阈值不能高过全局；admin 不受限。
+#[sqlx::test]
+async fn members_can_only_tighten_scheduling(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = Actor::from(store.admin_user().await.unwrap());
+    let agent_id =
+        store.create_user("agent1", "x", UserRole::Agent, admin.id).await.unwrap().unwrap().id;
+    let agent = Actor { id: agent_id, username: "agent1".into(), role: UserRole::Agent };
+    let c = store.insert("c", None, "at", "rt", u64::MAX, None, None, agent_id).await.unwrap().id;
+    store.set_setting(store::DEFAULT_RPM_LIMIT, "60").await.unwrap();
+    store.set_setting(store::QUOTA_PAUSE_PCT, "90").await.unwrap();
+    let state = AppState::for_test(store.clone());
+
+    let prio = |who: &Actor, p: i64| {
+        let (state, who) = (state.clone(), who.clone());
+        async move {
+            set_priority(
+                State(state),
+                Extension(who),
+                Path(c),
+                Json(SetPriorityReq { priority: p }),
+            )
+            .await
+            .err()
+            .map(|e| e.0)
+        }
+    };
+    assert_eq!(prio(&agent, 1).await, Some(StatusCode::FORBIDDEN));
+    assert_eq!(prio(&agent, 3).await, None);
+    assert_eq!(prio(&admin, 0).await, None, "admin 不受限");
+    assert_eq!(prio(&agent, 1).await, None, "admin 给的 P0 可以往下调");
+    assert_eq!(prio(&agent, 0).await, Some(StatusCode::FORBIDDEN), "但调不回去");
+
+    let rpm = |who: &Actor, n: i64| {
+        let (state, who) = (state.clone(), who.clone());
+        async move {
+            set_rpm_limit(
+                State(state),
+                Extension(who),
+                Path(c),
+                Json(SetRpmLimitReq { rpm_limit: n }),
+            )
+            .await
+            .err()
+            .map(|e| e.0)
+        }
+    };
+    assert_eq!(rpm(&agent, -1).await, Some(StatusCode::FORBIDDEN), "不能放开");
+    assert_eq!(rpm(&agent, 61).await, Some(StatusCode::FORBIDDEN), "不能高过全局");
+    assert_eq!(rpm(&agent, 60).await, None);
+    assert_eq!(rpm(&agent, 0).await, None, "跟随全局");
+    assert_eq!(rpm(&admin, -1).await, None);
+    assert_eq!(rpm(&agent, -1).await, None, "admin 给的「不限」原样带回来不算放宽");
+    assert_eq!(rpm(&agent, 61).await, Some(StatusCode::FORBIDDEN));
+
+    // 全局不限时号主随便设，含「不限」。
+    store.set_setting(store::DEFAULT_RPM_LIMIT, "0").await.unwrap();
+    assert_eq!(rpm(&agent, -1).await, None);
+
+    let pct = |short: Option<i64>, long: Option<i64>| {
+        let (state, agent) = (state.clone(), agent.clone());
+        async move {
+            set_credential_quota_pause_pct(
+                State(state),
+                Extension(agent),
+                Path(c),
+                Json(SetCredentialQuotaPausePctReq {
+                    quota_pause_pct: short,
+                    quota_pause_pct_7d: long,
+                }),
+            )
+            .await
+            .err()
+            .map(|e| e.0)
+        }
+    };
+    assert_eq!(pct(Some(0), None).await, Some(StatusCode::FORBIDDEN), "不能「不停」");
+    assert_eq!(pct(Some(95), None).await, Some(StatusCode::FORBIDDEN), "不能高过全局");
+    assert_eq!(pct(Some(80), Some(50)).await, None, "7d 全局默认不停，随便设");
+
+    // admin 给这个号的 7d 设了「不停」：号主只改 5h、7d 原样带回 0 照样能存；改成比全局宽的不行。
+    store.set_setting(store::QUOTA_PAUSE_PCT_7D, "80").await.unwrap();
+    store.set_quota_pause_pcts(c, Some(80), Some(0)).await.unwrap();
+    assert_eq!(pct(Some(70), Some(0)).await, None);
+    assert_eq!(pct(Some(70), Some(90)).await, Some(StatusCode::FORBIDDEN));
+    // 原样带回的那一档不写：号主只改 5h 时，这期间 admin 改了 7d，不会被号主那份旧值盖回去。
+    store.set_quota_pause_pcts(c, Some(70), Some(30)).await.unwrap();
+    assert!(store.set_quota_pause_pcts_partial(c, Some(Some(60)), None).await.unwrap());
+    let got = store.get(c).await.unwrap().unwrap();
+    assert_eq!((got.quota_pause_pct, got.quota_pause_pct_7d), (Some(60), Some(30)));
+}
+
+/// admin 给号主的号配了内网代理（随之进了号主的池子）：号主把这条池代理用到自己别的号上、
+/// 改它的名字都照常；没进池的内网地址仍然拒。
+#[sqlx::test]
+async fn pooled_internal_proxies_stay_usable_for_their_owner(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = Actor::from(store.admin_user().await.unwrap());
+    let uid = store.create_user("u", "x", UserRole::User, admin.id).await.unwrap().unwrap().id;
+    let user = Actor { id: uid, username: "u".into(), role: UserRole::User };
+    let a = store.insert("a", None, "at", "ra", u64::MAX, None, None, uid).await.unwrap().id;
+    let b = store.insert("b", None, "at", "rb", u64::MAX, None, None, uid).await.unwrap().id;
+    let state = AppState::for_test(store.clone());
+    let set = |who: &Actor, id: i64, url: &str| {
+        let (state, who, url) = (state.clone(), who.clone(), url.to_owned());
+        async move {
+            set_proxy(
+                State(state),
+                Extension(who),
+                Path(id),
+                Json(SetProxyReq { proxy: Some(url) }),
+            )
+            .await
+            .err()
+            .map(|e| e.0)
+        }
+    };
+    assert_eq!(set(&user, a, "http://10.0.0.5:3128").await, Some(StatusCode::BAD_REQUEST));
+    assert_eq!(set(&admin, a, "http://10.0.0.5:3128").await, None);
+    assert_eq!(set(&user, b, "http://10.0.0.5:3128").await, None, "已在本人池里");
+    let pid = store.list_proxies(Scope::Owner(uid)).await.unwrap()[0].id;
+    let renamed = update_saved_proxy(
+        State(state.clone()),
+        Extension(user.clone()),
+        Path(pid),
+        Json(UpdateProxyReq { label: "gw".into(), url: "http://10.0.0.5:3128".into() }),
+    )
+    .await;
+    assert!(renamed.is_ok(), "只改名称");
+    assert_eq!(set(&user, b, "http://10.0.0.6:3128").await, Some(StatusCode::BAD_REQUEST));
+}
+
+/// 号主看自己号的流水：下游的设备 / 会话 / UA 与 luban 的改写细节抹掉，用量与费用照给；
+/// admin 看到全量。按号统计里按设备、按客户端的拆分也不给号主。
+#[sqlx::test]
+async fn owners_see_usage_without_forensics(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = Actor::from(store.admin_user().await.unwrap());
+    let uid = store.create_user("u", "x", UserRole::User, admin.id).await.unwrap().unwrap().id;
+    let user = Actor { id: uid, username: "u".into(), role: UserRole::User };
+    let c = store.insert("c", None, "at", "rt", u64::MAX, None, None, uid).await.unwrap().id;
+    let mut rec = store::UsageRecord {
+        cred_id: Some(c),
+        cred_label: "c".into(),
+        device_id: Some("dev-in".into()),
+        ua: Some("claude-cli/2.1".into()),
+        cost_usd: Some(1.5),
+        ..Default::default()
+    };
+    rec.forensics.session_id_in = Some("sid-in".into());
+    rec.forensics.shape = Some("{}".into());
+    rec.forensics.error_type = Some("overloaded_error".into());
+    store.insert_usage_log(&rec).await.unwrap();
+    let state = AppState::for_test(store.clone());
+
+    let page = |who: &Actor| {
+        let (state, who) = (state.clone(), who.clone());
+        async move {
+            list_credential_usage(
+                State(state),
+                Extension(who),
+                Path(c),
+                Query(UsageQuery::default()),
+            )
+            .await
+            .unwrap()
+            .0
+            .logs
+            .remove(0)
+        }
+    };
+    let mine = page(&user).await;
+    assert_eq!((mine.device_id, mine.ua), (None, None));
+    assert_eq!((mine.forensics.session_id_in, mine.forensics.shape), (None, None));
+    assert_eq!(mine.forensics.error_type.as_deref(), Some("overloaded_error"), "错误类型照给");
+    assert_eq!(mine.cost_usd, Some(1.5));
+    let all = page(&admin).await;
+    assert_eq!(all.device_id.as_deref(), Some("dev-in"));
+    assert_eq!(all.forensics.session_id_in.as_deref(), Some("sid-in"));
+}
+
+/// 代理和用户的出口代理不能指向本机或内网：IP 直写、域名解析出来的都拦；admin 不受限。
+#[tokio::test]
+async fn member_proxies_cannot_point_inside() {
+    for ip in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "100.100.100.200",
+        "0.0.0.0",
+        "::1",
+        "fd00::1",
+        "fe80::1",
+        "::ffff:127.0.0.1",
+        "::7f00:1",
+        "64:ff9b::a00:5",
+        "64:ff9b:1::a9fe:a9fe",
+        "2002:7f00:1::",
+    ] {
+        assert!(is_internal_ip(ip.parse().unwrap()), "{ip} 该算内网");
+    }
+    for ip in [
+        "203.0.113.7",
+        "8.8.8.8",
+        "2001:db8::1",
+        "100.128.0.1",
+        "64:ff9b::808:808",
+        "2002:808:808::",
+    ] {
+        assert!(!is_internal_ip(ip.parse().unwrap()), "{ip} 不该算内网");
+    }
+    let member = Actor { id: 2, username: "u".into(), role: UserRole::User };
+    let admin = Actor { id: 1, username: "admin".into(), role: UserRole::Admin };
+    for url in ["socks5h://u:p@127.0.0.1:1080", "http://[::1]:8080", "http://localhost:3128"] {
+        assert!(check_proxy_target(&member, url).await.is_err(), "{url}");
+        assert!(check_proxy_target(&admin, url).await.is_ok(), "admin 不受限：{url}");
+    }
+    assert!(check_proxy_target(&member, "http://u:p@203.0.113.7:3128").await.is_ok());
 }

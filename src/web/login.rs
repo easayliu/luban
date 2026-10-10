@@ -8,9 +8,14 @@ use super::*;
 /// 一直占着位置。到点后那次登录会被判成「尚未生成授权链接」，重新点一次即可。
 pub(super) const PKCE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// 同时最多保留几个待完成的登录尝试。纯属防御——正常同时开几个标签页也就个位数，
-/// 上限只是不让反复点「添加账号」把内存撑起来。超出时丢掉最旧的那个。
-pub(super) const PKCE_MAX_PENDING: usize = 32;
+/// 同时最多保留几个待完成的登录尝试（全站）。纯属防御，只是不让反复点「添加账号」把内存
+/// 撑起来；正常够不着——每个人另有 [`PKCE_MAX_PER_OWNER`] 的上限。超出时丢掉最旧的那个。
+pub(super) const PKCE_MAX_PENDING: usize = 256;
+
+/// 每个人同时最多几个待完成的登录尝试。**按人限**：只有一个全站上限的话，任何一个代理或
+/// 用户（或泄露的上号 Key）连刷授权链接就能把别人——包括 admin——正在进行的登录挤掉。
+/// 超出时只丢这个人自己最旧的那个。
+pub(super) const PKCE_MAX_PER_OWNER: usize = 8;
 
 // ---------- 授权 ----------
 
@@ -22,44 +27,59 @@ pub(super) struct AuthorizeResp {
 /// 生成新的 PKCE 挑战并返回授权 URL；挑战按其 `state` 暂存，供后续交换时取回。
 ///
 /// 并发的多次登录互不干扰——每次各占一格，见 [`AppState::pkce`]。顺手清掉过期与超量的格子。
-pub(super) async fn authorize(State(state): State<AppState>) -> Json<AuthorizeResp> {
+pub(super) async fn authorize(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+) -> Json<AuthorizeResp> {
     let pkce = PkceChallenge::generate();
     // 申请哪些 scope 由 settings 决定（没配就是官方那一整套），见 [`store::OAUTH_SCOPES`]。
     let scopes = state.store.oauth_scopes();
     let url = pkce.authorize_url(&scopes);
     tracing::info!(scopes = %scopes, "authorization link generated");
-    remember_pkce(&mut state.pkce.lock(), pkce, std::time::Instant::now());
+    remember_pkce(&mut state.pkce.lock(), actor.id, pkce, std::time::Instant::now());
     Json(AuthorizeResp { url })
 }
 
-/// 进行中的登录尝试表，见 [`AppState::pkce`]。
-pub(super) type PendingPkce = Vec<(String, PkceChallenge, std::time::Instant)>;
+/// 一次进行中的登录尝试：`state`、发起人（控制台账号 id）、PKCE 上下文、发起时刻。
+pub(super) type PendingLogin = (String, i64, PkceChallenge, std::time::Instant);
 
-/// 记下一次新的登录尝试，顺手清掉过期与超量的格子。
+/// 进行中的登录尝试表，见 [`AppState::pkce`]。
+pub(super) type PendingPkce = Vec<PendingLogin>;
+
+/// 记下 `owner` 发起的一次新登录尝试，顺手清掉过期与超量的格子。
 ///
 /// 抽成自由函数是为了能直接测——它修的正是一个簿记 bug（并发登录互相顶掉），
 /// 而这类 bug 只在「同时两个人操作」时才现形，靠手点几乎复现不出来。
 pub(super) fn remember_pkce(
     pending: &mut PendingPkce,
+    owner: i64,
     pkce: PkceChallenge,
     now: std::time::Instant,
 ) {
-    pending.retain(|(_, _, at)| now.duration_since(*at) < PKCE_TTL);
-    pending.push((pkce.state.clone(), pkce, now));
-    // 超量时丢最旧的（尾插，故最旧在头部）。
+    pending.retain(|(_, _, _, at)| now.duration_since(*at) < PKCE_TTL);
+    // 这个人自己超量了只丢他自己最旧的（尾插，故最旧在前），不动别人的。
+    let mine = pending.iter().filter(|(_, o, _, _)| *o == owner).count();
+    if mine >= PKCE_MAX_PER_OWNER
+        && let Some(i) = pending.iter().position(|(_, o, _, _)| *o == owner)
+    {
+        pending.remove(i);
+    }
+    pending.push((pkce.state.clone(), owner, pkce, now));
     let overflow = pending.len().saturating_sub(PKCE_MAX_PENDING);
     pending.drain(..overflow);
 }
 
-/// 取出 `state` 对应的那次登录并从表中移除（一次挑战只能用一次）；过期的顺手清掉。
+/// 取出 `owner` 发起的、`state` 对应的那次登录并从表中移除（一次挑战只能用一次）；过期的
+/// 顺手清掉。别人发起的取不到：授权码只能由发起那次登录的人换。
 pub(super) fn take_pkce(
     pending: &mut PendingPkce,
+    owner: i64,
     state: &str,
     now: std::time::Instant,
 ) -> Option<PkceChallenge> {
-    pending.retain(|(_, _, at)| now.duration_since(*at) < PKCE_TTL);
-    let i = pending.iter().position(|(s, _, _)| s == state)?;
-    Some(pending.remove(i).1)
+    pending.retain(|(_, _, _, at)| now.duration_since(*at) < PKCE_TTL);
+    let i = pending.iter().position(|(s, o, _, _)| s == state && *o == owner)?;
+    Some(pending.remove(i).2)
 }
 
 /// 自动分配时已选中、还没入库的代理：`url` → 在途几次。并发的几个脚本同时上号时，库里的
@@ -119,7 +139,11 @@ where
         |url: &str| crate::clients::validate_proxy(url).map_err(|e| bad_request(format!("{e:#}")));
     match (raw, req.proxy_id) {
         (Some(_), Some(_)) => Err(bad_request("give either proxy or proxy_id, not both")),
-        (Some(raw), None) => Ok((Some(validate(raw)?), None)),
+        (Some(raw), None) => {
+            let url = validate(raw)?;
+            check_proxy_for(state, actor, &url).await?;
+            Ok((Some(url), None))
+        }
         (None, Some(id)) => {
             let not_found = || (StatusCode::NOT_FOUND, "proxy not found".to_string());
             if state.store.proxy_owner(id).await.map_err(internal)? != Some(actor.id) {
@@ -224,7 +248,7 @@ pub(super) async fn exchange(
     let (proxy, _reservation) =
         resolve_proxy(&state, &actor, &req, via_key.is_some(), probe_pool_proxy).await?;
     let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
-    let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
+    let pkce = take_pkce(&mut state.pkce.lock(), actor.id, &returned_state, std::time::Instant::now())
         .ok_or_else(|| bad_request("this login attempt expired or was not found; click 'Add account' again to generate a new authorization link"))?;
 
     // 有代理就临时建一个走代理的客户端——换码和拉 profile 都走它。

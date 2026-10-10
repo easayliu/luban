@@ -87,13 +87,20 @@ async fn saved_proxy_ids(
 /// 口径与卡片上的「设备 x/y」一致：只含 TTL 内仍活跃的绑定，所以条数必然等于 x。
 pub(super) async fn list_credential_devices(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<store::DeviceBinding>>, ApiError> {
     // 凭证不存在时给 404：否则前端会把「账号已被删掉」显示成「该账号没有设备」。
     if state.store.get(id).await.map_err(internal)?.is_none() {
         return Err(not_found());
     }
-    let devices = state.store.list_devices(id).await.map_err(internal)?;
+    let mut devices = state.store.list_devices(id).await.map_err(internal)?;
+    // 代理和用户：全池合计不给，见 [`store::DeviceBinding::cost_usd_all`]。
+    if actor.scope().owner().is_some() {
+        for d in &mut devices {
+            d.cost_usd_all = None;
+        }
+    }
     Ok(Json(devices))
 }
 
@@ -264,18 +271,25 @@ pub(super) async fn set_disabled(
 
 #[derive(Deserialize)]
 pub(super) struct SetPriorityReq {
-    priority: i64,
+    pub(super) priority: i64,
 }
 
-/// 设置优先级。
+/// 设置优先级。代理和用户最高只能调到 [`MemberCaps::min_priority`]（已经更高的只能往下调）。
 pub(super) async fn set_priority(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetPriorityReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     check_priority(req.priority)?;
-    if !state.store.set_priority(id, req.priority).await.map_err(internal)? {
-        return Err(not_found());
+    // 不能高过 P2，也不能比现在更高：admin 给的 P0 往下调一档（到 P1）照样可以。「比现在」
+    // 的判断与写入在同一条语句里，免得读完之后 admin 恰好改了档、这里再按旧值写回去。
+    let floor = member_caps(&state, &actor).map_or(PRIORITY_MIN, |c| c.min_priority);
+    if !state.store.set_priority(id, req.priority, floor).await.map_err(internal)? {
+        return Err(match state.store.get(id).await.map_err(internal)? {
+            Some(_) => stricter_only(Knob::Priority),
+            None => not_found(),
+        });
     }
     view_of(&state, id).await
 }
@@ -288,6 +302,144 @@ fn check_priority(priority: i64) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+// ---------- 代理和用户只能往紧里调 ----------
+
+/// 代理和用户改自己号的调度参数时能到的边：只能比全局更保守，不能更宽。
+///
+/// 这几项决定全池的流量往哪个号上走：P0 跨档先用尽、名额不限的号会把同组的流量吸过去，
+/// 而账单按号主算——号主把自己的号调到 P0、上限放开，就能把别人的流量抢过来，号一出事
+/// 下游的请求也跟着扎堆报错。admin 不受限（给某个号主的号单独放宽照样可以）。
+///
+/// 只在写入时核对：admin 之后把全局默认调紧，号主先前设的值不追溯。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct MemberCaps {
+    /// 能选的最高档（数值最小）：[`PRIORITY_DEFAULT`]，即 P2。
+    pub(crate) min_priority: i64,
+    /// 设备 / 会话 / RPM 上限换算成生效值后的天花板；`0` 为全局不限，这时随便设（含「不限」）。
+    pub(crate) device_limit: i64,
+    pub(crate) session_limit: i64,
+    pub(crate) rpm_limit: i64,
+    /// 提前停调度阈值（两档）换算成生效值后的天花板；`0` 为全局这一档不停，这时随便设。
+    pub(crate) quota_pause_pct: i64,
+    pub(crate) quota_pause_pct_7d: i64,
+}
+
+impl MemberCaps {
+    pub(crate) fn of(store: &store::CredentialStore) -> Self {
+        Self {
+            min_priority: PRIORITY_DEFAULT,
+            device_limit: store.default_device_limit().max(0),
+            session_limit: store.default_session_limit().max(0),
+            rpm_limit: store.default_rpm_limit().max(0),
+            quota_pause_pct: store.quota_pause_pct(),
+            quota_pause_pct_7d: store.quota_pause_pct_7d(),
+        }
+    }
+
+    /// 三态上限（`> 0` 独立 / `0` 跟随全局 / `< 0` 不限）换算成生效值后不超过天花板
+    /// （`0` 为不设边）。三种上限的三态语义相同，见 [`store::effective_device_limit`]。
+    fn allows_limit(&self, knob: Knob, limit: i64) -> bool {
+        let cap = match knob {
+            Knob::DeviceLimit => self.device_limit,
+            Knob::SessionLimit => self.session_limit,
+            Knob::RpmLimit => self.rpm_limit,
+            Knob::Priority | Knob::QuotaPause => unreachable!("not a three-state limit"),
+        };
+        cap == 0 || (1..=cap).contains(&store::effective_device_limit(limit, cap))
+    }
+}
+
+/// 代理和用户受 [`MemberCaps`] 约束的几项。
+#[derive(Debug, Clone, Copy)]
+enum Knob {
+    Priority,
+    DeviceLimit,
+    SessionLimit,
+    RpmLimit,
+    QuotaPause,
+}
+
+impl Knob {
+    fn name(self) -> &'static str {
+        match self {
+            Knob::Priority => "priority",
+            Knob::DeviceLimit => "device limit",
+            Knob::SessionLimit => "session limit",
+            Knob::RpmLimit => "rpm limit",
+            Knob::QuotaPause => "quota pause threshold",
+        }
+    }
+}
+
+/// admin 为 None（不受限），其余人回此刻的 [`MemberCaps`]。
+fn member_caps(state: &AppState, actor: &Actor) -> Option<MemberCaps> {
+    (!actor.is_admin()).then(|| MemberCaps::of(&state.store))
+}
+
+/// 代理和用户改单个号时，那个号此刻的样子（admin 不查，回 None）：原样保留的值不算放宽——
+/// admin 给的「不限」「不停」，号主改别的项时照原值带回来不该被拒。
+async fn current_for_member(
+    state: &AppState,
+    actor: &Actor,
+    id: i64,
+) -> Result<Option<Credential>, ApiError> {
+    if actor.is_admin() {
+        return Ok(None);
+    }
+    state.store.get(id).await.map_err(internal)?.ok_or_else(not_found).map(Some)
+}
+
+/// 核对一项三态上限（设备 / 会话 / RPM），回要不要写：admin 一律写；代理和用户与 `current`
+/// （单号接口给这个号的现值，批量不给）相同时**不写**、也不核对，否则换算后不能比全局宽。
+/// 单号与批量接口共用这一处。
+///
+/// 原值不写而不是「放行后照写」：读现值与写入之间 admin 可能刚把它收紧，照写就把 admin 收回
+/// 的「不限」又写了回去。不写就没有这个窗口——值本来就没变。
+fn check_member_limit(
+    state: &AppState,
+    actor: &Actor,
+    knob: Knob,
+    limit: i64,
+    current: Option<i64>,
+) -> Result<bool, ApiError> {
+    match member_caps(state, actor) {
+        None => Ok(true),
+        Some(_) if current == Some(limit) => Ok(false),
+        Some(c) if c.allows_limit(knob, limit) => Ok(true),
+        Some(_) => Err(stricter_only(knob)),
+    }
+}
+
+/// 核对两档提前停调度阈值（`None` 跟随全局 / `0` 不停 / `1..=100`），各档外层 `None` 表示这一档
+/// 不写、不核对。要写的那档换算成生效值后不超过全局（全局这一档不停时不设边）。
+fn check_member_pcts(
+    state: &AppState,
+    actor: &Actor,
+    short: Option<Option<i64>>,
+    long: Option<Option<i64>>,
+) -> Result<(), ApiError> {
+    let Some(c) = member_caps(state, actor) else { return Ok(()) };
+    let within = |pct: Option<Option<i64>>, cap: i64| match pct {
+        None => true,
+        Some(pct) => cap == 0 || (1..=cap).contains(&store::effective_quota_pause_pct(pct, cap)),
+    };
+    if within(short, c.quota_pause_pct) && within(long, c.quota_pause_pct_7d) {
+        Ok(())
+    } else {
+        Err(stricter_only(Knob::QuotaPause))
+    }
+}
+
+fn stricter_only(knob: Knob) -> ApiError {
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "{}: agents and users can only set values stricter than the global default",
+            knob.name()
+        ),
+    )
 }
 
 #[derive(Deserialize)]
@@ -311,6 +463,9 @@ pub(super) async fn set_priorities(
     match (req.priority, req.delta) {
         (Some(priority), None) => {
             check_priority(priority)?;
+            if member_caps(&state, &actor).is_some_and(|c| priority < c.min_priority) {
+                return Err(stricter_only(Knob::Priority));
+            }
             let n = state.store.set_priorities(&req.ids, priority).await.map_err(internal)?;
             tracing::info!(count = n, priority, "priority set in bulk");
         }
@@ -319,7 +474,9 @@ pub(super) async fn set_priorities(
             if delta == 0 || !(-span..=span).contains(&delta) {
                 return Err(bad_request(format!("delta must be non-zero and within ±{span}")));
             }
-            let n = state.store.shift_priorities(&req.ids, delta).await.map_err(internal)?;
+            // 代理和用户往上调最多到 P2；原本就在 P2 之上的（admin 给的）保持不动、不往下压。
+            let floor = member_caps(&state, &actor).map_or(PRIORITY_MIN, |c| c.min_priority);
+            let n = state.store.shift_priorities(&req.ids, delta, floor).await.map_err(internal)?;
             tracing::info!(count = n, delta, "priority shifted in bulk");
         }
         _ => return Err(bad_request("provide exactly one of priority or delta")),
@@ -357,6 +514,7 @@ pub(super) async fn set_device_limits(
     check_ids(&req.ids)?;
     // 负值统一收敛为 -1，与单账号接口保持一致。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
+    check_member_limit(&state, &actor, Knob::DeviceLimit, limit, None)?;
     let n = state.store.set_device_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
@@ -377,6 +535,7 @@ pub(super) async fn set_session_limits(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
+    check_member_limit(&state, &actor, Knob::SessionLimit, limit, None)?;
     let n = state.store.set_session_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, session_limit = limit, "session limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
@@ -397,6 +556,7 @@ pub(super) async fn set_rpm_limits(
 ) -> Result<Json<Vec<CredentialView>>, ApiError> {
     check_ids(&req.ids)?;
     let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
+    check_member_limit(&state, &actor, Knob::RpmLimit, limit, None)?;
     let n = state.store.set_rpm_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, rpm_limit = limit, "rpm limit set in bulk");
     list_credentials(State(state), Extension(actor)).await
@@ -422,6 +582,7 @@ pub(super) async fn set_quota_pause_pcts_many(
     check_ids(&req.ids)?;
     let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
     let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
+    check_member_pcts(&state, &actor, Some(short), Some(long))?;
     let n = state.store.set_quota_pause_pcts_many(&req.ids, short, long).await.map_err(internal)?;
     tracing::info!(
         count = n,
@@ -495,12 +656,21 @@ pub(super) struct SetDeviceLimitReq {
 /// 设置设备数上限。
 pub(super) async fn set_device_limit(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetDeviceLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     // 负值统一收敛为 -1，避免库里出现各式各样的“不限”取值。
     let limit = if req.device_limit < 0 { -1 } else { req.device_limit };
-    if !state.store.set_device_limit(id, limit).await.map_err(internal)? {
+    let current = current_for_member(&state, &actor, id).await?;
+    let write = check_member_limit(
+        &state,
+        &actor,
+        Knob::DeviceLimit,
+        limit,
+        current.map(|c| c.device_limit),
+    )?;
+    if write && !state.store.set_device_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -515,11 +685,20 @@ pub(super) struct SetSessionLimitReq {
 /// 设置模拟会话数上限。
 pub(super) async fn set_session_limit(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetSessionLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let limit = if req.session_limit < 0 { -1 } else { req.session_limit };
-    if !state.store.set_session_limit(id, limit).await.map_err(internal)? {
+    let current = current_for_member(&state, &actor, id).await?;
+    let write = check_member_limit(
+        &state,
+        &actor,
+        Knob::SessionLimit,
+        limit,
+        current.map(|c| c.session_limit),
+    )?;
+    if write && !state.store.set_session_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     view_of(&state, id).await
@@ -528,7 +707,7 @@ pub(super) async fn set_session_limit(
 #[derive(Deserialize)]
 pub(super) struct SetRpmLimitReq {
     /// RPM 上限三态：`> 0` 本账号独立上限；`0` 跟随全局默认；`< 0` 本账号明确不限。
-    rpm_limit: i64,
+    pub(super) rpm_limit: i64,
 }
 
 /// 设置该账号每分钟最多转发多少条请求。
@@ -537,11 +716,15 @@ pub(super) struct SetRpmLimitReq {
 /// 也不会因为调低而被追认——只影响之后的判定。
 pub(super) async fn set_rpm_limit(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetRpmLimitReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let limit = if req.rpm_limit < 0 { -1 } else { req.rpm_limit };
-    if !state.store.set_rpm_limit(id, limit).await.map_err(internal)? {
+    let current = current_for_member(&state, &actor, id).await?;
+    let write =
+        check_member_limit(&state, &actor, Knob::RpmLimit, limit, current.map(|c| c.rpm_limit))?;
+    if write && !state.store.set_rpm_limit(id, limit).await.map_err(internal)? {
         return Err(not_found());
     }
     tracing::info!(cred_id = id, rpm_limit = limit, "rpm limit set");
@@ -553,11 +736,11 @@ pub(super) struct SetCredentialQuotaPausePctReq {
     /// **5h 窗口**这一档：`null`（或不传）= 跟随全局；`0` = 本账号这一档不停；`1..=100` =
     /// 本账号独立阈值。后端夹到 0~100。
     #[serde(default)]
-    quota_pause_pct: Option<i64>,
+    pub(super) quota_pause_pct: Option<i64>,
     /// **7d 窗口**那一档，同上。两档**都要传**：这是整份覆盖，不传即视为「跟随全局」——
     /// 与全局那个接口「不传 = 保持现值」的约定不同，因为这里的三态里「跟随」本身就是 null。
     #[serde(default)]
-    quota_pause_pct_7d: Option<i64>,
+    pub(super) quota_pause_pct_7d: Option<i64>,
 }
 
 /// 设置该账号自己的「额度用到多少就提前停调度」阈值，覆盖全局的
@@ -566,12 +749,26 @@ pub(super) struct SetCredentialQuotaPausePctReq {
 /// 旧阈值停下的号不会因为调高阈值而自动回池——到点自恢复、手动启用或连通性测试照旧。
 pub(super) async fn set_credential_quota_pause_pct(
     State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
     Path(id): Path<i64>,
     Json(req): Json<SetCredentialQuotaPausePctReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     let short = req.quota_pause_pct.map(|p| p.clamp(0, 100));
     let long = req.quota_pause_pct_7d.map(|p| p.clamp(0, 100));
-    if !state.store.set_quota_pause_pcts(id, short, long).await.map_err(internal)? {
+    // 代理和用户：与现值相同的那一档不写（理由见 [`check_member_limit`]）。两档是整份提交的，
+    // 只改一档时另一档原样带回来，不写它就不会把这期间 admin 刚改的值盖回去。
+    let current = current_for_member(&state, &actor, id).await?;
+    let (short_w, long_w) = match &current {
+        None => (Some(short), Some(long)),
+        Some(c) => (
+            (short != c.quota_pause_pct).then_some(short),
+            (long != c.quota_pause_pct_7d).then_some(long),
+        ),
+    };
+    check_member_pcts(&state, &actor, short_w, long_w)?;
+    if (short_w.is_some() || long_w.is_some())
+        && !state.store.set_quota_pause_pcts_partial(id, short_w, long_w).await.map_err(internal)?
+    {
         return Err(not_found());
     }
     tracing::info!(
@@ -586,7 +783,7 @@ pub(super) async fn set_credential_quota_pause_pct(
 #[derive(Deserialize)]
 pub(super) struct SetProxyReq {
     /// 代理 URL；`null` 或空串表示清除（改回直连）。
-    proxy: Option<String>,
+    pub(super) proxy: Option<String>,
 }
 
 /// 设置/清除某个账号专用的出站代理。
@@ -607,6 +804,9 @@ pub(super) async fn set_proxy(
         }
         None => None,
     };
+    if let Some(url) = &proxy {
+        check_proxy_for(&state, &actor, url).await?;
+    }
     if !state.store.set_proxy(id, proxy.as_deref()).await.map_err(internal)? {
         return Err(not_found());
     }
