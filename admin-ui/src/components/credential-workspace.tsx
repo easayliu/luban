@@ -76,7 +76,7 @@ import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/too
 import { useI18n, type Language } from '@/lib/i18n'
 import { useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
-import { cacheHitRate, cn, displayCredentialLabel, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
+import { cacheHitRate, cn, displayCredentialLabel, formatPercent, formatUsd } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -400,25 +400,20 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     refetchInterval: 10_000,
     enabled: !!me.data,
   })
-  // 今日费用：今天（本地零点起）的等价费用，走分层账单接口，口径与费用页一致。管理员与访客看全池
-  // （标题行那枚摘要），代理和用户看本人名下的号（概览里那一格）。一分钟一拉——账单要扫当天的
-  // 预聚合，没必要跟实时流量一样 10 秒一次。成员只认查回来的真身份：占位数据的 id 是 0，拿它去查
-  // 会被后端当成别人。
+  // 今日费用：今天（本地零点起）的等价费用，走分层账单接口，口径与费用页一致。只给代理和用户
+  // （概览里那一格，本人名下的号）；管理员与访客的页头不放金额，看费用去费用页。一分钟一拉——账单
+  // 要扫当天的预聚合，没必要跟实时流量一样 10 秒一次。成员只认查回来的真身份：占位数据的 id 是 0，
+  // 拿它去查会被后端当成别人。
   const memberId = !seesWholePool && me.data && !me.isPlaceholderData ? me.data.id : null
   const todayStart = (() => {
     const d = new Date()
     return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000)
   })()
   const todayCostQuery = useQuery({
-    queryKey: ['billing-today', memberId ?? 'all', todayStart],
-    queryFn: () => getBilling({
-      from: todayStart,
-      to: todayStart + 86400,
-      by: 'day',
-      ...(memberId != null ? { owner_id: memberId } : {}),
-    }),
+    queryKey: ['billing-today', memberId, todayStart],
+    queryFn: () => getBilling({ from: todayStart, to: todayStart + 86400, by: 'day', owner_id: memberId! }),
     refetchInterval: 60_000,
-    enabled: seesWholePool || memberId != null,
+    enabled: memberId != null,
   })
   // 两枚质量卡片各拉两条线：近 24 小时逐小时（迷你线 + 近 1 小时的主数）与近 7 天（基线）。
   // 主数是「现在」，基线是「平时」——7 天平均看不出今天有没有变慢，一比就看出来了。
@@ -988,36 +983,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 </Tooltip>
               )}
             </div>
-            {/* 全池今日摘要（管理员与访客）：费用、请求数，悬浮看 token 分项与累计，点击去费用页。
-                代理和用户在概览里另有「今日费用」一格，这里不重复。
-                不做成带框的按钮：标题行里已有「N 个账号」徽标和设备那枚开关，再添一枚框，四样挤在
-                一起分不出主次。改成与「30 秒刷新」同一套的轻量文字，只把金额提一档字号与字重——
-                这一行里最该被看到的就是它。宽屏用一道竖线与刷新隔开；手机上标题行放不下，`basis-full`
-                让它独占第二行、贴左，读起来是标题的副标题，而不是一枚被挤下来的按钮。 */}
-            {seesWholePool && !isLoading && count > 0 && todayCostQuery.data && (() => {
-              const today = todayCostQuery.data.total
-              return (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={<button type="button" onClick={actions.onOpenBilling} />}
-                    className="mr-auto inline-flex min-w-0 items-baseline gap-1.5 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:basis-full sm:border-l sm:pl-3"
-                  >
-                    <span className="shrink-0">{t('今日费用', 'Today')}</span>
-                    <span className="shrink-0 text-sm font-semibold text-foreground tnum">{formatUsd(today.cost_usd)}</span>
-                    <span className="shrink-0" aria-hidden>·</span>
-                    <span className="truncate tnum">
-                      {t(`${formatNumber(today.requests)} 次请求`, `${formatNumber(today.requests)} requests`)}
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
-                    {t(
-                      `今日零点至今，全池按官方价格折算的费用。输入 ${formatTokens(today.input_tokens)}，输出 ${formatTokens(today.output_tokens)}，缓存写 ${formatTokens(today.cache_write_tokens)}，缓存读 ${formatTokens(today.cache_read_tokens)}；各账号累计 ${formatUsd(lifetimeCost)}。每分钟更新，点击查看明细。`,
-                      `Pool-wide cost since midnight at official API prices. Input ${formatTokens(today.input_tokens)}, output ${formatTokens(today.output_tokens)}, cache write ${formatTokens(today.cache_write_tokens)}, cache read ${formatTokens(today.cache_read_tokens)}; ${formatUsd(lifetimeCost)} across all accounts to date. Updated every minute. Click for details.`,
-                    )}
-                  </TooltipPopup>
-                </Tooltip>
-              )
-            })()}
           </div>
         {isLoading ? (
           <WorkspaceToolbarSkeleton />

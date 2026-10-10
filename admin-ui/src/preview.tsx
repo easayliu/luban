@@ -884,7 +884,7 @@ queryClient.setQueryData(['settings'], {
   tool_name_mimic: true,
 })
 queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 })
-// 今日费用：管理员标题行那枚摘要（全池）与成员概览那一格共用同一份样例。
+// 今日费用：成员概览那一格。预览没有真身份（memberId 为 null，查询不发），直接按那个键塞缓存。
 {
   const d = new Date()
   const todayStart = Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000)
@@ -892,7 +892,7 @@ queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 
     requests: 1286, input_tokens: 412_000, output_tokens: 1_830_000,
     cache_write_tokens: 2_460_000, cache_read_tokens: 48_900_000, cost_usd: 86.42,
   }
-  queryClient.setQueryData(['billing-today', 'all', todayStart], {
+  queryClient.setQueryData(['billing-today', null, todayStart], {
     from: todayStart, to: todayStart + 86400, rows: [{ key: String(todayStart), label: null, ...today }], total: today,
   })
 }
