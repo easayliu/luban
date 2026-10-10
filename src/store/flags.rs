@@ -124,13 +124,21 @@ pub struct ForwardFlags {
     /// - **开**：不补身份句、官方基座、第四块、官方工具、`thread` / `diagnostics` /
     ///   `output_config`，不重排顶层键（`metadata.user_id` 另由两项子开关管）；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
     ///   换头照旧；`cch` 跟随 [`Self::cch_sim_compute`]（开算真值、关填随机值）。上游放行只认
-    ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。代价：官方「仅 billing header」的请求几乎都是 0 工具、
-    ///   一两轮的辅助调用，长多轮带工具的主对话官方从不这样发，属官方不产生的形态。
+    ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。
+    ///   代价：官方「仅 billing header、无身份句」的请求几乎全是 message thread 的 `continue` 续轮
+    ///   （`cap/auto-2.1.291-20261006-full` 68 条、`auto-2.1.293-20261008-full` 81 条无一例外）：
+    ///   首轮已带身份句建好线程，续轮 system 只剩 billing header 一块，同时带 `thread`、会话链字段
+    ///   （`cc_prev_req` 等）与完整的 `thinking` / `output_config`；唯一例外是桌面端单轮、0 工具的
+    ///   状态摘要 helper（`cap/auto-desktop-2.1.295-20261010-sub`）。「billing header + 客户端自有
+    ///   system + 完整多轮历史、无 `thread`」官方不产生，这个开关只保证过闸、不保证形态。
+    ///   2026-10-10 实测：客户端 system 12KB、出站 system 9 块均照常走订阅额度、未判第三方，
+    ///   故这条路不跑完整模拟那两道防线（`cap_system_blocks` 块数封顶、`relocate_long_client_system`
+    ///   长 system 挪进首条消息）。
     /// - **关**（默认）：按完整官方形态模拟。
     pub sim_billing_only: bool,
     /// billing-only 下**模拟请求**带不带 `metadata.user_id`（[`Self::sim_billing_only`] 的子项）。
     /// 真实客户端另由 [`Self::real_billing_keep_user_id`] 管。官方每条请求都带 `user_id`，「仅
-    /// billing header」那类辅助调用也一样（`cap/auto-2.1.293-20261008-full`）。
+    /// billing header」的 `continue` 续轮也一样（`cap/auto-2.1.293-20261008-full`）。
     ///
     /// - **开**（默认）：带了就保留，并照常按身份伪装 / 归一化规则改写（[`Self::spoof_identity`]、
     ///   [`Self::spoof_device_id`]、[`Self::normalize_device_fp`]），会话段对齐出站会话头；没带就按

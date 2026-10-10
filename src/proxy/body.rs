@@ -397,7 +397,7 @@ pub(super) fn rewrite_body_out(
     // （Claude Desktop 不带，Claude Code 也能用环境变量关掉）。开着（默认）则原样透传。
     let meta_stripped = strip_uid && strip_metadata_user_id(&mut v);
     // 没带 `user_id` 的补一份官方形态的。billing-only 下照补（开着「带 user_id」时）：官方每条
-    // 请求都带它，「仅 billing header、无身份句」那类辅助调用也不例外（`cap/auto-2.1.293-20261008-full`
+    // 请求都带它，「仅 billing header、无身份句」的 `continue` 续轮也不例外（`cap/auto-2.1.293-20261008-full`
     // 174 条有 system 的请求全带）。真实客户端那份的会话 id 由 [`bare_session_id`] 给，它自己按
     // `real_billing_keep_user_id` 判。客户端已带的 [`ensure_cc_metadata`] 不动。
     let sim_meta = flags.spoof_identity
