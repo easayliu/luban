@@ -988,6 +988,19 @@ fn prune_send_window(q: &mut std::collections::VecDeque<(std::time::Instant, i64
     }
 }
 
+/// 一批号此刻在上游那边跑着的请求数之和（全部模型合计）。代理和用户的「实时流量」用它算在途：
+/// 全局那个 [`InFlightGuard`] 计数分不出是谁的号，这张表的键带着账号。口径比全局那个略窄——
+/// 只数已经选好号、发往上游的，还在排队选号的不算，对「我的号此刻压了多少」正合适。
+pub(crate) fn in_flight_of(load: &UpstreamLoad, cred_ids: &[i64]) -> i64 {
+    let table = load.lock();
+    table
+        .in_flight
+        .iter()
+        .filter(|((id, _), _)| cred_ids.contains(id))
+        .map(|(_, n)| i64::from(*n))
+        .sum()
+}
+
 /// 一发裸 429 落地时，我们这一侧的发送密度读数，见 [`UpstreamLoad`]。
 pub(super) struct UpstreamLoadSnapshot {
     /// 这条「账号 + 模型」路线此刻的在飞数，**含发起这次查询的这条请求自己**（它的格子还没归还）。

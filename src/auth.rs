@@ -447,6 +447,8 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/ban-events/{id}/logs", Owned::BanEventPath),
     // 请求流水：handler 把结果强制限定在本人名下的号上。
     ("/usage", Owned::Nothing),
+    // 实时流量：handler 按身份收窄到本人名下的号（缓存、时延等趋势仍是全池口径，只给 admin）。
+    ("/metrics", Owned::Nothing),
     // 分层账单：handler 按身份收窄可见的号主与拆分维度。
     ("/billing", Owned::Nothing),
     // 上号 Key：handler 按身份收窄到本人名下的（admin 看全部）。

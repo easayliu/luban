@@ -33,6 +33,7 @@ import { LoginPage } from '@/components/login-page'
 import { SetupPage } from '@/components/setup-page'
 import { UsersPage } from '@/components/users-page'
 import { BillingPage } from '@/components/billing-page'
+import { ProxiesPage } from '@/components/proxies-page'
 import { AppFooter } from '@/components/app-footer'
 import {
   AccountMenu,
@@ -69,7 +70,7 @@ function SettingsPageFallback({ onNavigate }: { onNavigate: (section: MainSectio
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        actions={<AccountMenu />}
+        actions={<AccountMenu onNavigate={onNavigate} />}
         nav={<MainNav current="settings" onNavigate={onNavigate} />}
         onNavigateHome={() => onNavigate('pool')}
       />
@@ -132,7 +133,7 @@ function readViewParams(): URLSearchParams {
 }
 
 // 与 settings-page 的 SettingsSection 保持一致；那边是懒加载的，不从那里 import 以免把它拉进首包。
-const SETTINGS_SECTIONS: readonly SettingsSection[] = ['access', 'groups', 'devices', 'proxies', 'forwarding', 'security', 'migration']
+const SETTINGS_SECTIONS: readonly SettingsSection[] = ['access', 'groups', 'devices', 'forwarding', 'security', 'migration']
 
 function readSettingsRoute(): SettingsSection | null {
   const match = /^#\/settings(?:\/([^/?]+))?/.exec(window.location.hash)
@@ -142,12 +143,17 @@ function readSettingsRoute(): SettingsSection | null {
   return section && SETTINGS_SECTIONS.includes(section) ? section : 'access'
 }
 
-/** 与账号池平级的一级页面（`#/users`、`#/billing`）。 */
-type MainPage = 'users' | 'billing'
+/** 与账号池平级的一级页面（`#/proxies`、`#/users`、`#/billing`）。 */
+type MainPage = 'proxies' | 'users' | 'billing'
 
 function readMainRoute(): MainPage | null {
-  const match = /^#\/(users|billing)(?:[/?]|$)/.exec(window.location.hash)
+  const match = /^#\/(proxies|users|billing)(?:[/?]|$)/.exec(window.location.hash)
   return match ? (match[1] as MainPage) : null
+}
+
+// 代理池原来是系统设置里的一个分区（`#/settings/proxies`），挪成一级页面后旧书签原地改到新地址。
+if (/^#\/settings\/proxies(?:[/?]|$)/.test(window.location.hash)) {
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#/proxies`)
 }
 
 /** `#/accounts/<id>` → 账号 id；其余地址不是详情页。 */
@@ -288,7 +294,7 @@ function App() {
     }
     window.scrollTo({ top: 0, behavior: 'instant' })
   }
-  // 主导航：账号池、费用、用户管理、系统设置四者平级。从账号池进去压一层历史（后退回
+  // 主导航：账号池、代理池、费用、用户管理、系统设置五者平级。从账号池进去压一层历史（后退回
   // 账号池），一级页面之间互切原地替换，不在历史里越积越深。
   const navigateMain = (section: MainSection) => {
     if (section === 'pool') {
@@ -359,7 +365,7 @@ function App() {
   const isAdmin = useIsAdmin()
   const seesWholePool = useSeesWholePool()
   const canManageUsers = useCanManageUsers()
-  // 系统设置只对管理员开放（后端也拒 `/settings`），用户管理只对管理员与代理开放：深链接、
+  // 系统设置只对管理员开放（后端也拒 `/settings`），用户管理只对管理员与代理开放，代理池不给访客：深链接、
   // 书签进来的落回账号池。只对确认过的身份清路由；身份未明时下面只是先不渲染，查回来有权限
   // 就照常打开。
   const confirmedRole = useConfirmedRole()
@@ -370,6 +376,10 @@ function App() {
       setSettingsRoute(null)
     }
     if (mainRoute === 'users' && confirmedRole !== 'admin' && confirmedRole !== 'agent') {
+      window.history.replaceState(null, '', '#/')
+      setMainRoute(null)
+    }
+    if (mainRoute === 'proxies' && confirmedRole === 'viewer') {
       window.history.replaceState(null, '', '#/')
       setMainRoute(null)
     }
@@ -434,6 +444,10 @@ function App() {
 
   if (!isBootstrapping && mainRoute === 'users' && canManageUsers) {
     return <UsersPage onNavigate={navigateMain} onSignOut={signOut} />
+  }
+
+  if (!isBootstrapping && mainRoute === 'proxies' && !readOnly) {
+    return <ProxiesPage onNavigate={navigateMain} onSignOut={signOut} />
   }
 
   if (!isBootstrapping && mainRoute === 'billing') {
@@ -513,8 +527,11 @@ function App() {
                 </Button>
               </Hint>
             )}
-            {/* 系统设置已在主导航里；这里只留账号池自己的工具（封号记录看全池，只给管理员与访客）。 */}
-            <AccountMenu onSignOut={authState?.configured && session ? signOut : undefined}>
+            {/* 账号池自己的工具在上（封号记录看全池，只给管理员与访客），成员管理、系统设置由菜单按身份补上。 */}
+            <AccountMenu
+              onNavigate={navigateMain}
+              onSignOut={authState?.configured && session ? signOut : undefined}
+            >
               {seesWholePool && (
                 <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
                   <ShieldAlertIcon />{t('封号记录', 'Ban events')}
@@ -565,6 +582,7 @@ function App() {
             onPageSizeChange: setPageSize,
             onRetry: retry,
             onAdd: () => setAdding(true),
+            onOpenBilling: () => navigateMain('billing'),
           }}
         />
       </main>

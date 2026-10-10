@@ -2,7 +2,6 @@ import {
   ArrowRightLeftIcon,
   CableIcon,
   FolderIcon,
-  GlobeIcon,
   LockKeyholeIcon,
   SlidersHorizontalIcon,
   SmartphoneIcon,
@@ -16,7 +15,6 @@ import { AppFooter } from '@/components/app-footer'
 import { ForwardingSettingsContent } from '@/components/forwarding-settings'
 import { GroupSettingsContent } from '@/components/group-settings'
 import { MigrationSettingsContent } from '@/components/migration-settings'
-import { ProxyPoolSettingsContent } from '@/components/proxy-pool-settings'
 import { AccountMenu, AppHeader, MainNav, type MainSection } from '@/components/app-header'
 import {
   Select,
@@ -30,7 +28,7 @@ import { useI18n } from '@/lib/i18n'
 import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 
-export type SettingsSection = 'access' | 'groups' | 'devices' | 'proxies' | 'forwarding' | 'security' | 'migration'
+export type SettingsSection = 'access' | 'groups' | 'devices' | 'forwarding' | 'security' | 'migration'
 
 export function SettingsPage({
   section,
@@ -62,12 +60,6 @@ export function SettingsPage({
       label: t('设备策略', 'Device policies'),
       navDescription: t('绑定、容量与身份校验', 'Bindings, capacity, and identity'),
       icon: SmartphoneIcon,
-    },
-    {
-      key: 'proxies',
-      label: t('代理池', 'Proxy pool'),
-      navDescription: t('出站代理地址管理', 'Outbound proxy management'),
-      icon: GlobeIcon,
     },
     {
       key: 'forwarding',
@@ -104,7 +96,7 @@ export function SettingsPage({
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        actions={<AccountMenu onSignOut={onSignOut} />}
+        actions={<AccountMenu onNavigate={onNavigate} onSignOut={onSignOut} />}
         nav={<MainNav current="settings" onNavigate={onNavigate} />}
         onNavigateHome={() => onNavigate('pool')}
       />
@@ -197,7 +189,7 @@ export function SettingsPage({
             <div className="min-w-0 flex-1">
               {/* 分区头只剩一行标题：原来这里是「图标徽章 + 标题 + 一句话」，可同一个图标左边导航
                   刚画过、同一句话下面第一张卡片又要再说一遍（「代理池」那一区最明显：三个字出现
-                  三次、描述出现两次）。左导航已经交代了「在哪一区」，这里留一个 h2 接住标题层级
+                  三次、描述出现两次；代理池后来挪成了一级页面）。左导航已经交代了「在哪一区」，这里留一个 h2 接住标题层级
                   与 aria 就够，各区具体讲什么交给卡片头自己说。 */}
               {/* 窄屏上这个 h2 紧贴在分类下拉底下，是同一个词连说两遍；留给读屏但不占位置。
                   lg 起侧栏在左、正文在右，它才是正文这一列的标题。 */}
@@ -213,9 +205,6 @@ export function SettingsPage({
               </TabsPanel>
               <TabsPanel className="min-w-0" value="devices">
                 {section === 'devices' && <DeviceSettingsContent />}
-              </TabsPanel>
-              <TabsPanel className="min-w-0" value="proxies">
-                {section === 'proxies' && <ProxyPoolSettingsContent />}
               </TabsPanel>
               <TabsPanel className="min-w-0" value="forwarding">
                 {section === 'forwarding' && <ForwardingSettingsContent />}

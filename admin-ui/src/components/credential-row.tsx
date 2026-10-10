@@ -473,7 +473,10 @@ export const CredentialRow = memo(function CredentialRow({
 
       {wide && (
       <TableRow className="hidden xl:table-row" data-state={selected ? 'selected' : undefined}>
-        <TableCell className={cn(COL.select, selectable ? 'pl-4 pr-0' : 'p-0')}>
+        {/* 卡片式表格给每行首格写死了 `ps-[calc(--spacing(2.5)-1px)]`（让过行左边框），选择器比
+            `pl-4` 具体，`pl-4` 在这里从来没生效——行里的勾选框离边 10px，表头那枚 16px，上下错开
+            6px。这里用 `!` 压过去，并扣掉那 1px 边框，与表头同在 16px 处。 */}
+        <TableCell className={cn(COL.select, selectable ? 'ps-[calc(--spacing(4)-1px)]! pr-0' : 'p-0')}>
           {selectable && (
             <Checkbox
               checked={selected}

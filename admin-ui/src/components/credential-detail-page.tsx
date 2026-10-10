@@ -233,7 +233,7 @@ export function CredentialDetailPage({
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        actions={<AccountMenu onSignOut={onSignOut} />}
+        actions={<AccountMenu onNavigate={onNavigate} onSignOut={onSignOut} />}
         nav={onNavigate && <MainNav current="pool" onNavigate={onNavigate} />}
         onNavigateHome={onBack}
       />

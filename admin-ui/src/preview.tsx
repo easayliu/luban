@@ -10,6 +10,7 @@ import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { AccessSettings } from '@/components/access-settings'
 import { ForwardingSettings } from '@/components/forwarding-settings'
 import { SettingsPage, type SettingsSection } from '@/components/settings-page'
+import { ProxiesPage } from '@/components/proxies-page'
 import { AppFooter } from '@/components/app-footer'
 import { AppHeader, PreferencesMenu, scrollToTop } from '@/components/app-header'
 import {
@@ -671,7 +672,7 @@ const previewLanguage = parseLanguage(previewParams.get('lang')) ?? 'zh-CN'
 const previewDialog = previewParams.get('dialog')
 const previewSettingsParam = previewParams.get('settings')
 const PREVIEW_SETTINGS_SECTIONS: readonly SettingsSection[] = [
-  'access', 'devices', 'proxies', 'forwarding', 'security', 'migration',
+  'access', 'devices', 'forwarding', 'security', 'migration',
 ]
 const previewSettings: SettingsSection | null =
   PREVIEW_SETTINGS_SECTIONS.find((section) => section === previewSettingsParam) ?? null
@@ -893,6 +894,18 @@ queryClient.setQueryData(['settings'], {
   tool_name_mimic: true,
 })
 queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 })
+// 今日费用：管理员标题行那枚摘要（全池）与成员概览那一格共用同一份样例。
+{
+  const d = new Date()
+  const todayStart = Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000)
+  const today = {
+    requests: 1286, input_tokens: 412_000, output_tokens: 1_830_000,
+    cache_write_tokens: 2_460_000, cache_read_tokens: 48_900_000, cost_usd: 86.42,
+  }
+  queryClient.setQueryData(['billing-today', 'all', todayStart], {
+    from: todayStart, to: todayStart + 86400, rows: [{ key: String(todayStart), label: null, ...today }], total: today,
+  })
+}
 // 学到的规则：四个种类各一两条，上游原话故意写长，用来检查列表与清空确认框在手机上的样子。
 queryClient.setQueryData(['learned-rejections'], [
   { kind: 'shape', model: 'claude-haiku-4-5', field: 'output_config.effort', value: 'xhigh', message: "invalid_request_error: output_config.effort: Input should be 'low', 'medium' or 'high' for this model; received 'xhigh'", learned_at: now - 5 * 3600, expires_at: now + 6 * 86400 },
@@ -1147,6 +1160,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <div className="relative isolate min-h-dvh">
             {previewParams.get('page') === 'login' ? (
               <LoginPage onSuccess={() => navigatePreview()} />
+            ) : previewParams.get('page') === 'proxies' ? (
+              <ProxiesPage onNavigate={() => navigatePreview()} onSignOut={() => {}} />
             ) : previewSettings ? (
               <PreviewSettingsRoute initialSection={previewSettings} />
             ) : (

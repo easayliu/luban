@@ -107,7 +107,7 @@ use upstream::{
     Aggregated, InFlightGuard, SessionConcurrencyGuard, SseAggregator, UPSTREAM_SEND_WINDOW,
     aggregate_sse, error_status, note_upstream_send, upstream_load_snapshot,
 };
-pub(crate) use upstream::{SessionConcurrency, UpstreamLoad};
+pub(crate) use upstream::{SessionConcurrency, UpstreamLoad, in_flight_of};
 
 mod logging;
 #[cfg(test)]

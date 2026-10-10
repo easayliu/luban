@@ -732,6 +732,14 @@ impl CredentialStore {
             .flatten())
     }
 
+    /// `owner` 名下全部号的 id（升序）。
+    pub async fn credential_ids_owned_by(&self, owner: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar("SELECT id FROM credentials WHERE owner_id = $1 ORDER BY id")
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     /// `ids` 里的号是不是**全都**存在且归 `owner`。
     pub async fn credentials_owned_by(&self, ids: &[i64], owner: i64) -> Result<bool> {
         // 去重后数命中的行：重复的 id 不该让「全都」判错。

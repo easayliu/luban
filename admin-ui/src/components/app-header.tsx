@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import {
   EllipsisVerticalIcon,
+  GlobeIcon,
   KeySquareIcon,
   KeyRoundIcon,
   LayersIcon,
@@ -132,12 +133,13 @@ export function AppHeader({
 }
 
 /** 顶栏主导航的一级页面。 */
-export type MainSection = 'pool' | 'billing' | 'users' | 'settings'
+export type MainSection = 'pool' | 'proxies' | 'billing' | 'users' | 'settings'
 
 /**
- * 顶栏主导航：账号池、费用、用户管理、系统设置是平级的一级页面，不是谁挂在谁下面——每一页
- * 都能直接去别的页，不必先回账号池。用户管理只给管理员与代理，系统设置只给管理员。窄屏只留
- * 图标，文字留给读屏与悬浮提示。
+ * 顶栏主导航：账号池、代理池、费用这几个天天用的一级页面平铺，每一页都能直接去别的页，不必先回
+ * 账号池。代理池不给访客（页上全是改动类操作）。成员管理和系统设置同样是一级页面，但不常去，
+ * 收进右上角的账号菜单（见 [AccountMenu]），顶栏五项挤在一起太满。窄屏只留图标，文字留给读屏与
+ * 悬浮提示。
  */
 export function MainNav({
   current,
@@ -147,13 +149,11 @@ export function MainNav({
   onNavigate: (section: MainSection) => void
 }) {
   const { t } = useI18n()
-  const canManageUsers = useCanManageUsers()
-  const isAdmin = useIsAdmin()
+  const readOnly = useReadOnly()
   const items = [
     { key: 'pool' as const, label: t('账号池', 'Accounts'), icon: LayersIcon },
+    ...(!readOnly ? [{ key: 'proxies' as const, label: t('代理池', 'Proxies'), icon: GlobeIcon }] : []),
     { key: 'billing' as const, label: t('费用', 'Billing'), icon: ReceiptIcon },
-    ...(canManageUsers ? [{ key: 'users' as const, label: t('成员管理', 'Members'), icon: UsersIcon }] : []),
-    ...(isAdmin ? [{ key: 'settings' as const, label: t('系统设置', 'Settings'), icon: SettingsIcon }] : []),
   ]
   return (
     <nav aria-label={t('主导航', 'Main navigation')} className="flex shrink-0 items-center gap-0.5">
@@ -239,19 +239,25 @@ export function PreferencesMenu({
 }
 
 /**
- * 所有一级页面共用的账号菜单：页面自己的工具（`children`）在上，修改密码、语言、外观、退出
- * 在下。修改密码给代理和用户（管理员的密码在系统设置的「控制台安全」里改，那里还能清除；
+ * 所有一级页面共用的账号菜单：页面自己的工具（`children`）在上，接着是成员管理、系统设置这两个
+ * 不常去的一级页面，再往下是上号 Key、修改密码、语言、外观、退出。修改密码给代理和用户（管理员的密码在系统设置的「控制台安全」里改，那里还能清除；
  * 访客的密码由管理员设）。每页都用它，菜单里有什么不再随所在页面变。
  */
 export function AccountMenu({
   children,
+  onNavigate,
   onSignOut,
 }: {
   children?: ReactNode
+  /** 给了才出「成员管理」「系统设置」两项（按身份）；初始化页这类没有导航的地方不给。 */
+  onNavigate?: (section: MainSection) => void
   onSignOut?: () => void
 }) {
   const { t } = useI18n()
   const role = useMe().data?.role
+  const canManageUsers = useCanManageUsers()
+  const isAdmin = useIsAdmin()
+  const manage = onNavigate && (canManageUsers || isAdmin)
   const [passwordOpen, setPasswordOpen] = useState(false)
   const [provisionOpen, setProvisionOpen] = useState(false)
   const canChangePassword = role === 'agent' || role === 'user'
@@ -261,6 +267,18 @@ export function AccountMenu({
     <>
       <PreferencesMenu onSignOut={onSignOut}>
         {children}
+        {children && manage && <MenuSeparator />}
+        {onNavigate && canManageUsers && (
+          <MenuItem onClick={() => onNavigate('users')}>
+            <UsersIcon />{t('成员管理', 'Members')}
+          </MenuItem>
+        )}
+        {onNavigate && isAdmin && (
+          <MenuItem onClick={() => onNavigate('settings')}>
+            <SettingsIcon />{t('系统设置', 'Settings')}
+          </MenuItem>
+        )}
+        {manage && <MenuSeparator />}
         {canProvision && (
           <MenuItem onClick={() => setProvisionOpen(true)}>
             <KeySquareIcon />{t('上号 Key', 'Provision keys')}

@@ -276,7 +276,7 @@ export function BillingPage({
   return (
     <div className="app-shell flex min-h-dvh flex-col text-foreground">
       <AppHeader
-        actions={<AccountMenu onSignOut={onSignOut} />}
+        actions={<AccountMenu onNavigate={onNavigate} onSignOut={onSignOut} />}
         nav={<MainNav current="billing" onNavigate={onNavigate} />}
         onNavigateHome={() => onNavigate('pool')}
       />

@@ -258,6 +258,18 @@ impl CredentialStore {
         .await?)
     }
 
+    /// 一批号合计的当前 RPM：代理和用户看的「实时流量」，只数自己名下的号。口径同
+    /// [`Self::total_rpm`]，所以 `ids` 取全部号时两者相等。
+    pub async fn rpm_of_creds(&self, ids: &[i64]) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_logs WHERE cred_id = ANY($1) AND ts >= unixepoch() - $2",
+        )
+        .bind(ids)
+        .bind(RPM_WINDOW_SECS)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// 单个凭证当前的 RPM；口径同 [`Self::recent_rpm`]，无请求时为 0。
     pub async fn recent_rpm_of(&self, cred_id: i64) -> Result<i64> {
         // 走 idx_usage_logs_cred_usage 的 (cred_id, ts) 前缀，直接定位到该号最近 60 秒那一小段。
@@ -617,6 +629,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.total_rpm().await.unwrap(), 3, "无账号的流水不进全局 RPM");
+
+        // 按一批号合计：只数这批，和逐账号同口径。
+        assert_eq!(store.rpm_of_creds(&[a]).await.unwrap(), 2);
+        assert_eq!(store.rpm_of_creds(&[a, b, c]).await.unwrap(), 3);
+        assert_eq!(store.rpm_of_creds(&[]).await.unwrap(), 0, "名下没有号就是 0");
     }
 
     /// 单账号的「最近使用 / 累计费用」与全量聚合同口径，无日志时分别是 None 与 0。

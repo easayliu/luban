@@ -9,6 +9,7 @@ import {
   PlusIcon,
   ActivityIcon,
   RadioIcon,
+  ReceiptIcon,
   RefreshCwIcon,
   SearchIcon,
   ShieldCheckIcon,
@@ -20,6 +21,7 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
+import { getBilling } from '@/api/billing'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
 import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
@@ -72,9 +74,9 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
-import { useReadOnly, useSeesWholePool } from '@/lib/role'
+import { useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
-import { cacheHitRate, cn, displayCredentialLabel, formatPercent } from '@/lib/utils'
+import { cacheHitRate, cn, displayCredentialLabel, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
 
 export type CredentialFilterKey =
   | 'all'
@@ -327,6 +329,8 @@ interface CredentialWorkspaceActions {
   onPageSizeChange: (value: CredentialPageSize) => void
   onRetry: () => void
   onAdd: () => void
+  /** 代理和用户点「今日费用」那一格：去费用页看明细。 */
+  onOpenBilling?: () => void
 }
 
 export interface CredentialWorkspaceProps {
@@ -385,14 +389,36 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   // 实时指标单独轮询，10 秒一次：全局 RPM 与在途并发都是秒级变化的量，跟着账号列表那份
   // 30 秒的节奏走就成了「一直在看十几秒前的现场」。这个接口只有两条查询，拉得起。
   //
-  // 实时流量、缓存命中率、首字时延与拒绝统计都是全池口径，只给管理员与访客：代理和用户只看得到
-  // 自己名下的号，这几个接口后端回 403，查询干脆不发，格子也不出现。
+  // 实时流量人人都有：管理员与访客看全池，代理和用户看自己名下的号（后端按身份收窄）。缓存命中率、
+  // 首字时延与拒绝统计是全池口径，只给管理员与访客：代理和用户只看得到自己名下的号，这几个接口
+  // 后端回 403，查询干脆不发，格子也不出现。
   const seesWholePool = useSeesWholePool()
+  const me = useMe()
   const metricsQuery = useQuery({
     queryKey: ['metrics'],
     queryFn: getMetrics,
     refetchInterval: 10_000,
-    enabled: seesWholePool,
+    enabled: !!me.data,
+  })
+  // 今日费用：今天（本地零点起）的等价费用，走分层账单接口，口径与费用页一致。管理员与访客看全池
+  // （标题行那枚摘要），代理和用户看本人名下的号（概览里那一格）。一分钟一拉——账单要扫当天的
+  // 预聚合，没必要跟实时流量一样 10 秒一次。成员只认查回来的真身份：占位数据的 id 是 0，拿它去查
+  // 会被后端当成别人。
+  const memberId = !seesWholePool && me.data && !me.isPlaceholderData ? me.data.id : null
+  const todayStart = (() => {
+    const d = new Date()
+    return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000)
+  })()
+  const todayCostQuery = useQuery({
+    queryKey: ['billing-today', memberId ?? 'all', todayStart],
+    queryFn: () => getBilling({
+      from: todayStart,
+      to: todayStart + 86400,
+      by: 'day',
+      ...(memberId != null ? { owner_id: memberId } : {}),
+    }),
+    refetchInterval: 60_000,
+    enabled: seesWholePool || memberId != null,
   })
   // 两枚质量卡片各拉两条线：近 24 小时逐小时（迷你线 + 近 1 小时的主数）与近 7 天（基线）。
   // 主数是「现在」，基线是「平时」——7 天平均看不出今天有没有变慢，一比就看出来了。
@@ -538,6 +564,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     )
   }, [evaluatedPool, sort, dir, filter, tier, debouncedQuery, now, language])
 
+  // 「今日费用」那格的小字：名下各号累计费用之和（账号列表里本来就有，不必另查）。
+  const lifetimeCost = useMemo(
+    () => (credentials ?? []).reduce((sum, c) => sum + (c.cost_total ?? 0), 0),
+    [credentials],
+  )
   const metrics = useMemo(() => {
     const filterCounts: Record<CredentialFilterKey, number> = {
       all: 0,
@@ -957,6 +988,36 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 </Tooltip>
               )}
             </div>
+            {/* 全池今日摘要（管理员与访客）：费用、请求数，悬浮看 token 分项与累计，点击去费用页。
+                代理和用户在概览里另有「今日费用」一格，这里不重复。
+                不做成带框的按钮：标题行里已有「N 个账号」徽标和设备那枚开关，再添一枚框，四样挤在
+                一起分不出主次。改成与「30 秒刷新」同一套的轻量文字，只把金额提一档字号与字重——
+                这一行里最该被看到的就是它。宽屏用一道竖线与刷新隔开；手机上标题行放不下，`basis-full`
+                让它独占第二行、贴左，读起来是标题的副标题，而不是一枚被挤下来的按钮。 */}
+            {seesWholePool && !isLoading && count > 0 && todayCostQuery.data && (() => {
+              const today = todayCostQuery.data.total
+              return (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={<button type="button" onClick={actions.onOpenBilling} />}
+                    className="mr-auto inline-flex min-w-0 items-baseline gap-1.5 rounded-sm text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-sm:basis-full sm:border-l sm:pl-3"
+                  >
+                    <span className="shrink-0">{t('今日费用', 'Today')}</span>
+                    <span className="shrink-0 text-sm font-semibold text-foreground tnum">{formatUsd(today.cost_usd)}</span>
+                    <span className="shrink-0" aria-hidden>·</span>
+                    <span className="truncate tnum">
+                      {t(`${formatNumber(today.requests)} 次请求`, `${formatNumber(today.requests)} requests`)}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipPopup className="max-w-80 whitespace-normal text-left leading-5">
+                    {t(
+                      `今日零点至今，全池按官方价格折算的费用。输入 ${formatTokens(today.input_tokens)}，输出 ${formatTokens(today.output_tokens)}，缓存写 ${formatTokens(today.cache_write_tokens)}，缓存读 ${formatTokens(today.cache_read_tokens)}；各账号累计 ${formatUsd(lifetimeCost)}。每分钟更新，点击查看明细。`,
+                      `Pool-wide cost since midnight at official API prices. Input ${formatTokens(today.input_tokens)}, output ${formatTokens(today.output_tokens)}, cache write ${formatTokens(today.cache_write_tokens)}, cache read ${formatTokens(today.cache_read_tokens)}; ${formatUsd(lifetimeCost)} across all accounts to date. Updated every minute. Click for details.`,
+                    )}
+                  </TooltipPopup>
+                </Tooltip>
+              )
+            })()}
           </div>
         {isLoading ? (
           <WorkspaceToolbarSkeleton />
@@ -1083,19 +1144,26 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       {isLoading ? (
         <section
           aria-label={t('正在加载账号池概览', 'Loading account pool overview')}
-          className="grid grid-cols-2 border-t lg:grid-cols-6"
+          className={seesWholePool ? 'grid grid-cols-2 border-t lg:grid-cols-6' : 'grid grid-cols-2 border-t lg:grid-cols-5'}
         >
+          {/* 与加载完的格数、边框一一对应（管理员六格、代理和用户五格），数据到了不跳。 */}
           <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
           <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
           <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
           <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-          <OverviewMetricSkeleton className="border-r" />
-          <OverviewMetricSkeleton />
+          {seesWholePool ? (
+            <>
+              <OverviewMetricSkeleton className="border-r" />
+              <OverviewMetricSkeleton />
+            </>
+          ) : (
+            <OverviewMetricSkeleton className="col-span-2 lg:col-span-1" />
+          )}
         </section>
       ) : count > 0 && (
         <section
           aria-label={t('账号池概览', 'Account pool overview')}
-          className={seesWholePool ? 'grid grid-cols-2 border-t lg:grid-cols-6' : 'grid grid-cols-2 border-t lg:grid-cols-3'}
+          className={seesWholePool ? 'grid grid-cols-2 border-t lg:grid-cols-6' : 'grid grid-cols-2 border-t lg:grid-cols-5'}
         >
           {/* 手机上齐整的 2 列 × 3 行，lg 起一字排开六格。
               原来末两格各带 `col-span-2` 独占一整行——「首字时延 — 暂无数据」右半边整片空着，
@@ -1136,7 +1204,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             onClick={() => selectMetric('attention')}
           />
           <OverviewMetric
-            className={seesWholePool ? 'border-r border-b lg:border-b-0' : 'border-r lg:border-r-0'}
+            className="border-r border-b lg:border-b-0"
             label={t('用量风险', 'Usage risk')}
             value={formatNumber(quotaRiskCount)}
             status={quotaRiskStatus}
@@ -1192,7 +1260,27 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             opensDetail
             onClick={() => setTtftTrendOpen(true)}
           />
+          </>)}
+          {/* 代理和用户没有缓存与时延那两格（全池口径），换成自己名下的「今日费用」：只计费不扣费，
+              看的是这些号今天跑出了多少等价费用。点开去费用页看按号 / 模型的明细。 */}
+          {!seesWholePool && (
+            <OverviewMetric
+              className="border-b lg:border-r lg:border-b-0"
+              label={t('今日费用', 'Cost today')}
+              value={todayCostQuery.data ? formatUsd(todayCostQuery.data.total.cost_usd) : '—'}
+              status={t(`累计 ${formatUsd(lifetimeCost)}`, `${formatUsd(lifetimeCost)} total`)}
+              statusHint={t(
+                `今日零点至今，名下账号按官方价格折算的费用${todayCostQuery.data ? `，共 ${formatNumber(todayCostQuery.data.total.requests)} 次请求` : ''}。累计为各账号接入以来的总和。仅作计量，不实际扣费；每分钟更新，点击查看明细。`,
+                `Cost of your accounts since midnight at official API prices${todayCostQuery.data ? ` across ${formatNumber(todayCostQuery.data.total.requests)} requests` : ''}. The total covers each account since it was added. Metered only, never charged; updated every minute. Click for details.`,
+              )}
+              icon={ReceiptIcon}
+              tone="neutral"
+              opensDetail={!!actions.onOpenBilling}
+              onClick={actions.onOpenBilling}
+            />
+          )}
           <LiveTrafficMetric
+            className={seesWholePool ? undefined : 'col-span-2 lg:col-span-1'}
             label={t('实时流量', 'Live traffic')}
             value={metricsQuery.data ? formatNumber(metricsQuery.data.rpm) : '—'}
             unit="RPM"
@@ -1203,13 +1291,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 )
               : t('读取中', 'Loading')}
             live={(metricsQuery.data?.in_flight ?? 0) > 0}
-            hint={t(
-              `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及当前已进入转发、响应尚未结束的在途请求数。每 10 秒刷新一次。`,
-              `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
-            )}
+            hint={seesWholePool
+              ? t(
+                  `全池实时流量：最近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求总数（各账号 RPM 之和），以及当前已进入转发、响应尚未结束的在途请求数。每 10 秒刷新一次。`,
+                  `Live traffic across the pool: requests forwarded in the last ${metricsQuery.data?.window_secs ?? 60} seconds (the sum of every account's RPM), plus the requests in flight right now — accepted for forwarding but not finished responding. Refreshed every 10 seconds.`,
+                )
+              : t(
+                  `名下账号近 ${metricsQuery.data?.window_secs ?? 60} 秒转发的请求数，以及已发往上游、尚未完成的在途请求数。每 10 秒更新。`,
+                  `Requests forwarded through your accounts in the last ${metricsQuery.data?.window_secs ?? 60} seconds, and those sent upstream that are still in progress. Updated every 10 seconds.`,
+                )}
             icon={ActivityIcon}
           />
-          </>)}
         </section>
       )}
       </section>
