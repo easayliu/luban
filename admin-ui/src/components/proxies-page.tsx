@@ -392,14 +392,23 @@ function ProxyPoolContent() {
         onClose={() => setPending(null)}
       />
 
-      {pending?.kind === 'accounts' && (
-        <ProxyAccountsDialog
-          proxy={pending.proxy}
-          pool={proxies}
-          open
-          onOpenChange={(next) => { if (!next) setPending(null) }}
-        />
-      )}
+      {/* 只关自己这一次：账号分配弹框保存中也能关掉，旧请求回来时 onSuccess 仍会调 onOpenChange(false)。
+          那时 pending 可能已换成新开的添加、编辑或另一条代理的分配框，无条件清空会把它一并关掉、
+          丢掉未保存的输入。所以按打开时的那份 pending 比对，不是它就不动。 */}
+      {pending?.kind === 'accounts' && (() => {
+        const session = pending
+        return (
+          <ProxyAccountsDialog
+            key={session.proxy.id}
+            proxy={session.proxy}
+            pool={proxies}
+            open
+            onOpenChange={(next) => {
+              if (!next) setPending((cur) => (cur === session ? null : cur))
+            }}
+          />
+        )
+      })()}
 
       <ProxyBatchImportDialog
         open={importOpen}
