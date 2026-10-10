@@ -549,7 +549,12 @@ fn splits_fable_api_shape_with_reporting_block() {
     let out = rewrite_body(&other, &test_cred(), "fp", all_on(), None, None);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["system"].as_array().unwrap().len(), 4, "认不出的四块不该动: {v}");
-    assert!(!String::from_utf8_lossy(&out).contains("\"ttl\""), "没整形就不补 ttl");
+    // 1h 按请求类别补、不看整形成没成：主线程照补，结构不动、不标 scope。
+    assert_eq!(
+        v["system"][3]["cache_control"],
+        serde_json::json!({"type":"ephemeral","ttl":"1h"}),
+        "主线程没整形也补 1h: {v}"
+    );
 }
 
 /// 锚点匹配不到（未知模型族/新版本改了措辞）时**不动结构**，退回三块原样转发——
@@ -562,9 +567,99 @@ fn leaves_system_alone_when_anchor_missing() {
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
     assert_eq!(v["system"].as_array().unwrap().len(), 3, "不该拆块: {s}");
-    assert!(!s.contains("\"ttl\""), "不拆块时不应注入 ttl: {s}");
+    // 桌面端、子代理的基座与 CLI 不同，锚点就是认不出——主线程照样全部断点补 1h。
+    assert_eq!(
+        s.matches(r#""ttl":"1h""#).count(),
+        crate::proxy::count_cache_control(&v),
+        "主线程不拆块也该全部断点 1h: {s}"
+    );
     assert!(!s.contains("\"scope\""), "不拆块时不应标 scope: {s}");
     assert!(s.contains("; cch="), "其余改写仍应生效: {s}");
+}
+
+/// 1h 按请求类别补：订阅端官方的分叉、子代理、预热全部裸断点（`cap/auto-2.1.293-20261008-full`），
+/// 即便基座拆得开也不补；主线程与「猜下一句」全部 1h。
+#[test]
+fn cache_ttl_follows_request_kind_not_shaping() {
+    use crate::proxy::CcRequestKind;
+    let raw = Bytes::from(API_SHAPE_BODY);
+    let out = |kind| {
+        let out = crate::proxy::rewrite_body_out(
+            &raw,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            None,
+            None,
+            kind,
+            None,
+        )
+        .0;
+        String::from_utf8(out.to_vec()).unwrap()
+    };
+    for kind in [CcRequestKind::Fork, CcRequestKind::Subagent, CcRequestKind::Prewarm] {
+        let s = out(kind);
+        assert!(!s.contains(r#""ttl""#), "{kind:?} 官方不带 1h: {s}");
+    }
+    // 官方不标断点的几类（这里以 `Auxiliary` 为例）出现断点，是客户端自己标的——多半是被判成
+    // 辅助调用的无工具普通对话，照开关补。
+    for kind in [CcRequestKind::Main, CcRequestKind::Suggestion, CcRequestKind::Auxiliary] {
+        let s = out(kind);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let total = crate::proxy::count_cache_control(&v);
+        assert!(total > 0);
+        assert_eq!(s.matches(r#""ttl":"1h""#).count(), total, "{kind:?} 全部断点 1h: {s}");
+    }
+}
+
+/// 不补 1h 的类别（子代理、分叉）拆块时要沿用客户端合并块上原有的 `ttl`：客户端 system 与消息
+/// 都写了 1h 时，拆完的两块若退回默认 5m，出站就是 system 5m → 消息 1h，上游按时长须单调不增拒收。
+#[test]
+fn split_keeps_client_ttl_when_kind_skips_1h() {
+    use crate::proxy::CcRequestKind;
+    let raw = Bytes::from(API_SHAPE_BODY.replace(
+        r#""cache_control":{"type":"ephemeral"}"#,
+        r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#,
+    ));
+    assert!(
+        String::from_utf8_lossy(&raw).matches(r#""ttl":"1h""#).count() >= 2,
+        "用例前提：来访自带 1h"
+    );
+    for kind in [CcRequestKind::Subagent, CcRequestKind::Fork] {
+        let out = crate::proxy::rewrite_body_out(
+            &raw,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            None,
+            None,
+            kind,
+            None,
+        )
+        .0;
+        let s = String::from_utf8(out.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 4, "{kind:?} 照常拆块: {s}");
+        assert_eq!(
+            s.matches(r#""ttl":"1h""#).count(),
+            crate::proxy::count_cache_control(&v),
+            "{kind:?} 客户端的 1h 一个都不能丢: {s}"
+        );
+    }
 }
 
 /// 客户端本来就是订阅形态（四块）时不动 `system`——它已经是目标形态了。
@@ -1594,6 +1689,63 @@ fn outbound_carries_fallbacks_billing_only_counts_only_what_actually_ships() {
     );
 }
 
+/// 官方一次性侧查询（这里是 WebFetch 页面处理）既不补消息断点、也不补 1h：同一会话连着两次
+/// WebFetch 时 tools + system 相同，「前缀稳定」那道闸会放行，不排除就给它标上官方没有的断点、
+/// 再升成 1h。对照：不带工具的普通多轮对话同样判成 `Auxiliary`，但不是侧查询，照开关补 1h。
+#[test]
+fn official_side_query_gets_no_breakpoint_or_1h() {
+    use crate::proxy::CcRequestKind;
+    let system = concat!(
+        r#"[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.293.abc; cc_entrypoint=cli;"},"#,
+        r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}]"#
+    );
+    let rewrite = |messages: &str, sid: &str| -> String {
+        let body = Bytes::from(format!(
+            r#"{{"model":"claude-haiku-5-5","system":{system},"messages":{messages},"max_tokens":1024}}"#
+        ));
+        let out = crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            Some(sid),
+            false,
+            None,
+            true,
+            true,
+            None,
+            None,
+            CcRequestKind::Auxiliary,
+            None,
+        )
+        .0;
+        String::from_utf8(out.to_vec()).unwrap()
+    };
+    let page = |text: &str| {
+        format!(
+            r#"[{{"role":"user","content":[{{"type":"text","text":"Web page content:\n---\n{text}\n---\nsummarize"}}]}}]"#
+        )
+    };
+    let sid = crate::proxy::uuid_v4();
+    for text in ["page one", "page two", "page two"] {
+        let s = rewrite(&page(text), &sid);
+        assert!(!s.contains("cache_control"), "WebFetch 侧查询不该被补断点: {s}");
+    }
+
+    // 普通无工具多轮对话：客户端自己标了断点 → 照开关补 1h。
+    let chat = concat!(
+        r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},"#,
+        r#"{"role":"user","content":[{"type":"text","text":"and then?","cache_control":{"type":"ephemeral"}}]}]"#
+    );
+    let s = rewrite(chat, &crate::proxy::uuid_v4());
+    assert!(
+        s.contains(r#""cache_control":{"type":"ephemeral","ttl":"1h"}"#),
+        "普通对话照补 1h: {s}"
+    );
+}
+
 /// 真 CC 来访 `messages` 里一个断点都没有时补第三个断点（[`ensure_cc_message_breakpoint`]），
 /// 且只在缓存前缀与上一轮相同时补（[`cache_prefix_stable`]）。
 /// 形态照现网 `req_zu6ELzACscXlpGSg`：claude-vscode 2.1.273 的 agent-sdk 构建，5 块
@@ -1694,9 +1846,15 @@ fn cc_request_without_message_breakpoint_gets_one_on_the_last_block() {
     let v = once(&body(&system("5m"), tool_loop), all_on(), None);
     assert_eq!(crate::proxy::count_cache_control_in(&v["messages"]), 0, "没有会话键不标: {v}");
 
-    // 正例：末块 tool_result 拿到断点，ttl 抄 system 的 5m 而不是开关的 1h，不带 scope；
-    // 字符串形态的旧 reminder 不被转成块数组；总数正好 4。
+    // 开着 1h 开关：主线程全部断点（含新补的这个）统一升 1h，见 [`crate::proxy::fill_cache_ttl`]。
     let v = run(&body(&system("5m"), tool_loop), all_on());
+    let last = v["messages"][3]["content"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}), "{v}");
+
+    // 正例（关着 1h 开关）：末块 tool_result 拿到断点，ttl 抄 system 的 5m，不带 scope；
+    // 字符串形态的旧 reminder 不被转成块数组；总数正好 4。
+    let no_ttl = store::ForwardFlags { cache_ttl_1h: false, ..all_on() };
+    let v = run(&body(&system("5m"), tool_loop), no_ttl);
     let msgs = v["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 4, "messages 不该增删: {v}");
     assert!(msgs[1]["content"].is_string(), "旧 reminder 的字符串形态不该被转: {v}");
@@ -1711,9 +1869,9 @@ fn cc_request_without_message_breakpoint_gets_one_on_the_last_block() {
     assert_eq!(crate::proxy::count_cache_control(&v), 4, "总数正好封顶: {v}");
     assert_eq!(v["system"].as_array().unwrap().len(), 5, "system 块数不变: {v}");
 
-    // 客户端 system 断点不带 ttl → 消息断点也不带。
+    // 客户端 system 断点不带 ttl → 消息断点也不带（关着 1h 开关；开着时主线程全部升 1h）。
     let bare = system("5m").replace(r#","ttl":"5m""#, "");
-    let v = run(&body(&bare, tool_loop), all_on());
+    let v = run(&body(&bare, tool_loop), no_ttl);
     let last = v["messages"][3]["content"].as_array().unwrap().last().unwrap();
     assert_eq!(last["cache_control"], serde_json::json!({"type": "ephemeral"}), "{v}");
 

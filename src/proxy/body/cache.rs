@@ -83,19 +83,27 @@ pub(in crate::proxy) fn align_system_shape(v: &mut serde_json::Value, cache: Cac
     // 自己标满了断点，拆开就正好顶到 5。
     //
     // 满了就整形不做（`false`，一个字节不动），不做「拆开但其余那块不标断点」：官方两块都有
-    // 断点，标一个不标一个是个官方不产生的半对齐形态，与 [`fill_cache_ttl`] 那处
-    // 「整形没做成就别补 ttl」同一个取舍。代价是这一条请求走客户端自己那份三块形态出去，
+    // 断点，标一个不标一个是个官方不产生的半对齐形态。代价是这一条请求走客户端自己那份三块形态出去，
     // 少一次基座级缓存命中——总好过整条被拒。判据与 [`align_message_shape`] 同一口径。
     if total + 1 - usize::from(sys[1].get("cache_control").is_some()) > MAX_CACHE_BREAKPOINTS {
         tracing::debug!(breakpoints = total, "system 整形会把缓存断点顶过上限，这一条按原样转发");
         return false;
     }
 
+    // 合并块上客户端自己写的时长要带到拆出来的两块上：开关不要 1h（子代理、分叉这类官方裸断点
+    // 的请求）时照抄它，否则客户端 `system` 1h、`messages` 1h 的来访拆完成了 system 5m、消息 1h，
+    // 违反「tools → system → messages 单调不增」，上游 400。
+    let client_ttl = sys[last]
+        .get("cache_control")
+        .and_then(|c| c.get("ttl"))
+        .and_then(|t| t.as_str())
+        .map(str::to_owned);
     if let Some(obj) = sys[1].as_object_mut() {
         obj.remove("cache_control");
     }
-    let base = text_block(&body[..at - 2], cache_control(cache));
-    let rest = text_block(&body[at..], cache_control(cache.tail()));
+    let ttl = client_ttl.as_deref();
+    let base = text_block(&body[..at - 2], cache_control_keeping(cache, ttl));
+    let rest = text_block(&body[at..], cache_control_keeping(cache.tail(), ttl));
     sys.truncate(2);
     if reporting {
         sys.push(text_block_bare(config::CC_SYSTEM_REPORTING));
@@ -482,16 +490,21 @@ impl CacheShape {
 /// 每条请求上一处稳定差异。代价要知情：1h 的缓存**写入**单价是默认 5m 的 2 倍,故
 /// [`store::ForwardFlags::cache_ttl_1h`] 可以关掉，关掉即沿用客户端自己传的时长。
 /// 长会话里 1h 通常反而更省（5m 内没接上话就得按写入价重写一遍），但那取决于使用节奏，
-/// 所以给了开关。客户端自己写了 `ttl` 的照发，两条路都不覆盖它。
+/// 所以给了开关。开着时同一请求里客户端自己写的短 `ttl` 一并升 1h，见 [`fill_cache_ttl`]。
 ///
 /// `global` 同理由 [`store::ForwardFlags::cache_scope_global`] 拨。两项各要一个 beta 认
 /// （`prompt-caching-scope` / `extended-cache-ttl`），故都还连着 `merge_beta`，
 /// 见 [`rewrite_body`]。
 pub(in crate::proxy) fn cache_control(shape: CacheShape) -> serde_json::Value {
+    cache_control_keeping(shape, None)
+}
+
+/// 同 [`cache_control`]，但 `shape` 不要 1h 时沿用客户端原有的 `ttl`（拆块时取自被拆的那个断点）。
+fn cache_control_keeping(shape: CacheShape, client_ttl: Option<&str>) -> serde_json::Value {
     let mut cc = serde_json::Map::new();
     cc.insert("type".into(), "ephemeral".into());
-    if shape.ttl_1h {
-        cc.insert("ttl".into(), "1h".into());
+    if let Some(ttl) = if shape.ttl_1h { Some("1h") } else { client_ttl } {
+        cc.insert("ttl".into(), ttl.into());
     }
     if shape.global {
         cc.insert("scope".into(), "global".into());

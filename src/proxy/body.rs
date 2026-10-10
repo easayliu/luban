@@ -155,9 +155,13 @@ pub(super) fn rewrite_body_out(
     // 字符串 `fallbacks` 要归一、`user_id` 可能要剥，都得解析了才知道。
     let may_fill_eager =
         flags.eager_tool_streaming && adv_beta && body_contains(body, b"\"tools\"");
+    // 补 1h 不跟着 `system_shape` 走（见下方 `ttl_wanted`），没有 `cache_control` 字面量的体
+    // 一个断点都没有，不必为它解析。
+    let may_fill_ttl = cache.ttl_1h && body_contains(body, b"\"cache_control\"");
     if sim.is_none()
         && !shape
         && !may_fill_eager
+        && !may_fill_ttl
         && !flags.spoof_identity
         && !flags.billing_cch
         && !flags.strip_extra_fields
@@ -285,10 +289,17 @@ pub(super) fn rewrite_body_out(
     // **只在 tools + system 与上一轮相同时补**（[`cache_prefix_stable`]）：前缀变了，后面的
     // messages 标了断点也是未命中，只会把裸算换成更贵的写入；会话第一轮同样不补。按
     // 请求类别分谱系：同一会话里主线程与辅助请求交替出现，不能互相当对方的「上一轮」。
+    //
+    // 官方一次性侧查询（[`CcRequestKind::is_side_query`]：WebFetch 页面处理、标题、桌面端状态摘要
+    // 等）一个断点都不标，也不补——同一会话连着两次 WebFetch 时 tools + system 相同，不排除就会
+    // 被当成「前缀稳定」标上一个官方没有的断点。判据要求单条消息并命中官方独有的内容，不带工具
+    // 的普通多轮对话不在其内。
+    let side_query = sim.is_none() && cc_kind.is_side_query(&v);
     let cc_msg_shape = shape
         && !billing_only
         && sim.is_none()
         && cc_inbound
+        && !side_query
         && cc_kind.allows_system_prefix()
         && session_out.is_some_and(|sid| {
             cache_prefix_stable(
@@ -298,8 +309,22 @@ pub(super) fn rewrite_body_out(
             )
         })
         && ensure_cc_message_breakpoint(&mut v);
+    // 真实客户端**按请求类别补，不看整形成没成**：订阅端官方写不写 1h 只由类别决定——主线程
+    // （含 `sdk-cli`）与「猜下一句」全部断点 1h，分叉、子代理、预热全部裸断点，其余几类没有
+    // 断点（`cap/auto-2.1.285-20260930`、`auto-2.1.291-20261006-full`、`auto-2.1.293-20261008-full`
+    // 逐条核过，无一例外）。原先挂在 `shaped` 上：子代理、桌面端（`claude-desktop-3p`）的基座
+    // 与 CLI 不同，锚点认不出、拆不开，主线程就一个 1h 都不补，开关形同虚设；反过来分叉能拆开，
+    // 却被补上了官方不带的 1h。
+    // 判据见 [`CcRequestKind::wants_cache_ttl_1h`]；官方侧查询（`side_query`）不补。
+    let ttl_wanted = match sim {
+        Some(_) => simulated,
+        None => cc_inbound && !side_query && cc_kind.wants_cache_ttl_1h(),
+    };
+    // 拆块自己也会写 ttl（[`cache_control`]），得跟收尾那步同一个判据，否则分叉拆开后
+    // system 是 1h、消息是裸的。不补 1h 时拆块沿用客户端合并块上原有的时长，不是把它抹掉。
+    let shape_cache = CacheShape { ttl_1h: cache.ttl_1h && ttl_wanted, ..cache };
     // 模拟已经产出官方的 5 块形态，再走一遍三块拆分器只会切错地方。
-    let shaped = shape && !billing_only && !simulated && align_system_shape(&mut v, cache);
+    let shaped = shape && !billing_only && !simulated && align_system_shape(&mut v, shape_cache);
     // CC 子代理/desktop-3p 有时不带 billing header，上游按第三方计、限流更严。
     // 补上 billing + 身份句让上游按订阅额度计。放在 ensure_billing_cch 之前——后者给
     // billing header 追加 cch，得先有 billing header 它才有东西追加。
@@ -348,12 +373,8 @@ pub(super) fn rewrite_body_out(
     let capped = shape && !billing_only && cap_system_blocks(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。
-    //
-    // **只在整形真的成了才补**：`ttl:"1h"` 属于订阅形态，API-key 的三块形态官方
-    // 一个 ttl 都不带（`cap/raw/00012`）。整形没做成（比如锚点漂了、`system_shape` 关着）
-    // 时 body 还是三块，这时补 ttl 就是把半对齐换了个方向，比不补更糟。
-    let ttl_filled =
-        cache.ttl_1h && !billing_only && (simulated || shaped) && fill_cache_ttl(&mut v);
+    // 判据（`ttl_wanted`）见拆块前那段。
+    let ttl_filled = shape_cache.ttl_1h && !billing_only && fill_cache_ttl(&mut v);
     tracing::debug!(
         metadata = %v.get("metadata").map(|m| m.to_string()).unwrap_or_else(|| "<none>".into()),
         "inbound metadata"
@@ -466,6 +487,7 @@ pub(super) fn rewrite_body_out(
         msg_shape,
         cc_msg_shape,
         ttl_filled,
+        cc_kind = ?cc_kind,
         streamed,
         stripped,
         top_level_ordered,

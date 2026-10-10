@@ -1007,6 +1007,7 @@ impl CcRequestKind {
     /// | 安全分类 | system 里有「You are a security monitor for autonomous AI coding agents」 |
     /// | WebFetch 页面处理 | 无工具，消息以「Web page content:」开头（主线程发起的是 `Auxiliary`，子代理发起的是 `Helper`） |
     /// | WebSearch 子调用 | [`super::simulation::is_official_web_search_request`] |
+    /// | 桌面端会话状态摘要 | 无工具，system 里有「A user kicked off a Claude Code agent to do a coding task and walked away」（`cap/auto-desktop-2.1.295-20261010-sub/00145`、`00056`，由桌面端发、不带身份句） |
     ///
     /// `count_tokens` 按路径认、不在这里判（调用方对不计费路径直接给类别）：它本来就不占会话。
     pub(super) fn is_side_query(self, v: &serde_json::Value) -> bool {
@@ -1028,7 +1029,8 @@ impl CcRequestKind {
             Self::Auxiliary | Self::Helper => {
                 super::simulation::is_official_web_search_request(v)
                     || (super::simulation::field_is_empty(v.get("tools"))
-                        && last_user_text_starts_with(v, "Web page content:"))
+                        && (last_user_text_starts_with(v, "Web page content:")
+                            || system_contains(v, CC_DESKTOP_STATUS_SUMMARY)))
             }
             _ => false,
         }
@@ -1107,6 +1109,15 @@ impl CcRequestKind {
     /// `max_tokens:1` 的探测改成了「带身份声明的请求」——官方从不产生。
     pub(super) fn allows_system_prefix(self) -> bool {
         !matches!(self, Self::QuotaProbe | Self::CountTokens)
+    }
+
+    /// 缓存断点该不该按开关补 `ttl:"1h"`。订阅端官方：主线程与「猜下一句」全部断点 1h；分叉、
+    /// 子代理（含其无工具辅助调用）、预热全部裸断点（`cap/auto-2.1.293-20261008-full` 等三批逐条
+    /// 核过）——这几类不补。其余几类官方一个断点都不标：官方那一条本身由调用方按
+    /// [`Self::is_side_query`] 排除（连消息断点都不补），剩下的是被归错类的普通对话
+    /// （[`Self::of`] 把不带工具的多轮对话判成 `Auxiliary`），照开关补。
+    pub(super) fn wants_cache_ttl_1h(self) -> bool {
+        !matches!(self, Self::Fork | Self::Subagent | Self::Helper | Self::Prewarm)
     }
 }
 
@@ -1188,6 +1199,10 @@ pub(super) fn client_session_link(
 }
 
 /// `system` 里（块数组的任一 text 块，或字符串形态的整段）是否包含 `needle`。
+/// 桌面端会话状态摘要那条 helper 的 system 开头（用户走开后，桌面端拿主线程的末尾给它做摘要）。
+const CC_DESKTOP_STATUS_SUMMARY: &str =
+    "A user kicked off a Claude Code agent to do a coding task and walked away";
+
 fn system_contains(v: &serde_json::Value, needle: &str) -> bool {
     match v.get("system") {
         Some(serde_json::Value::String(s)) => s.contains(needle),
