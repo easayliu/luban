@@ -93,6 +93,7 @@ pub(super) async fn admit(
         &client_ua,
         &headers,
         &facts,
+        key_access.groups.as_deref(),
         &session_from_header,
         concurrency_limit,
         &mut session_concurrency_guard,
@@ -430,6 +431,8 @@ async fn identity_gates(
     client_ua: &str,
     headers: &HeaderMap,
     facts: &Facts,
+    // 接入 Key 能用的分组：探针本地作答前看号池里还有没有可调度的号（见 2.1a）。
+    key_groups: Option<&[i64]>,
     session_from_header: &Option<String>,
     concurrency_limit: i64,
     session_concurrency_guard: &mut SessionConcurrencyGuard,
@@ -481,6 +484,18 @@ async fn identity_gates(
         )
         .await
     {
+        // 号池真空了（这把 Key 能用的号全停用、全冷却或套餐都不含这个模型）就不能再报健康：
+        // 回 529 overloaded_error，与上游过载同一口径，下游的渠道自动禁用 / 切换才会生效。
+        // 否则探活永远是 200、渠道一直挂着，真流量全落到这里的 503 / 429 上。查库出错时照旧
+        // 本地作答——探活误报一次「健康」，好过因为一次查库失败把整条渠道摘掉。
+        let usable = state
+            .store
+            .has_usable_credential(key_groups, req_model.as_deref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "probe pool check failed, answering locally anyway");
+                true
+            });
         // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
         // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。
         let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
@@ -491,9 +506,17 @@ async fn identity_gates(
             tracing::warn!(
                 %method, path = %path_and_query, ua = %client_ua,
                 model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
-                kind = kind.tag(), from_cc_client, suppressed, reason = kind.message(),
-                "not forwarded: request matches a probe / health-check signature; answered locally with a minimal 200"
+                kind = kind.tag(), from_cc_client, suppressed, reason = kind.message(), pool_empty = !usable,
+                "not forwarded: request matches a probe / health-check signature; answered locally (minimal 200, or 529 when the pool has no usable account)"
             );
+        }
+        if !usable {
+            *log_state.local_reject.lock() = Some("unavailable");
+            return Err(error_response(
+                StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                "overloaded_error",
+                "Overloaded",
+            ));
         }
         *log_state.local_replay.lock() = Some(REWRITE_PROBE_REPLY);
         return Err(probe_reply(

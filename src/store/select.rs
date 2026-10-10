@@ -299,6 +299,36 @@ async fn free_session_slot(
 }
 
 impl CredentialStore {
+    /// 这把接入 Key 能用的号里，此刻还有没有**可调度**的：启用（或限流暂停已到点）、号主有效、
+    /// 在 `groups` 里、没被判过「套餐不含 `model`」、不在冷却。只读——不放回到点的暂停号、
+    /// 不写绑定、不占名额、不计裸请求与 RPM。
+    ///
+    /// 给探活本地应答用（`crate::proxy::probe_reply`）：号池真空了还回 200，下游会一直以为
+    /// 渠道健康、不切走，真流量全部失败。名额满、RPM 满这类按请求的瞬时容量不算「没号」。
+    pub async fn has_usable_credential(
+        &self,
+        groups: Option<&[i64]>,
+        model: Option<&str>,
+    ) -> Result<bool> {
+        let model = model.map(nul_free);
+        let model_key = model.as_deref().map(model_denial_key);
+        let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT id FROM credentials \
+              WHERE (disabled = 0 OR (resume_at IS NOT NULL AND resume_at <= unixepoch())) \
+                AND {OWNER_ACTIVE} \
+                AND ($1::BIGINT[] IS NULL OR id IN \
+                     (SELECT cred_id FROM credential_groups WHERE group_id = ANY($1::BIGINT[]))) \
+                AND NOT EXISTS (SELECT 1 FROM model_denials d \
+                                 WHERE d.cred_id = credentials.id AND d.model = $2 \
+                                   AND (d.expires_at IS NULL OR d.expires_at > unixepoch()))"
+        )))
+        .bind(groups)
+        .bind(model_key.as_deref())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().any(|id| !self.cooldown.is_cooling(id, model.as_deref())))
+    }
+
     /// 同 [`Self::select_with_slot`]，只要号（测试用）。
     #[cfg(test)]
     pub async fn select_for_device(&self, sel: Select<'_>) -> Result<Credential> {

@@ -234,6 +234,8 @@ async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) 
     let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
     assert!(store.require_device_id(), "这条用例的前提是设备身份闸开着");
     assert!(store.forward_flags().reject_probes, "这条用例的前提是探针开关开着");
+    // 号池里得有一个可调度的号，否则探活回的是 529（见 `the_probe_reports_529_when_the_pool_is_empty`）。
+    insert_probe_cred(&store).await;
     let state = crate::web::AppState::for_test(store.clone());
 
     // 复盘里那批 Go-http-client 探活的形态：没有 metadata（即没有 device_id）、没有 system、
@@ -282,6 +284,91 @@ async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) 
     assert_eq!(row.cost_usd, Some(0.0));
     assert_eq!(row.cred_id, None, "没到上游，不该挂在任何账号上");
     assert!(!row.has_usage, "没到上游，没有用量");
+}
+
+/// 探活用例共用的一个可调度的号（号主是测试库里的 admin）。
+async fn insert_probe_cred(store: &store::CredentialStore) -> i64 {
+    let far_future = crate::credentials::now_secs() + 30 * 24 * 3600;
+    store
+        .insert(
+            "acct-probe",
+            Some("max"),
+            "tok-probe",
+            "rt-probe",
+            far_future,
+            Some("00000000-0000-4000-8000-000000000001"),
+            None,
+            1,
+        )
+        .await
+        .unwrap()
+        .id
+}
+
+/// 发一条 Go-http-client 那批探活的形态（无 metadata / system / tools，max_tokens 8）。
+async fn send_go_probe(state: crate::web::AppState, model: &str) -> axum::response::Response {
+    let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": "ping" }]});
+    let mut headers = super::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    super::handle(
+        axum::extract::State(state),
+        axum::http::Method::POST,
+        "/v1/messages".parse::<axum::http::Uri>().unwrap(),
+        headers,
+        axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+    )
+    .await
+}
+
+/// 号池里没有可调度的号时，探活不再报健康：回 529 `overloaded_error`，下游的渠道自动禁用 /
+/// 切换才会生效。空池、号全停用、套餐都不含这个模型三种都算；只有其中一个号能用就照旧本地 200。
+/// 529 同样进流水（本地拒绝，标 `unavailable`），不到上游。
+#[sqlx::test]
+async fn the_probe_reports_529_when_the_pool_is_empty(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
+    let state = crate::web::AppState::for_test(store.clone());
+    let overloaded = StatusCode::from_u16(529).unwrap();
+
+    // 空池。
+    let resp = send_go_probe(state.clone(), "claude-opus-5").await;
+    assert_eq!(resp.status(), overloaded);
+    assert!(resp.headers().get(super::LOCAL_REPLY_HEADER).is_none(), "529 不是本地作答的那条 200");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["error"]["type"], "overloaded_error");
+
+    // 唯一的号停用了。
+    let id = insert_probe_cred(&store).await;
+    store.set_disabled(id, true).await.unwrap();
+    assert_eq!(send_go_probe(state.clone(), "claude-opus-5").await.status(), overloaded);
+
+    // 号启用但套餐不含这个模型：只对这个模型 529，别的模型照旧 200。
+    store.set_disabled(id, false).await.unwrap();
+    store.deny_model(id, "claude-opus-5", "test", None).await.unwrap();
+    assert_eq!(send_go_probe(state.clone(), "claude-opus-5").await.status(), overloaded);
+    assert_eq!(send_go_probe(state.clone(), "claude-sonnet-5").await.status(), StatusCode::OK);
+
+    // 流水：三条 529 都是本地拒绝、没有账号，那条 200 是本地作答。
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = store.list_usage_logs(10).await.unwrap();
+        if rows.len() == 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.iter().filter(|r| r.status == 529 && r.cred_id.is_none()).count(), 3);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.forensics.rewrites.as_deref() == Some(super::REWRITE_PROBE_REPLY))
+            .count(),
+        1
+    );
 }
 
 /// 开关关掉之后同一条探活照常往下走（走到没有可用账号那步），确认上面那条 200 是
