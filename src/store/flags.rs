@@ -121,25 +121,28 @@ pub struct ForwardFlags {
     /// 不走模拟，自带的 billing header 照旧（缺了只补 billing header、不补身份句），`metadata.user_id`
     /// 的去留看 [`Self::sim_billing_keep_user_id`] / [`Self::real_billing_keep_user_id`]，身份补全 / 会话链 / 工具名混淆 / 断点与 system 整形 / 字段剥除等改写同样一概跳过，见 [`Self::billing_only`]。
     ///
-    /// - **开**：不补身份句、官方基座、第四块、官方工具、`metadata` / `thread` / `diagnostics` /
-    ///   `output_config`，不重排顶层键；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
+    /// - **开**：不补身份句、官方基座、第四块、官方工具、`thread` / `diagnostics` /
+    ///   `output_config`，不重排顶层键（`metadata.user_id` 另由两项子开关管）；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
     ///   换头照旧；`cch` 跟随 [`Self::cch_sim_compute`]（开算真值、关填随机值）。上游放行只认
     ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。代价：官方「仅 billing header」的请求几乎都是 0 工具、
     ///   一两轮的辅助调用，长多轮带工具的主对话官方从不这样发，属官方不产生的形态。
     /// - **关**（默认）：按完整官方形态模拟。
     pub sim_billing_only: bool,
-    /// billing-only 下**模拟请求**自带的 `metadata.user_id` 留不留（[`Self::sim_billing_only`] 的子项）。
-    /// 真实客户端另由 [`Self::real_billing_keep_user_id`] 管。
+    /// billing-only 下**模拟请求**带不带 `metadata.user_id`（[`Self::sim_billing_only`] 的子项）。
+    /// 真实客户端另由 [`Self::real_billing_keep_user_id`] 管。官方每条请求都带 `user_id`，「仅
+    /// billing header」那类辅助调用也一样（`cap/auto-2.1.293-20261008-full`）。
     ///
     /// - **开**（默认）：带了就保留，并照常按身份伪装 / 归一化规则改写（[`Self::spoof_identity`]、
-    ///   [`Self::spoof_device_id`]、[`Self::normalize_device_fp`]），会话段对齐出站会话头；没带不补。
+    ///   [`Self::spoof_device_id`]、[`Self::normalize_device_fp`]），会话段对齐出站会话头；没带就按
+    ///   官方形态补一份（会话段即出站会话头那个）。身份伪装关着时不补、不改。
     /// - **关**：整个剥掉（`metadata` 剥空了一并去掉）。
     pub sim_billing_keep_user_id: bool,
-    /// billing-only 下**真实 CC 客户端**自带的 `metadata.user_id` 留不留（[`Self::sim_billing_only`]
-    /// 的子项）。
+    /// billing-only 下**真实 CC 客户端**带不带 `metadata.user_id`（[`Self::sim_billing_only`]
+    /// 的子项）。billing-only 下由它代替 [`Self::fill_metadata`] 决定补不补。
     ///
     /// - **开**（默认）：带了就保留，并照常按身份伪装 / 归一化规则改写（account 换成本号、device 按
-    ///   设备指纹派生、会话段对齐按账号钉住的出站会话头）；身份伪装关着时原样透传。没带不补。
+    ///   设备指纹派生、会话段对齐按账号钉住的出站会话头）；没带就补一份（同
+    ///   [`crate::proxy::bare_session_id`]）。身份伪装关着时原样透传、不补。
     /// - **关**：整个剥掉。官方本就有不带 `user_id` 的形态（Claude Desktop 不带，Claude Code 也能用
     ///   环境变量关掉）。
     pub real_billing_keep_user_id: bool,

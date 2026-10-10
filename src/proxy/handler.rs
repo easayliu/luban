@@ -159,20 +159,13 @@ pub(super) async fn handle_inner(
 /// 在它之前就返回了，得各自算。
 fn early_logged_device(
     device_id: &Option<String>,
-    upstream: &Upstream<'_>,
-    flags: store::ForwardFlags,
+    attempt: &Attempt<'_>,
     cred: &crate::credentials::Credential,
     device_fp: &str,
 ) -> Option<String> {
-    device_id.clone().or_else(|| {
-        sim_device_id(
-            upstream.sim.as_ref(),
-            upstream.bare_session.as_deref(),
-            flags,
-            cred,
-            device_fp,
-        )
-    })
+    device_id
+        .clone()
+        .or_else(|| sim_device_id(attempt.sent_bits.device_id_out.as_deref(), cred, device_fp))
 }
 
 /// 会话 RPM 超限那条 429：两个入口（头一路、body 一路）共用，免得两处的状态码、头、正文

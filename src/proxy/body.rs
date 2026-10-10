@@ -388,7 +388,7 @@ pub(super) fn rewrite_body_out(
     // 就被删掉、且没人补回来——头上还有会话 id、体里却什么都没有。那既违背这个开关的语义
     // （「别改身份」被执行成了「把身份删了」），也违背客户端数据透传契约。
     // `billing_only`：不剥不重建；客户端自带的 `user_id` 留还是剥看下面的 `meta_stripped`，留下的
-    // 按身份伪装规则改写（`spoofed` / `session_synced`），没带的不补。
+    // 按身份伪装规则改写（`spoofed` / `session_synced`），没带的按「带 user_id」那项补（`sim_meta`）。
     if sim.is_some() && !billing_only && flags.spoof_identity {
         strip_metadata_user_id(&mut v);
     }
@@ -396,11 +396,15 @@ pub(super) fn rewrite_body_out(
     // 它自己登录的账号，与 luban 换上的 token 不是同一个账号；官方本身就有不带 `user_id` 的形态
     // （Claude Desktop 不带，Claude Code 也能用环境变量关掉）。开着（默认）则原样透传。
     let meta_stripped = strip_uid && strip_metadata_user_id(&mut v);
+    // 没带 `user_id` 的补一份官方形态的。billing-only 下照补（开着「带 user_id」时）：官方每条
+    // 请求都带它，「仅 billing header、无身份句」那类辅助调用也不例外（`cap/auto-2.1.293-20261008-full`
+    // 174 条有 system 的请求全带）。真实客户端那份的会话 id 由 [`bare_session_id`] 给，它自己按
+    // `real_billing_keep_user_id` 判。客户端已带的 [`ensure_cc_metadata`] 不动。
     let sim_meta = flags.spoof_identity
-        && !billing_only
+        && !strip_uid
         && meta_session.is_some_and(|sid| ensure_cc_metadata(&mut v, cred, device_fp, sid));
-    // billing-only 下同样跑：保留下来的 `user_id` 按身份伪装 / 归一化的规则改写；剥掉了或客户端
-    // 本就没带时这里没有东西可改（billing-only 不补 metadata）。
+    // billing-only 下同样跑：保留下来的 `user_id` 按身份伪装 / 归一化的规则改写；剥掉了或刚补的
+    // 那份这里没有东西可改。
     let spoofed =
         flags.spoof_identity && spoof_identity(&mut v, cred, device_fp, flags.spoof_device_id);
     // 客户端自带的那份 user_id 里，会话段要和出站头同值。跟在 [`spoof_identity`] 之后——

@@ -5,27 +5,25 @@ use super::*;
 /// 裸客户端（无 `metadata.user_id`）在请求日志里用的设备标识：出站那份**伪装** device_id，
 /// 加 `sim:` 前缀。没伪装过就返回 `None`（日志照旧是 `-`）。
 ///
-/// **只在真伪装过时才记**：要求 [`ensure_cc_metadata`] 确实把这个 id 写进了出站体，也就是
-/// `spoof_identity` 开着、且走了会补身份的那两条路之一——模拟路径（`sim` 为 `Some`）或
-/// CC 形态补身份（`bare_session` 为 `Some`，见 [`Upstream::bare_session`]）。否则记出来的是
-/// 一个上游根本没见过的 id，比留个 `-` 更误导。
+/// **只在真伪装过时才记**，且按**出站体**判，不按开关推：`out_device` 是实际发出去的
+/// `metadata.user_id` 里的 device_id（[`ShapeBits::device_id_out`]），等于本号按这台设备派生的
+/// 那个才算——即 [`ensure_cc_metadata`] 真把它写进了出站体（模拟路径、CC 形态补身份、
+/// billing-only 下补的那份）。从开关推会漏掉几种没写的情形：billing-only 保留了客户端自带的
+/// 非 CC 格式 `user_id`（`client-uid-123` 这类，补那步不覆盖已有的）、非计费路径
+/// （`count_tokens`）原样透传；那时记出来的是一个上游根本没见过的 id，还会进设备费用表
+/// （`device_costs`），比留个 `-` 更误导。
 ///
 /// **前缀不是装饰**：这个值只随「账号 + 平台指纹」变（裸客户端没有自己的 device_id，指纹退化
 /// 成 `"|<arch>|<os>"`，同账号同平台的所有裸客户端共用一个），看着就像「一台设备打了全部
 /// 请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成真实设备读。它也**不写设备绑定**，故不占 `device_limit` 名额、不会出现在设备列表里
 /// （[`store::CredentialStore::list_devices`] 从 `device_bindings` 出发）。
 pub(in crate::proxy) fn sim_device_id(
-    sim: Option<&Simulation>,
-    bare_session: Option<&str>,
-    flags: store::ForwardFlags,
+    out_device: Option<&str>,
     cred: &crate::credentials::Credential,
     device_fp: &str,
 ) -> Option<String> {
-    // billing-only 下不补 metadata（[`ensure_cc_metadata`] 不跑），没有伪装 device_id 可记。
-    if (sim.is_none() && bare_session.is_none()) || !flags.spoof_identity || flags.billing_only() {
-        return None;
-    }
-    cred.spoof_device_id(device_fp).map(|d| format!("sim:{d}"))
+    let derived = cred.spoof_device_id(device_fp)?;
+    (out_device == Some(derived.as_str())).then(|| format!("sim:{derived}"))
 }
 
 /// 构造设备指纹：客户端原始 `device_id` + 平台 `arch`/`os` + **这条请求实际发往上游的 UA**，

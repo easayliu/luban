@@ -2606,6 +2606,94 @@ mod billing_only {
         assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
     }
 
+    /// 来访没带 `metadata.user_id`：billing-only 下照补官方形态的一份（官方每条请求都带），会话段即
+    /// 出站会话 id。模拟请求按 `sim.session_id`、真实客户端按 [`crate::proxy::bare_session_id`] 给的那个；
+    /// 「带 user_id」关掉或身份伪装关着都不补。
+    #[test]
+    fn fills_user_id_when_absent() {
+        const NO_META: &str = concat!(
+            r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+            r#""system":[{"type":"text","text":"CLIENT-A 指令"}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let raw = Bytes::from_static(NO_META.as_bytes());
+        let sim_out = |flags: store::ForwardFlags| -> serde_json::Value {
+            let sim = detect_for(&raw, flags).unwrap();
+            assert!(sim.billing_only);
+            serde_json::from_slice(&rewrite_body(&raw, &test_cred(), "fp", flags, Some(&sim), None))
+                .unwrap()
+        };
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        let v = sim_out(on_flags());
+        let uid: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().expect("应补 user_id")).unwrap();
+        assert_eq!(uid["account_uuid"], ACCOUNT_UUID);
+        assert_eq!(uid["session_id"], sim.session_id.as_str(), "会话段即出站会话头");
+        assert_eq!(uid["device_id"], test_cred().spoof_device_id("fp").unwrap());
+        assert_eq!(v["system"].as_array().unwrap().len(), 2, "其余仍不整形: {v}");
+        let off = sim_out(store::ForwardFlags { sim_billing_keep_user_id: false, ..on_flags() });
+        assert!(off.get("metadata").is_none(), "关掉「带 user_id」不补: {off}");
+        let no_spoof = sim_out(store::ForwardFlags { spoof_identity: false, ..on_flags() });
+        assert!(no_spoof.get("metadata").is_none(), "身份伪装关着不补: {no_spoof}");
+
+        // 真实客户端：补不补由 bare_session_id 判（billing-only 下看 real_billing_keep_user_id，
+        // 不看 fill_metadata），给了会话 id 就补。
+        const REAL_BARE: &str = concat!(
+            r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
+            r#""system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
+            r#""messages":[{"role":"user","content":"hi"}]}"#
+        );
+        let headers = crate::proxy::HeaderMap::new();
+        let bare = |flags| {
+            crate::proxy::bare_session_id(&headers, flags, None, true, false, &test_cred(), "fp")
+        };
+        let flags = store::ForwardFlags { fill_metadata: false, ..on_flags() };
+        let sid = bare(flags).expect("billing-only 下按「真实客户端带 user_id」补");
+        let raw = Bytes::from_static(REAL_BARE.as_bytes());
+        let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
+            &raw,
+            &test_cred(),
+            "fp",
+            flags,
+            None,
+            Some(&sid),
+        ))
+        .unwrap();
+        let uid: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().expect("应补 user_id")).unwrap();
+        assert_eq!(uid["session_id"], sid.as_str());
+        assert!(
+            bare(store::ForwardFlags { real_billing_keep_user_id: false, ..on_flags() }).is_none(),
+            "关掉「真实客户端带 user_id」不补"
+        );
+        assert!(
+            bare(store::ForwardFlags { sim_billing_keep_user_id: false, ..on_flags() }).is_some(),
+            "模拟那项不管真实客户端"
+        );
+        assert!(
+            bare(store::ForwardFlags { fill_metadata: false, ..all_on() }).is_none(),
+            "不在 billing-only 时仍看 fill_metadata"
+        );
+    }
+
+    /// 流水的伪装 device 按出站体记：billing-only 下补了 user_id 的照记；关了「带 user_id」、或保留的
+    /// 是客户端自带的非 CC 格式 user_id（补那步不覆盖），出站体里都没有派生设备，不记。
+    #[test]
+    fn logs_simulated_device_only_when_sent() {
+        let logged = |raw: &str, flags| {
+            let raw = Bytes::from(raw.to_string());
+            let sim = detect_for(&raw, flags).unwrap();
+            let out = rewrite_body(&raw, &test_cred(), "fp", flags, Some(&sim), None);
+            let dev = crate::proxy::logging::shape_summary(&out).device_id_out;
+            crate::proxy::sim_device_id(dev.as_deref(), &test_cred(), "fp")
+        };
+        let no_meta = RAW.replace(r#""metadata":{"user_id":"client-uid-123"},"#, "");
+        assert!(logged(&no_meta, on_flags()).is_some(), "补了 user_id，记派生设备");
+        let off = store::ForwardFlags { sim_billing_keep_user_id: false, ..on_flags() };
+        assert!(logged(&no_meta, off).is_none(), "关了「带 user_id」不补，不记");
+        assert!(logged(RAW, on_flags()).is_none(), "client-uid-123 原样出站，不记");
+    }
+
     /// 真实 CC 来访缺 billing header：billing-only 下只补 billing header，不补身份句。
     #[test]
     fn real_client_without_billing_gets_only_billing_header() {
@@ -3944,28 +4032,35 @@ fn injected_metadata_matches_raw_capture_bytes() {
     );
 }
 
-/// 裸客户端的日志设备标识：只在真伪装过时才有值，且带 `sim:` 前缀以免被当成真实设备。
+/// 裸客户端的日志设备标识：只在出站体里真有那个派生 device_id 时才有值，且带 `sim:` 前缀以免
+/// 被当成真实设备。
 #[test]
 fn logs_simulated_device_only_when_spoofed() {
     let sim = sim_for(PLAIN_BODY);
+    let raw = Bytes::from_static(PLAIN_BODY.as_bytes());
+    let logged = |flags, sim, bare, cred: &crate::credentials::Credential| {
+        let out = rewrite_body(&raw, cred, "fp", flags, sim, bare);
+        let dev = crate::proxy::logging::shape_summary(&out).device_id_out;
+        crate::proxy::sim_device_id(dev.as_deref(), cred, "fp")
+    };
     let expect = format!("sim:{}", test_cred().spoof_device_id("fp").unwrap());
-    let id = crate::proxy::sim_device_id(Some(&sim), None, all_on(), &test_cred(), "fp").unwrap();
-    assert_eq!(id, expect);
+    assert_eq!(logged(all_on(), Some(&sim), None, &test_cred()).as_deref(), Some(expect.as_str()));
 
     // CC 形态补身份那条路（sim 为 None、bare_session 有值）同样把这个 id 发了出去，
     // 日志要记它——否则这段流量在库里只留下 `-`，无从聚合。
-    let bare =
-        crate::proxy::sim_device_id(None, Some("sess"), all_on(), &test_cred(), "fp").unwrap();
-    assert_eq!(bare, expect, "两条补身份的路径记的是同一个 id");
+    let bare = logged(all_on(), None, Some("sess"), &test_cred());
+    assert_eq!(bare.as_deref(), Some(expect.as_str()), "两条补身份的路径记的是同一个 id");
 
-    // 两条路都没走（来访是 CC 形态且自带 metadata）→ 出站体里根本没有这个 id，不该记。
-    assert!(crate::proxy::sim_device_id(None, None, all_on(), &test_cred(), "fp").is_none());
+    // 两条路都没走 → 出站体里根本没有这个 id，不该记。
+    assert!(logged(all_on(), None, None, &test_cred()).is_none());
     // spoof_identity 关着时同理：ensure_cc_metadata 不会写 metadata。
     let no_spoof = store::ForwardFlags { spoof_identity: false, ..all_on() };
-    assert!(crate::proxy::sim_device_id(Some(&sim), None, no_spoof, &test_cred(), "fp").is_none());
+    assert!(logged(no_spoof, Some(&sim), None, &test_cred()).is_none());
     // 凭证没有 account_uuid 就派生不出来，退回 `-`。
     let no_uuid = crate::credentials::Credential { account_uuid: None, ..test_cred() };
-    assert!(crate::proxy::sim_device_id(Some(&sim), None, all_on(), &no_uuid, "fp").is_none());
+    assert!(logged(all_on(), Some(&sim), None, &no_uuid).is_none());
+    // 出站体里的 device 不是本号派生的那个（客户端自带、原样透传）：不记。
+    assert!(crate::proxy::sim_device_id(Some("dev-real"), &test_cred(), "fp").is_none());
 }
 
 /// 日志用的 UA 取值：缺失/空串取 `-`，过长按 char 截断（不能按字节切，会劈开多字节 UTF-8）。

@@ -211,10 +211,18 @@ fn cc_request(extra: serde_json::Value) -> (HeaderMap, Bytes) {
 }
 
 async fn send(state: &AppState, req: (HeaderMap, Bytes)) -> (StatusCode, HeaderMap, Bytes) {
+    send_to(state, "/v1/messages", req).await
+}
+
+async fn send_to(
+    state: &AppState,
+    path: &str,
+    req: (HeaderMap, Bytes),
+) -> (StatusCode, HeaderMap, Bytes) {
     let resp = crate::proxy::handle(
         axum::extract::State(state.clone()),
         axum::http::Method::POST,
-        "/v1/messages".parse::<Uri>().unwrap(),
+        path.parse::<Uri>().unwrap(),
         req.0,
         req.1,
     )
@@ -903,4 +911,63 @@ async fn deleting_the_last_key_does_not_open_the_proxy(pool: sqlx::PgPool) {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     assert!(mock.seen().is_empty());
+}
+
+/// 第三方客户端（非 CC 的 UA、不带官方提示词）的一条请求，`metadata` 由调用方给。
+fn third_party_request(metadata: Option<serde_json::Value>) -> (HeaderMap, Bytes) {
+    let mut body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 1024,
+        "stream": true,
+        "system": "You are a terse assistant.",
+        "messages": [{"role": "user", "content": "write a haiku about the sea"}],
+    });
+    if let Some(m) = metadata {
+        body["metadata"] = m;
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(header::USER_AGENT, HeaderValue::from_static("curl/8.7.1"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+}
+
+/// billing-only 下流水的伪装设备按**出站体**记：补了 `user_id` 的记 `sim:` 派生设备；客户端自带
+/// 非 CC 格式的 `user_id`（补那步不覆盖，出站体里没有派生设备）、非计费的 `count_tokens`（原样
+/// 透传）都不记——否则上游没见过的设备会进流水与设备费用。
+#[sqlx::test]
+async fn billing_only_logs_the_simulated_device_only_when_it_was_sent(pool: sqlx::PgPool) {
+    let count_ok = Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: br#"{"input_tokens":12}"#.to_vec(),
+    };
+    let mock = MockUpstream::start(vec![sse_ok("a"), sse_ok("b"), count_ok]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SIM_BILLING_ONLY, "1").await.unwrap();
+    // 放行不带设备身份的裸客户端（默认拒）：这里要测的正是它们。
+    store.set_setting(store::REQUIRE_DEVICE_ID, "0").await.unwrap();
+
+    let (status, _, body) = send(&state, third_party_request(None)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let rows = usage_logs(&store, 1).await;
+    let dev = rows[0].device_id.as_deref().unwrap_or_default();
+    assert!(dev.starts_with("sim:"), "补了 user_id，记派生设备: {dev:?}");
+
+    let plain = serde_json::json!({"user_id": "client-uid-123"});
+    let (status, _, _) = send(&state, third_party_request(Some(plain))).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = usage_logs(&store, 2).await;
+    let row = rows.iter().max_by_key(|r| r.id).unwrap();
+    assert_eq!(row.device_id, None, "出站是客户端原样的 user_id，没有派生设备");
+
+    let (status, _, body) =
+        send_to(&state, "/v1/messages/count_tokens", third_party_request(None)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 3);
+    let rows = usage_logs(&store, 3).await;
+    assert_eq!(rows.len(), 3);
+    let row = rows.iter().max_by_key(|r| r.id).unwrap();
+    assert!(row.path.contains("count_tokens"), "{}", row.path);
+    assert_eq!(row.device_id, None, "count_tokens 原样透传，不记派生设备");
 }

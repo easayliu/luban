@@ -15,20 +15,14 @@ pub(super) async fn respond(
     upstream_limit: Option<RateLimitInfo>,
 ) -> Response {
     let Attempt { upstream, sent, sent_bits, route_load } = attempt;
-    let Inbound { ref device_id, ref device_fp, flags, .. } = *inb;
+    let Inbound { ref device_id, ref device_fp, .. } = *inb;
     let Pick { ref cred, .. } = *pick;
     // 请求日志里记哪个设备：客户端自己带了就记它的，裸客户端记出站那份**伪装** device_id。
     // 不记的话这段流量在日志里只留下 `device=-`，既看不出是谁、也无从聚合。见 [`sim_device_id`]。
     // 取最终那一轮的凭证与模拟参数——换过号的话，实际发出去的就是那份。
-    let logged_device = device_id.clone().or_else(|| {
-        sim_device_id(
-            upstream.sim.as_ref(),
-            upstream.bare_session.as_deref(),
-            flags,
-            cred,
-            device_fp,
-        )
-    });
+    let logged_device = device_id
+        .clone()
+        .or_else(|| sim_device_id(sent_bits.device_id_out.as_deref(), cred, device_fp));
 
     match resp {
         Ok(up) => {

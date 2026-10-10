@@ -81,11 +81,11 @@ export interface Settings {
   fill_absent_tools: boolean
   /** 模拟路径注入的官方工具去掉 Artifact、ListAgents、SendFeedback 三条（官方用户可自行关掉的那三条），遥测按关掉后的样子报；默认启用。 */
   sim_trim_tools: boolean
-  /** 模拟路径只在 system[0] 注一条最小 billing header、其余注入全部跳过（身份句/基座/工具/metadata/thread 一律不补），客户端 system 与参数原样透传；实验性，默认停用。 */
+  /** 模拟路径只在 system[0] 注一条最小 billing header、其余注入全部跳过（身份句/基座/工具/thread 一律不补，metadata.user_id 由两项子开关管），客户端 system 与参数原样透传；实验性，默认停用。 */
   sim_billing_only: boolean
-  /** 仅注入 billing 标识时保留模拟请求自带的 metadata.user_id（按身份规则改写，没带不补）；停用后整个剥离；默认启用。 */
+  /** 仅注入 billing 标识时模拟请求带 metadata.user_id（自带的按身份规则改写，没带补一份）；停用后整个剥离；默认启用。 */
   sim_billing_keep_user_id: boolean
-  /** 仅注入 billing 标识时保留真实客户端自带的 metadata.user_id（按身份规则改写，没带不补）；停用后整个剥离；默认启用。 */
+  /** 仅注入 billing 标识时真实客户端带 metadata.user_id（自带的按身份规则改写，没带补一份，代替 fill_metadata）；停用后整个剥离；默认启用。 */
   real_billing_keep_user_id: boolean
   /** 模拟路径的主线程按官方 message threads 形态写 thread：首轮 create，接得上的续轮 continue 只发增量（2.1.291 起四族都写）；并在末尾补官方的 total_tokens 提醒。 */
   sim_message_threads: boolean
