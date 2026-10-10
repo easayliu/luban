@@ -598,6 +598,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
     verify_secret_key(conn)?;
     encrypt_plaintext_tokens(conn)?;
     migrate_groups(conn)?;
+    migrate_provision_keys(conn)?;
     migrate_billing(conn)?;
     ensure_secret_check(conn)?;
     purge_orphan_rows(conn)?;

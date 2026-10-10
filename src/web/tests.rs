@@ -606,3 +606,87 @@ fn serde_urlencoded_query(s: &str) -> BillingQuery {
     let uri: axum::http::Uri = format!("/billing?{s}").parse().unwrap();
     axum::extract::Query::<BillingQuery>::try_from_uri(&uri).unwrap().0
 }
+
+/// 上号代理：给地址就用地址，给 id 只认本人池里的，两个都给拒；都不给时网页直连、上号 Key
+/// 从本人池里按挂号从少到多（在途的也算）测试、用第一条通的，都不通回 502，池子空了直连。
+#[tokio::test]
+async fn exchange_proxy_is_explicit_or_auto_assigned_for_provision_keys() {
+    let store = std::sync::Arc::new(CredentialStore::open_in_memory().unwrap());
+    let admin = store.admin_user().unwrap().id;
+    let hash = "x".to_string();
+    let agent = store.create_user("agent1", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let other = store.create_user("agent2", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let pa = store.add_proxy(agent, "A", "http://u:a@h:1").unwrap();
+    let pb = store.add_proxy(agent, "B", "http://u:b@h:2").unwrap();
+    let foreign = store.add_proxy(other, "C", "http://u:c@h:3").unwrap();
+    let busy = store.insert("busy", None, "at", "rt-busy", u64::MAX, None, None, other).unwrap();
+    store.set_proxy(busy.id, Some(&pa.url)).unwrap();
+    let state = AppState::for_test(store.clone());
+    let actor = Actor { id: agent, username: "agent1".into(), role: UserRole::Agent };
+    let all_up = |_url: String| async { Ok::<(), String>(()) };
+    let req = |proxy: Option<&str>, proxy_id: Option<i64>| ExchangeReq {
+        code: "c#s".into(),
+        label: None,
+        proxy: proxy.map(Into::into),
+        proxy_id,
+        group_ids: vec![],
+    };
+
+    let (url, _) = resolve_proxy(&state, &actor, &req(Some("http://u:x@h:9"), None), true, all_up).await.unwrap();
+    assert_eq!(url.as_deref(), Some("http://u:x@h:9"));
+    let (url, _) = resolve_proxy(&state, &actor, &req(None, Some(pa.id)), false, all_up).await.unwrap();
+    assert_eq!(url.as_deref(), Some(pa.url.as_str()));
+    assert_eq!(
+        resolve_proxy(&state, &actor, &req(None, Some(foreign.id)), true, all_up).await.err().map(|e| e.0),
+        Some(StatusCode::NOT_FOUND)
+    );
+    assert_eq!(
+        resolve_proxy(&state, &actor, &req(Some(&pa.url), Some(pa.id)), true, all_up).await.err().map(|e| e.0),
+        Some(StatusCode::BAD_REQUEST)
+    );
+    assert_eq!(resolve_proxy(&state, &actor, &req(None, None), false, all_up).await.unwrap().0, None);
+
+    // A 已经挂了一个号（别人的也算）：先分到 B；B 在途时两边各 1，并列取 id 小的 A；
+    // 在途的放掉之后又回到 B。
+    let (first, held) = resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
+    assert_eq!(first.as_deref(), Some(pb.url.as_str()));
+    let (second, _held2) = resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
+    assert_eq!(second.as_deref(), Some(pa.url.as_str()));
+    drop(held);
+    drop(_held2);
+    let (third, _) = resolve_proxy(&state, &actor, &req(None, None), true, all_up).await.unwrap();
+    assert_eq!(third.as_deref(), Some(pb.url.as_str()));
+
+    // 导入进来的条目不经校验：建不出客户端的跳过；归一化前的写法按归一化后的地址数挂号。
+    let odd = store.create_user("agent4", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let odd_actor = Actor { id: odd, username: "agent4".into(), role: UserRole::Agent };
+    store.add_proxy(odd, "bad", "ftp://h:21").unwrap();
+    let legacy = store.add_proxy(odd, "legacy", "socks5://u:l@h:5").unwrap();
+    let fresh = store.add_proxy(odd, "fresh", "socks5h://u:f@h:6").unwrap();
+    let on_legacy = store.insert("l", None, "at", "rt-l", u64::MAX, None, None, odd).unwrap();
+    store.set_proxy(on_legacy.id, Some("socks5h://u:l@h:5")).unwrap();
+    let (url, _) = resolve_proxy(&state, &odd_actor, &req(None, None), true, all_up).await.unwrap();
+    assert_eq!(url.as_deref(), Some(fresh.url.as_str()), "legacy #{} 已挂一个号", legacy.id);
+
+    // 测不通的跳过：B 不通就落到 A；都不通回 502，不退回直连。
+    let b_url = pb.url.clone();
+    let b_down = move |url: String| {
+        let down = url == b_url;
+        async move { if down { Err("down".to_string()) } else { Ok(()) } }
+    };
+    let (url, _) = resolve_proxy(&state, &actor, &req(None, None), true, b_down).await.unwrap();
+    assert_eq!(url.as_deref(), Some(pa.url.as_str()));
+    let all_down = |_url: String| async { Err::<(), String>("down".into()) };
+    assert_eq!(
+        resolve_proxy(&state, &actor, &req(None, None), true, all_down).await.err().map(|e| e.0),
+        Some(StatusCode::BAD_GATEWAY)
+    );
+    // 显式指定的不测（脚本自己负责）。
+    let (url, _) =
+        resolve_proxy(&state, &actor, &req(None, Some(pb.id)), true, all_down).await.unwrap();
+    assert_eq!(url.as_deref(), Some(pb.url.as_str()));
+
+    let lonely = store.create_user("agent3", &hash, UserRole::Agent, admin).unwrap().unwrap().id;
+    let lonely = Actor { id: lonely, username: "agent3".into(), role: UserRole::Agent };
+    assert_eq!(resolve_proxy(&state, &lonely, &req(None, None), true, all_up).await.unwrap().0, None);
+}

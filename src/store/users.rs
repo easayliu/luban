@@ -302,7 +302,7 @@ pub(super) fn owner_exists(conn: &Connection, owner_id: i64) -> Result<bool> {
 }
 
 impl CredentialStore {
-    fn query_user(
+    pub(super) fn query_user(
         conn: &Connection,
         filter: &str,
         p: impl rusqlite::Params,
@@ -563,6 +563,7 @@ impl CredentialStore {
         }
         tx.execute("DELETE FROM sessions WHERE user_id = ?1", [id])?;
         tx.execute("DELETE FROM proxies WHERE owner_id = ?1", [id])?;
+        tx.execute("DELETE FROM provision_keys WHERE user_id = ?1", [id])?;
         tx.execute("DELETE FROM users WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(Ok(()))

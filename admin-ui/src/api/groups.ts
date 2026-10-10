@@ -90,3 +90,37 @@ export async function revealApiKey(id: number): Promise<string> {
   const { data } = await api.get<{ key: string }>(`/api-keys/${id}/reveal`)
   return data.key
 }
+
+/** 一把上号 Key（不含明文）：脚本拿它只能走「添加账号」，上的号落在所属账号名下。 */
+export interface ProvisionKey {
+  id: number
+  user_id: number
+  /** 所属账号的用户名（admin 看全部时认人用）。 */
+  username: string
+  label: string
+  /** 明文开头几位。 */
+  prefix: string
+  disabled: boolean
+  created_at: number
+  /** 最近一次被使用的时间；从没用过为 null。 */
+  last_used_at: number | null
+}
+
+export async function listProvisionKeys(): Promise<ProvisionKey[]> {
+  const { data } = await api.get<ProvisionKey[]>('/provision-keys')
+  return data
+}
+
+/** 给自己新建一把上号 Key，回明文——只回这一次。 */
+export async function createProvisionKey(label: string): Promise<{ id: number; key: string }> {
+  const { data } = await api.post<{ id: number; key: string }>('/provision-keys', { label })
+  return data
+}
+
+export async function updateProvisionKey(id: number, input: { label: string; disabled: boolean }): Promise<void> {
+  await api.post(`/provision-keys/${id}`, input)
+}
+
+export async function deleteProvisionKey(id: number): Promise<void> {
+  await api.delete(`/provision-keys/${id}`)
+}

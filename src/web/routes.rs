@@ -101,6 +101,8 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", post(update_api_key).delete(delete_api_key))
         .route("/api-keys/{id}/reveal", get(reveal_api_key))
+        .route("/provision-keys", get(list_provision_keys).post(create_provision_key))
+        .route("/provision-keys/{id}", post(update_provision_key).delete(delete_provision_key))
         .route("/users", get(list_users).post(create_user))
         .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/password", post(set_user_password))

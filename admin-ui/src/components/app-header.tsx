@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import {
   EllipsisVerticalIcon,
+  KeySquareIcon,
   KeyRoundIcon,
   LayersIcon,
   ReceiptIcon,
@@ -32,6 +33,7 @@ import {
 import { useI18n } from '@/lib/i18n'
 import { useCanManageUsers, useIsAdmin, useMe, useReadOnly } from '@/lib/role'
 import { ChangePasswordDialog } from '@/components/change-password-dialog'
+import { ProvisionKeysDialog } from '@/components/provision-keys-dialog'
 
 /**
  * 顶栏动作按钮的窄屏形态：手机上只留图标，撑成 40px 见方的点按目标；文字由按钮里的
@@ -251,11 +253,19 @@ export function AccountMenu({
   const { t } = useI18n()
   const role = useMe().data?.role
   const [passwordOpen, setPasswordOpen] = useState(false)
+  const [provisionOpen, setProvisionOpen] = useState(false)
   const canChangePassword = role === 'agent' || role === 'user'
+  // 访客只读，不能上号，也就用不着上号 Key。
+  const canProvision = !!role && role !== 'viewer'
   return (
     <>
       <PreferencesMenu onSignOut={onSignOut}>
         {children}
+        {canProvision && (
+          <MenuItem onClick={() => setProvisionOpen(true)}>
+            <KeySquareIcon />{t('上号 Key', 'Provision keys')}
+          </MenuItem>
+        )}
         {canChangePassword && (
           <MenuItem onClick={() => setPasswordOpen(true)}>
             <KeyRoundIcon />{t('修改密码', 'Change password')}
@@ -263,6 +273,7 @@ export function AccountMenu({
         )}
       </PreferencesMenu>
       {canChangePassword && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
+      {canProvision && <ProvisionKeysDialog open={provisionOpen} onOpenChange={setProvisionOpen} />}
     </>
   )
 }

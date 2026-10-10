@@ -62,26 +62,151 @@ pub(super) fn take_pkce(
     Some(pending.remove(i).1)
 }
 
+/// 自动分配时已选中、还没入库的代理：`url` → 在途几次。并发的几个脚本同时上号时，库里的
+/// 挂号数还没变，只看库会全挑到同一条上；把在途的也算进去才分得开。
+static PROXY_IN_FLIGHT: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// 自动分配占着的一个名额，上号结束（成功或失败）时放掉。
+pub(super) struct ProxyReservation(String);
+
+impl Drop for ProxyReservation {
+    fn drop(&mut self) {
+        let mut map = PROXY_IN_FLIGHT.lock();
+        if let Some(n) = map.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// 自动分配时最多试几条代理。按挂号从少到多试，通了就停；前几条都不通多半是出口整体出了
+/// 问题，再往下试只是让脚本干等。
+const AUTO_PROXY_MAX_TRIES: usize = 5;
+
+/// 自动分配时每条代理测试的超时，比「测试代理」按钮短：脚本在等着，试满也不过一分钟。
+const AUTO_PROXY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 自动分配用的连通性测试：与「测试代理」按钮同一份判据（[`probe_proxy`]）。
+pub(super) async fn probe_pool_proxy(url: String) -> Result<(), String> {
+    let client = crate::clients::upstream_client(Some(&url)).map_err(|e| format!("{e:#}"))?;
+    let result = probe_proxy(&client, AUTO_PROXY_TEST_TIMEOUT).await;
+    if result.ok { Ok(()) } else { Err(result.error.unwrap_or_else(|| "test failed".into())) }
+}
+
+/// 定这次上号走哪个代理：
+/// - `proxy`：直接给的地址，校验后用；
+/// - `proxy_id`：本人代理池里的那条，别人的按不存在回 404；
+/// - 都没给：网页上号直连；上号 Key 从本人代理池里按挂号从少到多（挂号数按全部号算，同一个
+///   出口不管谁的号都算；并列取 id 小的）逐条用 `probe` 测试，用第一条测通的。池子空了才
+///   直连；池里有代理却一条都不通回 502，不退回直连——直连等于把服务器自己的 IP 交出去。
+pub(super) async fn resolve_proxy<F, Fut>(
+    state: &AppState,
+    actor: &Actor,
+    req: &ExchangeReq,
+    auto: bool,
+    probe: F,
+) -> Result<(Option<String>, Option<ProxyReservation>), ApiError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let raw = req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let validate =
+        |url: &str| crate::clients::validate_proxy(url).map_err(|e| bad_request(format!("{e:#}")));
+    match (raw, req.proxy_id) {
+        (Some(_), Some(_)) => Err(bad_request("give either proxy or proxy_id, not both")),
+        (Some(raw), None) => Ok((Some(validate(raw)?), None)),
+        (None, Some(id)) => {
+            let not_found = || (StatusCode::NOT_FOUND, "proxy not found".to_string());
+            if state.store.proxy_owner(id).map_err(internal)? != Some(actor.id) {
+                return Err(not_found());
+            }
+            let saved = state.store.get_proxy(id).map_err(internal)?.ok_or_else(not_found)?;
+            Ok((Some(validate(&saved.url)?), None))
+        }
+        (None, None) if auto => {
+            // 池里的地址按校验后的样子比：迁移文件导入的条目没经过校验，可能是归一化之前的写法
+            // （号上存的是归一化之后的），也可能根本建不出客户端。后者一个号都挂不上、挂号数恒为
+            // 0，不跳过的话每次都排在最前面。
+            let mut pool: Vec<(i64, String)> = state
+                .store
+                .list_proxies(Scope::Owner(actor.id))
+                .map_err(internal)?
+                .into_iter()
+                .filter_map(|p| match crate::clients::validate_proxy(&p.url) {
+                    Ok(url) => Some((p.id, url)),
+                    Err(e) => {
+                        tracing::warn!(proxy_id = p.id, error = %e, "auto-assign: skipped an invalid pool proxy");
+                        None
+                    }
+                })
+                .collect();
+            if pool.is_empty() {
+                return Ok((None, None));
+            }
+            let used = state.store.proxy_usage_counts(Scope::All).map_err(internal)?;
+            {
+                let in_flight = PROXY_IN_FLIGHT.lock();
+                let load = |url: &str| {
+                    used.get(url).copied().unwrap_or(0) as usize
+                        + in_flight.get(url).copied().unwrap_or(0)
+                };
+                pool.sort_by_key(|(id, url)| (load(url), *id));
+            }
+            let mut failures = Vec::new();
+            for (id, url) in pool.into_iter().take(AUTO_PROXY_MAX_TRIES) {
+                match probe(url.clone()).await {
+                    Ok(()) => {
+                        *PROXY_IN_FLIGHT.lock().entry(url.clone()).or_default() += 1;
+                        tracing::info!(proxy_id = id, owner = %actor.username, "provision key: proxy auto-assigned");
+                        return Ok((Some(url.clone()), Some(ProxyReservation(url))));
+                    }
+                    Err(e) => {
+                        tracing::warn!(proxy_id = id, error = %e, "auto-assign: proxy failed the connectivity test");
+                        failures.push(format!("proxy #{id}: {e}"));
+                    }
+                }
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "no proxy in your pool passed the connectivity test (tried the {} least used): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ),
+            ))
+        }
+        (None, None) => Ok((None, None)),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct ExchangeReq {
     /// 用户从授权回调页粘贴的 `code#state`。
-    code: String,
+    pub(super) code: String,
     /// 可选的显示名；留空则自动命名。
     #[serde(default)]
-    label: Option<String>,
+    pub(super) label: Option<String>,
     /// 可选的出站代理——登录换码和拉 profile 都走它，入库后自动存为该凭证的逐账号代理。
     #[serde(default)]
-    proxy: Option<String>,
+    pub(super) proxy: Option<String>,
+    /// 改从代理池里选：只认本人池里的那条。与 `proxy` 二选一。
+    #[serde(default)]
+    pub(super) proxy_id: Option<i64>,
     /// 放进哪些号池分组（至少一个）。不传或为空时放进默认分组。代理和用户只能选开放给
     /// 自己的分组。
     #[serde(default)]
-    group_ids: Vec<i64>,
+    pub(super) group_ids: Vec<i64>,
 }
 
 /// 用粘贴的 `code#state` 交换 token，并新增一条凭证。
 pub(super) async fn exchange(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    via_key: Option<Extension<auth::ViaProvisionKey>>,
     Json(req): Json<ExchangeReq>,
 ) -> Result<Json<CredentialView>, ApiError> {
     // 先从粘贴内容里取出 state，据此找到**它自己那次**登录的挑战——不能拿「最后一次生成的
@@ -93,17 +218,15 @@ pub(super) async fn exchange(
         check_selectable(&state, &actor, &req.group_ids)?;
         req.group_ids.clone()
     };
+    // 代理也在取挑战之前定：选错了代理（不是本人池里的、地址不合法）、池里的代理都不通时，
+    // 这次授权还能重试。
+    let (proxy, _reservation) =
+        resolve_proxy(&state, &actor, &req, via_key.is_some(), probe_pool_proxy).await?;
     let returned_state = oauth::state_of(&req.code).map_err(|e| bad_request(e.to_string()))?;
     let pkce = take_pkce(&mut state.pkce.lock(), &returned_state, std::time::Instant::now())
         .ok_or_else(|| bad_request("this login attempt expired or was not found; click 'Add account' again to generate a new authorization link"))?;
 
-    // 如果用户指定了代理，先校验、再临时建一个走代理的客户端——换码和拉 profile 都走它。
-    let proxy = match req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(raw) => {
-            Some(crate::clients::validate_proxy(raw).map_err(|e| bad_request(format!("{e:#}")))?)
-        }
-        None => None,
-    };
+    // 有代理就临时建一个走代理的客户端——换码和拉 profile 都走它。
     let tmp_client;
     let client: &wreq::Client = match proxy.as_deref() {
         Some(url) => {
