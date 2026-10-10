@@ -60,8 +60,6 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/proxies/batch", post(add_saved_proxies))
         .route("/proxies/{id}", post(update_saved_proxy).delete(delete_saved_proxy))
         .route("/usage", get(list_usage))
-        .route("/ban-events", get(list_ban_events))
-        .route("/ban-events/{id}/logs", get(list_ban_event_logs))
         .route("/metrics", get(get_metrics))
         .route("/metrics/cache-series", get(get_cache_series))
         .route("/metrics/ttft-series", get(get_ttft_series))

@@ -1,4 +1,4 @@
-//! 会话保活被上游拒绝时的处置：判定账号级与否、停用并记封号事件。
+//! 会话保活被上游拒绝时的处置：判定账号级与否、停用。
 
 use super::*;
 
@@ -18,7 +18,7 @@ pub(super) enum KeepaliveRejection {
 /// 保活端点回 401/403：**诊断与停用判定分开**。先把完整上下文（端点、状态码、错误类型与
 /// 文案、上游 request-id）记进日志，再按转发路径同一套 [`proxy::classify_account_rejection`] 决定
 /// 要不要停用——命中账号级特征（401 `authentication_error`、`invalid_grant`、「账号 /
-/// 组织 被停用」之类）才 [`CredentialStore::record_ban`]，事件里带同一份上下文；没命中的
+/// 组织 被停用」之类）才 [`CredentialStore::record_ban`]（停号日志里带同一份上下文）；没命中的
 /// （订阅未生效、`permission_error`、区域限制、网关页面……）不封号。
 /// 返回是否停用了。
 ///

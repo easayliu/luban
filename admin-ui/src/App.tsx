@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { PlusIcon, SearchIcon, ShieldAlertIcon } from 'lucide-react'
+import { PlusIcon, SearchIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
 import { getAuthState, logout } from '@/api/auth'
 import { getSettings } from '@/api/settings'
@@ -27,7 +27,6 @@ import {
 import { AddAccount } from '@/components/add-account'
 import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
-import { BanEventsDialog } from '@/components/ban-events-dialog'
 import type { SettingsSection } from '@/components/settings-page'
 import { LoginPage } from '@/components/login-page'
 import { SetupPage } from '@/components/setup-page'
@@ -46,7 +45,6 @@ import {
 import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { MenuItem } from '@/components/ui/menu'
 import { useI18n } from '@/lib/i18n'
 import {
   rememberRole,
@@ -167,7 +165,6 @@ function App() {
   const queryClient = useQueryClient()
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
-  const [bansOpen, setBansOpen] = useState(false)
   const [mainRoute, setMainRoute] = useState<MainPage | null>(readMainRoute)
   // 同设置页：从账号页点进来的，返回时消费 history；深链接直接打开的原地替换回账号页。
   const enteredMainFromAccounts = useRef(false)
@@ -511,7 +508,7 @@ function App() {
                 </Button>
               </Hint>
             )}
-            {/* 请求查询、封号记录看的是全池，只给管理员与访客。 */}
+            {/* 请求查询看的是全池，只给管理员与访客。 */}
             {seesWholePool && (
               <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
                 <Button
@@ -527,17 +524,11 @@ function App() {
                 </Button>
               </Hint>
             )}
-            {/* 账号池自己的工具在上（封号记录看全池，只给管理员与访客），成员管理、系统设置由菜单按身份补上。 */}
+            {/* 成员管理、系统设置由菜单按身份补上。 */}
             <AccountMenu
               onNavigate={navigateMain}
               onSignOut={authState?.configured && session ? signOut : undefined}
-            >
-              {seesWholePool && (
-                <MenuItem disabled={isBootstrapping} onClick={() => setBansOpen(true)}>
-                  <ShieldAlertIcon />{t('封号记录', 'Ban events')}
-                </MenuItem>
-              )}
-            </AccountMenu>
+            />
           </>
         }
       />
@@ -546,7 +537,6 @@ function App() {
         {/* 添加账号保持为短流程弹框；复杂设置使用独立页面。 */}
         <AddAccount open={adding} onOpenChange={setAdding} />
         <RequestLookupDialog open={lookupOpen} onOpenChange={setLookupOpen} />
-        {seesWholePool && <BanEventsDialog open={bansOpen} onOpenChange={setBansOpen} />}
 
         <CredentialWorkspace
           data={{

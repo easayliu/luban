@@ -17,7 +17,7 @@ fn keepalive_result_keeps_the_rejection_context() {
     assert!(KeepaliveResult::from_parts("x", 200, None, b"").is_ok());
     assert!(KeepaliveResult::from_parts("x", 304, None, b"").is_ok());
     assert_eq!(KeepaliveResult::from_parts("x", 503, None, b"oops"), KeepaliveResult::Failed);
-    // 超长体按字符截断，别把几十 KB 的网关页面整个塞进封号事件。
+    // 超长体按字符截断，别把几十 KB 的网关页面整个塞进停号原因。
     let long = "é".repeat(AUTH_REJECTION_BODY_CAP * 2);
     let KeepaliveResult::AuthRejected(r) =
         KeepaliveResult::from_parts("x", 401, None, long.as_bytes())

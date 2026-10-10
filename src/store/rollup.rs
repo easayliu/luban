@@ -14,7 +14,7 @@
 //!   取到更早的数，最新的数一定在；代价是窗口最早那一段至多少算 15 分钟。
 //!
 //! 每条流水在写入的**同一事务**里累加三行（[`rollup_record`]），与账本同一套路；保留
-//! [`ROLLUP_RETENTION_SECS`]（90 天），比流水的 8 天长，裁剪随流水裁剪一起跑。
+//! [`ROLLUP_RETENTION_SECS`]（90 天），比流水的 30 天长，裁剪随流水裁剪一起跑。
 
 use super::*;
 
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(
             count(&store).await,
             2,
-            "超过 90 天的那一桶裁掉，89 天前的还在（流水只留 8 天）"
+            "超过 90 天的那一桶裁掉，89 天前的还在（流水只留 30 天）"
         );
         store.clear().await.unwrap();
         assert_eq!(count(&store).await, 0);

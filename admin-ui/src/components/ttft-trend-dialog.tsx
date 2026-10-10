@@ -473,8 +473,8 @@ export function TtftTrendDialog({
           {/* p50 / p95 的含义交给图例与它末尾那枚 info，这里只剩图例说不了的两件事。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空白格表示该时段没有成功请求。请求明细只保留 8 天。',
-              'A gap means no successful requests in that period. Request logs are kept for 8 days.',
+              '空白格表示该时段没有成功请求。请求明细只保留 30 天。',
+              'A gap means no successful requests in that period. Request logs are kept for 30 days.',
             )}
           </p>
 

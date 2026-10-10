@@ -16,7 +16,7 @@ pub enum KeepaliveResult {
     Ok,
     /// 上游 401/403——token 已吊销、账号被暂停，也可能是组织权限不足或区域限制。到底是
     /// 哪一种只有响应体说得清，所以把状态码、响应体与上游 `request-id` 一并带回，由调用点
-    /// 写进封号事件（[`crate::store::CredentialStore::record_ban`]）。此前这是个单元变体，
+    /// 写进停号原因与日志（[`crate::store::CredentialStore::record_ban`]）。此前这是个单元变体，
     /// 落库的原因固定成「upstream 401/403」、来源记成 `manual`，事后无从区分。
     AuthRejected(AuthRejection),
     /// 网络错误或 5xx。

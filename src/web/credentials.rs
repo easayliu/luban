@@ -29,7 +29,6 @@ pub(super) async fn list_credentials(
             store.cost_by_cred().await?,
             store.recent_rpm().await?,
             store.all_model_denials().await?,
-            store.ban_counts().await?,
             store.proxy_ids_by_owner().await?,
         ))
     };
@@ -44,7 +43,6 @@ pub(super) async fn list_credentials(
         costs,
         rpm,
         mut denials,
-        bans,
         proxy_ids,
     ) = rest;
     let defaults = DefaultLimits::of(&state.store);
@@ -57,7 +55,6 @@ pub(super) async fn list_credentials(
                 session_counts.get(&c.id).copied().unwrap_or(0),
                 defaults,
             )
-            .with_ban_count(bans.get(&c.id).copied().unwrap_or(0))
             .with_proxy_ids(&proxy_ids)
             .with_owner_name(owners.as_ref())
             .with_groups(groups.remove(&c.id).unwrap_or_default())

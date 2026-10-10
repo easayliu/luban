@@ -209,7 +209,7 @@ fn detects_org_oauth_disallowed() {
     ));
 }
 
-/// 暂停写进库：号出池、不带恢复时刻、原因可读且带固定片段，不落封号事件；连通性测试
+/// 暂停写进库：号出池、不带恢复时刻、原因可读且带固定片段，不算封号；连通性测试
 /// 那条恢复认得出它。
 #[sqlx::test]
 async fn park_org_oauth_disallowed_pauses_until_resumed(pool: sqlx::PgPool) {
@@ -225,7 +225,6 @@ async fn park_org_oauth_disallowed_pauses_until_resumed(pool: sqlx::PgPool) {
             "[subscription-inactive 403] organization does not allow OAuth authentication (subscription lapsed, or a Free plan without one); paused until enabled manually or a connectivity test passes"
         )
     );
-    assert!(store.list_ban_events(None, 10).await.unwrap().is_empty(), "暂停不是封号，不落事件");
     assert!(got.is_subscription_paused() && !got.is_banned());
     assert!(!park_org_oauth_disallowed(&store, &a, 403, "keepalive").await, "已暂停的不重写");
     assert!(store.resume_if_subscription_suspended(a.id).await.unwrap());

@@ -36,7 +36,7 @@ import { Table, TableBody, TableCaption, TableCell, TableHead, TableHeader, Tabl
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Hint } from '@/components/ui/tooltip'
 
-/** 时间范围与粒度：与缓存 / 延迟趋势对话框同一套两档（24h 逐小时，7d 逐天）。流水只留 8 天，再长就是空格子。 */
+/** 时间范围与粒度：与缓存 / 延迟趋势对话框同一套两档（24h 逐小时，7d 逐天）。流水保留 30 天，两档都覆盖得住。 */
 const RANGES = {
   '24h': { hours: 24, slots: 24, granularity: 'hour' as CacheGranularity, bucketSecs: 3600 },
   '7d': { hours: 7 * 24, slots: 7, granularity: 'day' as CacheGranularity, bucketSecs: 86400 },
@@ -219,8 +219,8 @@ export function CredentialStatsSection({ cred }: { cred: Credential }) {
       icon={ChartColumnIcon}
       title={t('用量统计', 'Usage statistics')}
       description={t(
-        `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 8 天。`,
-        `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 8 days.`,
+        `${rangeLabel[range]}${preset.granularity === 'hour' ? '逐小时' : '逐天'}的请求、token 与费用，以及按模型、设备、客户端、状态码的拆分。流水只保留 30 天。`,
+        `${rangeLabel[range]} of requests, tokens and cost ${preset.granularity === 'hour' ? 'per hour' : 'per day'}, broken down by model, device, client and status. Logs are kept for 30 days.`,
       )}
       action={(
         <>

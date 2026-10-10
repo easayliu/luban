@@ -1,4 +1,4 @@
-//! 用量流水、凭证统计与封号事件的查询接口。
+//! 用量流水与凭证统计的查询接口。
 
 use super::*;
 
@@ -160,70 +160,4 @@ async fn usage_page(
     let anchor = filter.until_id;
     let logs = state.store.query_usage_logs(filter).await.map_err(internal)?;
     Ok(Json(UsagePage { total, total_cost, anchor, logs }))
-}
-
-#[derive(Deserialize)]
-pub(super) struct BanEventsQuery {
-    #[serde(default)]
-    cred_id: Option<i64>,
-    #[serde(default)]
-    limit: Option<i64>,
-}
-
-/// 封号事件列表（新的在前），见 [`store::CredentialStore::record_ban`]。
-///
-/// 已删账号的事件照常返回：事件按 cred_id 存、不随删号消失——死号最容易被清理，而清理的
-/// 瞬间恰是最需要留下它的时候。
-///
-/// 代理和用户只能查本人名下某个号的（必须带 `cred_id`）；admin 与访客可以不带、看全部。
-pub(super) async fn list_ban_events(
-    State(state): State<AppState>,
-    Extension(actor): Extension<Actor>,
-    Query(q): Query<BanEventsQuery>,
-) -> Result<Json<Vec<store::BanEvent>>, ApiError> {
-    if let Scope::Owner(owner) = actor.scope() {
-        let owned = match q.cred_id {
-            Some(id) => state.store.credential_owner(id).await.map_err(internal)? == Some(owner),
-            None => false,
-        };
-        if !owned {
-            return Err(not_found());
-        }
-    }
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let events = state.store.list_ban_events(q.cred_id, limit).await.map_err(internal)?;
-    Ok(Json(events))
-}
-
-#[derive(Deserialize)]
-pub(super) struct FrozenLogsQuery {
-    /// 返回条数上限（默认 100，最多 1000）。
-    #[serde(default)]
-    limit: Option<i64>,
-    /// 跳过前多少条（页码 × 每页条数）。
-    #[serde(default)]
-    offset: Option<i64>,
-}
-
-/// 一页冻结流水 + 该事件冻结的总条数。翻页锚点这里不需要：冻结表写完就不再变。
-#[derive(serde::Serialize)]
-pub(super) struct FrozenLogPage {
-    total: i64,
-    logs: Vec<store::UsageLog>,
-}
-
-/// 某封号事件冻结下来的一页流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求，
-/// 带取证列（出口代理、形态摘要、上游错误文案、第三方判定、改写标签）。
-///
-/// 一次封号常冻下上千行、几十 MB，整份一次吐出去页面要卡住半天，所以按页给；要整份的
-/// （下载取证包）由前端连着翻完再拼。
-pub(super) async fn list_ban_event_logs(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Query(q): Query<FrozenLogsQuery>,
-) -> Result<Json<FrozenLogPage>, ApiError> {
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let offset = q.offset.unwrap_or(0).max(0);
-    let (total, logs) = state.store.frozen_usage_logs(id, limit, offset).await.map_err(internal)?;
-    Ok(Json(FrozenLogPage { total, logs }))
 }

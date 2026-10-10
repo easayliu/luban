@@ -239,16 +239,13 @@ export function PreferencesMenu({
 }
 
 /**
- * 所有一级页面共用的账号菜单：页面自己的工具（`children`）在上，接着是成员管理、系统设置这两个
- * 不常去的一级页面，再往下是上号 Key、修改密码、语言、外观、退出。修改密码给代理和用户（管理员的密码在系统设置的「控制台安全」里改，那里还能清除；
+ * 所有一级页面共用的账号菜单：先是成员管理、系统设置这两个不常去的一级页面，再往下是上号 Key、修改密码、语言、外观、退出。修改密码给代理和用户（管理员的密码在系统设置的「控制台安全」里改，那里还能清除；
  * 访客的密码由管理员设）。每页都用它，菜单里有什么不再随所在页面变。
  */
 export function AccountMenu({
-  children,
   onNavigate,
   onSignOut,
 }: {
-  children?: ReactNode
   /** 给了才出「成员管理」「系统设置」两项（按身份）；初始化页这类没有导航的地方不给。 */
   onNavigate?: (section: MainSection) => void
   onSignOut?: () => void
@@ -266,8 +263,6 @@ export function AccountMenu({
   return (
     <>
       <PreferencesMenu onSignOut={onSignOut}>
-        {children}
-        {children && manage && <MenuSeparator />}
         {onNavigate && canManageUsers && (
           <MenuItem onClick={() => onNavigate('users')}>
             <UsersIcon />{t('成员管理', 'Members')}

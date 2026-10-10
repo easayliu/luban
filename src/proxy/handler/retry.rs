@@ -82,7 +82,7 @@ pub(super) async fn on_response(
     // （那段只读 status / headers / bytes）。
     //
     // **先选到下一个号再动库**：换得到才在这里停用 / 暂停并 `continue`；换不到就原样
-    // 交出去，由下面的 4xx 段照旧判定、停用 / 暂停——同一条 403 不会落两次封号事件。
+    // 交出去，由下面的 4xx 段照旧判定、停用 / 暂停——同一条 403 不会停两次号。
     if swaps.max_retry > 0
         && swaps.retried < swaps.max_retry
         && let Ok(up) = &resp

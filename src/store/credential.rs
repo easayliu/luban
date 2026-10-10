@@ -37,8 +37,8 @@ use sqlx::PgConnection;
 use super::session_events::{args1, delete_logged};
 use super::users::owner_exists;
 use super::{
-    BanContext, COLS, Credential, OwnerGone, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN, Scope,
-    seal, token_fingerprint,
+    COLS, Credential, OwnerGone, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MIN, Scope, seal,
+    token_fingerprint,
 };
 use super::{CredentialStore, row_to_cred};
 
@@ -321,20 +321,16 @@ impl CredentialStore {
         .await
     }
 
-    /// 自动检测到上游账号级错误（如封号）时调用：停用凭证并记录原因，同时清空其设备绑定。
-    ///
-    /// 这是 [`Self::record_ban`] 的简写：只有一句原因、没有别的上下文（事件来源记为
-    /// `manual`）。**已弃用**：生产路径一律走 `record_ban`，把状态码、完整报文、请求 id
-    /// 一并存进封号事件。保留为兼容入口，测试里用它造「已封禁」状态。
-    #[allow(dead_code)] // 兼容入口：本 crate 内只剩测试在用
-    #[deprecated(
-        since = "0.3.97",
-        note = "走 record_ban 并带上 BanContext（状态码、错误正文、request id），别只留一句原因"
-    )]
+    /// 测试用：[`Self::record_ban`] 的简写，一句原因造出「已封禁」状态（来源记为 `manual`）。
+    #[cfg(test)]
     pub async fn mark_banned(&self, id: i64, reason: &str) -> Result<bool> {
         self.record_ban(
             id,
-            &BanContext { reason: reason.to_string(), source: "manual", ..Default::default() },
+            &super::BanContext {
+                reason: reason.to_string(),
+                source: "manual",
+                ..Default::default()
+            },
         )
         .await
     }
@@ -721,8 +717,6 @@ pub(super) async fn write_tokens(
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)] // 测试用 `mark_banned` 一句话造出「已封禁」状态
-
     use std::collections::HashMap;
 
     use sqlx::PgPool;

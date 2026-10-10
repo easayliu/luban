@@ -138,8 +138,6 @@ export interface Credential {
   session_count: number
   /** 自动检测到的上游账号级错误原因（如封号）；为 null 表示未被自动停用。 */
   ban_reason: string | null
-  /** 该号被自动封停过几次（封号事件条数，解封不清零）。见 `listBanEvents`。 */
-  ban_count: number
   /**
    * 该账号专用的出站代理（`socks5://`/`http://` 等）；null 表示直连。
    *
@@ -247,7 +245,7 @@ export interface DeviceBinding {
 /**
  * 一条请求流水（`usage_logs` 的一行）。
  *
- * **与卡片上的累计值不同源**：卡片读的是终身账本，流水只保留近 8 天，所以明细逐条加起来
+ * **与卡片上的累计值不同源**：卡片读的是终身账本，流水只保留近 30 天，所以明细逐条加起来
  * 通常小于卡片上的累计花费——不是哪一边算错了。
  */
 export interface UsageLog {
@@ -352,86 +350,6 @@ export interface UsageLog {
    * tools_not_cc / probe。没走模拟为 null；0.3.99 之前的旧记录也是 null。
    */
   sim_reason: string | null
-}
-
-/** 分布项：某个取值出现了多少次。 */
-export interface ValueCount {
-  value: string
-  count: number
-}
-
-/**
- * 一条封号事件：每次自动停用落一条，只追加——解封不清、删号不删。
- * 除上游给的那几句外还带封号当时的账号侧快照，见后端 `store::BanEvent`。
- */
-export interface BanEvent {
-  id: number
-  ts: number
-  cred_id: number
-  cred_label: string
-  /** forward / forward_401 / probe / refresh / proxy / manual */
-  source: string
-  reason: string
-  status: number | null
-  error_type: string | null
-  error_message: string | null
-  request_id: string | null
-  upstream_request_id: string | null
-  tier: string | null
-  org_type: string | null
-  proxy: string | null
-  account_created_at: number
-  lifetime_requests: number
-  lifetime_cost_usd: number
-  last_used_at: number | null
-  requests_7d: number
-  devices_7d: number
-  models_7d: ValueCount[]
-  uas_7d: ValueCount[]
-  proxies_7d: ValueCount[]
-  last_unified_status: string | null
-  last_overage_in_use: boolean | null
-  frozen_rows: number
-  /** 封前 7 天**发给 Anthropic** 的去重设备数与分布（伪装开着时是派生值）；上游眼里的设备数看这一对。 */
-  devices_out_7d: number
-  device_ids_out_7d: ValueCount[]
-}
-
-/** 封号事件列表（新的在前）。`cred_id` 可选，含已删账号。 */
-export async function listBanEvents(params: { cred_id?: number; limit?: number } = {}): Promise<BanEvent[]> {
-  const { data } = await api.get<BanEvent[]>('/ban-events', { params })
-  return data
-}
-
-/** 一页冻结流水 + 该事件冻结的总条数。冻结表写完就不再变，翻页不需要锚点。 */
-export interface FrozenLogPage {
-  total: number
-  logs: UsageLog[]
-}
-
-/**
- * 某封号事件冻结下来的**一页**流水（时间正序）：封前 7 天 + 封后 10 分钟内到达的该号全部请求。
- *
- * 一次封号常冻下上千行、几十 MB（每行还带形态摘要），一次全拉页面要白等好几秒再卡在渲染上，
- * 所以按页取；要整份的走 `fetchAllBanEventLogs`。
- */
-export async function listBanEventLogs(
-  id: number,
-  params: { limit?: number; offset?: number } = {},
-): Promise<FrozenLogPage> {
-  const { data } = await api.get<FrozenLogPage>(`/ban-events/${id}/logs`, { params })
-  return data
-}
-
-/** 取证包用的整份流水：按后端上限连着翻完再拼，只在导出时才走这条路。 */
-export async function fetchAllBanEventLogs(id: number): Promise<UsageLog[]> {
-  const pageSize = 1000
-  const all: UsageLog[] = []
-  for (;;) {
-    const page = await listBanEventLogs(id, { limit: pageSize, offset: all.length })
-    all.push(...page.logs)
-    if (page.logs.length < pageSize || all.length >= page.total) return all
-  }
 }
 
 /** 生成授权链接（后端暂存 PKCE）。 */

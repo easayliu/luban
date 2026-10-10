@@ -907,7 +907,6 @@ impl CredentialStore {
 #[cfg(test)]
 pub(super) mod tests {
     //! 选号的测试，以及 `pg` 下 C 那几个模块的测试共用的建库 / 造数辅助。
-    #![allow(deprecated)] // 测试用 `mark_banned` 一句话造出「已封禁」状态
 
     use std::time::Duration;
 

@@ -12,7 +12,6 @@ import {
   PencilIcon,
   RefreshCwIcon,
   ScrollTextIcon,
-  ShieldAlertIcon,
   SlidersHorizontalIcon,
   SmartphoneIcon,
   TimerOffIcon,
@@ -20,7 +19,6 @@ import {
   WalletCardsIcon,
 } from 'lucide-react'
 import {
-  listBanEvents,
   listCredentialDevices,
   listCredentialSessions,
   listCredentialUsage,
@@ -37,7 +35,6 @@ import {
   cn,
   displayCredentialLabel,
   extractError,
-  formatCompactNumber,
   formatClockTime,
   formatCountdown,
   formatDuration,
@@ -49,7 +46,6 @@ import {
 } from '@/lib/utils'
 import { AppFooter } from '@/components/app-footer'
 import { AccountMenu, AppHeader, Breadcrumb, MainNav, type MainSection } from '@/components/app-header'
-import { BanEventDetail, sourceLabel } from '@/components/ban-events-dialog'
 import { ExtraWindows, verdictShownByMeter, visibleExtraWindows } from '@/components/credential-card'
 import { CredentialDevicesDialog, DeviceList, SessionList } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
@@ -87,7 +83,6 @@ import { SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { DetailSection as Section } from '@/components/detail-section'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { GroupBadges, SetGroupsDialog, useGroups } from '@/components/group-picker'
-import { statusVariant } from '@/components/usage-shared'
 import { Fact } from '@/components/fact'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
@@ -100,7 +95,6 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
-import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Meter, MeterIndicator, MeterTrack } from '@/components/ui/meter'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
@@ -324,16 +318,16 @@ function StatusBanner({ cred, status }: { cred: Credential; status: CredentialSt
   )
 }
 
-type DetailTab = 'overview' | 'stats' | 'requests' | 'bindings' | 'bans'
+type DetailTab = 'overview' | 'stats' | 'requests' | 'bindings'
 
 /** 手机分页签的断点，与 Tailwind 的 `sm`、⋯ 底部面板、对话框贴底是同一条线（40rem）。 */
 const MOBILE_QUERY = '(max-width: 39.98rem)'
 
 /**
- * 页头与六格读数之下的正文。
+ * 页头与读数带之下的正文。
  *
- * 桌面整页铺开（各块按行对齐，见 overview 里那段）；**手机上改成五个页签**：同样的内容在 375px
- * 上一路摞下来有四千多像素，想看封号记录得先滑过图表、流水、设备三大块。页头、状态提示和六格
+ * 桌面整页铺开（各块按行对齐，见 overview 里那段）；**手机上改成四个页签**：同样的内容在 375px
+ * 上一路摞下来有四千多像素，想看设备得先滑过图表、流水两大块。页头、状态提示和
  * 读数留在页签上面常驻，它们是「这个号现在怎么样」，切到哪一页都该看得见；页签栏吸顶，
  * 滑到哪儿都能换页。页签只切换挂载哪一块，数据查询各块自己管，切走再切回来命中缓存。
  */
@@ -342,13 +336,11 @@ function DetailBody({
   stats,
   requests,
   bindings,
-  bans,
 }: {
   overview: ReactNode
   stats: ReactNode
   requests: ReactNode
   bindings: ReactNode
-  bans: ReactNode
 }) {
   const { t } = useI18n()
   const mobile = useMediaQuery(MOBILE_QUERY)
@@ -361,20 +353,18 @@ function DetailBody({
         {stats}
         {requests}
         {bindings}
-        {bans}
       </>
     )
   }
-  // 页签不挂数量角标：正上方六格读数里就有设备、会话与被封停次数，「设备 5」还是设备加会话的
+  // 页签不挂数量角标：正上方读数里就有设备与会话，「设备 5」还是设备加会话的
   // 合计，与读数「2/3」对不上，反倒要人去想这 5 是怎么来的。
   const tabs: { key: DetailTab; label: string }[] = [
     { key: 'overview', label: t('概览', 'Overview') },
     { key: 'stats', label: t('统计', 'Stats') },
     { key: 'requests', label: t('请求', 'Requests') },
     { key: 'bindings', label: t('设备', 'Devices') },
-    { key: 'bans', label: t('封号', 'Bans') },
   ]
-  const panels: Record<DetailTab, ReactNode> = { overview, stats, requests, bindings, bans }
+  const panels: Record<DetailTab, ReactNode> = { overview, stats, requests, bindings }
   const change = (value: unknown) => {
     if (typeof value !== 'string' || !tabs.some((item) => item.key === value)) return
     setTab(value as DetailTab)
@@ -422,7 +412,7 @@ function BreakableLabel({ label }: { label: string }) {
   return <>{label.slice(0, at)}<wbr />{label.slice(at)}</>
 }
 
-/** 账号列表还没回来时的占位：与真页面同构（页头、六格读数、两栏），数据到了不跳版。 */
+/** 账号列表还没回来时的占位：与真页面同构（页头、读数带、两栏），数据到了不跳版。 */
 function DetailSkeleton() {
   const { t } = useI18n()
   return (
@@ -431,13 +421,12 @@ function DetailSkeleton() {
         <Skeleton className="h-8 w-64 max-w-full" />
         <Skeleton className="h-5 w-80 max-w-full" />
       </div>
-      <div className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card lg:grid-cols-6">
+      <div className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card lg:grid-cols-5">
         <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
         <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
         <OverviewMetricSkeleton className="border-r border-b lg:border-b-0" />
         <OverviewMetricSkeleton className="border-b lg:border-r lg:border-b-0" />
-        <OverviewMetricSkeleton className="border-r" />
-        <OverviewMetricSkeleton />
+        <OverviewMetricSkeleton className="col-span-2 lg:col-span-1" />
       </div>
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_22rem]">
         <Skeleton className="h-72 rounded-2xl" />
@@ -590,7 +579,6 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
         stats={<CredentialStatsSection cred={cred} />}
         requests={<RecentUsageSection cred={cred} onViewAll={() => setUsageOpen(true)} />}
         bindings={<BindingsSection cred={cred} onManage={() => setDevicesOpen(true)} />}
-        bans={<BanEventsSection cred={cred} />}
       />
 
       <DeferredMount open={renaming || proxyOpen || devicesOpen || usageOpen || confirmDelete || rpmOpen || quotaOpen || testing}>
@@ -628,7 +616,7 @@ function levelTone(level: QuotaLevel): 'bad' | 'warn' | 'neutral' {
 }
 
 /**
- * 页头下面那排六格：名额三格 + 费用 + 最近使用 + 封号次数。单格复用 OverviewMetric（图标、字号、
+ * 页头下面那排读数：名额三格 + 费用 + 最近使用。单格复用 OverviewMetric（图标、字号、
  * 告警色与首页概览一致），外面是这一页自己的一条读数带。
  *
  * 前四格点开的是与卡片页脚同一批对话框（带角标），详情页是卡片的放大版，入口不该换地方。
@@ -649,15 +637,15 @@ function StatsRow({
   const { t, language, locale } = useI18n()
   const ratio = (count: number, limit: number) =>
     `${count.toLocaleString(locale)}/${limit > 0 ? limit.toLocaleString(locale) : '∞'}`
-  // 设备按会话占名额时设备上限不生效，设备那格不出现：剩五格，桌面一行五列，手机两列、
-  // 最后一格横跨两列。下面几格的边框按有没有设备那格分两套。
+  // 设备按会话占名额时设备上限不生效，设备那格不出现：剩四格，桌面一行四列，手机两行两列；
+  // 有设备那格时五格，手机上最后一格横跨两列。下面几格的边框按有没有设备那格分两套。
   const devices = cred.device_limit_applies
   return (
     <section
       aria-label={t('账号概览', 'Account overview')}
       className={cn(
         'grid grid-cols-2 overflow-hidden rounded-xl border bg-card shadow-xs/5',
-        devices ? 'lg:grid-cols-6' : 'lg:grid-cols-5',
+        devices ? 'lg:grid-cols-5' : 'lg:grid-cols-4',
       )}
     >
       <OverviewMetric
@@ -696,7 +684,7 @@ function StatsRow({
         onClick={onDevices}
       />
       <OverviewMetric
-        className={devices ? 'border-b lg:border-r lg:border-b-0' : 'border-r border-b lg:border-b-0'}
+        className={devices ? 'border-b lg:border-r lg:border-b-0' : 'border-r'}
         label={t('累计费用', 'Total cost')}
         value={formatUsd(cred.cost_total)}
         statusHint={t('按公开价目表估算的等价 API 费用，不是账单金额。点击查看请求明细', 'Equivalent API cost estimated from the public price list, not a bill. Click to view the request log')}
@@ -706,20 +694,12 @@ function StatsRow({
         onClick={onUsage}
       />
       <OverviewMetric
-        className={devices ? 'border-r' : 'border-b lg:border-r lg:border-b-0'}
+        className={devices ? 'col-span-2 lg:col-span-1' : undefined}
         label={t('最近使用', 'Last used')}
         value={cred.last_used ? relativeTime(cred.last_used, now, language) : t('从未使用', 'Never')}
         statusHint={cred.last_used ? formatFullTime(cred.last_used, language) : undefined}
         icon={ClockIcon}
         tone="neutral"
-      />
-      <OverviewMetric
-        className={devices ? undefined : 'col-span-2 lg:col-span-1'}
-        label={t('被封停次数', 'Auto-disables')}
-        value={cred.ban_count.toLocaleString(locale)}
-        statusHint={t('自动封停的累计次数，解封后不清零', 'Cumulative automatic disables; re-enabling does not reset it')}
-        icon={ShieldAlertIcon}
-        tone={cred.ban_count > 0 ? 'bad' : 'neutral'}
       />
     </section>
   )
@@ -1107,14 +1087,14 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
       title={t('最近请求', 'Recent requests')}
       description={usage.data
         ? t(
-            `近 8 天共 ${total.toLocaleString(locale)} 条，费用 ${formatUsd(totalCost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
-            `${total.toLocaleString(locale)} requests costing ${formatUsd(totalCost)} in the last 8 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
+            `近 30 天共 ${total.toLocaleString(locale)} 条，费用 ${formatUsd(totalCost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
+            `${total.toLocaleString(locale)} requests costing ${formatUsd(totalCost)} in the last 30 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
           )
-        : t('流水仅保留最近 8 天。', 'Logs are retained for 8 days.')}
+        : t('流水仅保留最近 30 天。', 'Logs are retained for 30 days.')}
       mobileDescription={usage.data
         ? t(
-            `近 8 天 ${total.toLocaleString(locale)} 条 · ${formatUsd(totalCost)}`,
-            `${total.toLocaleString(locale)} in 8 days · ${formatUsd(totalCost)}`,
+            `近 30 天 ${total.toLocaleString(locale)} 条 · ${formatUsd(totalCost)}`,
+            `${total.toLocaleString(locale)} in 30 days · ${formatUsd(totalCost)}`,
           )
         : undefined}
       action={(
@@ -1225,83 +1205,6 @@ function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () =>
         error={sessions.error}
         onRetry={() => { void sessions.refetch() }}
       />
-    </Section>
-  )
-}
-
-/** 该账号自己的封号事件；展开一条就是封号记录对话框里同一份取证详情。 */
-function BanEventsSection({ cred }: { cred: Credential }) {
-  const { t, language } = useI18n()
-  const [expanded, setExpanded] = useState<number | null>(null)
-  const events = useQuery({
-    // 封号计数进 key：计数一变就是多了一条事件，跟着重取；平时不轮询。
-    queryKey: ['ban-events', cred.id, cred.ban_count],
-    queryFn: () => listBanEvents({ cred_id: cred.id, limit: 50 }),
-  })
-  const rows = events.data ?? []
-
-  return (
-    <Section
-      icon={ShieldAlertIcon}
-      title={t('封号记录', 'Ban events')}
-      description={t(
-        '每次自动封停生成一条记录，解封或删除账号均不会删除该记录。展开可查看上游返回的原始信息与封号前 7 天的流水。',
-        'One row per automatic disable; re-enabling or deleting the account never removes it. Expand a row for the upstream message and the 7 days of logs before it.',
-      )}
-    >
-      {events.isPending ? (
-        <div className="flex justify-center py-8"><Spinner /></div>
-      ) : events.error ? (
-        <div className="p-4 sm:p-5">
-          <Alert variant="error">
-            <AlertTitle>{t('读取失败', 'Failed to load')}</AlertTitle>
-            <AlertDescription className="break-words">{extractError(events.error, language)}</AlertDescription>
-          </Alert>
-        </div>
-      ) : rows.length === 0 ? (
-        <p className="p-4 text-sm text-muted-foreground sm:p-5">{t('该账号从未被自动封停。', 'This account has never been auto-disabled.')}</p>
-      ) : (
-        <ul className="divide-y">
-          {rows.map((ev) => {
-            const isOpen = expanded === ev.id
-            // 一次只展开一条（展开别的会收起这条），所以开合状态仍记在外面，Collapsible 受控。
-            return (
-              <Collapsible
-                key={ev.id}
-                open={isOpen}
-                onOpenChange={(open) => setExpanded(open ? ev.id : null)}
-                render={<li />}
-              >
-                <CollapsibleTrigger
-                  className="flex w-full min-w-0 items-start gap-2 px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
-                >
-                  <span className="mt-0.5 shrink-0 text-muted-foreground" aria-hidden>
-                    {isOpen ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
-                  </span>
-                  <span className="min-w-0 flex-1 space-y-1">
-                    <span className="flex flex-wrap items-center gap-2 text-sm">
-                      <span className="tabular-nums">{formatFullTime(ev.ts, language)}</span>
-                      <Badge size="sm" variant="outline">{sourceLabel(ev.source, t)}</Badge>
-                      {ev.status != null && <Badge size="sm" variant={statusVariant(ev.status)}>{ev.status}</Badge>}
-                      {/* 手机上固定单独一行（basis-full），不随宽度在徽章后面随机折行；sm 起跟在徽章后面。 */}
-                      <span className="text-xs text-muted-foreground tabular-nums max-sm:basis-full">
-                        {t(
-                          `封号前 7 天 ${formatCompactNumber(ev.requests_7d)} 次 · 入站 ${ev.devices_7d} → 出站 ${ev.devices_out_7d} 台`,
-                          `7d before: ${formatCompactNumber(ev.requests_7d)} req · ${ev.devices_7d} in → ${ev.devices_out_7d} out`,
-                        )}
-                      </span>
-                    </span>
-                    <span className="line-clamp-2 block break-all font-mono text-xs text-muted-foreground">{ev.reason}</span>
-                  </span>
-                </CollapsibleTrigger>
-                <CollapsiblePanel>
-                  <BanEventDetail ev={ev} />
-                </CollapsiblePanel>
-              </Collapsible>
-            )
-          })}
-        </ul>
-      )}
     </Section>
   )
 }

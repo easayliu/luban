@@ -38,7 +38,6 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
     // 每小时裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
     // 流水只需保留近期。按小时而不是按天：一天一次会让表最多撑到保留期再加一整天，删除也全挤在
     // 同一时段。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务。
-    // 冻结流水（封号取证）按自己的保留期一起清；裁之前先把没做完的封号取证补上。
     {
         let store = state.store.clone();
         tokio::spawn(async move {
@@ -46,21 +45,9 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                // 先补没落成的封号取证（上次中途出错或进程退出），再裁流水：补得上的趁流水还在补完；
-                // 补不上的，裁剪会留着它要冻结的那段窗口（见 `prune_usage_logs`）。
-                match store.finish_pending_ban_forensics().await {
-                    Ok(n) if n > 0 => tracing::info!(events = n, "finished pending ban forensics"),
-                    Err(e) => tracing::warn!(error = %e, "failed to finish pending ban forensics"),
-                    _ => {}
-                }
                 match store.prune_usage_logs().await {
                     Ok(n) if n > 0 => tracing::info!(rows = n, "pruned expired usage logs"),
                     Err(e) => tracing::warn!(error = %e, "failed to prune usage logs"),
-                    _ => {}
-                }
-                match store.prune_frozen_usage_logs().await {
-                    Ok(n) if n > 0 => tracing::info!(rows = n, "pruned expired frozen usage logs"),
-                    Err(e) => tracing::warn!(error = %e, "failed to prune frozen usage logs"),
                     _ => {}
                 }
             }

@@ -245,15 +245,12 @@ pub struct UsageLogStats {
     pub max_id: Option<i64>,
 }
 
-/// 用量日志流水的保留时长：8 天。必须大于最长的统计窗口（7 天）：7d 窗口起点是 reset 往前推
-/// 7 天，封号取证要回看 7 天加 10 分钟（[`FREEZE_WINDOW_SECS`]），正好 7 天会在边界上少算，
-/// cost_7d 平白变小。再往前的流水没人看——终身口径都在账本里——留着只是让表、索引和每条
-/// 按时间扫的查询跟着变大（线上 30 天时 180 万行、5GB 多）。
-pub const USAGE_LOG_RETENTION_SECS: i64 = 8 * 24 * 3600;
+/// 用量日志流水的保留时长：30 天。必须大于最长的统计窗口（7 天）：7d 窗口起点是 reset 往前推
+/// 7 天。封号复盘直接查库里的流水，30 天够事后回看。当初在 SQLite 上为性能压到 8 天，PG 上
+/// 30 天（线上约 180 万行、5GB 多）扛得住。
+pub const USAGE_LOG_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
-/// `usage_logs` 与 `usage_logs_frozen` 共用的列清单（不含各自的主键）。**读与写都用它**：
-/// 冻结是 `INSERT … SELECT` 逐列照搬，两张表的列必须一一对齐，清单只此一份才不会漂。
-/// 顺序即 [`usage_log_from_row`] 的下标顺序（从 1 起，0 号是主键）。
+/// 读流水时的列清单（不含主键）。顺序即 [`usage_log_from_row`] 的下标顺序（从 1 起，0 号是主键）。
 pub(super) const USAGE_LOG_COLS: &str =
     "ts, cred_id, cred_label, device_id, model, path, status, has_usage,
         input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
@@ -270,14 +267,12 @@ pub(super) fn head_chars(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n).collect() }
 }
 
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::postgres::{PgArguments, PgRow};
 use sqlx::{Arguments, Row};
 
-use super::FREEZE_TAIL_SECS;
 use super::billing::billing_record;
 use super::rollup::rollup_record;
 use super::{CredentialStore, strip_nul};
@@ -413,37 +408,22 @@ pub(super) fn usage_log_page_sql(where_sql: &str, n: usize) -> String {
     )
 }
 
-/// 写一条流水并顺手补冻结的那条 SQL，见 [`CredentialStore::insert_usage_log_at`]。
-///
-/// 写流水与「刚封的号补进冻结表」合成一条：CTE 里插流水、`RETURNING` 整行，外层按这一行的
-/// 号与时刻找封后 [`FREEZE_TAIL_SECS`] 内最近的那条封号事件，有就把这一行照搬进冻结表。
-static INSERT_USAGE_LOG_SQL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "WITH ins AS (
-             INSERT INTO usage_logs
-                (ts, cred_id, cred_label, device_id, model, path, status, has_usage,
-                 input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
-                 cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
-                 unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
-                 rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
-                 rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
-                 request_id, upstream_request_id,
-                 proxy, simulated, shape, session_id, error_type, error_message, third_party,
-                 rewrites, device_id_out, response_excerpt, sim_reason, session_key,
-                 session_id_in)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
-                     $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44,
-                     $45)
-             RETURNING id, {USAGE_LOG_COLS})
-         INSERT INTO usage_logs_frozen (ban_event_id, src_id, {USAGE_LOG_COLS})
-         SELECT b.id, ins.id, {USAGE_LOG_COLS}
-           FROM ins
-           JOIN LATERAL (SELECT id FROM ban_events
-                          WHERE cred_id = ins.cred_id AND ts >= ins.ts - $46
-                          ORDER BY ts DESC, id DESC LIMIT 1) b ON TRUE"
-    )
-});
+/// 写一条流水的那条 SQL，见 [`CredentialStore::insert_usage_log_at`]。
+const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
+        (ts, cred_id, cred_label, device_id, model, path, status, has_usage,
+         input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
+         cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
+         unified_status, rl_5h_status, rl_5h_reset, rl_5h_utilization,
+         rl_7d_status, rl_7d_reset, rl_7d_utilization, rl_representative,
+         rl_overage_in_use, ratelimit_raw, cost_usd, ua, ua_out, sse_aggregated,
+         request_id, upstream_request_id,
+         proxy, simulated, shape, session_id, error_type, error_message, third_party,
+         rewrites, device_id_out, response_excerpt, sim_reason, session_key,
+         session_id_in)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
+             $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44,
+             $45)";
 
 /// 落账（`credential_stats` 与 `device_costs`）的那条 SQL：不带额度快照的。设备账本在 CTE 里，
 /// `$4`（device_id）为 NULL 时不记。
@@ -532,13 +512,7 @@ impl CredentialStore {
     ///
     /// 每条转发请求后都跑：普通事务（不拿全局写锁），语句能合的都合了。并发正确性靠行锁：
     ///
-    /// - 第一步拿这个号的冻结锁（advisory 共享锁，键见 [`super::freeze_lock_key`]），同时给账号行
-    ///   上 `FOR KEY SHARE`、顺手读出号主（费用汇总的号主就定在这一刻）。
-    ///   - 冻结锁和别的流水写入不冲突，只和封号取证（`bans` 模块）的排它锁互斥：封号事件落地与这条
-    ///     流水的写入一定分得出先后——先封的，这里后面的语句看得到那条事件、把这一行补进冻结表；
-    ///     先写的，取证那边等它提交后再冻结、冻得到它。SQLite 版靠全局写锁串行化天然如此，PG 版
-    ///     不加这一步，两边各看各的快照就会漏掉触发封号的那一发。用 advisory 锁而不是账号行的
-    ///     行锁：号被删掉之后没有行可锁，删号时还在途的流水照样要和补做的取证分出先后。
+    /// - 第一步给账号行上 `FOR KEY SHARE`、顺手读出号主（费用汇总的号主就定在这一刻）。
     ///   - 账号行读不到说明号已被 [`Self::remove`] 删掉（删号时还在途的请求）：流水照记（删号本来
     ///     就保留历史流水），账本与费用汇总跳过，不把刚删掉的账本行又建回来、记出号主为 0 的费用。
     ///     `FOR KEY SHARE` 让删号等这条流水提交（删号先锁账号行再删账本，见 [`Self::remove`]）；
@@ -556,14 +530,11 @@ impl CredentialStore {
             (ts.unwrap_or_default(), None)
         } else {
             // 号主列为空时记 0（同 SQLite 版），这样 None 只表示「没有这一行」。
-            // 先拿这个号的冻结锁（共享），见下面的文档；号为空时参数为 NULL，函数不加锁。
             let (now, owner): (i64, Option<i64>) = sqlx::query_as(
                 "SELECT unixepoch(),
-                        (SELECT COALESCE(owner_id, 0) FROM credentials WHERE id = $1 FOR KEY SHARE)
-                   FROM (SELECT pg_advisory_xact_lock_shared($2)) freeze_lock",
+                        (SELECT COALESCE(owner_id, 0) FROM credentials WHERE id = $1 FOR KEY SHARE)",
             )
             .bind(rec.cred_id)
-            .bind(rec.cred_id.map(super::freeze_lock_key))
             .fetch_one(&mut *tx)
             .await?;
             (ts.unwrap_or(now), owner)
@@ -580,10 +551,7 @@ impl CredentialStore {
             .execute(&mut *tx)
             .await?;
         }
-        // 刚封的号：封号事件落地时冻结的是**当时已有**的流水，而触发封号的那一发（以及同时
-        // 在途的几发）要等响应流结束才落库，冻结时还不存在。故封后 FREEZE_TAIL_SECS 内到达
-        // 的这个号的流水，写入时顺手补进冻结表——不然最要紧的那一条恰好缺席。
-        sqlx::query(sqlx::AssertSqlSafe(INSERT_USAGE_LOG_SQL.as_str()))
+        sqlx::query(INSERT_USAGE_LOG_SQL)
             .bind(ts)
             .bind(rec.cred_id)
             .bind(&rec.cred_label)
@@ -634,7 +602,6 @@ impl CredentialStore {
             .bind(&rec.forensics.sim_reason)
             .bind(&rec.forensics.session_key)
             .bind(&rec.forensics.session_id_in)
-            .bind(FREEZE_TAIL_SECS)
             .execute(&mut *tx)
             .await?;
         // 落账与费用汇总。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属、号已删掉的
@@ -698,8 +665,8 @@ impl CredentialStore {
     /// 裁掉超过保留期（[`USAGE_LOG_RETENTION_SECS`]）的用量日志流水，返回删除条数。汇总另有
     /// 保留期（90 天，比流水长），随这里一起裁。
     ///
-    /// 流水裁剪不影响任何终身口径——最近使用/累计费用/最新快照都在账本里（写时落账）；还要读
-    /// 流水的只剩两处：5h/7d 窗口统计（最多回看 7 天多）和请求日志页（只翻近期），8 天都覆盖
+    /// 流水裁剪不影响任何终身口径——最近使用/累计费用/最新快照都在账本里（写时落账）；读流水
+    /// 的是 5h/7d 窗口统计（最多回看 7 天多）、请求日志页与封号复盘时的直接查库，30 天都覆盖
     /// 得住。
     ///
     /// 分批删、批间歇一下：日志表可能积了几百万行，一条大 DELETE 是一个长事务，产生的 WAL
@@ -709,23 +676,12 @@ impl CredentialStore {
         const PAUSE: Duration = Duration::from_millis(50);
         let mut total = 0;
         loop {
-            // 还有封号取证待办（`ban_pending`）要冻结的那段窗口不裁：取证可能因为停机或一直出错
-            // 拖过了保留期，先裁掉的话补出来的统计与冻结就残缺了，而且再也补不回来。窗口口径同
-            // `bans` 模块的补做：[封号时刻 - FREEZE_WINDOW_SECS, 封号时刻 + FREEZE_TAIL_SECS]。
             let n = sqlx::query(
                 "DELETE FROM usage_logs WHERE id IN (
-                     SELECT u.id FROM usage_logs u
-                      WHERE u.ts < unixepoch() - $1
-                        AND NOT EXISTS (
-                            SELECT 1 FROM ban_pending p
-                             WHERE p.cred_id = u.cred_id
-                               AND u.ts >= p.ban_ts - $3 AND u.ts <= p.ban_ts + $4)
-                      LIMIT $2)",
+                     SELECT id FROM usage_logs WHERE ts < unixepoch() - $1 LIMIT $2)",
             )
             .bind(USAGE_LOG_RETENTION_SECS)
             .bind(BATCH)
-            .bind(FREEZE_WINDOW_SECS)
-            .bind(FREEZE_TAIL_SECS)
             .execute(&self.pool)
             .await?
             .rows_affected() as usize;
@@ -1303,7 +1259,7 @@ pub(super) mod tests {
         );
     }
 
-    /// 后台的各条只读报表在一个有流水、有封号事件的库上都跑得通（SQL 在 PG 上合法、聚合列的
+    /// 后台的各条只读报表在一个有流水、有封号的库上都跑得通（SQL 在 PG 上合法、聚合列的
     /// 类型解码得了）。对应 SQLite 版 `reader_sees_committed_writes_and_rejects_writes` 里
     /// 「每个读方法跑一遍」的那一半；只读连接、WAL 那一半 PG 版没有对应物。
     #[sqlx::test]
@@ -1341,9 +1297,6 @@ pub(super) mod tests {
         let q = UsageLogQuery { limit: 10, ..Default::default() };
         assert_eq!(store.usage_log_stats(q.clone()).await.unwrap().total, 1);
         assert_eq!(store.query_usage_logs(q).await.unwrap().len(), 1);
-        let ev = store.list_ban_events(None, 10).await.unwrap().remove(0);
-        assert_eq!(store.ban_counts().await.unwrap().get(&a).copied(), Some(1));
-        assert_eq!(store.frozen_usage_logs(ev.id, 10, 0).await.unwrap().0, 1);
     }
 
     /// 删号时还在途的请求：流水照记，账本与费用汇总不再给已删的号建行。
@@ -1389,7 +1342,7 @@ pub(super) mod tests {
         assert_eq!(billed, 1);
     }
 
-    /// 流水与封号事件里带 NUL 的文本去掉 NUL 后照常落库，不让整条语句报错。
+    /// 流水与封号原因里带 NUL 的文本去掉 NUL 后照常落库，不让整条语句报错。
     #[sqlx::test]
     async fn nul_in_usage_and_ban_text_is_stripped(pool: sqlx::PgPool) {
         let (store, ids) = store_with(pool, &["a"]).await;
@@ -1420,13 +1373,12 @@ pub(super) mod tests {
             ..Default::default()
         };
         assert!(store.record_ban(a, &ctx).await.unwrap());
-        let ev = store.list_ban_events(None, 10).await.unwrap().remove(0);
-        assert_eq!(ev.reason, "r");
+        assert_eq!(store.get(a).await.unwrap().unwrap().ban_reason.as_deref(), Some("r"));
         store.deny_model(a, "m\0", "why\0", None).await.unwrap();
         assert_eq!(store.denied_models(a).await.unwrap().len(), 1);
     }
 
-    /// 工具名清单拆进 `tool_sets`：库里的 shape 不带清单，读出来（含冻结流水）补回后与写入时
+    /// 工具名清单拆进 `tool_sets`：库里的 shape 不带清单，读出来补回后与写入时
     /// 逐字一致；同一份清单只存一行。
     #[sqlx::test]
     async fn tool_names_are_stored_once_and_restored_on_read(pool: PgPool) {
@@ -1457,12 +1409,6 @@ pub(super) mod tests {
         let logs = store.list_usage_logs(10).await.unwrap();
         assert_eq!(logs.len(), 2);
         assert!(logs.iter().all(|l| l.forensics.shape.as_deref() == Some(shape)));
-
-        let ctx = BanContext { reason: "[403] x".into(), source: "forward", ..Default::default() };
-        assert!(store.record_ban(a, &ctx).await.unwrap());
-        let ev = store.list_ban_events(Some(a), 1).await.unwrap().remove(0);
-        let frozen = store.frozen_usage_logs(ev.id, 10, 0).await.unwrap().1;
-        assert_eq!(frozen[0].forensics.shape.as_deref(), Some(shape));
 
         // 没有工具的、不是 JSON 的原样存。
         assert_eq!(split_tool_names(Some("not json")).0.as_deref(), Some("not json"));

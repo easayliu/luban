@@ -153,7 +153,7 @@ export function RequestLookupDialog({
                       '按会话 ID 查询：同时匹配客户端自报的会话 ID 与上游看到的会话 ID，列出该会话最近 50 条请求。',
                       'Looking up by session ID: matches both the client-reported and the upstream-visible session ID, listing the session\'s latest 50 requests.',
                     )
-                  : t('精确匹配；流水只保留最近 8 天。', 'Exact match; logs are retained for 8 days.')}
+                  : t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
               </FieldDescription>
             </Field>
           </Form>}
@@ -173,8 +173,8 @@ export function RequestLookupDialog({
                 <EmptyTitle className="text-base">{filter ? t('所选时间范围内没有请求', 'No requests in this period') : t('未找到该请求', 'No request found')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '请确认 ID 完整（请求 ID 形如 req_ 加 16 位随机字符，会话 ID 为 uuid）；超过 8 天的流水已被清理。0.3.139 之前的记录没有客户端侧会话 ID，只能用上游看到的会话 ID 查询。',
-                    'Check that the ID is complete (request IDs look like req_ plus 16 random characters; a session ID is a uuid). Records older than 8 days have been pruned. Records from before 0.3.139 have no client-side session ID; look those up with the upstream one.',
+                    '请确认 ID 完整（请求 ID 形如 req_ 加 16 位随机字符，会话 ID 为 uuid）；超过 30 天的流水已被清理。0.3.139 之前的记录没有客户端侧会话 ID，只能用上游看到的会话 ID 查询。',
+                    'Check that the ID is complete (request IDs look like req_ plus 16 random characters; a session ID is a uuid). Records older than 30 days have been pruned. Records from before 0.3.139 have no client-side session ID; look those up with the upstream one.',
                   )}
                 </EmptyDescription>
               </EmptyHeader>

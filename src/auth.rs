@@ -411,9 +411,6 @@ enum Owned {
     CredentialIds,
     /// body 里的 `ids`：一批出口代理。
     ProxyIds,
-    /// 路径里的封号事件 id（`/ban-events/{id}/…`）：看它落在哪个号上。号已删掉的事件
-    /// 无从判断归属，只给 admin / 访客。
-    BanEventPath,
 }
 
 /// 代理和用户能打的路由（路径不带 `/api` 前缀，与 `MatchedPath` 对应）。
@@ -442,9 +439,6 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     ("/proxies/batch", Owned::Nothing),
     ("/proxies/delete", Owned::ProxyIds),
     ("/proxies/{id}", Owned::ProxyPath),
-    // 封号记录：列表接口由 handler 要求带上本人名下的 `cred_id`。
-    ("/ban-events", Owned::Nothing),
-    ("/ban-events/{id}/logs", Owned::BanEventPath),
     // 请求流水：handler 把结果强制限定在本人名下的号上。
     ("/usage", Owned::Nothing),
     // 实时流量：handler 按身份收窄到本人名下的号（缓存、时延等趋势仍是全池口径，只给 admin）。
@@ -543,20 +537,6 @@ async fn check_owned(
             match state.store.proxy_owner(id).await {
                 Ok(Some(o)) if o == owner => Ok(req),
                 Ok(_) => Err(not_found("proxy")),
-                Err(e) => Err(internal(e).into_response()),
-            }
-        }
-        Owned::BanEventPath => {
-            let id = path_id(&req, 1).ok_or_else(|| not_found("ban event"))?;
-            let owner_of = async {
-                match state.store.ban_event_credential(id).await? {
-                    Some(cred) => state.store.credential_owner(cred).await,
-                    None => Ok::<_, anyhow::Error>(None),
-                }
-            };
-            match owner_of.await {
-                Ok(Some(o)) if o == owner => Ok(req),
-                Ok(_) => Err(not_found("ban event")),
                 Err(e) => Err(internal(e).into_response()),
             }
         }
@@ -1040,7 +1020,7 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> ApiError {
 /// 只有用户名（`http://token@h`，常见于把凭据放在用户名里的代理商）整段换成 `***`。
 ///
 /// 给访客的响应体整体过一遍，而不是只盯着 `proxy` 这类字段：代理串会顺着报错文案流到别处
-/// （`invalid proxy URL: http://u:p@h:0` 进了 `ban_reason`、封号事件的 reason、流水的
+/// （`invalid proxy URL: http://u:p@h:0` 进了 `ban_reason`、流水的
 /// error_message……），按字段打码总会漏一处，往后新加的字段也不会有人记得补。
 ///
 /// 一段 authority 从 `://` 后数到**未转义的双引号或换行**为止，别的字符一概不当结束符：

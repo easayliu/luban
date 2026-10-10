@@ -12,7 +12,7 @@
 //! 旧值的，用普通的 `self.pool.begin()` 即可。
 //!
 //! 进程内先排一把 [`tokio::sync::Mutex`]，排到了才去池里取连接、开事务：只靠 advisory 锁的话，
-//! 排队的事务各自先占着一条连接卡在锁上，持锁的那笔一慢（封号冻结大批流水、删号级联），
+//! 排队的事务各自先占着一条连接卡在锁上，持锁的那笔一慢（删号级联），
 //! 连接池就被排队者占满，转发路径上的鉴权与流水写入全都取不到连接。advisory 锁留着，
 //! 兜同一个库被多个进程共用的情况。
 
@@ -198,17 +198,6 @@ impl Drop for PendingWrite {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-/// 封号冻结与写流水之间按号互斥的 advisory 锁的键：`FREEZE_LOCK_BASE + 号 id`。写流水拿共享锁，
-/// 补封号取证拿排它锁（见 [`CredentialStore::insert_usage_log_at`] 与 `bans` 模块）。不用账号行
-/// 的行锁：号被删掉之后没有行可锁，两边就失去互斥，在途流水会两头漏冻。基数（ASCII "lubfrz" 打头）
-/// 与 [`WRITE_LOCK_KEY`] 相隔极远，号 id 撞不到它。
-const FREEZE_LOCK_BASE: i64 = 0x6c75_6266_727a_0000;
-
-/// 号 `cred_id` 的冻结锁键，见 [`FREEZE_LOCK_BASE`]。
-pub(super) fn freeze_lock_key(cred_id: i64) -> i64 {
-    FREEZE_LOCK_BASE.wrapping_add(cred_id)
 }
 
 /// [`CredentialStore::begin_write`] 拿的 advisory 锁的键（任意常量，ASCII "lubanwr\0"）。

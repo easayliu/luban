@@ -237,8 +237,8 @@ export function CacheHitTrendDialog({
               这里只剩图例说不了的那两件事。原来这段是 100 字的 10px 灰字，铺满整个弹窗宽度。 */}
           <p className="text-2xs leading-4 text-muted-foreground">
             {t(
-              '空白格表示该时段没有请求；柱形深浅表示该时段的 token 量。请求明细只保留 8 天。',
-              'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 8 days.',
+              '空白格表示该时段没有请求；柱形深浅表示该时段的 token 量。请求明细只保留 30 天。',
+              'A gap means no traffic in that period; a bar’s opacity reflects its token volume. Request logs are kept for 30 days.',
             )}
           </p>
 

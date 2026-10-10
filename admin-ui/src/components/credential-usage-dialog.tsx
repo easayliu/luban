@@ -207,14 +207,14 @@ export function CredentialUsageDialog({
           <section className="grid gap-2 rounded-xl border bg-muted/32 px-4 py-3 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center sm:gap-5">
             <div className="flex items-baseline justify-between gap-4 sm:block">
               <p className="text-2xs font-medium text-muted-foreground">
-                {t('近 8 天明细花费', 'Request cost, last 8 days')}
+                {t('近 30 天明细花费', 'Request cost, last 30 days')}
               </p>
               <p className="font-semibold text-sm tabular-nums sm:mt-0.5">
                 {shown ? formatUsd(shown.cost) : '—'}
               </p>
             </div>
             <p id={retentionNoteId} className="min-w-0 text-2xs leading-4 text-muted-foreground sm:text-right">
-              {/* 「近 8 天」左边的标签已经写着，这里只说它和累计花费为什么对不上。这个对话框也从详情页
+              {/* 「近 30 天」左边的标签已经写着，这里只说它和累计花费为什么对不上。这个对话框也从详情页
                   打开，那里没有卡片，所以不说「卡片上的」。 */}
               {t(
                 '累计花费取自累计账本，与此处的明细合计不一定相等。',

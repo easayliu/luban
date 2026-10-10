@@ -766,14 +766,6 @@ impl CredentialStore {
         Ok(n as usize == ids.len())
     }
 
-    /// 封号事件落在哪个号上。事件不存在为 `Ok(None)`。
-    pub async fn ban_event_credential(&self, event_id: i64) -> Result<Option<i64>> {
-        Ok(sqlx::query_scalar("SELECT cred_id FROM ban_events WHERE id = $1")
-            .bind(event_id)
-            .fetch_optional(&self.pool)
-            .await?)
-    }
-
     /// 出口代理的主人。不存在为 `Ok(None)`。
     pub async fn proxy_owner(&self, proxy_id: i64) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar::<_, Option<i64>>("SELECT owner_id FROM proxies WHERE id = $1")

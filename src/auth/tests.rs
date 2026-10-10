@@ -1,5 +1,3 @@
-// 测试用 `mark_banned` 一句话造出「已封禁」状态就够了，不必每处都拼 BanContext。
-#![allow(deprecated)]
 use super::constant_time_eq;
 use crate::store::{LEGACY_SHA256_PREFIX, UserRole};
 use axum::{
@@ -60,7 +58,6 @@ fn app(state: &crate::web::AppState) -> Router {
             .route("/credentials/{id}/usage", get(who))
             .route("/proxies/{id}", post(who))
             .route("/proxies/delete", post(who))
-            .route("/ban-events/{id}/logs", get(who))
             .route("/settings", get(who))
             .route("/settings/forwarding", post(who))
             .route("/export", get(who))
@@ -197,20 +194,6 @@ async fn members_are_scoped_to_their_own_things(pool: sqlx::PgPool) {
     assert_eq!(
         s(Method::POST, "/api/proxies/delete".into(), &a, format!(r#"{{"ids":[{admin_proxy}]}}"#))
             .await,
-        StatusCode::NOT_FOUND
-    );
-    // 封号事件按它落在的号核对归属。
-    let ban = async |cred: i64| {
-        state.store.mark_banned(cred, "test").await.unwrap();
-        state.store.list_ban_events(Some(cred), 1).await.unwrap()[0].id
-    };
-    let (my_ban, their_ban) = (ban(mine).await, ban(theirs).await);
-    assert_eq!(
-        s(Method::GET, format!("/api/ban-events/{my_ban}/logs"), &a, String::new()).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        s(Method::GET, format!("/api/ban-events/{their_ban}/logs"), &a, String::new()).await,
         StatusCode::NOT_FOUND
     );
     // 用户管理：代理能进，用户不能。

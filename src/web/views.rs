@@ -159,9 +159,6 @@ pub(super) struct CredentialView {
     /// 区别只在这一项。展示绝对时刻而非倒计时的理由同 `expires_at`。恢复有三条路：到点自动、
     /// 连通性测试通过、手动打开启用开关。
     resume_at: Option<u64>,
-    /// 该号被自动封停过几次（`ban_events` 条数，解封不清零）。列表接口才填，其余返回单个
-    /// 视图的接口为 0——前端拿列表的那份。
-    ban_count: i64,
 }
 
 impl CredentialView {
@@ -232,13 +229,7 @@ impl CredentialView {
             rate_limited_models: Vec::new(),
             denied_models: Vec::new(),
             resume_at: c.resume_at,
-            ban_count: 0,
         }
-    }
-
-    pub(super) fn with_ban_count(mut self, n: i64) -> Self {
-        self.ban_count = n;
-        self
     }
 
     /// 附加「套餐不含」的模型记录（落库的，没有就是空）。

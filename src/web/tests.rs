@@ -265,9 +265,9 @@ async fn handle_keepalive_rejection_reports_whether_the_ban_landed(pool: sqlx::P
         KeepaliveRejection::SubscriptionInactive
     );
     let got = store.get(a.id).await.unwrap().unwrap();
-    assert!(store.list_ban_events(None, 10).await.unwrap().is_empty(), "不是封号，不落封号事件");
-    // 但订阅未生效要暂停调度：不带恢复时刻（等人工或连通性测试），不落封号事件。
+    // 不是封号，但订阅未生效要暂停调度：不带恢复时刻（等人工或连通性测试）。
     assert!(got.disabled && got.resume_at.is_none(), "订阅未生效应暂停调度");
+    assert!(!got.is_banned(), "不是封号");
     assert!(got.ban_reason.as_deref().unwrap().contains(store::ORG_OAUTH_SUSPEND_MARKER));
     // 其它非账号级的 403（权限 / 区域）仍只记日志，号照常启用。
     let region = rej(403, "permission_error", "This model is not available in your region");
@@ -289,7 +289,7 @@ async fn handle_keepalive_rejection_reports_whether_the_ban_landed(pool: sqlx::P
     // 恢复 a，下面接着测账号级那档。
     store.set_disabled(a.id, false).await.unwrap();
 
-    // 账号级：停用、事件带完整上下文。
+    // 账号级：停用、记原因。
     let revoked = rej(401, "authentication_error", "OAuth token has been revoked");
     assert_eq!(handle_keepalive_rejection(&store, &a, &revoked).await, KeepaliveRejection::Banned);
     let got = store.get(a.id).await.unwrap().unwrap();
@@ -298,11 +298,6 @@ async fn handle_keepalive_rejection_reports_whether_the_ban_landed(pool: sqlx::P
         got.ban_reason.as_deref(),
         Some("[keepalive/event_logging 401] authentication_error: OAuth token has been revoked")
     );
-    let ev = &store.list_ban_events(None, 10).await.unwrap()[0];
-    assert_eq!(ev.source, "keepalive");
-    assert_eq!(ev.status, Some(401));
-    assert_eq!(ev.error_type.as_deref(), Some("authentication_error"));
-    assert_eq!(ev.upstream_request_id.as_deref(), Some("req_k"));
 
     // 号已经被删：没有主体，`false`，b 不受影响。
     store.delete(a.id).await.unwrap();

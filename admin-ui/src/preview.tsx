@@ -4,7 +4,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { PlusIcon, SettingsIcon } from 'lucide-react'
 import { AddAccount } from '@/components/add-account'
 import { LoginPage } from '@/components/login-page'
-import { BanEventsDialog } from '@/components/ban-events-dialog'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { AccessSettings } from '@/components/access-settings'
@@ -28,7 +27,7 @@ import { AnchoredToastProvider, ToastProvider } from '@/components/ui/toast'
 import { Hint, TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
 import { initTheme } from '@/lib/theme'
-import type { BanEvent, Credential, CredentialStats, CredentialStatsBucket, UsageLog, UsagePage } from '@/api/credentials'
+import type { Credential, CredentialStats, CredentialStatsBucket, UsageLog, UsagePage } from '@/api/credentials'
 import './index.css'
 
 // 离线预览：覆盖正常、额度风险、冷却、封禁与停用，通过生产共用的 CredentialWorkspace
@@ -84,7 +83,6 @@ const banned: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -154,7 +152,6 @@ const normal: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now,
     unified_status: 'allowed',
@@ -223,7 +220,6 @@ const overage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 18,
     unified_status: 'allowed',
@@ -290,7 +286,6 @@ const nearLimit: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 90,
     unified_status: 'allowed_warning',
@@ -358,7 +353,6 @@ const unknownOverage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 4 * 60,
     unified_status: 'allowed',
@@ -425,7 +419,6 @@ const only5hWindow: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 30,
     unified_status: 'allowed',
@@ -497,7 +490,6 @@ const overagePoolExhausted: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 45,
     unified_status: 'rejected',
@@ -581,7 +573,6 @@ const cooldown: Credential = {
     },
   ],
   resume_at: null,
-  ban_count: 0,
   quota: null,
 }
 
@@ -629,7 +620,6 @@ const disabledHistoricalOverage: Credential = {
   rate_limited_secs: 0,
   rate_limited_models: [],
   resume_at: null,
-  ban_count: 0,
   quota: {
     ts: now - 6 * 3600,
     unified_status: 'allowed',
@@ -962,7 +952,7 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
     ? '11111111-2222-4333-8444-555555555555'
     : '7a6d8f9e-0c1b-4a2d-9e3f-5b6c7d8e9f01',
 }))
-// 详情页的「最近请求」与封号记录：每个预览账号共用同一份流水，封号只给 #1。
+// 详情页的「最近请求」：每个预览账号共用同一份流水。
 for (const cred of previewCredentials) {
   queryClient.setQueryData<UsagePage>(['credential-usage-recent', cred.id], {
     total: 37,
@@ -970,39 +960,6 @@ for (const cred of previewCredentials) {
     anchor: previewUsageLogs[0]?.id ?? null,
     logs: previewUsageLogs.slice(0, 10),
   })
-  // 封号记录对话框（全部账号）读 ['ban-events']，详情页按账号读带 id 的那份；这里两份共用同一条样例。
-  queryClient.setQueryData<BanEvent[]>(['ban-events', cred.id, cred.ban_count], cred.id === 1
-    ? [{
-        id: 1,
-        ts: now - 26 * 3600,
-        cred_id: 1,
-        cred_label: cred.label,
-        source: 'forward',
-        reason: 'This organization has been disabled.',
-        status: 400,
-        error_type: 'invalid_request_error',
-        error_message: 'This organization has been disabled.',
-        request_id: 'req_7Hs2kLq9Xw3PzR1a',
-        upstream_request_id: 'req_011CT9xyzABCdef',
-        tier: cred.tier,
-        org_type: cred.org_type,
-        proxy: null,
-        account_created_at: cred.created_at,
-        lifetime_requests: 5231,
-        lifetime_cost_usd: 182.4,
-        last_used_at: now - 26 * 3600,
-        requests_7d: 1840,
-        devices_7d: 3,
-        models_7d: [{ value: 'claude-opus-5-5', count: 1200 }, { value: 'claude-sonnet-5', count: 640 }],
-        uas_7d: [{ value: 'claude-cli/2.1.280 (external, cli)', count: 1840 }],
-        proxies_7d: [],
-        last_unified_status: 'allowed',
-        last_overage_in_use: false,
-        frozen_rows: 0,
-        devices_out_7d: 2,
-        device_ids_out_7d: [],
-      }]
-    : [])
   // 用量统计：三档时间范围各造一份，桶按本地整点 / 零点对齐，数值随时段起伏。
   for (const [hours, bucketSecs, slots] of [[24, 3600, 24], [168, 86400, 7]] as const) {
     const points: CredentialStatsBucket[] = Array.from({ length: slots }, (_, i) => {
@@ -1057,7 +1014,6 @@ for (const cred of previewCredentials) {
   queryClient.setQueryData(['credential-devices', cred.id], queryClient.getQueryData(['credential-devices', cred.id]) ?? [])
   queryClient.setQueryData(['credential-sessions', cred.id], queryClient.getQueryData(['credential-sessions', cred.id]) ?? [])
 }
-queryClient.setQueryData<BanEvent[]>(['ban-events'], queryClient.getQueryData<BanEvent[]>(['ban-events', 1, previewCredentials.find((c) => c.id === 1)?.ban_count ?? 0]) ?? [])
 queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 'first', 25], {
   total: 37,
   total_cost: 1.2846,
@@ -1177,7 +1133,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
                 <AddAccount open={previewDialog === 'add'} onOpenChange={closePreviewDialog} />
                 <RequestLookupDialog open={previewDialog === 'lookup'} onOpenChange={closePreviewDialog} />
-                <BanEventsDialog open={previewDialog === 'bans'} onOpenChange={closePreviewDialog} />
                 <AccessSettings open={previewDialog === 'access'} onOpenChange={closePreviewDialog} />
                 <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
               </PreviewAccountRoute>

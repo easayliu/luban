@@ -70,7 +70,7 @@ export function useIsAdmin(): boolean {
 }
 
 /**
- * 看得到全池数据（实时指标、请求查询、封号记录）的身份：管理员与访客。代理和用户只看得到
+ * 看得到全池数据（实时指标、请求查询）的身份：管理员与访客。代理和用户只看得到
  * 自己名下的号，全池的东西后端回 403，界面上直接不出现。
  */
 export function useSeesWholePool(): boolean {

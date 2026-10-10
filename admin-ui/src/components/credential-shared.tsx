@@ -1387,8 +1387,8 @@ export function DeleteCredentialDialog({
             {t('删除', 'Deleting ')}
             {t('「', '"')}<span className="font-medium text-foreground [overflow-wrap:anywhere]">{credentialLabel}</span>{t('」后，', '" will ')}
             {t(
-              '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 8 天保留期到期后自动清除。',
-              'remove its device bindings immediately. This cannot be undone. Its request log is not deleted right away; entries are cleared automatically once they pass the 8-day retention period.',
+              '设备绑定将立即清除，且无法恢复；请求记录不会立即删除，按 30 天保留期到期后自动清除。',
+              'remove its device bindings immediately. This cannot be undone. Its request log is not deleted right away; entries are cleared automatically once they pass the 30-day retention period.',
             )}
           </AlertDialogDescription>
         </AlertDialogHeader>
