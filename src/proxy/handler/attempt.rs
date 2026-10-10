@@ -352,6 +352,7 @@ pub(super) async fn prepare<'a>(
             &trusted_cc_version(client_ua)
                 .map(|(a, b, c)| format!("{a}.{b}.{c}"))
                 .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),
+            cc_ua_entrypoint(client_ua),
         )
     {
         spawn_session_handshake(

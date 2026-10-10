@@ -283,46 +283,106 @@ fn probe_request_is_official_shaped() {
 
     // **别的模型不套额度探测那身皮**：官方那条恒为 haiku-4.5，一条 opus 请求长着
     // 「无 system、无 billing header、那一小串 beta」的样子，官方从不产生。
-    // 连通性测试恰恰要逐个模型都测一遍，所以这条必须分开。
-    for model in ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5"] {
+    for model in ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"] {
         let sim = crate::proxy::probe_simulation(&cred, model);
-        assert_ne!(
-            sim.profile.kind,
-            config::CcProfileKind::QuotaProbe,
-            "{model} 不该套 QuotaProbe"
-        );
-        let out =
-            rewrite_body(&crate::proxy::probe_body(model), &cred, "fp", all_on(), Some(&sim), None);
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        let sys = v["system"].as_array().unwrap_or_else(|| panic!("{model} 该有 system"));
-        assert!(
-            sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"),
-            "{model}: 主线程形态要带 billing header"
-        );
-        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "{model}: 身份声明");
-        let beta = crate::proxy::simulated_beta(&sim.beta, None);
-        assert!(beta.contains(config::CC_BETA_CLAUDE_CODE), "{model}: 主线程串带 claude-code");
+        assert_eq!(sim.profile.kind, config::CcProfileKind::Prewarm, "{model} 走 /model 预热");
+    }
+}
 
-        // **不能只换 profile**：`max_tokens:1` 的体配主线程的 system/beta，会得到一条
-        // 没有 `thinking`/`context_management`/`output_config`、还非流式的请求——同样是
-        // 抓包里不存在的混合形态，也验证不了真实主线程链路。逐项钉住。
-        assert_eq!(v["thinking"]["type"], "adaptive", "{model}: 要有 thinking\n{v}");
+/// 非 haiku-4.5 的连通性测试发的是 `/model` 预热，头与体都要与抓包**逐字**相同
+/// （`cap/auto-2.1.293-20261010-model/00031` opus、`00034` sonnet、`00039` fable、`00046` haiku-5-5）。
+///
+/// 体按真实 CC 来访的预热改写（`sim: None`、[`CcRequestKind::Prewarm`]），与 [`crate::proxy::probe`]
+/// 里那份参数一致：身份由 [`crate::proxy::ensure_cc_metadata`] 补、`cch` 补在 `cc_entrypoint` 之后并按
+/// 最终字节算，断点保持裸的——模拟路径那套主线程整形（基座、1h、`diagnostics`）一样都不能有。
+#[test]
+fn prewarm_probe_matches_the_capture() {
+    use crate::proxy::body::{CcClient, apply_cch};
+    use crate::proxy::session_link::CcRequestKind;
+
+    // `00031` 原文。cch 算法在这个形态上同样成立：四条体只差模型名，cch 却都是同一个值，
+    // 一并钉住。
+    const CAPTURED: &str = concat!(
+        r#"{"model":"claude-opus-5-5","max_tokens":1,"system":[{"type":"text","text":"#,
+        r#""x-anthropic-billing-header: cc_version=2.1.293.9b8; cc_entrypoint=cli; cch=645f2;"},"#,
+        r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
+        r#""messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}],"#,
+        r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\","#,
+        r#"\"account_uuid\":\"4f05d4a7-840d-4fa3-b674-fcfe4fa1b370\",\"session_id\":\"b89cc88e-58ac-4d9e-be86-3abeb3cf13a5\"}"}}"#,
+    );
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5"] {
+        let captured = CAPTURED.replace("claude-opus-5-5", model);
         assert_eq!(
-            v["context_management"]["edits"][0]["type"], "clear_thinking_20251015",
-            "{model}: 要有 context_management\n{v}"
+            apply_cch(&mut captured.clone().into_bytes()).as_deref(),
+            Some("645f2"),
+            "{model}"
         );
-        assert_eq!(v["output_config"]["effort"], "high", "{model}: 官方主线程恒带\n{v}");
-        assert_eq!(v["stream"], true, "{model}: 官方主线程恒为流式\n{v}");
-        assert_eq!(
-            v["diagnostics"],
-            serde_json::json!({ "previous_message_id": serde_json::Value::Null }),
-            "{model}: 首轮 diagnostics\n{v}"
+    }
+
+    let cred = test_cred();
+    let official = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                    redact-thinking-2026-02-12,context-management-2025-06-27,\
+                    prompt-caching-scope-2026-01-05";
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5"] {
+        let sim = crate::proxy::probe_simulation(&cred, model);
+        let sid = sim.session_id.clone();
+
+        let headers = crate::proxy::build_forward_headers(
+            &crate::proxy::HeaderMap::new(),
+            "tok",
+            all_on(),
+            Some(&sim),
+            None,
         );
-        let tools = v["tools"].as_array().unwrap_or_else(|| panic!("{model} 该注入工具"));
-        assert!(tools.iter().any(|t| t["name"] == "Bash"), "{model}: 要有官方工具\n{v}");
-        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.first(), Some(&"model"), "{model}: key 序");
-        assert_eq!(keys.last(), Some(&"stream"), "{model}: stream 在队尾");
+        let h = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_string());
+        let beta = if model.contains("haiku") {
+            official.replace("claude-code-20250219,", "")
+        } else {
+            official.to_string()
+        };
+        assert_eq!(h("anthropic-beta").as_deref(), Some(beta.as_str()), "{model}");
+        assert_eq!(h("x-claude-code-request-class").as_deref(), Some("auxiliary"), "{model}");
+        assert_eq!(h("anthropic-dispatch-id").as_deref(), Some(config::CC_DISPATCH_ID), "{model}");
+        assert_eq!(h("user-agent").as_deref(), Some(config::CC_USER_AGENT), "{model}");
+        assert_eq!(h("x-claude-code-session-id"), Some(sid.clone()), "{model}");
+        assert_eq!(h("x-claude-code-prompt-id"), None, "{model}: 预热不在会话链上");
+
+        let out = crate::proxy::rewrite_body_out(
+            &crate::proxy::probe_body(model),
+            &cred,
+            "fp",
+            all_on(),
+            None,
+            Some(&sid),
+            Some(&sid),
+            false,
+            None,
+            false,
+            false,
+            Some(CcClient { version: config::CC_VERSION_BASE, entrypoint: "cli" }),
+            None,
+            CcRequestKind::Prewarm,
+            None,
+        )
+        .0;
+        let out = String::from_utf8(out.to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let user_id = v["metadata"]["user_id"].as_str().unwrap();
+        let inner: serde_json::Value = serde_json::from_str(user_id).unwrap();
+        assert_eq!(inner["device_id"], cred.spoof_device_id("fp").unwrap(), "{model}");
+        assert_eq!(inner["account_uuid"], ACCOUNT_UUID, "{model}");
+        assert_eq!(inner["session_id"], sid.as_str(), "{model}: 与出站头同一个会话");
+        let cch = apply_cch(&mut out.clone().into_bytes()).unwrap();
+
+        // 抓包那条换上本凭证的身份与这份体自己的 cch，其余逐字节相同。
+        let want = CAPTURED
+            .replace("claude-opus-5-5", model)
+            .replace("cch=645f2", &format!("cch={cch}"))
+            .replace(
+                &CAPTURED[CAPTURED.find(r#""metadata""#).unwrap()..],
+                &format!(r#""metadata":{{"user_id":{}}}}}"#, serde_json::json!(user_id)),
+            );
+        assert_eq!(out, want, "{model}");
     }
 }
 
@@ -456,4 +516,27 @@ async fn broken_probe_does_not_resume_a_subscription_pause(pool: sqlx::PgPool) {
     assert!(settle(StatusCode::OK, msg, End::Complete).await);
     let got = store.get(cred.id).await.unwrap().unwrap();
     assert!(!got.disabled && got.ban_reason.is_none(), "完整 Message 那次才恢复");
+}
+
+/// 握手里的额度探测只给交互式 CLI 的会话补：`-p`（`sdk-cli`）与桌面端（`claude-desktop`）官方
+/// 都不发，模拟路径冒充的是 CLI、照补。
+#[test]
+fn quota_probe_only_for_interactive_cli_sessions() {
+    use crate::proxy::session_link::CcSessionLink;
+    let link = ("sid".to_string(), CcSessionLink { first_seen: true, ..Default::default() });
+    let quota = |ep: Option<&str>| {
+        super::session_start(None, Some(&link), "2.1.293", ep).map(|s| s.quota_probe)
+    };
+    assert_eq!(quota(Some("cli")), Some(true));
+    for ep in [Some("sdk-cli"), Some("claude-desktop"), Some("claude-vscode"), None] {
+        assert_eq!(quota(ep), Some(false), "{ep:?}");
+    }
+
+    let sim = crate::proxy::probe_simulation(&test_cred(), "claude-opus-5-5");
+    let sim = crate::proxy::Simulation {
+        link: CcSessionLink { first_seen: true, ..Default::default() },
+        ..sim
+    };
+    let start = super::session_start(Some(&sim), None, "2.1.293", Some("sdk-cli")).unwrap();
+    assert!(start.quota_probe, "模拟路径恒补，不看来访 UA");
 }

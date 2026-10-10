@@ -10,8 +10,8 @@ use super::ban::{
     park_org_oauth_disallowed, parse_upstream_error,
 };
 use super::body::{
-    OutboundIdentity, THINKING_MIN_MAX_TOKENS, ensure_beta_query, outbound_identity,
-    rewrite_body_out, sim_device_fingerprint, ua_of, with_outbound_identity,
+    OutboundIdentity, ensure_beta_query, outbound_identity, rewrite_body_out,
+    sim_device_fingerprint, ua_of, with_outbound_identity,
 };
 use super::headers::{build_forward_headers_for, orig_header_case};
 use super::learned_rules::is_max_plan;
@@ -22,7 +22,7 @@ use super::rate_limit::{
 };
 use super::session_id::session_id_for;
 use super::session_link::{CcRequestKind, CcSessionLink};
-use super::simulation::{Simulation, SimulationReason, cc_profile_for, cc_system_base};
+use super::simulation::{Simulation, SimulationReason, billing_header_text};
 use super::upstream::{
     Aggregated, SseAggregator, Upstream, error_chain, resp_shape, upstream_error_kind,
 };
@@ -150,8 +150,10 @@ impl ProbeReport {
 /// `usage_logs`，不写就等于「测出来的额度只在弹窗里存在」，而这条请求真的花了钱、也真的
 /// 拿到了此刻最新的限流头。日志里那条以 `device_id = "probe"` 标出，与真实流量可区分。
 ///
-/// 代价是它**真的会消耗一点订阅额度**：请求带官方 `system` 基座（opus 族约 300 token、
-/// sonnet 族约 2700），与真实流量共用同一份 1h 全局缓存前缀，稳定后走缓存读价。
+/// 代价是它**真的会消耗一点订阅额度**，但只是官方那两种最小请求的量：haiku-4.5 发额度探测，
+/// 其余模型发 `/model` 预热（35 个输入 token、1 个输出 token，`cap/auto-2.1.285-20260930/00230`），
+/// 见 [`ProbeShape`]。测通说明「这个号 + 这个模型」过了身份闸与计费头，**不验**工具与 thinking
+/// 那条主线程链路。
 pub async fn probe(
     state: &AppState,
     cred: &crate::credentials::Credential,
@@ -222,9 +224,12 @@ pub async fn probe(
     // （[`sim_device_fingerprint`]）：这条测试走模拟路径，平台段与 UA 段都是它发出去的那套。
     let device_fp = sim_device_fingerprint(None);
     let flags = store::ForwardFlags::default();
-    // 直接构造 `Simulation` 而不走 `Simulation::detect`：这条请求本来就是 luban 自己发的裸
-    // 请求（body 里没有那句身份声明），detect 只会在开关关掉时返回 None，那样发出去必被上游拒。
+    // 直接构造 `Simulation` 而不走 `Simulation::detect`，见 [`probe_simulation`]。
+    let shape = ProbeShape::of(model);
     let sim = probe_simulation(cred, model);
+    // 预热那条体按真实 CC 来访改写（`sim: None`），会话 id 由这里给：头上那个出自 `sim`，
+    // 体里 `metadata` 要与它同值。
+    let real_session = (shape == ProbeShape::Prewarm).then(|| sim.session_id.clone());
     let headers = build_forward_headers_for(
         &HeaderMap::new(),
         &token,
@@ -269,20 +274,21 @@ pub async fn probe(
         headers,
         flags,
         billable: true,
-        sim: Some(sim),
-        // 走的是模拟那条路（sim 恒为 Some），会话 id 在 Simulation 里，出站两处也都取它。
-        bare_session: None,
-        session_out: None,
-        // 连通性测试保持非流式：它下面那套读法（`up.bytes()` 一把梭 + [`probe_report`] 按
-        // 整段 Message 解析出 model/error_type）是照非流式响应写的，改成 SSE 就全得跟着改，
-        // 而这条请求本来就不是客户端流量（`max_tokens:1` 的 ping），形态对齐的收益也不在这。
+        // 额度探测走模拟那条路，会话 id 在 Simulation 里。预热那条体已是官方原样，**按真实 CC
+        // 来访的预热改写**：模拟路径的整形是给主线程准备的（基座、1h 断点、`diagnostics`），
+        // 而真实来访那条路对预热只补身份与 `cch`、断点保持裸的——与官方逐字相同，也正是一个
+        // 真 2.1.293 客户端的预热经 luban 转发时走的那套改写。头已经按 `sim` 造好，不受影响。
+        sim: (shape == ProbeShape::Quota).then_some(sim),
+        bare_session: real_session.clone(),
+        session_out: real_session,
+        // 两种官方形态都是非流式（`keeps_nonstream`），下面那套读法（`up.bytes()` 一把梭 +
+        // [`probe_report`] 按整段 Message 解析出 model/error_type）也是照非流式响应写的。
         force_stream: false,
         // 探测体不带 `tools`（见 [`probe_body`]），没有可混淆的名字。
         tool_names: None,
-        // 同上：模拟路径的链在 `sim` 里。
+        // 两种形态都不在会话链上。
         client_link: None,
-        // 连通性测试自己造 body，形态由 profile 定，不必再判一次。
-        cc_kind: CcRequestKind::Main,
+        cc_kind: shape.cc_kind(),
         // 探测不补 fallbacks：它要测的是这个号在**这个模型**上通不通，换模型作答等于没测。
         refusal_fallbacks: None,
     };
@@ -407,10 +413,9 @@ pub async fn probe(
                     }
                 }
                 Ok(Ok(bytes)) => {
-                    // 主线程形态的探活是流式的（官方主线程恒为 `stream:true`），回来的是
-                    // SSE。把它攒回一条整段 Message，后面那套读法（封号判定、
-                    // [`probe_report`] 解 model/error_type）就不必分两种。攒不出来时退回
-                    // 原始字节——错误响应本来就是整段 JSON，不走 SSE。
+                    // 两种探测形态都是非流式，回来的本该是整段 JSON；上游万一回了 SSE，攒回
+                    // 一条整段 Message，后面那套读法（封号判定、[`probe_report`] 解
+                    // model/error_type）就不必分两种，半截流与流里的错误事件也照样判失败。
                     let (bytes, stream_end) = if compressed {
                         (bytes, ProbeStreamEnd::Undecodable)
                     } else if is_sse {
@@ -493,13 +498,22 @@ pub(super) struct SessionStart<'a> {
     /// 这条来访走的是模拟路径吗。决定要不要补无鉴权的公共请求，
     /// 见 [`crate::oauth::HandshakeRunner::public_traffic`]。
     pub(super) simulated: bool,
+    /// 握手里要不要补那条额度探测（[`send_quota_probe`]）。只有交互式 CLI（UA 里 entrypoint 为
+    /// `cli`）启动时发：`-p`（`sdk-cli`，`cap/auto-2.1.285-20260930` 起三版共 21 条，没有一条额度
+    /// 探测）与桌面端（`claude-desktop`，`cap/auto-desktop-2.1.295-20261010-sub` 两个会话）都不发。
+    /// 模拟路径冒充的是 CLI，恒为真。
+    pub(super) quota_probe: bool,
 }
 
 /// 从两条路里取会话起点；不是新会话（或这条请求不在链上）时 `None`。
+///
+/// `client_entrypoint` 是真实 CC 来访 UA 里自报的那段（[`super::body::cc_ua_entrypoint`]），
+/// 只决定 [`SessionStart::quota_probe`]。
 pub(super) fn session_start<'a>(
     sim: Option<&'a Simulation>,
     client_link: Option<&'a (String, CcSessionLink)>,
     client_version: &str,
+    client_entrypoint: Option<&str>,
 ) -> Option<SessionStart<'a>> {
     if let Some(s) = sim {
         return s.link.first_seen.then(|| SessionStart {
@@ -507,6 +521,7 @@ pub(super) fn session_start<'a>(
             version: s.profile.version.to_string(),
             prompt_id: s.link.prompt_id.as_deref().unwrap_or_default(),
             simulated: true,
+            quota_probe: true,
         });
     }
     let (sid, link) = client_link?;
@@ -517,6 +532,7 @@ pub(super) fn session_start<'a>(
         version: client_version.to_string(),
         prompt_id: link.prompt_id.as_deref().unwrap_or_default(),
         simulated: false,
+        quota_probe: client_entrypoint == Some("cli"),
     })
 }
 
@@ -598,18 +614,25 @@ pub(super) async fn spawn_session_handshake(
     let session_id = start.session_id.to_string();
     let probe_version = start.version.clone();
     let probe_flags = state.store.forward_flags();
+    let quota_probe = start.quota_probe;
     tokio::spawn(async move {
         handshake_sequence(
             runner.lead(&client_for_task, &token_for_task),
-            send_quota_probe(
-                &client_for_task,
-                &token_for_task,
-                &cred_for_task,
-                &ident,
-                &probe_version,
-                &session_id,
-                probe_flags,
-            ),
+            // 不补额度探测时这一段立即完成，放行信号照常在 lead 之后发出。
+            async {
+                if quota_probe {
+                    send_quota_probe(
+                        &client_for_task,
+                        &token_for_task,
+                        &cred_for_task,
+                        &ident,
+                        &probe_version,
+                        &session_id,
+                        probe_flags,
+                    )
+                    .await;
+                }
+            },
             runner.rest(&client_for_task, &token_for_task),
             probe_done,
         )
@@ -660,8 +683,9 @@ pub(super) async fn handshake_sequence(
 /// 官方启动串里那条额度探测：`POST /v1/messages?beta=true`，haiku、`max_tokens:1`、
 /// 正文就一个词 `quota`（`cap/2.1.260-2/00004`）。
 ///
-/// **只在模拟路径的新会话上补**（调用点已经判过）：真实 CC 自己每次启动都会发一条，经
-/// luban 转发过去，再补一条就是同一个会话发了两遍。
+/// **只给交互式 CLI 的新会话补**（[`SessionStart::quota_probe`]，调用点已经判过）：`-p` 与
+/// 桌面端官方都不发这一条，替它们补一条 `(external, cli)` 的探测，就是在一个 sdk-cli / 桌面端
+/// 会话里冒出一个 CLI 客户端。
 ///
 /// **代价是实打实的**：每个新的模拟会话多一次上游调用。输出只有 1 个 token，钱可以忽略，
 /// 但它**占一次请求数**——5h 窗口按请求数也算一笔。不想要就关掉 `api_telemetry`，那条开关
@@ -764,31 +788,52 @@ async fn send_quota_probe(
     }
 }
 
-/// 连通性测试那条请求的 [`Simulation`]：profile 直接指定 [`config::CcProfileKind::QuotaProbe`]。
+/// 连通性测试按模型分两种官方形态，[`probe_simulation`] / [`probe_body`] / [`probe`] 三处同源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeShape {
+    /// haiku-4.5 → 官方额度探测（[`config::CcProfileKind::QuotaProbe`]），走模拟路径改写。
+    Quota,
+    /// 其余模型 → `/model` 预热（[`config::CcProfileKind::Prewarm`]），按真实 CC 来访的预热改写。
+    Prewarm,
+}
+
+impl ProbeShape {
+    /// **逐字比规范名**，不是「名字里带 haiku」：官方那条额度探测恒为
+    /// `claude-haiku-4-5-20251001`（[`QUOTA_PROBE_MODEL`]），haiku-5-5 / 3.5 / 将来某个 haiku 都不该
+    /// 套那身皮——它们走 `/model` 预热。
+    pub(super) fn of(model: &str) -> Self {
+        if model == QUOTA_PROBE_MODEL { Self::Quota } else { Self::Prewarm }
+    }
+
+    fn cc_kind(self) -> CcRequestKind {
+        match self {
+            Self::Quota => CcRequestKind::QuotaProbe,
+            Self::Prewarm => CcRequestKind::Prewarm,
+        }
+    }
+}
+
+/// 连通性测试那条请求的 [`Simulation`]，profile 按 [`ProbeShape`] 直接指定。
 ///
-/// 不走 [`Simulation::detect`]——这条请求是 luban 自己发的裸请求（body 里没有那句身份
-/// 声明），detect 只会在开关关掉时返回 `None`，那样发出去必被上游拒。
+/// 不走 [`Simulation::detect`]——这条请求是 luban 自己发的，detect 只会在开关关掉时返回
+/// `None`，那样发出去必被上游拒。
 ///
-/// **只有 haiku 才用 `QuotaProbe`。** 官方那条额度探测**恒为 haiku-4.5**
-/// （`cap/2.1.260-2/00004`、`00021`、`00047` 三份都是），它的形状——`max_tokens:1`、
-/// 无 `system`、无 billing header、正文 `quota`、那一小串 beta——是和这个模型绑在一起的。
-/// 把一条 opus-5 或 fable 的连通性测试也套成这个形状，发出去的是「一个 opus 请求长着额度
-/// 探测的皮」，官方从不产生；而连通性测试恰恰要逐个模型都测一遍。
-///
-/// 别的模型退回该族的主线程 profile：多花一个基座的写入价（约 300 / 2700 token，且带
-/// `scope:global` 断点，全网共用一份、基本走缓存读价），换一条真实存在的形态。
+/// - **haiku-4.5 → `QuotaProbe`**。官方那条额度探测**恒为 haiku-4.5**（`cap/2.1.260-2/00004`、
+///   `cap/auto-2.1.293-20261008-full/00017` …），`max_tokens:1`、无 `system`、无 billing header、
+///   正文 `quota`、那一小串 beta——是和这个模型绑在一起的。头与体都按它发。
+/// - **其余模型 → `Prewarm`**，即 `/model` 选完模型后那条「Hi」（`cap/auto-2.1.293-20261010-model`）：
+///   官方本来就拿它来试「这个号能不能用这个模型」，35 个输入 token、1 个输出 token。这里的
+///   `Simulation` **只用来出头**（UA、`request-class: auxiliary`、那串 beta）；体由 [`probe_body`]
+///   造成官方原样，按真实 CC 来访的预热走改写（见 [`probe`]），不进模拟那套主线程整形——那会给它
+///   补上基座、断点 ttl 与 `diagnostics`，官方的预热一个都没有。
 pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
-    // **逐字比规范名**，不是「名字里带 haiku」：官方那条额度探测恒为
-    // `claude-haiku-4-5-20251001`（[`QUOTA_PROBE_MODEL`]），haiku-3 / 3.5 / 将来某个 haiku
-    // 都不该套那身皮——它们的连通性测试要走正常主线程探针。
-    let haiku = model == QUOTA_PROBE_MODEL;
-    let profile = if haiku {
-        config::cc_profile(config::CcProfileKind::QuotaProbe)
-    } else {
-        cc_profile_for(model)
-    };
+    let profile = config::cc_profile(match ProbeShape::of(model) {
+        ProbeShape::Quota => config::CcProfileKind::QuotaProbe,
+        ProbeShape::Prewarm => config::CcProfileKind::Prewarm,
+    });
     Simulation {
-        base: if haiku { None } else { cc_system_base(model) },
+        // 两种形态都没有基座：额度探测连 `system` 都没有，预热只有 billing header 与身份句。
+        base: None,
         profile,
         beta: config::cc_model_beta(profile, model),
         // 探测用第 0 个槽位的会话 id：它是 luban 自己发的一条小请求，挂在这个账号固定的那组
@@ -796,20 +841,14 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
         session_id: session_id_for(cred, &crate::credentials::slot_session_seed(0)),
         link: CcSessionLink::default(),
         reason: SimulationReason::Probe,
-        // 探测不补第四块：它一句 `ping` 就完，没有客户端 system 要安置，多一万字节的前缀只是
-        // 多付一次写入价；转发路径的形态由 [`Simulation::detect`] 管。
         rest: None,
-        // 环境说明随第四块走，探测同样不补。
         env: None,
         context_1m: false,
-        // 探测体是 `tools: []`（[`probe_body`]），一直靠注入补齐官方工具、验的正是主线程链路；
-        // 这是 luban 自己发的，不受 `fill_absent_tools` 开关管。
-        fill_absent_tools: true,
-        // 连通性探测验的是完整的主线程链路，按官方默认那 14 条发，不跟 `sim_trim_tools`。
+        // 两种官方形态都不带工具。
+        fill_absent_tools: false,
         trim_tools: false,
         // 探测恒走完整形态，不跟 `sim_billing_only`。
         billing_only: false,
-        // 探测是一句新输入，不是工具续轮。
         usage_limit: false,
         thread: Default::default(),
     }
@@ -821,7 +860,7 @@ pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &st
 /// 2xx 状态码下都会被当成「通过」——测试报绿，还顺手把暂停中的号放回池子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeStreamEnd {
-    /// 非流式回复（haiku 额度探测、错误响应）：体就是整段 JSON，由 [`probe_report`] 看它是不是 Message。
+    /// 非流式回复（两种探测形态、错误响应）：体就是整段 JSON，由 [`probe_report`] 看它是不是 Message。
     NotStreamed,
     /// 收到了 `message_stop`，攒出一条完整 Message。
     Complete,
@@ -854,51 +893,41 @@ pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
     }
 }
 
-/// 主线程 profile 的连通性测试用的 `max_tokens`。
+/// 连通性测试的请求体，按 [`ProbeShape`] 分两种，都是官方逐字形态。
 ///
-/// 官方主线程发的是 64000，但那个数字会被上游按「声明的输出预算」记进限流窗口，也被
-/// luban 自己的 [`note_upstream_send`] 记一笔——一次手动探活占掉 64000 的预算，一轮把
-/// 四个模型都测一遍就是 256000。取 1024：这是 [`THINKING_MIN_MAX_TOKENS`] 的下限，
-/// 低于它 [`ensure_thinking`] 就不补 `thinking`，跟着 `context_management` 也没了，
-/// 整条又退回那个「有主线程 system/beta、却没有 thinking」的混合形态。
+/// **额度探测**（`cap/2.1.260-2/00004`）：键序 `model → max_tokens → messages → metadata`
+/// （`metadata` 由 [`ensure_cc_metadata`] 补），正文就是 `quota` 这一个词。
 ///
-/// 与官方的差别只剩这一个字段的**取值**（客户端本来就可以自己配），不再是**字段缺失**。
-const PROBE_MAIN_MAX_TOKENS: u64 = THINKING_MIN_MAX_TOKENS;
-
-/// 连通性测试的请求体，按 profile 分两种。
-///
-/// **haiku → 官方额度探测的逐字形态**（`cap/2.1.260-2/00004`）：键序
-/// `model → max_tokens → messages → metadata`（`metadata` 由 [`ensure_cc_metadata`] 补），
-/// 正文就是 `quota` 这一个词。
-///
-/// **其余模型 → 一条真正的主线程请求**。这里不能只换个 profile 就完事：`max_tokens:1`
-/// 的体配上主线程的 system/beta，会得到一条**没有 `thinking`、没有 `context_management`、
-/// 没有 `output_config`、非流式**的请求——抓包里不存在这种东西，而且它也验证不了正常
-/// 主线程链路（客户端真实流量走的是流式 + thinking 那条）。故这里把主线程该有的字段一次
-/// 给齐，剩下的 `system` / `tools` / `metadata` / `diagnostics` 由 [`rewrite_body`] 按同一
-/// 套规则补——测试与真实转发共用一套改写，这是这条测试存在的意义。
-///
-/// 代价：非 haiku 的探活会真的生成一小段回复（含 adaptive thinking），比 1 个 token 贵。
-/// 换来的是「测通了」真的等于「主线程这条路通了」。
+/// **`/model` 预热**（`cap/auto-2.1.293-20261010-model/00031`）：键序
+/// `model → max_tokens → system → messages → metadata`，`system` 是 billing header 与身份句两块
+/// （都不带断点），正文 `Hi` 带一个裸 `ephemeral` 断点。billing header 先不写 `cch`——真实 CC 来访
+/// 那条路由 [`ensure_billing_cch`] 补在 `cc_entrypoint` 之后、出站前按最终字节重算；`metadata` 同样
+/// 交给那条路补（[`probe`] 给的 `bare_session`）。
 pub(super) fn probe_body(model: &str) -> Bytes {
-    // 判据与 [`probe_simulation`] 必须同源：一个说「套 QuotaProbe profile」、另一个说
-    // 「发主线程体」，就会拼出一条谁都不是的请求。
-    let v = if model == QUOTA_PROBE_MODEL {
-        serde_json::json!({
+    let v = match ProbeShape::of(model) {
+        ProbeShape::Quota => serde_json::json!({
             "model": model,
             "max_tokens": 1,
-            "messages": [{ "role": "user", "content": "quota" }]})
-    } else {
-        serde_json::json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": "quota" }],
-            // 空数组由 [`inject_cc_tools`] 填成官方主线程那 14 个；**这个键必须在**，
-            // 缺了那个函数就当是「官方无工具 helper」而不补。
-            "tools": [],
-            "max_tokens": PROBE_MAIN_MAX_TOKENS,
-            // 官方主线程恒带（`cap/2.1.260-2/00025`）；luban 没有别处会补它。
-            "output_config": { "effort": "high" },
-            "stream": true})
+            "messages": [{ "role": "user", "content": "quota" }]}),
+        ProbeShape::Prewarm => {
+            let messages = serde_json::json!([{ "role": "user", "content": [
+                { "type": "text", "text": "Hi", "cache_control": { "type": "ephemeral" } }]}]);
+            // 版本取 [`config::CC_VERSION_BASE`] 而非 Prewarm 那行的：出站 UA 是
+            // [`config::CC_USER_AGENT`]，两者约定同步；新版本表若没编 Prewarm 行，`cc_profile`
+            // 会落回旧表，取行上的版本就成了「UA 一个版本、billing header 另一个」。
+            let billing = billing_header_text(
+                &serde_json::json!({ "messages": messages }),
+                Some(config::CC_VERSION_BASE),
+                Some("cli"),
+            );
+            serde_json::json!({
+                "model": model,
+                "max_tokens": 1,
+                "system": [
+                    { "type": "text", "text": billing },
+                    { "type": "text", "text": config::CC_SYSTEM_IDENTITY }],
+                "messages": messages})
+        }
     };
     // 常量结构，序列化不会失败；真失败了也会以上游 400 的形式如实报出来，不必在这里 panic。
     Bytes::from(serde_json::to_vec(&v).unwrap_or_default())

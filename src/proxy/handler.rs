@@ -23,9 +23,9 @@ use super::ban::{
 };
 use super::body::{
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
-    client_supplied_fallbacks, device_fingerprint, ensure_beta_query, extract_device_id,
-    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
-    misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
+    cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
+    extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
+    known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
     remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
     stream_requested, trusted_cc_version, ua_of,
 };

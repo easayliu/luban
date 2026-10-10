@@ -34,6 +34,10 @@ pub enum CcProfileKind {
     SecurityClassifierSonnet,
     /// 额度探测（`cap/2.1.260-2/00004`）：`max_tokens:1`、无 `system`、无 billing header。
     QuotaProbe,
+    /// `/model` 选完模型后那条「Hi」预热（`cap/auto-2.1.293-20261010-model/00031` 等）：
+    /// `max_tokens:1`、`system` 只有 billing header 与身份句、没有工具与 `stream`。luban 只拿它
+    /// 做连通性测试的形态（[`crate::proxy::probe_simulation`]），只有 2.1.293 表里有这一行。
+    Prewarm,
 }
 
 /// profile 的 `thinking` 形态。
@@ -231,6 +235,10 @@ pub const CC_BODY_ORDER_CLASSIFIER: &[&str] =
 /// 额度探测的顶层键序（`cap/2.1.260-2/00004`、`00021`、`00047`）。
 pub const CC_BODY_ORDER_QUOTA: &[&str] = &["model", "max_tokens", "messages", "metadata"];
 
+/// `/model` 预热的顶层键序（`cap/auto-2.1.293-20261010-model/00031`、`00034`、`00039`、`00046`）。
+pub const CC_BODY_ORDER_PREWARM: &[&str] =
+    &["model", "max_tokens", "system", "messages", "metadata"];
+
 /// 主线程模型的**代际**：2.1.285 同一族内不同模型的 beta 串只差这几档（`cap/2.1.285`，
 /// 11 个模型逐条核过，见 [`CC_PROFILES`]）。profile 表里记的是每族最新一代的全集，
 /// [`cc_model_beta`] 按代际从全集里去掉 [`Self::dropped_betas`]，其余项与顺序一个不动。
@@ -325,14 +333,24 @@ pub fn cc_haiku_is_5_5_family(model: &str) -> bool {
 }
 
 /// 模拟路径给这个模型发的 beta 串：`profile.beta` 按 [`cc_model_tier`] 去掉那一代不发的项。
-/// 只动主线程三族（opus / fable / sonnet）；haiku、额度探测等其余 profile 原样返回——代际的
-/// 证据只有这三族的主线程。
+/// 只动主线程三族（opus / fable / sonnet）与 haiku 的 `/model` 预热；haiku、额度探测等其余 profile
+/// 原样返回——代际的证据只有这三族的主线程。
 pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'static, str> {
     let main3 = matches!(
         profile.kind,
         CcProfileKind::MainOpus | CcProfileKind::MainFable | CcProfileKind::MainSonnet
     );
-    let dropped = if main3 { cc_model_tier(model).dropped_betas() } else { &[] };
+    // `/model` 预热：haiku 那条不带 `claude-code`（`cap/auto-2.1.293-20261010-model/00046`），
+    // opus / sonnet / fable 带（`00031`、`00034`、`00039`）。
+    let prewarm_haiku =
+        profile.kind == CcProfileKind::Prewarm && model.to_ascii_lowercase().contains("haiku");
+    let dropped: &[&str] = if main3 {
+        cc_model_tier(model).dropped_betas()
+    } else if prewarm_haiku {
+        &[CC_BETA_CLAUDE_CODE]
+    } else {
+        &[]
+    };
     if dropped.is_empty() {
         return std::borrow::Cow::Borrowed(profile.beta);
     }

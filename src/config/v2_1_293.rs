@@ -213,6 +213,24 @@ pub const CC_PROFILES: &[CcProfile] = &[
         request_class: "auxiliary",
         effort: None,
     },
+    CcProfile {
+        kind: CcProfileKind::Prewarm,
+        version: "2.1.293",
+        // `cap/auto-2.1.293-20261010-model/00031`（opus）、`00034`（sonnet）、`00039`（fable）三条
+        // 逐字相同；haiku-5-5（`00046`）少 `claude-code`，见 [`cc_model_beta`]；`[1m]` 那条（`00042`）
+        // 在 `oauth` 后多 `context-1m`，探测不发 1M。2.1.296（`cap/auto-2.1.296-20261010-model`）同。
+        beta: "claude-code-20250219,interleaved-thinking-2025-05-14,\
+               redact-thinking-2026-02-12,context-management-2025-06-27,\
+               prompt-caching-scope-2026-01-05",
+        subagent: false,
+        system: CcSystemShape::Identity,
+        thinking: CcThinking::Absent,
+        fallbacks: None,
+        body_key_order: CC_BODY_ORDER_PREWARM,
+        eager_tools: CcEagerTools::Unknown,
+        request_class: "auxiliary",
+        effort: None,
+    },
 ];
 
 /// **2.1.293 还缺的抓包**（`cap/auto-2.1.293-20261008-full`：场景同 2.1.291，另加 haiku-5-5 的
