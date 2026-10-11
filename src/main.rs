@@ -39,7 +39,7 @@ struct Cli {
     #[arg(long, env = "LUBAN_DATABASE_URL")]
     database_url: Option<String>,
     /// API key used by clients such as Claude Code; also available through LUBAN_API_KEY or `api_key` in the config file.
-    /// If unset, the proxy does not authenticate callers; use it only on a trusted local network.
+    /// If unset, only access keys created in the console are accepted; with none, every forwarded request is rejected.
     #[arg(long, env = "LUBAN_API_KEY")]
     api_key: Option<String>,
     /// Admin console password; also available through LUBAN_ADMIN_PASSWORD or `admin_password` in the config file.

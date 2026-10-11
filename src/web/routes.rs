@@ -115,10 +115,6 @@ pub(super) fn router(state: AppState) -> Router {
     // `/api/*` 管理接口；`/v1/*` 转发到官方 API；其余由内嵌前端 SPA 兜底。
     Router::new()
         .nest("/api", api)
-        // axum 对 `Bytes` 提取器默认限 2MB，超过的请求进不了 handler 就被 413 拦掉——
-        // 而上游官方 /v1/messages 的上限是 32MB，长对话/带附件的合法请求很容易超 2MB。
-        // 这里放到 64MB 留出余量，真正的大小判决交给上游；管理接口维持默认即可。
-        .route("/v1/{*path}", any(proxy::handle).layer(DefaultBodyLimit::max(64 * 1024 * 1024)))
         // 个别移动端/前置层会以 POST 打开首页；用 PRG 把最终文档历史落成 GET。
         .route(
             "/",
@@ -129,5 +125,11 @@ pub(super) fn router(state: AppState) -> Router {
         // SPA 只允许由 GET/HEAD 打开。若把 POST 也兜底成 index.html，浏览器会把页面
         // 记作表单提交结果，之后在移动端刷新便弹出“确认重新提交表单”。
         .fallback_service(get(admin_ui::fallback).layer(admin_ui::compression()))
+        // 管理面的安全响应头。`layer` 只套在它之前登记的路由（含 fallback）上，故 `/v1/*`
+        // 放在它之后：转发的响应头原样回给客户端，不掺这几个。
+        .layer(middleware::map_response(admin_ui::security_headers))
+        // 转发收原始体流、由 handler 鉴权之后自己按上限读（见 `proxy::MAX_BODY_BYTES`），
+        // 不走 `Bytes` 提取器：那个会在鉴权之前把体整个读进内存。管理接口维持默认 2MB。
+        .route("/v1/{*path}", any(proxy::handle))
         .with_state(state)
 }

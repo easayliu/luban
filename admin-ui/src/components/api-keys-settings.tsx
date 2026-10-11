@@ -52,9 +52,17 @@ import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
 import { GroupPickerSkeleton, OrderedGroupPicker, useGroups } from '@/components/group-picker'
 
-/** Claude Code 的接入片段。 */
+/**
+ * Claude Code 的接入片段。值按 shell 规则转义后再拼：Key 可能来自导入的迁移文件，带着
+ * `;`、`$(…)` 之类的字符原样拼进 `export`，粘到终端里就会被当成命令执行。
+ */
 export function setupSnippet(key: string): string {
-  return `export ANTHROPIC_BASE_URL=${window.location.origin}\nexport ANTHROPIC_AUTH_TOKEN=${key}`
+  return `export ANTHROPIC_BASE_URL=${shellQuote(window.location.origin)}\nexport ANTHROPIC_AUTH_TOKEN=${shellQuote(key)}`
+}
+
+/** 只含安全字符的原样返回（正常生成的 Key 与地址都是），否则用单引号包起来、内部的 `'` 转成 `'\''`。 */
+export function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 /**
@@ -96,7 +104,7 @@ function KeyReveal({ secret }: { secret: string }) {
  *
  * `envKey`：`LUBAN_API_KEY` 设的那把（可用全部号），只读列在最上面。
  */
-export function ApiKeysSettings({ envKey, required }: { envKey: string | null; required: boolean }) {
+export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
   const { t, language } = useI18n()
   const qc = useQueryClient()
   const keysQuery = useQuery({ queryKey: ['api-keys'], queryFn: listApiKeys })
@@ -110,11 +118,8 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
   const failed = (error: unknown) => {
     toastManager.add({ title: t('操作失败', 'Operation failed'), description: extractError(error, language), type: 'error' })
   }
-  // 「是否要求接入 Key」（settings 的 api_keys_required）在首次建 Key 时由服务端翻转，Key 有增删改
-  // 都一并刷新 settings，否则删光 Key 后页面还停在建 Key 之前的状态，提示「任何人都能使用」。
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['api-keys'] })
-    void qc.invalidateQueries({ queryKey: ['settings'] })
   }
   const reveal = useMutation({
     mutationFn: (k: ApiKey) => revealApiKey(k.id).then((secret) => ({ k, secret })),
@@ -173,7 +178,7 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
             <CopyButton label={t('复制接入片段', 'Copy setup snippet')} text={setupSnippet(envKey)} />
           </div>
         )}
-        {/* 列表没拉到之前别落到下面「尚未配置接入 Key」的提示：那句话在加载中与读取失败时都是错的。 */}
+        {/* 列表没拉到之前别落到下面「当前没有接入 Key」的提示：那句话在加载中与读取失败时都是错的。 */}
         {keysQuery.isPending ? (
           <LoadingState className="min-h-24" label={t('正在加载接入 Key', 'Loading access keys')} />
         ) : keysQuery.isError ? (
@@ -235,15 +240,10 @@ export function ApiKeysSettings({ envKey, required }: { envKey: string | null; r
         ))}
         {keysQuery.isSuccess && !envKey && keys.length === 0 && (
           <div className="px-3 py-3 text-xs text-warning-foreground">
-            {required
-              ? t(
-                  '当前没有可用的接入 Key：所有转发请求都将被拒绝。新建 Key 后即可恢复。',
-                  'There is no usable access key: every forwarded request is rejected. Create a key to restore access.',
-                )
-              : t(
-                  '尚未配置接入 Key：转发不校验来访身份，任何客户端均可使用全部账号。',
-                  'No access key is configured: forwarding does not authenticate callers, and any client can use every account.',
-                )}
+            {t(
+              '当前没有接入 Key：所有转发请求都将被拒绝。新建 Key 后即可使用。',
+              'There is no access key: every forwarded request is rejected. Create a key to start forwarding.',
+            )}
           </div>
         )}
       </div>

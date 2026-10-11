@@ -219,12 +219,33 @@ async fn send_to(
     path: &str,
     req: (HeaderMap, Bytes),
 ) -> (StatusCode, HeaderMap, Bytes) {
+    send_body_to(state, path, req.0, axum::body::Body::from(req.1)).await
+}
+
+async fn send_body(
+    state: &AppState,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> (StatusCode, HeaderMap, Bytes) {
+    send_body_to(state, "/v1/messages", headers, body).await
+}
+
+async fn send_body_to(
+    state: &AppState,
+    path: &str,
+    mut headers: HeaderMap,
+    body: axum::body::Body,
+) -> (StatusCode, HeaderMap, Bytes) {
+    // 用例自己带了 Key（换 Key、错 Key）就用它的，否则带上测试状态的那把。
+    if !headers.contains_key("x-api-key") {
+        headers.insert("x-api-key", HeaderValue::from_static(AppState::TEST_CLIENT_KEY));
+    }
     let resp = crate::proxy::handle(
         axum::extract::State(state.clone()),
         axum::http::Method::POST,
         path.parse::<Uri>().unwrap(),
-        req.0,
-        req.1,
+        headers,
+        body,
     )
     .await;
     let (status, headers) = (resp.status(), resp.headers().clone());
@@ -586,7 +607,27 @@ async fn gate_invalid_api_key(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
     let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
     store.create_api_key("k", "the-right-key", &[]).await.unwrap().unwrap();
-    let req = cc_request(serde_json::json!({}));
+    let mut req = cc_request(serde_json::json!({}));
+    req.0.insert("x-api-key", HeaderValue::from_static("a-wrong-key"));
+    assert_local_reject(
+        &mock,
+        &state,
+        req,
+        StatusCode::UNAUTHORIZED,
+        "authentication_error",
+        "invalid API key",
+    )
+    .await;
+}
+
+/// 环境变量与库里都没有任何接入 Key：不带 Key 的请求照样 401，不退回「没配就放行」。
+#[sqlx::test]
+async fn gate_rejects_when_no_key_is_configured(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![]).await;
+    let (_store, mut state, _) = setup(pool.clone(), 1, &mock.base).await;
+    state.client_key = None;
+    let mut req = cc_request(serde_json::json!({}));
+    req.0.insert("x-api-key", HeaderValue::from_static(""));
     assert_local_reject(
         &mock,
         &state,
@@ -899,14 +940,14 @@ async fn api_key_groups_route_to_their_accounts(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn deleting_the_last_key_does_not_open_the_proxy(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;
-    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let (store, mut state, _) = setup(pool.clone(), 1, &mock.base).await;
+    state.client_key = None;
     let id = store.create_api_key("k", "old-key", &[]).await.unwrap().unwrap();
     store.delete_api_key(id).await.unwrap();
-    for key in [None, Some("old-key")] {
+    // 空串即「不带 Key」（`presented_key` 滤掉空值），也挡住 `send_to` 补测试 Key。
+    for key in ["", "old-key"] {
         let mut req = cc_request(serde_json::json!({}));
-        if let Some(k) = key {
-            req.0.insert("x-api-key", HeaderValue::from_static(k));
-        }
+        req.0.insert("x-api-key", HeaderValue::from_static(key));
         let (status, _, _) = send(&state, req).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
@@ -970,4 +1011,54 @@ async fn billing_only_logs_the_simulated_device_only_when_it_was_sent(pool: sqlx
     let row = rows.iter().max_by_key(|r| r.id).unwrap();
     assert!(row.path.contains("count_tokens"), "{}", row.path);
     assert_eq!(row.device_id, None, "count_tokens 原样透传，不记派生设备");
+}
+
+/// 不带 Key 的请求在读体之前就被拒：体是一条发完第一块就挂住的流，读它的话这条永远回不来。
+#[sqlx::test]
+async fn unauthenticated_requests_are_rejected_before_the_body_is_read(pool: sqlx::PgPool) {
+    use futures_util::StreamExt;
+    let mock = MockUpstream::start(vec![]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let first = futures_util::stream::once(async {
+        Ok::<_, std::io::Error>(Bytes::from_static(b"{\"model\":"))
+    });
+    let body = axum::body::Body::from_stream(first.chain(futures_util::stream::pending()));
+    let mut headers = cc_request(serde_json::json!({})).0;
+    headers.insert("x-api-key", HeaderValue::from_static("a-wrong-key"));
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::proxy::handle(
+            axum::extract::State(state.clone()),
+            axum::http::Method::POST,
+            "/v1/messages".parse::<Uri>().unwrap(),
+            headers,
+            body,
+        ),
+    )
+    .await
+    .expect("鉴权失败的请求不该等体读完");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(mock.seen().is_empty());
+}
+
+/// 带了 Key 的超限体回 413 `request_too_large`，不打上游。
+#[sqlx::test]
+async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
+    static MB: [u8; 1024 * 1024] = [b' '; 1024 * 1024];
+    let mock = MockUpstream::start(vec![]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let chunks = crate::proxy::MAX_BODY_BYTES / MB.len() + 1;
+    let stream = futures_util::stream::iter(
+        (0..chunks).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&MB))),
+    );
+    let (status, _, body) = send_body(
+        &state,
+        cc_request(serde_json::json!({})).0,
+        axum::body::Body::from_stream(stream),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["type"], "request_too_large");
+    assert!(mock.seen().is_empty());
 }

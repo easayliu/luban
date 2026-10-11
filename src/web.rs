@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -82,7 +82,7 @@ pub struct AppState {
     pkce: Arc<parking_lot::Mutex<PendingPkce>>,
     /// 凭证存储。
     pub store: Arc<CredentialStore>,
-    /// 接入用的 API Key（None 表示不校验来访身份）。
+    /// `--api-key` / `LUBAN_API_KEY` 设的接入 Key；None 时只认库里的 Key，两边都没有就全部拒绝。
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
@@ -131,11 +131,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// [`Self::for_test`] 配的环境接入 Key。
+    #[cfg(test)]
+    pub(crate) const TEST_CLIENT_KEY: &'static str = "test-client-key";
+
     /// 测试用的最小状态：给定（内存）库，其余字段全取默认。
     ///
     /// `pkce` 是私有字段，crate 内别处的测试自己拼不出 [`AppState`]，而转发路径
     /// （[`crate::proxy::handle`]）的端到端用例要的正是一份能跑的状态。不出网——
     /// [`crate::clients::ClientPool::new`] 只是把出站客户端建起来。
+    ///
+    /// 带一把环境接入 Key（[`Self::TEST_CLIENT_KEY`]）：转发不带 Key 一律拒绝，端到端用例得带上它。
     #[cfg(test)]
     pub(crate) fn for_test(store: Arc<CredentialStore>) -> Self {
         Self {
@@ -144,7 +150,7 @@ impl AppState {
             ),
             pkce: Arc::new(parking_lot::Mutex::new(Vec::new())),
             store,
-            client_key: None,
+            client_key: Some(Arc::new(Self::TEST_CLIENT_KEY.into())),
             admin_env: None,
             viewer_env: None,
             setup_token: Arc::new("test-setup-token".into()),
@@ -220,7 +226,7 @@ pub async fn run(
             "Claude Code setup: ANTHROPIC_BASE_URL={base}, ANTHROPIC_AUTH_TOKEN=<--api-key>"
         ),
         None => tracing::info!(
-            "Claude Code setup: ANTHROPIC_BASE_URL={base} (no --api-key set, the proxy does not authenticate callers -- keep it local-only)"
+            "Claude Code setup: ANTHROPIC_BASE_URL={base}, ANTHROPIC_AUTH_TOKEN=<an access key created in the console> (forwarding rejects every request until one exists)"
         ),
     }
     if let Some(token) = &setup_token {

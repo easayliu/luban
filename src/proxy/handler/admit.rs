@@ -68,7 +68,7 @@ pub(super) async fn admit(
     method: Method,
     uri: &Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
     log_state: &RequestLogState,
 ) -> Result<(Inbound, Guards), Response> {
     let started = std::time::Instant::now();
@@ -85,6 +85,8 @@ pub(super) async fn admit(
     *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
+    // 只看头的闸都过了才读体，见 [`MAX_BODY_BYTES`]。
+    let body = read_body(body, &method, &path_and_query, &client_ua).await?;
     let facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
     identity_gates(
         state,
@@ -214,6 +216,39 @@ pub(super) async fn admit(
     ))
 }
 
+/// 按 [`MAX_BODY_BYTES`] 读完请求体：边读边数，超限立刻停、回 413（与上游同一个
+/// `request_too_large`），不会先攒满再判；读到一半断开等读失败回 400。
+async fn read_body(
+    body: axum::body::Body,
+    method: &Method,
+    path_and_query: &str,
+    client_ua: &str,
+) -> Result<Bytes, Response> {
+    use futures_util::StreamExt;
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, error = %e, "rejected: failed to read the request body");
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "failed to read the request body",
+            )
+        })?;
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request body too large");
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                format!("request body exceeds {} MB", MAX_BODY_BYTES / (1024 * 1024)),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
+}
+
 /// 1～1.5：来访 API key 与最低客户端版本，只看头。回这把 Key 能用哪些号。
 async fn client_gates(
     state: &AppState,
@@ -222,7 +257,7 @@ async fn client_gates(
     client_ua: &str,
     headers: &HeaderMap,
 ) -> Result<store::KeyAccess, Response> {
-    // 1) 校验来访 API Key（一把都没配则放行），见 [`client_access`]。
+    // 1) 校验来访 API Key（一把都没配则全部拒绝），见 [`client_access`]。
     let access = match client_access(state, headers).await {
         Ok(Some(access)) => access,
         Ok(None) => {

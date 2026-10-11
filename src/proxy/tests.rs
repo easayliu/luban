@@ -247,12 +247,13 @@ async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) 
     let mut headers = super::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    headers.insert("x-api-key", HeaderValue::from_static(crate::web::AppState::TEST_CLIENT_KEY));
     let resp = super::handle(
         axum::extract::State(state),
         axum::http::Method::POST,
         "/v1/messages".parse::<axum::http::Uri>().unwrap(),
         headers,
-        axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        axum::body::Body::from(serde_json::to_vec(&body).unwrap()),
     )
     .await;
 
@@ -314,12 +315,13 @@ async fn send_go_probe(state: crate::web::AppState, model: &str) -> axum::respon
     let mut headers = super::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    headers.insert("x-api-key", HeaderValue::from_static(crate::web::AppState::TEST_CLIENT_KEY));
     super::handle(
         axum::extract::State(state),
         axum::http::Method::POST,
         "/v1/messages".parse::<axum::http::Uri>().unwrap(),
         headers,
-        axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        axum::body::Body::from(serde_json::to_vec(&body).unwrap()),
     )
     .await
 }
@@ -387,12 +389,13 @@ async fn the_same_probe_goes_on_when_the_switch_is_off(pool: sqlx::PgPool) {
     let mut headers = super::HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    headers.insert("x-api-key", HeaderValue::from_static(crate::web::AppState::TEST_CLIENT_KEY));
     let resp = super::handle(
         axum::extract::State(state),
         axum::http::Method::POST,
         "/v1/messages".parse::<axum::http::Uri>().unwrap(),
         headers,
-        axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        axum::body::Body::from(serde_json::to_vec(&body).unwrap()),
     )
     .await;
     // 关掉之后这条探活照常往下走，最终停在「没有可用账号」那一步（本地库里一个号都没有），

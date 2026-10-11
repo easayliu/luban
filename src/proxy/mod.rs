@@ -169,7 +169,8 @@ pub async fn handle(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    // 原始体流，不在入口读：鉴权等只看头的闸先过完才读（见 [`MAX_BODY_BYTES`]）。
+    body: axum::body::Body,
 ) -> Response {
     let started = std::time::Instant::now();
     let request_id = request_id_for(&headers);
@@ -229,6 +230,13 @@ pub async fn handle(
     }
     resp
 }
+
+/// 转发请求体的上限。上游官方 /v1/messages 收 32MB，长对话、带附件的合法请求很容易超过
+/// axum 默认的 2MB，这里放到 64MB 留出余量，真正的大小判决交给上游。
+///
+/// 体在 Key、最低版本、头上的会话闸都过了之后才读（[`handler::admit`]）：先读后验的话，
+/// 不带 Key 的人并发灌 64MB 的体就能把内存吃满。
+pub(super) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// 来访 `X-Request-Id` 能沿用的形态：`[A-Za-z0-9._-]`，1 到 128 位。
 ///
@@ -583,25 +591,22 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
 ///
 /// - `--api-key` / `LUBAN_API_KEY` 设的那把：用全部号；
 /// - 库里启用中的接入 Key：用它绑定的分组（没绑 = 全部号）；
-/// - 两边都没有配置任何 Key：不校验，用全部号——与老版本「没配接入 Key 就放行」一致。
+/// - 其余一律拒绝，两边都没配任何 Key 时也是——默认对外监听，不带 Key 放行等于把号池敞给
+///   扫端口的人。
 async fn client_access(
     state: &AppState,
     headers: &HeaderMap,
 ) -> anyhow::Result<Option<store::KeyAccess>> {
-    let all = || store::KeyAccess { key_id: None, groups: None };
     let key = presented_key(headers);
     if let (Some(env), Some(k)) = (&state.client_key, key)
         && crate::auth::secrets_equal(env.as_bytes(), k.as_bytes())
     {
-        return Ok(Some(all()));
+        return Ok(Some(store::KeyAccess { key_id: None, groups: None }));
     }
     if let Some(k) = key
         && let Some(access) = state.store.api_key_access(k).await?
     {
         return Ok(Some(access));
-    }
-    if state.client_key.is_none() && !state.store.api_keys_required().await? {
-        return Ok(Some(all()));
     }
     Ok(None)
 }

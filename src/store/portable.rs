@@ -19,8 +19,11 @@ impl From<&SavedProxy> for PortableProxy {
     }
 }
 
-/// 迁移用的一把接入 Key：名称、明文、停用状态。分组绑定不带——分组 id 由目标库自己发，
-/// 导进去的 Key 一律不绑定分组（用全部号），需要的话在目标站重新绑。
+/// 迁移用的一把接入 Key：名称、明文、停用状态与范围。
+///
+/// 范围按**分组名**带：分组 id 由各库自己发，分组本身也不随迁移走，导入时按名字对上目标库
+/// 里的分组。对不全（或是不带范围的旧版文件）就以停用状态导入，等 admin 在目标站重新绑——
+/// 绝不退成「全部号」：原本只限几个分组的 Key 迁移一趟就能用全部号，等于凭空放大了权限。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PortableApiKey {
     #[serde(default)]
@@ -28,6 +31,12 @@ pub struct PortableApiKey {
     pub key: String,
     #[serde(default)]
     pub disabled: bool,
+    /// 可用全部号。`None` 是不带范围的旧版导出文件。
+    #[serde(default)]
+    pub all_groups: Option<bool>,
+    /// 只限这些分组（按优先顺序），`all_groups == Some(false)` 时才看。
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// 迁移用的一条凭证：导出与导入**共用同一个形态**，导出的文件原样喂回来就是导入的入参。
@@ -399,10 +408,13 @@ impl CredentialStore {
             // 旧版导出文件里的全局接入 Key：转成一把不绑定分组的接入 Key（设置项本身已不再使用）。
             if k == CLIENT_API_KEY {
                 if !v.trim().is_empty() {
+                    // 旧版只有这一把全局 Key，本来就能用全部号，范围照实写上。
                     let key = PortableApiKey {
                         label: "导入的 Key".into(),
                         key: v.trim().into(),
                         disabled: false,
+                        all_groups: Some(true),
+                        groups: Vec::new(),
                     };
                     self.import_api_key(&key).await?;
                     n += 1;
@@ -415,17 +427,27 @@ impl CredentialStore {
         Ok(n)
     }
 
-    /// 导出全部接入 Key（含明文）。
+    /// 导出全部接入 Key（含明文与范围）。
     pub async fn export_api_keys(&self) -> Result<Vec<PortableApiKey>> {
+        let names: HashMap<i64, String> =
+            self.list_groups().await?.into_iter().map(|g| (g.id, g.name)).collect();
         let mut out = Vec::new();
         for k in self.list_api_keys().await? {
             let key = self.reveal_api_key(k.id).await?.unwrap_or_default();
-            out.push(PortableApiKey { label: k.label, key, disabled: k.disabled });
+            let groups = k.groups.iter().filter_map(|id| names.get(id).cloned()).collect();
+            out.push(PortableApiKey {
+                label: k.label,
+                key,
+                disabled: k.disabled,
+                all_groups: Some(k.all_groups),
+                groups,
+            });
         }
         Ok(out)
     }
 
-    /// 导入一把接入 Key：同一把（明文相同）已在就跳过，回 `Updated`；否则新增、不绑定分组。
+    /// 导入一把接入 Key：同一把（明文相同）已在就跳过，回 `Updated`；否则按文件里的范围新增，
+    /// 范围还原不全就停用（见 [`PortableApiKey`]）。停用状态与范围同一个事务落库。
     pub async fn import_api_key(&self, k: &PortableApiKey) -> Result<ImportOutcome> {
         anyhow::ensure!(!k.key.trim().is_empty(), "API key must not be empty");
         let exists: bool =
@@ -436,15 +458,32 @@ impl CredentialStore {
         if exists {
             return Ok(ImportOutcome::Updated);
         }
-        let id = self
-            .create_api_key(k.label.trim(), k.key.trim(), &[])
-            .await?
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if k.disabled {
-            self.update_api_key(id, k.label.trim(), true, &[], None)
-                .await?
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (all_groups, group_ids, complete) = match k.all_groups {
+            Some(true) => (true, Vec::new(), true),
+            Some(false) => {
+                let ids: HashMap<String, i64> =
+                    self.list_groups().await?.into_iter().map(|g| (g.name, g.id)).collect();
+                let found: Vec<i64> = k.groups.iter().filter_map(|n| ids.get(n).copied()).collect();
+                let complete = found.len() == k.groups.len();
+                (false, found, complete)
+            }
+            None => (false, Vec::new(), false),
+        };
+        if !complete {
+            tracing::warn!(
+                label = %k.label.trim(), groups = ?k.groups,
+                "import: the API key's group scope could not be restored; imported it disabled"
+            );
         }
+        self.insert_api_key(
+            k.label.trim(),
+            k.key.trim(),
+            k.disabled || !complete,
+            all_groups,
+            &group_ids,
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(ImportOutcome::Added)
     }
 }
@@ -712,13 +751,75 @@ mod tests {
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].label, "p2");
 
-        let k = PortableApiKey { label: "k".into(), key: " key-1 ".into(), disabled: true };
+        let k = PortableApiKey {
+            label: "k".into(),
+            key: " key-1 ".into(),
+            disabled: true,
+            all_groups: Some(true),
+            groups: vec![],
+        };
         assert_eq!(store.import_api_key(&k).await.unwrap(), ImportOutcome::Added);
         assert_eq!(store.import_api_key(&k).await.unwrap(), ImportOutcome::Updated);
         let keys = store.export_api_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!((keys[0].key.as_str(), keys[0].disabled), ("key-1", true));
         assert!(store.api_key_access("key-1").await.unwrap().is_none(), "停用状态跟着走");
+    }
+
+    /// 接入 Key 的范围随迁移走：按分组名还原；对不全、或是不带范围的旧版文件，以停用状态导入，
+    /// 绝不退成全部号。
+    #[sqlx::test]
+    async fn api_key_scope_survives_migration(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let vip = store.create_group("vip", "").await.unwrap().unwrap();
+        let gone = store.create_group("gone", "").await.unwrap().unwrap();
+        store.create_api_key("all", "key-all", &[]).await.unwrap().unwrap();
+        store.create_api_key("vip", "key-vip", &[vip]).await.unwrap().unwrap();
+        store.create_api_key("orphan", "key-orphan", &[gone]).await.unwrap().unwrap();
+        store.delete_group(gone).await.unwrap().unwrap();
+        let mut exported = store.export_api_keys().await.unwrap();
+        exported.sort_by(|a, b| a.label.cmp(&b.label));
+        let by = |l: &str| exported.iter().find(|k| k.label == l).unwrap().clone();
+        assert_eq!((by("all").all_groups, by("all").groups.len()), (Some(true), 0));
+        assert_eq!(
+            (by("vip").all_groups, by("vip").groups.clone()),
+            (Some(false), vec!["vip".into()])
+        );
+        assert_eq!((by("orphan").all_groups, by("orphan").groups.len()), (Some(false), 0));
+
+        // 目标库：有同名的 vip，没有 other。
+        for id in store.list_api_keys().await.unwrap().iter().map(|k| k.id) {
+            store.delete_api_key(id).await.unwrap();
+        }
+        let missing = PortableApiKey {
+            label: "missing".into(),
+            key: "key-missing".into(),
+            disabled: false,
+            all_groups: Some(false),
+            groups: vec!["vip".into(), "other".into()],
+        };
+        let legacy = PortableApiKey {
+            label: "legacy".into(),
+            key: "key-legacy".into(),
+            disabled: false,
+            all_groups: None,
+            groups: vec![],
+        };
+        for k in exported.iter().chain([&missing, &legacy]) {
+            assert_eq!(store.import_api_key(k).await.unwrap(), ImportOutcome::Added);
+        }
+        let groups_of = |key: &'static str| {
+            let store = &store;
+            async move { store.api_key_access(key).await.unwrap().map(|a| a.groups) }
+        };
+        assert_eq!(groups_of("key-all").await, Some(None), "全部号照旧");
+        assert_eq!(groups_of("key-vip").await, Some(Some(vec![vip])), "按名字对回 vip");
+        assert_eq!(groups_of("key-orphan").await, Some(Some(vec![])), "原本就一个号都选不到");
+        assert_eq!(groups_of("key-missing").await, None, "分组对不全：停用");
+        assert_eq!(groups_of("key-legacy").await, None, "旧版文件不知道范围：停用");
+        let legacy_row =
+            store.list_api_keys().await.unwrap().into_iter().find(|k| k.label == "legacy").unwrap();
+        assert!(!legacy_row.all_groups, "停用的也不留成全部号，免得一启用就放大");
     }
 
     /// 设置导入只写文件里有的键、跳过管理密码；旧版的全局接入 Key 变成一把接入 Key。

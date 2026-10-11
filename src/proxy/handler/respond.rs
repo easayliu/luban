@@ -334,13 +334,8 @@ async fn client_error(
         }
     }
     if !compressed && is_third_party_rejection(&err_bytes) {
+        // 出站那份只记结构摘要（`request_digest`）；入站原件同样不进日志，理由见裸 429 那条。
         log_third_party_rejection(sent, &upstream.headers, cred, status);
-        tracing::info!(
-            cred_id = cred.id, cred = %cred.label,
-            inbound_bytes = body.len(),
-            inbound_body = %String::from_utf8_lossy(body),
-            "third-party rejection: dumping the INBOUND (client-original) request body for local replay"
-        );
     }
     // 历史思考块验不过的那三条 400（签名 / 被改过 / `redacted_thinking` 的密文）：
     // 把上游点名的那个块在入站（客户端原件）与出站（luban 实际发出去的）两份体里
@@ -349,7 +344,7 @@ async fn client_error(
     // 三条共用这一段：它们的兜底各不相同，但问的是同一个问题，而
     // [`trace_thinking_block`] 本就不分块型（`thinking` 按 `signature` 配、
     // `redacted_thinking` 按 `data` 配）。`kind` 记是哪一条，见
-    // [`thinking_block_error_kind`]。这条不打正文，故不受 `inbound_body` 那种体量之累。
+    // [`thinking_block_error_kind`]。这条不打正文。
     if !compressed
         && status == StatusCode::BAD_REQUEST
         && let Some(kind) = thinking_block_error_kind(&err_bytes)
@@ -561,12 +556,15 @@ async fn bare_429(
                 route_in_flight = load.route_in_flight,
                 sent_60s = load.sent,
                 max_tokens_60s = load.max_tokens,
-                inbound_body = %String::from_utf8_lossy(body),
-                outbound_body = %String::from_utf8_lossy(sent),
+                // 只记体的大小：整份请求体是用户的对话、源码与附件，落进应用 / Docker 日志后
+                // 不受流水保留期管，也谁都翻得到。排查形态时去流水里看这条的取证字段。
+                inbound_bytes = body.len(),
+                outbound_bytes = sent.len(),
                 outbound_headers = %out_headers,
                 response_headers = %resp_headers,
-                response_body = %String::from_utf8_lossy(&bytes),
-                "upstream bare 429: full inbound/outbound dump for local debugging"
+                // 上游的错误体（几百字节的 JSON），截短防异常长体刷屏。
+                response_body = %String::from_utf8_lossy(&bytes).chars().take(1000).collect::<String>(),
+                "upstream bare 429"
             );
             // 错误文本里可能回显假工具名，同 4xx 那一路顺手还原。
             let bytes = match &tool_names {

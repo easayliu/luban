@@ -2,12 +2,16 @@
 //!
 //! 参考 kiro.rs 的做法：SPA fallback + 按路径设置缓存策略。
 
+use std::sync::LazyLock;
+
 use axum::{
     body::Body,
-    http::{Response, StatusCode, Uri, header},
+    http::{HeaderValue, Response, StatusCode, Uri, header},
     response::{IntoResponse, Redirect},
 };
+use base64::Engine;
 use rust_embed::Embed;
+use sha2::{Digest, Sha256};
 use tower_http::compression::{
     CompressionLayer, DefaultPredicate, Predicate, predicate::NotForContentType,
 };
@@ -31,6 +35,51 @@ pub fn compression() -> CompressionLayer<impl Predicate> {
         .compress_when(DefaultPredicate::new().and(NotForContentType::new("font/")))
 }
 
+/// 管理面（`/api/*` 与前端）统一加的安全响应头，挂成 `map_response` 中间件；`/v1/*` 不挂。
+///
+/// - `X-Frame-Options: DENY`：不许被别的站点嵌进 iframe 诱导点击（删号、显示 Key……）；
+/// - `nosniff`：不让浏览器把 JSON / 资源猜成别的类型执行；
+/// - `no-referrer`：地址栏的 hash 路由里有账号 id，别随外链带出去。
+///
+/// CSP 只对页面本身有意义，由 [`serve_index`] 单独加。
+pub async fn security_headers(mut resp: Response<Body>) -> Response<Body> {
+    let h = resp.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    resp
+}
+
+/// index.html 的 CSP：脚本只认同源文件，外加 index.html 里那段内联脚本（还原语言）的哈希——
+/// 哈希按嵌进来的 index.html 现算，改了那段脚本不用跟着手改。登录 token 存在 localStorage，
+/// 这道是哪天出现注入点时的兜底。样式放开 `unsafe-inline`：组件库大量用 `style` 属性。
+static INDEX_CSP: LazyLock<HeaderValue> = LazyLock::new(|| {
+    let html = Asset::get("index.html").map(|c| c.data.into_owned()).unwrap_or_default();
+    let hashes: String = inline_scripts(&String::from_utf8_lossy(&html))
+        .map(|js| {
+            let digest = Sha256::digest(js.as_bytes());
+            format!(" 'sha256-{}'", base64::engine::general_purpose::STANDARD.encode(digest))
+        })
+        .collect();
+    let csp = format!(
+        "default-src 'self'; script-src 'self'{hashes}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; \
+         object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    );
+    HeaderValue::from_str(&csp).expect("CSP 只含可见 ASCII")
+});
+
+/// 页面里不带 `src` 的 `<script>` 的内容（原样，CSP 哈希按它逐字节算）。
+fn inline_scripts(html: &str) -> impl Iterator<Item = &str> {
+    html.split("<script").skip(1).filter_map(|rest| {
+        let (attrs, after) = rest.split_once('>')?;
+        if attrs.contains("src=") {
+            return None;
+        }
+        after.split_once("</script>").map(|(js, _)| js)
+    })
+}
+
 /// 将误发到首页的 POST 文档导航转换为 GET，避免浏览器刷新时要求重新提交表单。
 ///
 /// 固定跳回 `/`，不复用请求体或查询参数；真正的 API POST 会先被主路由匹配，不会走这里。
@@ -48,6 +97,11 @@ pub async fn fallback(uri: Uri) -> impl IntoResponse {
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from("Invalid path"))
             .expect("build response");
+    }
+
+    // 直接打 `/index.html` 也是控制台本身，得和 SPA 兜底一样带上 CSP，不能当普通资源回。
+    if path == "index.html" {
+        return serve_index();
     }
 
     if let Some(content) = Asset::get(path) {
@@ -77,6 +131,7 @@ fn serve_index() -> Response<Body> {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONTENT_SECURITY_POLICY, INDEX_CSP.clone())
             .body(Body::from(content.data.into_owned()))
             .expect("build response"),
         None => Response::builder()
@@ -164,6 +219,16 @@ mod tests {
             redirected.headers().get(header::CONTENT_TYPE),
             Some(&header::HeaderValue::from_static("text/html; charset=utf-8"))
         );
+    }
+
+    /// 内联脚本的哈希与浏览器的算法一致：`<script>` 与 `</script>` 之间逐字节取，带 src 的跳过。
+    #[test]
+    fn inline_script_hashes_cover_only_inline_scripts() {
+        let html = "<head><script>\n  a()\n</script><script type=\"module\" src=\"/x.js\"></script></head>";
+        assert_eq!(inline_scripts(html).collect::<Vec<_>>(), vec!["\n  a()\n"]);
+        let csp = INDEX_CSP.to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
     }
 
     #[tokio::test]

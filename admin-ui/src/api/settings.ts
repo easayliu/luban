@@ -5,8 +5,6 @@ export interface Settings {
   api_key: string | null
   /** 是否设了 `LUBAN_API_KEY`。 */
   env_managed: boolean
-  /** 转发是否要求带接入 Key：设了环境变量那把、库里有 Key，或者配过（全删了也算）。 */
-  api_keys_required: boolean
   /** 设备绑定有效期（秒）；0 表示永不过期。 */
   device_binding_ttl_secs: number
   /** 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。0 = 永久保留。 */

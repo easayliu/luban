@@ -70,10 +70,6 @@ pub(super) struct KeyAccessCache {
 /// [`KeyAccessCache`] 里一条的有效期。
 const KEY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 配过接入 Key 的标记：有了它，转发就恒要求带 Key——哪怕后来把 Key 全删了，也只是谁都
-/// 进不来，而不是退回「没配 Key 就不校验」。
-pub const API_KEYS_CONFIGURED: &str = "api_keys_configured";
-
 /// 默认分组的名称（建库时）。
 pub(super) const DEFAULT_GROUP_NAME: &str = "默认分组";
 
@@ -475,44 +471,46 @@ impl CredentialStore {
             .collect()
     }
 
-    /// 新建一把接入 Key，回它的 id。`group_ids` 按优先顺序，空 = 用全部号。建过一把之后
-    /// 转发就恒要求带 Key（[`API_KEYS_CONFIGURED`]）。
-    ///
-    /// 标记与 Key 在同一个事务里落库（旧版是建完 Key 再单独写设置），提交后再同步内存镜像。
+    /// 新建一把接入 Key，回它的 id。`group_ids` 按优先顺序，空 = 用全部号。
     pub async fn create_api_key(
         &self,
         label: &str,
         key: &str,
         group_ids: &[i64],
     ) -> Result<std::result::Result<i64, GroupError>> {
-        let group_ids = dedup_ordered(group_ids);
+        self.insert_api_key(label, key, false, group_ids.is_empty(), group_ids).await
+    }
+
+    /// 按给定的停用状态与范围新建一把 Key，全在一个事务里（迁移导入用：停用的 Key 不能先以
+    /// 启用状态落库再改）。`all_groups` 为假时只限 `group_ids`，空列表就是一个号都不能用。
+    pub async fn insert_api_key(
+        &self,
+        label: &str,
+        key: &str,
+        disabled: bool,
+        all_groups: bool,
+        group_ids: &[i64],
+    ) -> Result<std::result::Result<i64, GroupError>> {
+        let group_ids = if all_groups { Vec::new() } else { dedup_ordered(group_ids) };
         let mut tx = self.begin_write().await?;
         if !groups_exist(&mut tx, &group_ids).await? {
             return Ok(Err(GroupError::UnknownGroup));
         }
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix, all_groups) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO api_keys (label, key_hash, key_sealed, key_prefix, all_groups, disabled) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(label)
         .bind(key_hash(key))
         .bind(seal(key))
         .bind(key_prefix(key))
-        .bind(group_ids.is_empty() as i64)
+        .bind(all_groups as i64)
+        .bind(disabled as i64)
         .fetch_one(&mut *tx)
         .await
         .context("this API key already exists")?;
         write_key_groups(&mut tx, id, &group_ids).await?;
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ($1, '1') \
-             ON CONFLICT (key) DO UPDATE SET value = '1'",
-        )
-        .bind(API_KEYS_CONFIGURED)
-        .execute(&mut *tx)
-        .await?;
         self.commit_invalidating_keys(tx).await?;
-        // 设置在内存里有一份镜像（见 `CredentialStore::settings`），落库成功后同步。
-        self.settings.write().insert(API_KEYS_CONFIGURED.to_string(), "1".to_string());
         Ok(Ok(id))
     }
 
@@ -584,18 +582,6 @@ impl CredentialStore {
                 .fetch_optional(&self.pool)
                 .await?;
         sealed.map(|s| super::open(&s)).transpose()
-    }
-
-    /// 转发要不要求带接入 Key：库里有 Key，或者配过（[`API_KEYS_CONFIGURED`]）。从没配过、
-    /// 环境变量也没设时才不校验来访身份（与老版本「没配接入 Key 就不校验」一致）；配过之后
-    /// 把 Key 全删了也不会因此敞开。
-    pub async fn api_keys_required(&self) -> Result<bool> {
-        if self.get_setting(API_KEYS_CONFIGURED)?.is_some() {
-            return Ok(true);
-        }
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM api_keys)")
-            .fetch_one(&self.pool)
-            .await?)
     }
 
     /// 按来访带的 Key 明文认身份：启用中的 Key 才算，回它能用的分组（按优先顺序）。
@@ -771,17 +757,15 @@ mod tests {
         assert_eq!(store.list_api_keys().await.unwrap()[0].id, key);
     }
 
-    /// 停用的 Key 认不出来；库里有 Key 时 `has_api_keys` 为真（停用的也算，不会因此变成放行）。
+    /// 停用的 Key 认不出来；明文以密文落库。
     #[sqlx::test]
     async fn disabled_api_keys_are_rejected(pool: PgPool) {
         let store = CredentialStore::for_test(pool).await;
-        assert!(!store.api_keys_required().await.unwrap());
         let id = store.create_api_key("k", "key-x", &[]).await.unwrap().unwrap();
         assert!(store.api_key_access("key-x").await.unwrap().is_some());
         assert!(store.api_key_access("key-x").await.unwrap().is_some(), "第二次走缓存");
         store.update_api_key(id, "k", true, &[], None).await.unwrap().unwrap();
         assert!(store.api_key_access("key-x").await.unwrap().is_none());
-        assert!(store.api_keys_required().await.unwrap());
         assert_eq!(store.reveal_api_key(id).await.unwrap().as_deref(), Some("key-x"));
         let sealed: String = sqlx::query_scalar("SELECT key_sealed FROM api_keys WHERE id = $1")
             .bind(id)
@@ -789,20 +773,6 @@ mod tests {
             .await
             .unwrap();
         assert!(sealed.starts_with("enc1:"), "库里存的是密文");
-    }
-
-    /// 配过接入 Key 之后把 Key 全删了，转发仍要求带 Key（不退回「不校验」）。
-    #[sqlx::test]
-    async fn deleting_every_key_keeps_auth_required(pool: PgPool) {
-        let store = CredentialStore::for_test(pool.clone()).await;
-        assert!(!store.api_keys_required().await.unwrap(), "从没配过：不校验");
-        let id = store.create_api_key("k", "key-only", &[]).await.unwrap().unwrap();
-        store.delete_api_key(id).await.unwrap();
-        assert!(store.api_keys_required().await.unwrap(), "删光了也仍要求带 Key");
-        assert!(store.api_key_access("key-only").await.unwrap().is_none());
-        // 标记落了库：重启（重新读设置）之后照样要求。
-        let reopened = CredentialStore::for_test(pool).await;
-        assert!(reopened.api_keys_required().await.unwrap());
     }
 
     /// Key 唯一绑定的分组被删掉：这把 Key 变成一个号都不能用，而不是全部号；显式不绑分组的

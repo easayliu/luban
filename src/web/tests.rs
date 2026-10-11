@@ -939,6 +939,9 @@ async fn member_proxies_cannot_point_inside() {
         "64:ff9b::a00:5",
         "64:ff9b:1::a9fe:a9fe",
         "2002:7f00:1::",
+        "192.0.0.8",
+        "240.0.0.1",
+        "fec0::1",
     ] {
         assert!(is_internal_ip(ip.parse().unwrap()), "{ip} 该算内网");
     }
@@ -949,6 +952,8 @@ async fn member_proxies_cannot_point_inside() {
         "100.128.0.1",
         "64:ff9b::808:808",
         "2002:808:808::",
+        "192.0.2.1",
+        "198.18.0.1",
     ] {
         assert!(!is_internal_ip(ip.parse().unwrap()), "{ip} 不该算内网");
     }
@@ -1026,4 +1031,96 @@ async fn agents_list_their_team_read_only(pool: sqlx::PgPool) {
     assert_eq!(store.credential_ids_of_team(agent.id).await.unwrap(), ids[..2].to_vec());
     assert!(store.credential_in_team(ids[1], agent.id).await.unwrap());
     assert!(!store.credential_in_team(ids[2], agent.id).await.unwrap());
+}
+
+/// 安全响应头只给管理面（接口、页面、静态资源）加，页面另带 CSP；`/v1/*` 原样回上游的头。
+#[sqlx::test]
+async fn security_headers_cover_the_console_but_not_forwarding(pool: sqlx::PgPool) {
+    use tower::ServiceExt;
+    let store = Arc::new(CredentialStore::for_test(pool).await);
+    let app = router(AppState::for_test(store));
+    let get = |uri: &str| {
+        axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()
+    };
+    for uri in ["/api/auth/state", "/", "/accounts/1", "/missing.js"] {
+        let resp = app.clone().oneshot(get(uri)).await.unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY", "{uri}");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff", "{uri}");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer", "{uri}");
+    }
+    // 控制台页面的每个入口都带 CSP：根路径、SPA 兜底，以及直接打 `/index.html`。
+    for uri in ["/", "/accounts/1", "/index.html"] {
+        let page = app.clone().oneshot(get(uri)).await.unwrap();
+        let csp = page.headers().get(header::CONTENT_SECURITY_POLICY);
+        let csp = csp.unwrap_or_else(|| panic!("{uri} 没带 CSP")).to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+    }
+
+    let fwd = app.oneshot(get("/v1/models")).await.unwrap();
+    assert_eq!(fwd.status(), StatusCode::UNAUTHORIZED, "不带 Key 的转发被拒");
+    assert!(fwd.headers().get(header::X_FRAME_OPTIONS).is_none());
+}
+
+/// 一个假「HTTP 代理」：收下一条请求，原样回 `head` 再按 `body` 发体（`None` = 发完头就挂住）。
+async fn fake_proxy(head: String, body: Option<Vec<u8>>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (head, body) = (head.clone(), body.clone());
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                match body {
+                    Some(b) => {
+                        let _ = sock.write_all(&b).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            });
+        }
+    });
+    port
+}
+
+/// 200 JSON 响应头；`len` 为 None 时不带长度，体读到断开为止。
+fn json_head(len: Option<usize>) -> String {
+    let len = len.map(|n| format!("content-length: {n}\r\n")).unwrap_or_default();
+    format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{len}\r\n")
+}
+
+/// 测试代理：失败时不把响应体原样带回前端，体有上限，超时管到读完体为止。
+#[tokio::test]
+async fn proxy_probe_bounds_and_hides_the_response() {
+    let timeout = std::time::Duration::from_secs(2);
+    let probe = |port: u16| async move {
+        let client =
+            crate::clients::upstream_client(Some(&format!("http://127.0.0.1:{port}"))).unwrap();
+        probe_proxy(&client, timeout).await
+    };
+
+    // 代理被指到一个内网服务上：那个服务的 JSON 不该原样回给前端。
+    let leak = br#"{"message":"do-not-leak","query":"10.0.0.9"}"#.to_vec();
+    let port = fake_proxy(json_head(Some(leak.len())), Some(leak)).await;
+    let r = probe(port).await;
+    assert!(!r.ok);
+    let err = r.error.clone().unwrap();
+    assert!(!err.contains("do-not-leak"), "{err}");
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(!json.to_string().contains("10.0.0.9"), "没成功的回包里的字段一个都不带回去：{json}");
+
+    // 超大的体：读到上限就停。
+    let port = fake_proxy(json_head(None), Some(vec![b' '; 1024 * 1024])).await;
+    let r = probe(port).await;
+    assert!(r.error.unwrap().contains("exceeds"));
+
+    // 发完头就挂住的慢流：照样在 timeout 内收场。
+    let port = fake_proxy(json_head(Some(100)), None).await;
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), probe(port)).await.unwrap();
+    assert!(r.error.unwrap().contains("timed out"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

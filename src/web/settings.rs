@@ -10,8 +10,6 @@ pub(super) struct SettingsResp {
     api_key: Option<String>,
     /// 是否设了 `LUBAN_API_KEY` / `--api-key`。
     env_managed: bool,
-    /// 转发是否要求带接入 Key：设了环境变量那把、库里有 Key，或者配过（全删了也算）。
-    api_keys_required: bool,
     /// 设备绑定有效期（秒）；0 表示永不过期。
     device_binding_ttl_secs: i64,
     /// 软绑定保留期（秒）：超过有效期的绑定不再占名额，但这段时间内设备回来仍优先回原号。
@@ -262,7 +260,6 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
         return SettingsResp {
             api_key: Some(k.to_string()),
             env_managed: true,
-            api_keys_required: true,
             device_binding_ttl_secs,
             device_binding_retention_secs,
             session_binding_ttl_secs,
@@ -298,7 +295,6 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
     SettingsResp {
         api_key,
         env_managed: false,
-        api_keys_required: state.store.api_keys_required().await.unwrap_or(true),
         device_binding_ttl_secs,
         device_binding_retention_secs,
         session_binding_ttl_secs,

@@ -36,6 +36,7 @@ pub const DEPLOYMENT_ONLY_KEYS: &[&str] = &[
     VIEWER_ENV_PASSWORD_HASH,
     VIEWER_ENV_PASSWORD_VERSION,
     "billing_backfilled",
+    // 旧版「配过接入 Key」的标记，已不再读写；老库与老导出文件里还有，照旧不随迁移走。
     "api_keys_configured",
     "secret_key_check",
     "secret_scrub_pending",

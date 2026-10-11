@@ -65,9 +65,9 @@ use super::upstream::{
     upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
-    EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_REPLY,
-    REWRITE_REFUSAL_REPLAY, RequestLogState, client_access, client_request_id, error_response,
-    header_opt, inbound_beta_list, log_early_upstream_failure, rate_limit_response,
+    EarlyUpstreamFailure, MAX_BODY_BYTES, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY,
+    REWRITE_PROBE_REPLY, REWRITE_REFUSAL_REPLAY, RequestLogState, client_access, client_request_id,
+    error_response, header_opt, inbound_beta_list, log_early_upstream_failure, rate_limit_response,
     request_max_tokens, request_model, request_speed,
 };
 
@@ -104,7 +104,7 @@ pub(super) async fn handle_inner(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
     request_id: &str,
     // 流水归属，见 [`RequestLogState`]：建 [`ReqLog`] 或早退路径就地写流水时置 `logged`，
     // 解析完体放下 `parsed`；仍没人写的 4xx/5xx 由 [`handle`] 按本地拒绝补一条。

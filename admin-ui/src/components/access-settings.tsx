@@ -172,7 +172,7 @@ export function AccessSettingsContent() {
           </InputGroup>
         </Field>
 
-        <ApiKeysSettings envKey={envKey} required={data?.api_keys_required ?? true} />
+        <ApiKeysSettings envKey={envKey} />
 
         <Field className="p-4 sm:p-5">
           <FieldLabel>{t('Claude Code 接入片段', 'Claude Code setup snippet')}</FieldLabel>

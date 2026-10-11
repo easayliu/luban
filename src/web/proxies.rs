@@ -123,6 +123,11 @@ pub(super) fn is_internal_ip(ip: std::net::IpAddr) -> bool {
                 || a == 0
                 // CGNAT 100.64.0.0/10：云上常拿它做内网（含部分厂商的元数据服务）。
                 || (a == 100 && (b & 0xc0) == 64)
+                // IETF 协议分配 192.0.0.0/24、保留 240.0.0.0/4：公网上不会有合法代理落在这两段。
+                // 198.18.0.0/15 刻意不拦：Clash/Surge 的 fake-ip 把所有域名都解析到这一段，
+                // 跑在这种机器上的 luban 拦了它，非 admin 的域名代理就一条都用不了。
+                || (a == 192 && b == 0 && v4.octets()[2] == 0)
+                || a >= 240
         }
         IpAddr::V6(v6) => {
             let seg = v6.segments();
@@ -144,6 +149,7 @@ pub(super) fn is_internal_ip(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
                 || (seg[0] & 0xffc0) == 0xfe80 // 链路本地 fe80::/10
+                || (seg[0] & 0xffc0) == 0xfec0 // 已废弃的站点本地 fec0::/10，老网络里仍当内网用
         }
     }
 }
@@ -489,49 +495,48 @@ pub(super) const PROXY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::
 
 /// 经 `client`（已配好代理）打一次 ip-api.com，看代理通不通。「测试代理」按钮与上号 Key
 /// 自动分配代理共用这一份判据。
+///
+/// `timeout` 管到读完响应体为止，体最多读 [`PROXY_TEST_MAX_BODY`]：代理是用户填的，它完全
+/// 可以回一个不停的慢流或者超大的体。响应里的内容也只在 ip-api 报成功时才回给前端，失败只回
+/// 状态码：代理域名可以事后改解析到内网（DNS rebinding，建连时不拦），对方服务回的任何字段
+/// 原样带回去，就是一条把内网响应读出来的路。
 pub(super) async fn probe_proxy(
     client: &wreq::Client,
     timeout: std::time::Duration,
 ) -> TestProxyResult {
     let started = std::time::Instant::now();
-    let resp = match tokio::time::timeout(
-        timeout,
-        client
+    let failed = |error: String| TestProxyResult {
+        ok: false,
+        ip: None,
+        country: None,
+        city: None,
+        region: None,
+        org: None,
+        latency_ms: started.elapsed().as_millis(),
+        error: Some(error),
+    };
+    let fetched = tokio::time::timeout(timeout, async {
+        let resp = client
             .get("http://ip-api.com/json/?fields=query,country,regionName,city,org,status")
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return TestProxyResult {
-                ok: false,
-                ip: None,
-                country: None,
-                city: None,
-                region: None,
-                org: None,
-                latency_ms: started.elapsed().as_millis(),
-                error: Some(format!("{e:#}")),
-            };
-        }
-        Err(_) => {
-            return TestProxyResult {
-                ok: false,
-                ip: None,
-                country: None,
-                city: None,
-                region: None,
-                org: None,
-                latency_ms: started.elapsed().as_millis(),
-                error: Some(format!("proxy test timed out ({}s)", timeout.as_secs())),
-            };
-        }
+            .send()
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let status = resp.status();
+        let body = read_capped(resp, PROXY_TEST_MAX_BODY).await?;
+        Ok::<_, String>((status, body))
+    })
+    .await;
+    let (status, body) = match fetched {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return failed(e),
+        Err(_) => return failed(format!("proxy test timed out ({}s)", timeout.as_secs())),
     };
     let latency_ms = started.elapsed().as_millis();
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let ok = body.get("status").and_then(|s| s.as_str()) == Some("success");
-    let str_field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let str_field =
+        |k: &str| body.get(k).and_then(|v| v.as_str()).filter(|_| ok).map(str::to_string);
+    let error = (!ok).then(|| format!("the IP lookup did not succeed (HTTP {status})"));
     TestProxyResult {
         ok,
         ip: str_field("query"),
@@ -540,8 +545,26 @@ pub(super) async fn probe_proxy(
         region: str_field("regionName"),
         org: str_field("org"),
         latency_ms,
-        error: if ok { None } else { Some(body.to_string()) },
+        error,
     }
+}
+
+/// 测试代理时响应体的上限。ip-api 的回包两百来字节，留足余量。
+const PROXY_TEST_MAX_BODY: usize = 16 * 1024;
+
+/// 读响应体，超过 `max` 字节就停、报错，不攒满。
+async fn read_capped(resp: wreq::Response, max: usize) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("{e:#}"))?;
+        if buf.len() + chunk.len() > max {
+            return Err(format!("the IP lookup response exceeds {} KB", max / 1024));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 #[derive(Deserialize)]
