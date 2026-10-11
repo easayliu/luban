@@ -555,7 +555,7 @@ pub(super) async fn set_proxies(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Json(req): Json<SetProxiesReq>,
-) -> Result<Json<Vec<CredentialView>>, ApiError> {
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     check_ids(&req.ids)?;
     let proxy = match req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {

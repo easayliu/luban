@@ -74,7 +74,7 @@ type Pending =
 /**
  * 成员管理：管理员管全部代理和用户，代理只管自己的下属用户。
  *
- * 代理看不到下属的号，这里也就不出现号数；停用代理会连带停用它名下的用户（登录不了、名下的号
+ * 停用代理会连带停用它名下的用户（登录不了、名下的号
  * 不接流量）。删除前要先清空：代理名下还有用户、或账号名下还有号时后端拒绝。
  */
 export function UsersPage({
@@ -150,10 +150,10 @@ export function UsersPage({
                   <Hint
                     label={isAdmin
                       ? t(
-                          '为代理与用户创建控制台登录。账号归添加者所有，代理看不到下属用户的账号。',
-                          'Create console sign-ins for agents and users. Accounts belong to the member who added them; agents cannot see their users’ accounts.',
+                          '为代理与用户创建控制台登录。账号归添加者所有。',
+                          'Create console sign-ins for agents and users. Accounts belong to the member who added them.',
                         )
-                      : t('为你创建下属用户。下属用户添加的账号对你不可见。', 'Create users under you. Accounts they add are not visible to you.')}
+                      : t('为你创建下属用户。', 'Create users under you.')}
                   >
                     <Badge variant="secondary">
                       {isAdmin
@@ -203,7 +203,7 @@ export function UsersPage({
                     <TableHead>{t('用户名', 'Username')}</TableHead>
                     {isAdmin && <TableHead>{t('角色', 'Role')}</TableHead>}
                     {isAdmin && <TableHead>{t('上级', 'Parent')}</TableHead>}
-                    {isAdmin && <TableHead className="text-right">{t('账号数', 'Accounts')}</TableHead>}
+                    <TableHead className="text-right">{t('账号数', 'Accounts')}</TableHead>
                     {isAdmin && <TableHead className="text-right">{t('下属用户', 'Users')}</TableHead>}
                     <TableHead>{t('状态', 'Status')}</TableHead>
                     <TableHead className="whitespace-nowrap">{t('创建时间', 'Created')}</TableHead>
@@ -220,7 +220,7 @@ export function UsersPage({
                         </TableCell>
                       )}
                       {isAdmin && <TableCell className="text-muted-foreground">{user.parent_username ?? '—'}</TableCell>}
-                      {isAdmin && <TableCell className="text-right tabular-nums">{user.credential_count ?? 0}</TableCell>}
+                      <TableCell className="text-right tabular-nums">{user.credential_count}</TableCell>
                       {isAdmin && (
                         <TableCell className="text-right tabular-nums">
                           {user.role === 'agent' ? user.child_count : '—'}

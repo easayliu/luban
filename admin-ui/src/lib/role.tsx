@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { createContext, useContext, useEffect, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getMe, type Me, type MemberCaps, type Role } from '@/api/auth'
 import { ROLE_KEY, getToken } from '@/api/client'
@@ -62,9 +62,23 @@ export function useRole(): Role | null {
  * 等身份查回来再放开。
  */
 export function useReadOnly(): boolean {
+  const forced = useContext(ForcedReadOnly)
   const role = useRole()
-  return role === null || role === 'viewer'
+  return forced || role === null || role === 'viewer'
 }
+
+const ForcedReadOnly = createContext(false)
+
+/**
+ * 把一棵子树按只读算（[useReadOnly] 在里面一律为真）：号的 `editable` 为假（代理看下属用户的号）
+ * 时包在那一行 / 那张卡 / 详情页外面，菜单、开关、对话框里的写按钮跟着藏掉，不必逐个控件传参。
+ */
+export function ReadOnlyScope({ readOnly, children }: { readOnly: boolean; children: ReactNode }) {
+  const outer = useContext(ForcedReadOnly)
+  return <ForcedReadOnly.Provider value={outer || readOnly}>{children}</ForcedReadOnly.Provider>
+}
+
+
 
 /** 管理员：系统设置、接入 Key 这类全站的东西只有它能动。 */
 export function useIsAdmin(): boolean {

@@ -28,7 +28,7 @@ import {
 } from '@/api/credentials'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
-import { useMemberCaps, useReadOnly } from '@/lib/role'
+import { ReadOnlyScope, useMemberCaps, useReadOnly } from '@/lib/role'
 import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
@@ -188,7 +188,12 @@ export function CredentialDetailPage({
   let content: ReactNode
   if (cred) {
     // 按 id 重挂：切到另一个账号时，页签、对话框、草稿不能串过去。
-    content = <CredentialDetail key={cred.id} cred={cred} onDeleted={onBack} />
+    // 代理打开下属用户的号：整页只读，见 `Credential.editable`。
+    content = (
+      <ReadOnlyScope readOnly={!cred.editable}>
+        <CredentialDetail key={cred.id} cred={cred} onDeleted={onBack} />
+      </ReadOnlyScope>
+    )
   } else if (isLoading && !credentials) {
     content = <DetailSkeleton />
   } else if (error && !credentials) {

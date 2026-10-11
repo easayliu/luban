@@ -3,8 +3,9 @@
 //!
 //! 可见范围按身份收窄（handler 里判，中间件只放行登录的人）：
 //! - **用户**：只看自己的号，按号 / 模型 / 分组 / 日拆；
-//! - **代理**：默认看自己与名下每个用户的人头汇总（按人 / 按日）。看自己时可拆到号、模型、
-//!   分组；看下属**只到人这一级**——总数与按日走势，不拆号、模型与分组（代理看不到下属的号）；
+//! - **代理**：默认看自己与名下每个用户的合计，按人 / 号 / 模型 / 分组 / 日拆；也可以只看
+//!   自己或某一个下属，拆法同上（不再按人拆）。代理在账号池里本来就看得到下属的号（只读），
+//!   费用与它同口径；
 //! - **admin 与访客**：全部，按人 / 号 / 模型 / 接入 Key / 分组 / 日拆，可按任意一维筛选。
 //!
 //! 接入 Key 是 admin 的东西，按 Key 拆与按 Key 筛只给 admin 与访客。
@@ -81,32 +82,15 @@ async fn scope_owners(
                 return Err(forbidden_view());
             }
             let children = state.store.child_user_ids(actor.id).await.map_err(internal)?;
+            // 号、分组、模型的筛选与号主范围是「且」的关系，筛到范围外的号只会是空结果。
             match q.owner_id {
                 None => {
-                    // 自己与下属合在一起时只能按人或按日看：再往下拆就会把下属的号与模型带出来。
-                    if !matches!(q.by, D::Owner | D::Day)
-                        || q.cred_id.is_some()
-                        || q.group_id.is_some()
-                        || q.model.is_some()
-                    {
-                        return Err(forbidden_view());
-                    }
                     let mut owners = children;
                     owners.push(actor.id);
                     Ok(Some(owners))
                 }
-                Some(o) if o == actor.id => {
+                Some(o) if o == actor.id || children.contains(&o) => {
                     if matches!(q.by, D::Owner) {
-                        return Err(forbidden_view());
-                    }
-                    Ok(Some(vec![o]))
-                }
-                Some(o) if children.contains(&o) => {
-                    if !matches!(q.by, D::Day)
-                        || q.cred_id.is_some()
-                        || q.group_id.is_some()
-                        || q.model.is_some()
-                    {
                         return Err(forbidden_view());
                     }
                     Ok(Some(vec![o]))

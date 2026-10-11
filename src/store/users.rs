@@ -86,8 +86,8 @@ pub struct UserListItem {
     #[serde(flatten)]
     pub user: User,
     pub parent_username: Option<String>,
-    /// 名下的号数。只给 admin 看（代理看不到下属的号，连个数也不给）。
-    pub credential_count: Option<i64>,
+    /// 名下的号数。
+    pub credential_count: i64,
     /// 名下的下属用户数（只有代理有）。
     pub child_count: i64,
 }
@@ -138,6 +138,10 @@ impl Scope {
         }
     }
 }
+
+/// 号落在代理 `$1` 本人或其下属用户名下（拼在 `credentials` 的 WHERE 里）。
+pub(super) const TEAM_OWNED: &str =
+    "owner_id IN (SELECT id FROM users WHERE id = $1 OR parent_id = $1)";
 
 /// 认会话时取回的一行：账号、签发时的密码指纹、当前存的密码哈希、剩余有效期（秒）。
 pub struct SessionRow {
@@ -415,12 +419,8 @@ impl CredentialStore {
     }
 
     /// 列出账号。`parent` 为 None 时列出全部代理和用户（admin 用），为 `Some(id)` 时只列
-    /// 该代理名下的用户。`with_cred_count` 决定带不带名下号数（只给 admin）。
-    pub async fn list_users(
-        &self,
-        parent: Option<i64>,
-        with_cred_count: bool,
-    ) -> Result<Vec<UserListItem>> {
+    /// 该代理名下的用户。都带名下号数。
+    pub async fn list_users(&self, parent: Option<i64>) -> Result<Vec<UserListItem>> {
         let filter = match parent {
             Some(_) => "u.parent_id = $1 AND u.role = 'user'",
             None => "u.role IN ('agent', 'user') AND $1::BIGINT IS NULL",
@@ -439,9 +439,7 @@ impl CredentialStore {
                 Ok(UserListItem {
                     user: row_to_user(row)?,
                     parent_username: row.try_get(9)?,
-                    credential_count: with_cred_count
-                        .then(|| row.try_get::<i64, _>(10))
-                        .transpose()?,
+                    credential_count: row.try_get(10)?,
                     child_count: row.try_get(11)?,
                 })
             })
@@ -738,6 +736,27 @@ impl CredentialStore {
             .bind(owner)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    /// 代理 `lead` 本人及下属用户名下全部号的 id（升序）。
+    pub async fn credential_ids_of_team(&self, lead: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT id FROM credentials WHERE {TEAM_OWNED} ORDER BY id"
+        )))
+        .bind(lead)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 号是不是在代理 `lead` 本人或下属用户名下。号不存在为 false。
+    pub async fn credential_in_team(&self, cred_id: i64, lead: i64) -> Result<bool> {
+        Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM credentials WHERE id = $2 AND {TEAM_OWNED})"
+        )))
+        .bind(lead)
+        .bind(cred_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// `ids` 里的号是不是**全都**存在且归 `owner`。

@@ -24,6 +24,7 @@ import {
   type CredentialPageSize,
   type CredentialViewMode,
 } from '@/components/credential-workspace'
+import { parseOwnerFilter, type CredentialOwnerFilter } from '@/components/credential-owner-filter'
 import { AddAccount } from '@/components/add-account'
 import { CredentialDetailPage } from '@/components/credential-detail-page'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
@@ -222,6 +223,13 @@ function App() {
     String,
     seed.get('tier'),
   )
+  const [owner, setOwner] = usePersisted<CredentialOwnerFilter>(
+    'owner',
+    'all',
+    parseOwnerFilter,
+    String,
+    seed.get('owner'),
+  )
   const [query, setQuery] = usePersisted('query', '', (raw) => raw, String, seed.get('q'))
   // 页码只认链接，不进 localStorage：下次打开该从第一页看起。
   const initialPage = Number(seed.get('page'))
@@ -237,6 +245,7 @@ function App() {
     if (query.trim()) params.set('q', query.trim())
     if (filter !== 'all') params.set('filter', filter)
     if (tier !== 'all') params.set('tier', tier)
+    if (owner !== 'all') params.set('owner', owner)
     if (sort !== 'priority') params.set('sort', sort)
     if (dir !== SORT_DIR_DEFAULT[sort]) params.set('dir', dir)
     if (pageSize !== CREDENTIAL_PAGE_SIZES[0]) params.set('size', String(pageSize))
@@ -245,7 +254,7 @@ function App() {
     const next = `${window.location.pathname}${window.location.search}#/?${params.toString()}`
     if (window.location.href.endsWith(`#/?${params.toString()}`)) return
     window.history.replaceState(null, '', next)
-  }, [query, filter, tier, sort, dir, view, page, pageSize, settingsRoute, mainRoute, accountRoute])
+  }, [query, filter, tier, owner, sort, dir, view, page, pageSize, settingsRoute, mainRoute, accountRoute])
   useEffect(() => {
     const syncRoute = () => {
       const next = readSettingsRoute()
@@ -551,6 +560,7 @@ function App() {
             query,
             filter,
             tier,
+            owner,
             sort,
             dir,
             view,
@@ -562,6 +572,7 @@ function App() {
             onQueryChange: setQuery,
             onFilterChange: setFilter,
             onTierChange: setTier,
+            onOwnerChange: setOwner,
             onSortChange: (key, nextDir) => {
               setSort(key)
               setDir(nextDir)

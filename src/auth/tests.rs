@@ -155,13 +155,32 @@ async fn members_are_scoped_to_their_own_things(pool: sqlx::PgPool) {
         s(Method::GET, "/api/export".into(), &u, String::new()).await,
         StatusCode::FORBIDDEN
     );
-    // 自己的号放行，别人的（下属的、admin 的）一律 404。
+    // 自己的号放行；下属的号代理只能读不能改；别的（admin 的、上级的、别的代理名下的）一律 404。
     assert_eq!(
         s(Method::POST, format!("/api/credentials/{mine}/label"), &a, "{}".into()).await,
         StatusCode::OK
     );
     assert_eq!(
         s(Method::GET, format!("/api/credentials/{theirs}/usage"), &a, String::new()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s(Method::POST, format!("/api/credentials/{theirs}/label"), &a, "{}".into()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s(Method::GET, format!("/api/credentials/{admins}/usage"), &a, String::new()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s(Method::GET, format!("/api/credentials/{mine}/usage"), &u, String::new()).await,
+        StatusCode::NOT_FOUND
+    );
+    let other_agent = create(&state, "agent2", UserRole::Agent, admin_id).await;
+    let other_user = create(&state, "user2", UserRole::User, other_agent).await;
+    let elsewhere = add_cred(&state, other_user, "r-elsewhere").await;
+    assert_eq!(
+        s(Method::GET, format!("/api/credentials/{elsewhere}/usage"), &a, String::new()).await,
         StatusCode::NOT_FOUND
     );
     assert_eq!(

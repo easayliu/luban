@@ -81,14 +81,15 @@ fn parent_error(e: anyhow::Error) -> ApiError {
     }
 }
 
-/// 列出账号：admin 看全部代理和用户（带名下号数），代理只看自己名下的用户（不带号数）。
+/// 列出账号：admin 看全部代理和用户，代理只看自己名下的用户，都带名下号数（代理只读看得到
+/// 下属的号，见 [`Actor::team_lead`]）。
 pub(super) async fn list_users(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<store::UserListItem>>, ApiError> {
     let list = match actor.role {
-        UserRole::Admin => state.store.list_users(None, true),
-        _ => state.store.list_users(Some(actor.id), false),
+        UserRole::Admin => state.store.list_users(None),
+        _ => state.store.list_users(Some(actor.id)),
     }
     .await
     .map_err(internal)?;

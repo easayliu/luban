@@ -1976,17 +1976,23 @@ export function AccountTierBadge({
 }
 
 /**
- * 号主：管理员与访客看全池时标出「这是谁上的号」。管理员自己的号不标（用户名固定为 admin），
- * 代理和用户的列表里只有自己的号，后端不给这个字段。
+ * 号旁要标的号主用户名：管理员与访客看全池、代理看下属的号时标出「这是谁上的号」。自己的号
+ * 后端不给名字；访客看到的管理员的号也不标（用户名固定为 admin）。
  */
+export function shownOwner(cred: Credential): string | null {
+  return cred.owner && cred.owner !== 'admin' ? cred.owner : null
+}
+
+/** 号主标签，见 [shownOwner]。 */
 export function CredentialOwner({ cred, className }: { cred: Credential; className?: string }) {
   const { t } = useI18n()
-  if (!cred.owner || cred.owner === 'admin') return null
+  const owner = shownOwner(cred)
+  if (!owner) return null
   return (
-    <Hint label={t(`所属成员：${cred.owner}`, `Owned by ${cred.owner}`)}>
+    <Hint label={t(`所属成员：${owner}`, `Owned by ${owner}`)}>
       <span className={cn('inline-flex min-w-0 items-center gap-1 text-muted-foreground', className)}>
         <UserIcon aria-hidden="true" className="size-3 shrink-0" />
-        <span className="truncate">{cred.owner}</span>
+        <span className="truncate">{owner}</span>
       </span>
     </Hint>
   )
@@ -2276,13 +2282,16 @@ export function proxyLabelParts(proxy: string): { scheme: string | null; host: s
  * - 不在池里的自定义地址 → 「自定义代理」。
  * 完整地址（脱敏）仍在 Tooltip 与出站代理对话框里。与代理池共用 `['proxies']` 缓存。
  */
-export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id'>) => string | null {
+export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id' | 'proxy_label'>) => string | null {
   const { t } = useI18n()
   const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
   const byId = useMemo(() => new Map((data ?? []).map((p) => [p.id, p])), [data])
-  return ({ proxy, proxy_id }) => {
+  return ({ proxy, proxy_id, proxy_label }) => {
     if (!proxy) return null
-    const saved = proxy_id == null ? undefined : byId.get(proxy_id)
+    // 自己的代理池里查不到时退回后端给的名称（代理看下属的号：那条在下属的池里）。
+    const saved = proxy_id == null
+      ? undefined
+      : byId.get(proxy_id) ?? (proxy_label == null ? undefined : { id: proxy_id, label: proxy_label })
     if (!saved) return t('自定义代理', 'Custom proxy')
     const name = saved.label.trim()
     const hostPort = proxyLabelParts(proxy).host

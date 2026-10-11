@@ -88,8 +88,8 @@ interface Focus {
  *
  * 可看的范围由后端按身份收窄，这里只决定给哪些拆分方式：
  * - 管理员 / 访客：按成员、账号、模型、接入 Key、分组、日；点某位成员下钻看其明细；
- * - 代理：默认按成员看自己与下属用户；点自己能拆到账号、模型、分组；点下属只看按日走势
- *   （代理看不到下属的账号）；
+ * - 代理：默认按成员看自己与下属用户，也能按账号、模型、分组、日拆整队；点自己或某个下属
+ *   下钻，拆法同上；
  * - 用户：只看自己，按账号、模型、分组、日。
  */
 export function BillingPage({
@@ -116,11 +116,10 @@ export function BillingPage({
       return focus ? ['cred', 'model', 'group', 'key', 'day'] : ['owner', 'cred', 'model', 'key', 'group', 'day']
     }
     if (role === 'agent') {
-      if (!focus) return ['owner', 'day']
-      return focus.id === me?.id ? ['cred', 'model', 'group', 'day'] : ['day']
+      return focus ? ['cred', 'model', 'group', 'day'] : ['owner', 'cred', 'model', 'group', 'day']
     }
     return ['cred', 'model', 'group', 'day']
-  }, [role, focus, me?.id])
+  }, [role, focus])
   const activeDim = dim && dims.includes(dim) ? dim : dims[0]
   const { from, to, days } = rangeOf(range)
 
@@ -268,7 +267,7 @@ export function BillingPage({
   const totalInput = total ? total.input_tokens + total.cache_write_tokens + total.cache_read_tokens : 0
   const hitRate = total ? cacheHitRate(totalInput, total.cache_read_tokens) : null
   const description = role === 'agent'
-    ? t('按官方 API 价格折算的等价费用，涵盖你本人与下属用户；下属用户仅显示汇总。', 'Equivalent cost at official API prices for you and your users; your users are shown as totals only.')
+    ? t('按官方 API 价格折算的等价费用，涵盖你本人与下属用户。', 'Equivalent cost at official API prices for you and your users.')
     : role === 'user'
       ? t('按官方 API 价格折算的等价费用，统计你添加的账号。', 'Equivalent cost at official API prices for the accounts you added.')
       : t('按官方 API 价格折算的等价费用。只计费，不扣费。', 'Equivalent cost at official API prices. Metered only; nothing is charged.')

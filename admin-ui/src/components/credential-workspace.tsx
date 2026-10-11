@@ -16,17 +16,20 @@ import {
   SmartphoneIcon,
   TimerIcon,
   TriangleAlertIcon,
+  UsersIcon,
   XIcon,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
 import { getBilling } from '@/api/billing'
+import { listUsers } from '@/api/users'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
 import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
+import { ownerFacets, type CredentialOwnerFilter } from '@/components/credential-owner-filter'
 import {
   SORTS,
   CREDENTIAL_CARD_GRID_CLASS,
@@ -74,7 +77,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
-import { useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
+import { ReadOnlyScope, useCanManageUsers, useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
 import { cacheHitRate, cn, displayCredentialLabel, formatPercent, formatUsd } from '@/lib/utils'
 
@@ -236,9 +239,12 @@ const SORT_GROUPS: readonly (readonly SortKey[])[] = [
 ]
 
 /** 下拉里的一项：名称靠左，计数靠右、弱化，不做染色。 */
-function FacetOption({ label, count }: { label: string; count: string }) {
+/** 能不能改由后端按权限给（`editable`）：代理的列表里下属的号只读。 */
+const owns = (credential: Credential) => credential.editable
+
+function FacetOption({ label, count, nested = false }: { label: string; count: string; nested?: boolean }) {
   return (
-    <span className="flex min-w-0 flex-1 items-center justify-between gap-4">
+    <span className={cn('flex min-w-0 flex-1 items-center justify-between gap-4', nested && 'ps-3')}>
       <span className="min-w-0 truncate">{label}</span>
       <span className="tnum text-xs text-muted-foreground">{count}</span>
     </span>
@@ -310,6 +316,7 @@ interface CredentialWorkspaceState {
   query: string
   filter: CredentialFilterKey
   tier: CredentialTierFilterKey
+  owner: CredentialOwnerFilter
   sort: SortKey
   dir: SortDir
   view: CredentialViewMode
@@ -322,6 +329,7 @@ interface CredentialWorkspaceActions {
   onQueryChange: (value: string) => void
   onFilterChange: (value: CredentialFilterKey) => void
   onTierChange: (value: CredentialTierFilterKey) => void
+  onOwnerChange: (value: CredentialOwnerFilter) => void
   onSortChange: (key: SortKey, dir: SortDir) => void
   onViewChange: (value: CredentialViewMode) => void
   onSelectedChange: (value: Set<number>) => void
@@ -376,6 +384,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     query,
     filter,
     tier,
+    owner,
     sort,
     dir,
     view,
@@ -537,9 +546,30 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     ?? t(...TIER_FILTERS[0].label)
   const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
     ?? t(...SORT_LABELS.priority)
+  // 成员筛选：管理员按代理（连同下属）或具体某人缩小，代理按本人或某个下属。它是「看谁的号」，
+  // 不是号的某种状态，所以概览各格与状态 / 套餐两个下拉的计数都跟着它走；名单只有管理员和代理
+  // 拉得到，访客按号上的号主平铺。
+  const canManageUsers = useCanManageUsers()
+  const usersQuery = useQuery({
+    queryKey: ['users'],
+    queryFn: listUsers,
+    enabled: canManageUsers && !!me.data && !me.isPlaceholderData,
+    staleTime: 60_000,
+  })
+  const ownerGroups = useMemo(
+    () => ownerFacets(pool, usersQuery.data, me.isPlaceholderData ? undefined : me.data, t),
+    [pool, usersQuery.data, me.data, me.isPlaceholderData, t],
+  )
+  // 选中的那一项不在下拉里了（人删了、号挪走了、名单还没拉回来）就按「全部」算，不留一个
+  // 看不见的条件把列表筛空。
+  const activeOwner = ownerGroups.flat().find((item) => item.value === owner)
+  const ownerValue = activeOwner?.value ?? 'all'
+  const activeOwnerLabel = activeOwner?.label ?? t('全部成员', 'All members')
   const evaluatedPool = useMemo(
-    () => pool.map((credential) => evaluateCredential(credential, now, language)),
-    [pool, now, language],
+    () => pool
+      .filter((credential) => !activeOwner || (credential.owner_id != null && activeOwner.owners.has(credential.owner_id)))
+      .map((credential) => evaluateCredential(credential, now, language)),
+    [pool, activeOwner, now, language],
   )
 
   const sorted = useMemo(() => {
@@ -559,9 +589,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     )
   }, [evaluatedPool, sort, dir, filter, tier, debouncedQuery, now, language])
 
-  // 「今日费用」那格的小字：名下各号累计费用之和（账号列表里本来就有，不必另查）。
+  // 「今日费用」那格的小字：名下各号累计费用之和（账号列表里本来就有，不必另查）。代理的列表里
+  // 混着下属的号，只加本人的，与「今日费用」同口径。
   const lifetimeCost = useMemo(
-    () => (credentials ?? []).reduce((sum, c) => sum + (c.cost_total ?? 0), 0),
+    () => (credentials ?? []).filter(owns).reduce((sum, c) => sum + (c.cost_total ?? 0), 0),
     [credentials],
   )
   const metrics = useMemo(() => {
@@ -681,12 +712,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
   const count = pool.length
   const total = sorted.length
+  // 能勾选、能批量改的：代理的列表里下属的号只读，不进勾选。
+  const editable = useMemo(() => sorted.filter(owns), [sorted])
   const enabledCount = metrics.filterCounts.enabled
   const schedulableCount = metrics.filterCounts.schedulable
   const attentionCount = metrics.filterCounts.attention
   const quotaRiskCount = metrics.filterCounts.nearLimit
   const fullDeviceCount = metrics.filterCounts.deviceFull
-  const filtering = filter !== 'all' || tier !== 'all' || debouncedQuery.trim() !== ''
+  const filtering = filter !== 'all' || tier !== 'all' || ownerValue !== 'all' || debouncedQuery.trim() !== ''
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
@@ -800,6 +833,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     actions.onPageChange(1)
     clearSelection()
   }
+  const changeOwner = (value: CredentialOwnerFilter) => {
+    actions.onOwnerChange(value)
+    actions.onPageChange(1)
+    clearSelection()
+  }
   // 下拉里字段与方向分开选：换字段时用该字段的默认方向，重选当前字段不翻转方向
   //（翻转是列表表头点击的交互，放进单选菜单里会让「点了已勾选的项」反而改掉排序）。
   const changeSortKey = (key: SortKey) => {
@@ -836,10 +874,10 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   // 不能还留在集合里被批量操作带上。列表没拉到之前不裁，免得加载中把勾选清空。
   useEffect(() => {
     if (!credentials || selected.size === 0) return
-    const visible = new Set(sorted.map((item) => item.id))
+    const visible = new Set(editable.map((item) => item.id))
     if ([...selected].every((id) => visible.has(id))) return
     onSelectedChangeRef.current(new Set([...selected].filter((id) => visible.has(id))))
-  }, [credentials, sorted, selected])
+  }, [credentials, editable, selected])
   // 套餐下拉按 TIER_GROUP_STARTS 切成几组，组间画分隔线。
   const tierGroups = useMemo(() => {
     const groups: { value: CredentialTierFilterKey; label: ReactNode }[][] = []
@@ -1000,7 +1038,30 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
             {/* 搜索与两个筛选是同一组「缩小范围」的控件，中间不加分隔线；排序与视图切换属于
                 「怎么展示」，在分隔线之后。与 GitHub / Linear 列表页的工具条排布一致。 */}
-            <ToolbarGroup className="grid min-w-0 grid-cols-3 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap">
+            <ToolbarGroup
+              className={cn(
+                'grid min-w-0 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap',
+                ownerGroups.length > 0 ? 'grid-cols-2 min-[24rem]:grid-cols-4' : 'grid-cols-3',
+              )}
+            >
+              {ownerGroups.length > 0 && (
+                <ToolbarMenuSelect
+                  active={ownerValue !== 'all'}
+                  ariaLabel={t(`成员：${activeOwnerLabel}`, `Member: ${activeOwnerLabel}`)}
+                  groups={[
+                    [{ value: 'all', label: <FacetOption label={t('全部成员', 'All members')} count={formatNumber(pool.length)} /> }],
+                    ...ownerGroups.map((items) => items.map((item) => ({
+                      value: item.value,
+                      label: <FacetOption label={item.label} count={formatNumber(item.count)} nested={item.nested} />,
+                    }))),
+                  ]}
+                  icon={UsersIcon}
+                  label={activeOwnerLabel}
+                  value={ownerValue}
+                  onChange={changeOwner}
+                />
+              )}
+
               <ToolbarMenuSelect
                 active={filter !== 'all'}
                 ariaLabel={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
@@ -1024,13 +1085,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 onChange={changeTier}
               />
 
-              {(filter !== 'all' || tier !== 'all') && (
+              {(filter !== 'all' || tier !== 'all' || ownerValue !== 'all') && (
                 <Button
                   variant="ghost"
                   className="text-muted-foreground max-sm:hidden"
                   onClick={() => {
                     changeFilter('all')
                     changeTier('all')
+                    changeOwner('all')
                   }}
                 >
                   {t('重置', 'Reset')}
@@ -1291,7 +1353,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           {!readOnly && count > 0 && selected.size > 0 && (
             <div className="relative">
               <BatchActionsBar
-                all={sorted}
+                all={editable}
                 selected={selected}
                 onSelectedChange={actions.onSelectedChange}
                 onClear={clearSelection}
@@ -1327,6 +1389,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       actions.onQueryChange('')
                       changeFilter('all')
                       changeTier('all')
+                      changeOwner('all')
                     }}
                   >
                     {t('清除筛选与搜索', 'Clear filters and search')}
@@ -1341,25 +1404,26 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             <Table variant="card" className="table-fixed">
               <TableCaption className="sr-only">{t('账号列表', 'Account list')}</TableCaption>
               <CredentialListHeader
-                selectable={!readOnly}
+                selectable={!readOnly && editable.length > 0}
                 sort={sort}
                 dir={dir}
                 onSortChange={changeSort}
-                allSelected={sorted.length > 0 && sorted.every((item) => selected.has(item.id))}
+                allSelected={editable.length > 0 && editable.every((item) => selected.has(item.id))}
                 onSelectAll={(checked) => actions.onSelectedChange(
-                  checked ? new Set(sorted.map((item) => item.id)) : new Set(),
+                  checked ? new Set(editable.map((item) => item.id)) : new Set(),
                 )}
               />
               <TableBody>
                 {pageItems.map((item) => (
-                  <CredentialRow
-                    key={item.id}
-                    cred={item}
-                    now={now}
-                    selectable={!readOnly}
-                    selected={selected.has(item.id)}
-                    onSelectedChange={toggleSelected}
-                  />
+                  <ReadOnlyScope key={item.id} readOnly={!owns(item)}>
+                    <CredentialRow
+                      cred={item}
+                      now={now}
+                      selectable={!readOnly && owns(item)}
+                      selected={selected.has(item.id)}
+                      onSelectedChange={toggleSelected}
+                    />
+                  </ReadOnlyScope>
                 ))}
               </TableBody>
             </Table>
@@ -1367,14 +1431,15 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             // 网格规则与加载骨架共用，见 CREDENTIAL_CARD_GRID_CLASS。
             <ul className={CREDENTIAL_CARD_GRID_CLASS}>
               {pageItems.map((item) => (
-                <CredentialCard
-                  key={item.id}
-                  cred={item}
-                  now={now}
-                  selectable={!readOnly}
-                  selected={selected.has(item.id)}
-                  onSelectedChange={toggleSelected}
-                />
+                <ReadOnlyScope key={item.id} readOnly={!owns(item)}>
+                  <CredentialCard
+                    cred={item}
+                    now={now}
+                    selectable={!readOnly && owns(item)}
+                    selected={selected.has(item.id)}
+                    onSelectedChange={toggleSelected}
+                  />
+                </ReadOnlyScope>
               ))}
             </ul>
           )}

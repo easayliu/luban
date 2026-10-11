@@ -54,8 +54,12 @@ pub(super) struct CredentialView {
     label: String,
     /// 号的主人（控制台账号 id）。
     owner_id: Option<i64>,
-    /// 主人的用户名：只有 admin / 访客的列表里填，代理和用户只看得到自己的号，用不着。
+    /// 主人的用户名：只给别人的号填（admin / 访客看全池，代理看下属的号）；自己的号不填，
+    /// 用户的列表里只有自己的号，一律不填。
     owner: Option<String>,
+    /// 当前身份能不能改这个号：admin 与号主能改；代理看下属的号、访客看全池都只读。前端据此
+    /// 藏写按钮，规则只在后端这一处判（与 `auth::check_owned` 同口径）。
+    editable: bool,
     /// 所在的号池分组（升序）。
     groups: Vec<i64>,
     tier: Option<String>,
@@ -120,6 +124,9 @@ pub(super) struct CredentialView {
     /// `proxy` 在代理池里对应那条的 id（按 URL 全等），不在池里或直连为 `None`。前端按它查
     /// 代理名称：访客拿到的 URL 已去掉密码，只差密码的两条代理打码后长得一样，按 URL 查会串位。
     pub(super) proxy_id: Option<i64>,
+    /// `proxy_id` 那条在代理池里的名称。只给代理看下属的号时填：那条在下属的池里，代理自己
+    /// 的 `/proxies` 查不到，前端按 id 认不出名称。
+    proxy_label: Option<String>,
     /// 脱敏后的 refresh_token（前缀 + 尾 4 位），仅用于界面区分。
     token_hint: String,
     /// 最新一次的订阅额度快照（无请求记录时为 None）。
@@ -175,6 +182,8 @@ impl CredentialView {
             label: c.label.clone(),
             owner_id: c.owner_id,
             owner: None,
+            // 构造它的除了列表都是改动接口（改完回一份新视图），能打进来的就是能改的人。
+            editable: true,
             groups: Vec::new(),
             tier: c.tier.clone(),
             org_type: c.org_type.clone(),
@@ -220,6 +229,7 @@ impl CredentialView {
             ban_reason: c.ban_reason.clone(),
             proxy: c.proxy.clone(),
             proxy_id: None,
+            proxy_label: None,
             token_hint: mask_token(&c.refresh_token),
             quota: None,
             last_used: None,
@@ -249,13 +259,33 @@ impl CredentialView {
         self
     }
 
-    /// 带上主人的用户名（只给 admin / 访客，`names` 为 None 时不填）。
+    /// 带上主人的用户名（`names` 为 None 时不填）。`me` 自己的号不填，见 [`Self::owner`]。
     pub(super) fn with_owner_name(
         mut self,
         names: Option<&std::collections::HashMap<i64, String>>,
+        me: i64,
     ) -> Self {
-        self.owner = names.zip(self.owner_id).and_then(|(n, id)| n.get(&id).cloned());
+        self.owner =
+            names.zip(self.owner_id.filter(|&id| id != me)).and_then(|(n, id)| n.get(&id).cloned());
         self
+    }
+
+    pub(super) fn with_editable(mut self, editable: bool) -> Self {
+        self.editable = editable;
+        self
+    }
+
+    /// 带上代理池里的名称，见 [`Self::proxy_label`]。
+    pub(super) fn with_proxy_label(
+        mut self,
+        labels: Option<&std::collections::HashMap<i64, String>>,
+    ) -> Self {
+        self.proxy_label = labels.zip(self.proxy_id).and_then(|(l, id)| l.get(&id).cloned());
+        self
+    }
+
+    pub(super) fn editable(&self) -> bool {
+        self.editable
     }
 
     pub(super) fn with_denials(mut self, denials: Vec<store::ModelDenial>) -> Self {

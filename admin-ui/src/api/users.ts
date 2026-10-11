@@ -15,8 +15,8 @@ export interface ConsoleUser {
   password_set: boolean
   created_at: number
   updated_at: number
-  /** 名下号数，只有管理员看得到（代理看不到下属的号）。 */
-  credential_count: number | null
+  /** 名下号数。 */
+  credential_count: number
   /** 名下下属用户数（只有代理有）。 */
   child_count: number
 }

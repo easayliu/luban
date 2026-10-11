@@ -28,6 +28,8 @@ import { Hint, TooltipProvider } from '@/components/ui/tooltip'
 import { LanguageProvider, parseLanguage, useI18n } from '@/lib/i18n'
 import { initTheme } from '@/lib/theme'
 import type { Credential, CredentialStats, CredentialStatsBucket, UsageLog, UsagePage } from '@/api/credentials'
+import type { Me } from '@/api/auth'
+import type { ConsoleUser } from '@/api/users'
 import './index.css'
 
 // 离线预览：覆盖正常、额度风险、冷却、封禁与停用，通过生产共用的 CredentialWorkspace
@@ -44,6 +46,7 @@ const banned: Credential = {
   label: 'burksupperclassmens946205@yahoo.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Max 5x',
   org_type: 'claude_max',
@@ -114,6 +117,7 @@ const normal: Credential = {
   label: 'robertsbeth812904@yahoo.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Max 5x',
   org_type: 'claude_max',
@@ -182,6 +186,7 @@ const overage: Credential = {
   label: 'design-system-overage@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Team Premium',
   org_type: 'claude_team',
@@ -248,6 +253,7 @@ const nearLimit: Credential = {
   label: 'quota-boundary-90-percent@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Pro',
   org_type: 'claude_pro',
@@ -315,6 +321,7 @@ const unknownOverage: Credential = {
   label: 'overage-window-needs-confirmation@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Max 5x',
   org_type: 'claude_max',
@@ -381,6 +388,7 @@ const only5hWindow: Credential = {
   label: 'single-window-no-7d@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Pro',
   org_type: 'claude_pro',
@@ -452,6 +460,7 @@ const overagePoolExhausted: Credential = {
   label: 'overage-pool-not-recorded@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Max 20x',
   org_type: 'claude_max',
@@ -521,6 +530,7 @@ const cooldown: Credential = {
   label: 'cooldown-without-quota@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: 'Free',
   org_type: 'claude_free',
@@ -582,6 +592,7 @@ const disabledHistoricalOverage: Credential = {
   label: 'disabled-historical-overage@example.com',
   owner_id: 1,
   owner: null,
+  editable: true,
   groups: [1],
   tier: null,
   org_type: null,
@@ -667,6 +678,47 @@ const PREVIEW_SETTINGS_SECTIONS: readonly SettingsSection[] = [
 const previewSettings: SettingsSection | null =
   PREVIEW_SETTINGS_SECTIONS.find((section) => section === previewSettingsParam) ?? null
 
+// 成员筛选：`?role=admin` / `?role=agent` 给各号分配号主，并灌入身份与成员名单；不带时照旧是
+// 单人号池，不出现成员下拉。代理那一档里有一半是下属的号，用来看只读的行与卡片。
+{
+  const role = previewParams.get('role')
+  const member = (id: number, username: string, roleName: 'agent' | 'user', parent: number, parentName: string): ConsoleUser => ({
+    id, username, role: roleName, parent_id: parent, parent_username: parentName, disabled: false, parent_disabled: false,
+    password_set: true, created_at: now - 30 * 86400, updated_at: now - 86400, credential_count: 0, child_count: 0,
+  })
+  const people: Record<'admin' | 'agent', { me: Me; users: ConsoleUser[]; owners: number[] }> = {
+    admin: {
+      me: { id: 1, username: 'admin', role: 'admin', admin_env_managed: false, viewer_configured: false, viewer_env_managed: false, member_caps: null },
+      users: [
+        member(2, 'east-agent', 'agent', 1, 'admin'),
+        member(3, 'zhang', 'user', 2, 'east-agent'),
+        member(4, 'li', 'user', 2, 'east-agent'),
+        member(5, 'south-agent', 'agent', 1, 'admin'),
+        member(6, 'wang', 'user', 5, 'south-agent'),
+        member(7, 'ops', 'user', 1, 'admin'),
+      ],
+      owners: [1, 2, 3, 3, 4, 5, 6, 7, 1],
+    },
+    agent: {
+      me: { id: 2, username: 'east-agent', role: 'agent', admin_env_managed: false, viewer_configured: false, viewer_env_managed: false, member_caps: null },
+      users: [member(3, 'zhang', 'user', 2, 'east-agent'), member(4, 'li', 'user', 2, 'east-agent')],
+      owners: [2, 3, 3, 4, 2, 3, 4, 2, 3],
+    },
+  }
+  const seed = role === 'admin' || role === 'agent' ? people[role] : null
+  if (seed) {
+    const names = new Map([[seed.me.id, seed.me.username], ...seed.users.map((u) => [u.id, u.username] as const)])
+    previewCredentials.forEach((cred, index) => {
+      cred.owner_id = seed.owners[index % seed.owners.length]
+      const mine = cred.owner_id === seed.me.id
+      cred.owner = mine ? null : (names.get(cred.owner_id) ?? null)
+      cred.editable = seed.me.role === 'admin' || mine
+    })
+    queryClient.setQueryData(['auth-me'], seed.me)
+    queryClient.setQueryData(['users'], seed.users)
+  }
+}
+
 function navigatePreview(search = '') {
   const next = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)
   const language = new URLSearchParams(window.location.search).get('lang')
@@ -741,6 +793,7 @@ function PreviewCredentialWorkspace() {
   const [tier, setTier] = React.useState<CredentialTierFilterKey>(
     (previewParams.get('tier') as CredentialTierFilterKey | null) ?? 'all',
   )
+  const [owner, setOwner] = React.useState(previewParams.get('owner') ?? 'all')
   const [sort, setSort] = React.useState<SortKey>('priority')
   const [dir, setDir] = React.useState<SortDir>('asc')
   const [view, setView] = React.useState<CredentialViewMode>(
@@ -763,6 +816,7 @@ function PreviewCredentialWorkspace() {
         query,
         filter,
         tier,
+        owner,
         sort,
         dir,
         view,
@@ -774,6 +828,7 @@ function PreviewCredentialWorkspace() {
         onQueryChange: setQuery,
         onFilterChange: setFilter,
         onTierChange: setTier,
+        onOwnerChange: setOwner,
         onSortChange: (key, nextDir) => {
           setSort(key)
           setDir(nextDir)

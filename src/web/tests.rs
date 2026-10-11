@@ -114,7 +114,7 @@ async fn credential_view_carries_the_exact_proxy_id(pool: sqlx::PgPool) {
     let admin = state.store.admin_user().await.unwrap();
     let views =
         list_credentials(State(state.clone()), Extension(Actor::from(admin))).await.unwrap().0;
-    let id_of = |id: i64| views.iter().find(|v| v.id == id).unwrap().proxy_id;
+    let id_of = |id: i64| views.iter().find(|v| v["id"] == id).unwrap()["proxy_id"].as_i64();
     assert_eq!(id_of(a.id), Some(pa.id));
     assert_eq!(id_of(b.id), Some(pb.id));
     assert_eq!(id_of(c.id), None, "不在池里的自定义地址");
@@ -607,8 +607,12 @@ async fn billing_scope_follows_the_hierarchy(pool: sqlx::PgPool) {
     let mut mine = vec![agent.id.to_string(), sub.id.to_string()];
     mine.sort();
     assert_eq!(owners(call(&agent, "owner", None).await.unwrap()), mine);
+    // 代理看整队或某个下属都能拆到号与模型（与账号池里只读看得到下属的号同口径），只是不按人拆单人。
+    assert_eq!(owners(call(&agent, "cred", Some(sub.id)).await.unwrap()).len(), 1);
+    assert_eq!(owners(call(&agent, "cred", None).await.unwrap()).len(), 2);
+    assert!(call(&agent, "model", None).await.is_ok());
     assert_eq!(
-        call(&agent, "cred", Some(sub.id)).await.err().map(|e| e.0),
+        call(&agent, "owner", Some(sub.id)).await.err().map(|e| e.0),
         Some(StatusCode::FORBIDDEN)
     );
     assert!(call(&agent, "day", Some(sub.id)).await.is_ok());
@@ -955,4 +959,71 @@ async fn member_proxies_cannot_point_inside() {
         assert!(check_proxy_target(&admin, url).await.is_ok(), "admin 不受限：{url}");
     }
     assert!(check_proxy_target(&member, "http://u:p@203.0.113.7:3128").await.is_ok());
+}
+
+/// 代理的账号列表连下属用户的号一起列、带号主用户名，别的代理名下的不列；用户只看自己的。
+/// 实时流量与列表同口径。
+#[sqlx::test]
+async fn agents_list_their_team_read_only(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = Actor::from(store.admin_user().await.unwrap());
+    let mk = |name: &'static str, role: UserRole, parent: i64| {
+        let store = store.clone();
+        async move {
+            let id = store.create_user(name, "x", role, parent).await.unwrap().unwrap().id;
+            Actor { id, username: name.into(), role }
+        }
+    };
+    let agent = mk("a1", UserRole::Agent, admin.id).await;
+    let user = mk("u1", UserRole::User, agent.id).await;
+    let other = mk("a2", UserRole::Agent, admin.id).await;
+    let stranger = mk("u2", UserRole::User, other.id).await;
+    let mut ids = Vec::new();
+    for (rt, owner) in [("ra", agent.id), ("ru", user.id), ("rs", stranger.id), ("rd", admin.id)] {
+        ids.push(store.insert(rt, None, "at", rt, u64::MAX, None, None, owner).await.unwrap().id);
+    }
+    // 下属的号配了带密码的出口代理：代理看到的打码，号主自己看到原样。
+    store.set_proxy(ids[1], Some("http://u1:secret@203.0.113.7:3128")).await.unwrap();
+    let sub_cred = ids[1];
+    let state = AppState::for_test(store.clone());
+    let proxy_of = |who: &Actor| {
+        let (state, who) = (state.clone(), who.clone());
+        async move {
+            let rows = list_credentials(State(state), Extension(who)).await.unwrap().0;
+            rows.into_iter().find(|v| v["id"] == sub_cred).unwrap()["proxy"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    assert!(!proxy_of(&agent).await.contains("secret"));
+    assert!(proxy_of(&user).await.contains("secret"));
+    let list = |who: &Actor| {
+        let (state, who) = (state.clone(), who.clone());
+        async move {
+            list_credentials(State(state), Extension(who))
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|v| {
+                    let v = serde_json::to_value(v).unwrap();
+                    (
+                        v["id"].as_i64().unwrap(),
+                        v["owner"].as_str().map(str::to_owned),
+                        v["editable"].as_bool().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        list(&agent).await,
+        vec![(ids[0], None, true), (ids[1], Some("u1".to_owned()), false)]
+    );
+    assert_eq!(list(&user).await, vec![(ids[1], None, true)]);
+    assert_eq!(list(&admin).await.len(), 4);
+    assert_eq!(store.credential_ids_of_team(agent.id).await.unwrap(), ids[..2].to_vec());
+    assert!(store.credential_in_team(ids[1], agent.id).await.unwrap());
+    assert!(!store.credential_in_team(ids[2], agent.id).await.unwrap());
 }

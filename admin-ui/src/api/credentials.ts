@@ -104,8 +104,13 @@ export interface Credential {
   extra_usage_enabled: boolean | null
   /** 号的主人（控制台账号 id）。 */
   owner_id: number | null
-  /** 主人的用户名：只有管理员与访客的列表里有，代理和用户看到的都是自己的号，为 null。 */
+  /** 主人的用户名：只给别人的号（管理员与访客看全池、代理看下属的号），自己的号为 null。 */
   owner: string | null
+  /**
+   * 当前身份能不能改这个号：管理员与号主能改；代理看下属的号、访客看全池都只读。后端按
+   * 权限判好给出，界面据此藏写按钮，不另推一遍规则。
+   */
+  editable: boolean
   priority: number
   disabled: boolean
   expires_in: number
@@ -142,11 +147,14 @@ export interface Credential {
    * 该账号专用的出站代理（`socks5://`/`http://` 等）；null 表示直连。
    *
    * 配了之后这个号的**全部**出站流量都走它——转发、token 刷新、profile、连通性测试。
-   * 后端对管理员不脱敏原样返回（访客拿到的已去掉密码）：串里可能带账号密码，但打了码就没法确认自己配的是哪一条。
+   * 后端对管理员与号主不脱敏原样返回（访客、代理看下属的号拿到的已去掉密码）：串里可能带账号密码，
+   * 但打了码就没法确认自己配的是哪一条。
    */
   proxy: string | null
   /** `proxy` 在代理池里对应那条的 id；不在池里或直连为 null。查代理名称用它，不要按 URL 查。 */
   proxy_id?: number | null
+  /** 那条在代理池里的名称：只在代理看下属的号时给（那条在下属的池里，代理自己的代理池里查不到）。 */
+  proxy_label?: string | null
   /** 所在的号池分组 id（升序）。 */
   groups: number[]
   token_hint: string

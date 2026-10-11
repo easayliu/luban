@@ -140,13 +140,22 @@ impl CredentialStore {
 
     /// 同 [`Self::list`]，只列 `scope` 看得到的号。
     pub async fn list_scoped(&self, scope: Scope) -> Result<Vec<Credential>> {
+        self.list_where("$1::BIGINT IS NULL OR owner_id = $1", scope.owner()).await
+    }
+
+    /// 代理 `lead` 本人及下属用户名下的号，排序同 [`Self::list_scoped`]。只读看用，见
+    /// `auth::Actor::team_lead`。
+    pub async fn list_team(&self, lead: i64) -> Result<Vec<Credential>> {
+        self.list_where(super::users::TEAM_OWNED, Some(lead)).await
+    }
+
+    async fn list_where(&self, cond: &str, bind: Option<i64>) -> Result<Vec<Credential>> {
         let mut conn = self.pool.acquire().await?;
         Self::resume_due(&mut conn).await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {COLS} FROM credentials WHERE $1::BIGINT IS NULL OR owner_id = $1 \
-             ORDER BY priority ASC, id ASC"
+            "SELECT {COLS} FROM credentials WHERE {cond} ORDER BY priority ASC, id ASC"
         )))
-        .bind(scope.owner())
+        .bind(bind)
         .fetch_all(&mut *conn)
         .await?;
         rows.iter().map(row_to_cred).collect()

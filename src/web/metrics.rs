@@ -4,14 +4,14 @@ use super::*;
 
 // ---------- 实时指标 ----------
 
-/// 此刻的两个实时数，见 [`get_metrics`]。admin 与访客是全池，代理和用户只算自己名下的号。
+/// 此刻的两个实时数，见 [`get_metrics`]。admin 与访客是全池，用户只算自己名下的号，代理连下属用户的号一起算（与账号列表同口径）。
 #[derive(Serialize)]
 pub(super) struct MetricsResp {
     /// RPM：最近 60 秒转发的请求总数，恒等于所含各账号 RPM 之和
     /// （见 [`store::CredentialStore::total_rpm`]、[`store::CredentialStore::rpm_of_creds`]）。
     rpm: i64,
     /// 在途请求数。全池是已进入转发入口、响应尚未走完的那些（流式回复整段传输期间都算）；
-    /// 代理和用户是自己名下的号此刻发往上游、尚未走完的那些，见 [`crate::proxy::in_flight_of`]。
+    /// 代理和用户是看得到的那些号此刻发往上游、尚未走完的那些，见 [`crate::proxy::in_flight_of`]。
     in_flight: i64,
     /// RPM 的统计窗口（秒），固定 60；前端据此写文案，不必两边各写死一个 60。
     window_secs: i64,
@@ -30,7 +30,12 @@ pub(super) async fn get_metrics(
             state.in_flight.load(std::sync::atomic::Ordering::Relaxed).max(0),
         ),
         Scope::Owner(owner) => {
-            let ids = store.credential_ids_owned_by(owner).await.map_err(internal)?;
+            // 代理连下属用户的号一起算，与账号列表看到的那些号同口径。
+            let ids = match actor.team_lead() {
+                Some(lead) => store.credential_ids_of_team(lead).await,
+                None => store.credential_ids_owned_by(owner).await,
+            }
+            .map_err(internal)?;
             (
                 store.rpm_of_creds(&ids).await.map_err(internal)?,
                 crate::proxy::in_flight_of(&state.upstream_load, &ids),

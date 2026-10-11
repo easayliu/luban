@@ -54,12 +54,20 @@ pub struct Actor {
 }
 
 impl Actor {
-    /// 数据可见范围：admin 与访客看全部，代理和用户只看自己名下的。
+    /// 数据可见范围：admin 与访客看全部，代理和用户只看自己名下的。改动一律按它判；代理只读时
+    /// 多看一层下属的号，见 [`Self::team_lead`]。
     pub fn scope(&self) -> Scope {
         match self.role {
             UserRole::Admin | UserRole::Viewer => Scope::All,
             UserRole::Agent | UserRole::User => Scope::Owner(self.id),
         }
+    }
+
+    /// 只读时多看一层：代理看得到下属用户的号（列表、详情、实时流量），返回代理自己的 id；
+    /// 其余身份为 None，读写同按 [`Self::scope`]。改动类接口一律还是 [`Self::scope`]，
+    /// 代理动不了下属的号。
+    pub fn team_lead(&self) -> Option<i64> {
+        (self.role == UserRole::Agent).then_some(self.id)
     }
 
     pub fn is_admin(&self) -> bool {
@@ -541,16 +549,31 @@ async fn check_owned(
     state: &AppState,
     actor: &Actor,
     owned: Owned,
-    req: Request,
+    mut req: Request,
 ) -> Result<Request, Response> {
     let owner = actor.id;
     match owned {
         Owned::Nothing => Ok(req),
         Owned::CredentialPath => {
             let id = path_id(&req, 1).ok_or_else(|| not_found("credential"))?;
-            match state.store.credential_owner(id).await {
-                Ok(Some(o)) if o == owner => Ok(req),
-                Ok(_) => Err(not_found("credential")),
+            let mine = match state.store.credential_owner(id).await {
+                Ok(o) => o == Some(owner),
+                Err(e) => return Err(internal(e).into_response()),
+            };
+            if mine {
+                return Ok(req);
+            }
+            // 只读的请求代理可以落在下属的号上（详情页的用量、设备、会话），见 [`Actor::team_lead`]；
+            // 响应像给访客的一样去掉代理密码，见 [`TeamRead`]。
+            let lead =
+                actor.team_lead().filter(|_| matches!(*req.method(), Method::GET | Method::HEAD));
+            let Some(lead) = lead else { return Err(not_found("credential")) };
+            match state.store.credential_in_team(id, lead).await {
+                Ok(true) => {
+                    req.extensions_mut().insert(TeamRead);
+                    Ok(req)
+                }
+                Ok(false) => Err(not_found("credential")),
                 Err(e) => Err(internal(e).into_response()),
             }
         }
@@ -595,6 +618,11 @@ async fn check_owned(
         }
     }
 }
+
+/// 代理在读下属的号（[`check_owned`] 放进请求扩展）：响应体过一遍 [`redact_url_credentials`]，
+/// 下属配的出口代理密码不给代理看。
+#[derive(Debug, Clone, Copy)]
+struct TeamRead;
 
 /// 中间件：认会话、判访问级别、核对归属，把 [`Actor`] 放进请求扩展。
 ///
@@ -662,10 +690,10 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
             },
         },
     };
-    let viewer = actor.is_viewer();
+    let redact = actor.is_viewer() || req.extensions().get::<TeamRead>().is_some();
     req.extensions_mut().insert(actor);
     let resp = next.run(req).await;
-    if viewer { redact_for_viewer(resp).await } else { resp }
+    if redact { redact_for_viewer(resp).await } else { resp }
 }
 
 /// 请求是拿上号 Key 来的（放进请求扩展）。上号时没指定代理就自动从代理池分配，见
