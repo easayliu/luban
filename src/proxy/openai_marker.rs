@@ -94,6 +94,37 @@ const OPENAI_CONTENT_TYPES: &[&str] = &[
     "refusal",
 ];
 
+/// 把历史里 OpenAI 形态的工具调用 id（`call_xxx`）改写成 Anthropic 形态（`toolu_xxx`），
+/// 返回改了几处。`tool_use.id` 与 `tool_result.tool_use_id` 走同一条前缀替换，配对不变；
+/// 同一个 id 每次改写结果一致，所以逐轮重放的历史前缀（缓存、线程指纹）保持稳定。
+///
+/// 只给自报 CC 的来访用：真实 CC 客户端自己不产生 `call_`（抓包 3368 个 id 全是 `toolu_`），
+/// 它们的历史里出现 `call_` 是会话中途切过别的后端（`/model` 换到非 Claude 模型、resume 了
+/// 别处跑过的会话）。不改写的话 id 永远留在历史里，这个会话此后每一轮都被拒。
+pub(super) fn remap_call_ids(body: &mut serde_json::Value) -> usize {
+    fn remap(block: &mut serde_json::Value, key: &str) -> usize {
+        let Some(slot) = block.get_mut(key) else { return 0 };
+        let Some(rest) = slot.as_str().and_then(|s| s.strip_prefix("call_")) else { return 0 };
+        *slot = serde_json::Value::String(format!("toolu_{rest}"));
+        1
+    }
+    let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else { return 0 };
+    let mut n = 0;
+    for msg in msgs {
+        let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for block in content {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") => n += remap(block, "id"),
+                Some("tool_result") => n += remap(block, "tool_use_id"),
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
 /// 在请求体里找 OpenAI 格式转换残留，找到第一处就返回。
 ///
 /// 到 luban 手里的请求 body 已经是 `/v1/messages` 的形态，转换器（litellm、one-api、
@@ -317,6 +348,7 @@ pub(super) fn find_openai_marker(
 
 #[cfg(test)]
 mod tests {
+    use super::remap_call_ids;
     use crate::proxy::{config, find_openai_marker};
     /// 剥字段走的是 [`crate::proxy::rewrite_body`] 这条统一路径，且开关关掉即原样透传。
     #[test]
@@ -500,7 +532,7 @@ mod tests {
         });
         let m = find_openai_marker(Some(&body), true, true).unwrap();
         assert_eq!(m.kind, "tool_call_id");
-        // CC 形态照拒——判据没放宽，只是把证据留进日志。
+        // 判据本身没放宽；自报 CC 的来访在准入处先经 [`remap_call_ids`] 改写，到不了这里。
         assert_eq!(m.sample.as_deref(), Some("call_1"), "触发值要能进日志");
     }
 
@@ -521,5 +553,50 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "http://x"}}
         ]}]});
         assert_eq!(find_openai_marker(Some(&img), false, true).unwrap().sample, None);
+    }
+
+    /// `call_` → `toolu_`：tool_use 与 tool_result 同步改写，配对不变，改完判据不再命中。
+    #[test]
+    fn remap_call_ids_keeps_pairs_and_clears_the_marker() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_ABC123", "name": "f", "input": {}},
+                {"type": "tool_use", "id": "toolu_01keep", "name": "g", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_ABC123", "content": "ok"},
+                {"type": "tool_result", "tool_use_id": "toolu_01keep", "content": "ok"},
+                {"type": "text", "text": "call_ABC123 in prose stays"}
+            ]}
+        ]});
+        assert!(find_openai_marker(Some(&body), true, true).is_some());
+        assert_eq!(remap_call_ids(&mut body), 2);
+        let c0 = &body["messages"][0]["content"];
+        let c1 = &body["messages"][1]["content"];
+        assert_eq!(c0[0]["id"], "toolu_ABC123");
+        assert_eq!(c0[1]["id"], "toolu_01keep");
+        assert_eq!(c1[0]["tool_use_id"], "toolu_ABC123");
+        assert_eq!(c1[2]["text"], "call_ABC123 in prose stays");
+        assert_eq!(find_openai_marker(Some(&body), true, true), None);
+        // 幂等：再跑一遍什么都不改。
+        assert_eq!(remap_call_ids(&mut body), 0);
+    }
+
+    /// 改写 id 后整份重新序列化会解码历史签名块里的转义；接上 `preserve_thinking_encoding`
+    /// 之后签名块的字节必须与来访逐字节相同，而 id 照改。
+    #[test]
+    fn remap_then_preserve_keeps_thinking_signature_bytes() {
+        let sig = r#"AB\/cd\u002Bef\/gh=="#;
+        let raw = format!(
+            r#"{{"messages":[{{"role":"assistant","content":[{{"type":"thinking","thinking":"t","signature":"{sig}"}},{{"type":"tool_use","id":"call_X1","name":"f","input":{{}}}}]}},{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"call_X1","content":"ok"}}]}}]}}"#
+        );
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(remap_call_ids(&mut v), 2);
+        let plain = serde_json::to_vec(&v).unwrap();
+        assert!(!String::from_utf8_lossy(&plain).contains(sig), "前提：直接序列化会改转义");
+        let out = crate::proxy::preserve_thinking_encoding(raw.as_bytes(), plain);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(sig), "签名块字节要保持: {out}");
+        assert!(out.contains("toolu_X1") && !out.contains("call_X1"), "{out}");
     }
 }

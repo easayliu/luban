@@ -50,6 +50,40 @@ pub(super) struct Guards {
     pub(super) session_concurrency: SessionConcurrencyGuard,
 }
 
+/// 见 [`remap_call_ids`]。只在 `reject_openai_shape` 开着、来访自报 CC 时改写；关着是原样透传。
+fn remap_foreign_tool_ids(
+    state: &AppState,
+    body: Bytes,
+    facts: &mut Facts,
+    client_ua: &str,
+) -> Bytes {
+    if !facts.cc_shaped
+        || !state.store.forward_flags().reject_openai_shape
+        || !body.windows(5).any(|w| w == b"call_")
+    {
+        return body;
+    }
+    let Some(v) = facts.body_json.as_mut() else { return body };
+    let n = remap_call_ids(v);
+    if n == 0 {
+        return body;
+    }
+    match serde_json::to_vec(v) {
+        Ok(bytes) => {
+            // 重新序列化会改掉历史 thinking 块里的转义（`\/`、`\uXXXX`），而上游按字节比对它们。
+            // 出站改写（[`rewrite_body_out`]）把这里交出去的体当「原始体」来还原，所以必须在这里
+            // 先对着真正的来访字节还原，之后就没有机会了。
+            let bytes = preserve_thinking_encoding(&body, bytes);
+            tracing::info!(
+                ua = %client_ua, remapped = n,
+                "rewrote 'call_' tool ids to 'toolu_' in a Claude Code request history"
+            );
+            Bytes::from(bytes)
+        }
+        Err(_) => body,
+    }
+}
+
 /// 从请求体与 UA 读出来的那几项，几道闸门共用。
 struct Facts {
     body_json: Option<serde_json::Value>,
@@ -87,7 +121,10 @@ pub(super) async fn admit(
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
     // 只看头的闸都过了才读体，见 [`MAX_BODY_BYTES`]。
     let body = read_body(body, &method, &path_and_query, &client_ua).await?;
-    let facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
+    let mut facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
+    // 自报 CC 的历史里混进了 `call_` id（会话中途切过别的后端）：改写成 `toolu_` 再往下走，
+    // 不然这个会话此后每一轮都被 2.3a 拒掉。后面所有闸门与出站改写都看改写后的那份。
+    let body = remap_foreign_tool_ids(state, body, &mut facts, &client_ua);
     identity_gates(
         state,
         &method,

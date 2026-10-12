@@ -42,7 +42,7 @@ use super::logging::{
     ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
     record_early_failure, telemetry_capture,
 };
-use super::openai_marker::find_openai_marker;
+use super::openai_marker::{find_openai_marker, remap_call_ids};
 use super::probe_detect::{probe_reply, probe_signature};
 use super::rate_limit::{
     LimitScope, RateLimitInfo, park_if_quota_nearly_exhausted, park_rate_limited,
@@ -56,7 +56,8 @@ use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{SimSessionSeed, Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
     block_site, error_block_path, is_redacted_thinking_data_error, is_thinking_signature_error,
-    latest_assistant_diff, retry_demoted_thinking, thinking_block_error_kind, trace_thinking_block,
+    latest_assistant_diff, preserve_thinking_encoding, retry_demoted_thinking,
+    thinking_block_error_kind, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
