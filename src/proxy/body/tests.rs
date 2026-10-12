@@ -4847,6 +4847,258 @@ fn sim_threads_fall_back_to_create_when_the_history_does_not_follow() {
     assert_eq!(v["thread"], create, "上一条 continue 失败后线程作废");
 }
 
+/// 线程过期：上游拒了 `continue`，同一轮改发 `create`（`retry_thread_as_create`）。历史里每轮补过的
+/// `<total_tokens>` 要原位带回——上游线程里有，官方过期后的 `create` 也带着
+/// （`cap/auto-2.1.296-20261012-idle/00045`）；漏了，前缀从那条提醒处就断，闲置前写的缓存读不到。
+#[test]
+fn sim_threads_create_after_a_rejected_continue_replays_earlier_reminders() {
+    use crate::proxy::session_link::CcSessionLink;
+    let model = "claude-opus-5-5";
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·过期 第一问" });
+    let (_, p1) = thread_turn(&thread_body(model, serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_E1",
+        Vec::new(),
+        reply_of("答一".into()),
+        40000,
+    );
+    let mut msgs = vec![
+        user1,
+        serde_json::json!({ "role": "assistant", "content": "答一" }),
+        serde_json::json!({ "role": "user", "content": "第二问" }),
+    ];
+    let (v2, p2) = thread_turn(&thread_body(model, msgs.clone().into()), all_on());
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+    let second = v2["messages"][1]["content"][0]["text"].clone();
+    assert!(second.as_str().unwrap().starts_with("<total_tokens>"), "{v2}");
+    CcSessionLink::record_thread(
+        &p2.unwrap(),
+        "msg_E2",
+        Vec::new(),
+        reply_of("答二".into()),
+        40100,
+    );
+
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "答二" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "第三问" }));
+    let body3 = thread_body(model, msgs.clone().into());
+    let (v3, p3) = thread_turn(&body3, all_on());
+    assert_eq!(v3["thread"]["type"], "continue", "{v3}");
+    CcSessionLink::drop_thread(&p3.unwrap());
+    let (v3, p3) = thread_turn(&body3, all_on());
+    assert_eq!(v3["thread"], serde_json::json!({ "type": "create" }), "{v3}");
+    let out = v3["messages"].as_array().unwrap();
+    let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(
+        roles,
+        ["user", "system", "assistant", "user", "system", "assistant", "user", "system"],
+        "第一问、环境说明、答一、第二问、那一轮的提醒、答二、第三问、这一轮的提醒: {v3}"
+    );
+    assert_eq!(out[4]["content"][0]["text"], second, "与上游线程里那条逐字相同");
+    assert!(out[4]["content"][0].get("cache_control").is_none(), "历史那条不带断点: {v3}");
+    assert!(out[7]["content"][0]["cache_control"].is_object(), "断点在这一轮的提醒上");
+
+    // 这次 create 提交之后，下一轮接得上；再过期一次，两条历史提醒都在。
+    CcSessionLink::record_thread(
+        &p3.unwrap(),
+        "msg_E3",
+        Vec::new(),
+        reply_of("答三".into()),
+        40200,
+    );
+    let third = out[7]["content"][0]["text"].clone();
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "答三" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "第四问" }));
+    let body4 = thread_body(model, msgs.into());
+    let (v4, p4) = thread_turn(&body4, all_on());
+    assert_eq!(v4["thread"]["previous_message_id"], "msg_E3", "{v4}");
+    CcSessionLink::drop_thread(&p4.unwrap());
+    let (v4, _) = thread_turn(&body4, all_on());
+    let out = v4["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 11, "{v4}");
+    assert_eq!(out[4]["content"][0]["text"], second);
+    assert_eq!(out[7]["content"][0]["text"], third);
+}
+
+/// haiku 不带 `mid-conversation-system`：提醒写在用户消息里，过期后 `create` 同样原位带回——
+/// 工具续轮那条拼在 `tool_result` 正文末尾。
+#[test]
+fn sim_threads_create_after_a_rejected_continue_replays_haiku_reminders() {
+    use crate::proxy::session_link::CcSessionLink;
+    let model = "claude-haiku-4-5-20251001";
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·haiku 过期 第一问" });
+    let (_, p1) = thread_turn(&thread_body(model, serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_HE1",
+        vec!["toolu_he".into()],
+        reply_of(serde_json::json!([bash_use("toolu_he", "ls")])),
+        30000,
+    );
+    let mut msgs = vec![
+        user1,
+        serde_json::json!({ "role": "assistant", "content": [bash_use("toolu_he", "ls")] }),
+        serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_he", "content": "a.txt" },
+        ] }),
+    ];
+    let (v2, p2) = thread_turn(&thread_body(model, msgs.clone().into()), all_on());
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+    let sent = v2["messages"][0]["content"][0]["content"].clone();
+    assert!(sent.as_str().unwrap().contains("<total_tokens>"), "{v2}");
+    CcSessionLink::record_thread(&p2.unwrap(), "msg_HE2", Vec::new(), reply_of("好".into()), 30100);
+
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "好" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "下一步" }));
+    let body3 = thread_body(model, msgs.into());
+    let (_, p3) = thread_turn(&body3, all_on());
+    CcSessionLink::drop_thread(&p3.unwrap());
+    let (v3, _) = thread_turn(&body3, all_on());
+    assert_eq!(v3["thread"], serde_json::json!({ "type": "create" }), "{v3}");
+    assert_eq!(v3["messages"].as_array().unwrap().len(), 5, "{v3}");
+    assert_eq!(v3["messages"][2]["content"][0]["content"], sent, "{v3}");
+}
+
+/// 跨模型族换到不带 `mid-conversation-system` 的模型（opus → haiku 4.5）：历史提醒照这一轮的落法
+/// 写成提醒块，与环境说明、换模型说明同一规矩；照当时的落法补成 `role: system` 消息，上游会 400。
+#[test]
+fn sim_replayed_reminders_follow_this_turns_model_family() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·跨族 第一问" });
+    let (_, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_X1",
+        Vec::new(),
+        reply_of("答一".into()),
+        40000,
+    );
+    let mut msgs = vec![
+        user1,
+        serde_json::json!({ "role": "assistant", "content": "答一" }),
+        serde_json::json!({ "role": "user", "content": "第二问" }),
+    ];
+    let (v2, p2) = thread_turn(&thread_body("claude-opus-5-5", msgs.clone().into()), all_on());
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+    CcSessionLink::record_thread(
+        &p2.unwrap(),
+        "msg_X2",
+        Vec::new(),
+        reply_of("答二".into()),
+        40100,
+    );
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "答二" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "第三问" }));
+    let (v3, _) = thread_turn(&thread_body("claude-haiku-4-5-20251001", msgs.into()), all_on());
+    assert_eq!(v3["thread"]["type"], "create", "{v3}");
+    let out = v3["messages"].as_array().unwrap();
+    assert!(out.iter().all(|m| m["role"] != "system"), "haiku 不收 role: system: {v3}");
+    let second = out[2]["content"].to_string();
+    assert!(second.contains("<total_tokens>"), "第二问那轮的提醒写进了用户消息: {v3}");
+}
+
+/// 客户端重新生成最后一轮（历史与上一轮一样）或改了最后一句：上一轮那条线程状态已经顶替了
+/// 更早的，它的提醒里只有最后一轮那条不再成立，更早的照样原位补回，前面那段缓存才接得上。
+#[test]
+fn sim_replayed_reminders_survive_a_regenerate_or_an_edited_last_prompt() {
+    use crate::proxy::session_link::CcSessionLink;
+    let model = "claude-opus-5-5";
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·重生成 第一问" });
+    let (_, p1) = thread_turn(&thread_body(model, serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_G1",
+        Vec::new(),
+        reply_of("答一".into()),
+        40000,
+    );
+    let mut msgs = vec![
+        user1,
+        serde_json::json!({ "role": "assistant", "content": "答一" }),
+        serde_json::json!({ "role": "user", "content": "第二问" }),
+    ];
+    let (v2, p2) = thread_turn(&thread_body(model, msgs.clone().into()), all_on());
+    let second = v2["messages"][1]["content"][0]["text"].clone();
+    CcSessionLink::record_thread(
+        &p2.unwrap(),
+        "msg_G2",
+        Vec::new(),
+        reply_of("答二".into()),
+        40100,
+    );
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "答二" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "第三问" }));
+    let (v3, p3) = thread_turn(&thread_body(model, msgs.clone().into()), all_on());
+    assert_eq!(v3["thread"]["type"], "continue", "{v3}");
+    CcSessionLink::record_thread(
+        &p3.unwrap(),
+        "msg_G3",
+        Vec::new(),
+        reply_of("答三".into()),
+        40200,
+    );
+
+    let (regen, _) = thread_turn(&thread_body(model, msgs.clone().into()), all_on());
+    assert_eq!(regen["thread"]["type"], "create", "重新生成: {regen}");
+    let out = regen["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 8, "五条来访、环境说明、补回的那条、这一轮的: {regen}");
+    assert_eq!(out[4]["content"][0]["text"], second, "{regen}");
+
+    *msgs.last_mut().unwrap() = serde_json::json!({ "role": "user", "content": "第三问（改过）" });
+    let (edited, _) = thread_turn(&thread_body(model, msgs.into()), all_on());
+    assert_eq!(edited["thread"]["type"], "create", "{edited}");
+    let out = edited["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 8, "五条来访、环境说明、补回的那条、这一轮的: {edited}");
+    assert_eq!(out[4]["content"][0]["text"], second, "{edited}");
+}
+
+/// 换模型那一轮来访自带一条 `role: system` 收尾：模型说明与 `<total_tokens>` 并进那一条
+/// （官方换模型那轮的 system 也是几样并成一条，`cap/2.1.285/00113` 第 10 条）。之后每次
+/// `create` 重建都得逐字重现这条合并后的消息，不然前缀从它这里就断。
+#[test]
+fn sim_switch_turn_merged_into_a_client_system_message_replays_verbatim() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·来访 system 第一问" });
+    let (_, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    CcSessionLink::record_thread(
+        &p1.unwrap(),
+        "msg_S1",
+        Vec::new(),
+        reply_of("答一".into()),
+        40000,
+    );
+    let mut msgs = vec![
+        user1,
+        serde_json::json!({ "role": "assistant", "content": "答一" }),
+        serde_json::json!({ "role": "user", "content": "第二问" }),
+        serde_json::json!({ "role": "system", "content": [{ "type": "text", "text": "来访的说明" }] }),
+    ];
+    let (v2, p2) = thread_turn(&thread_body("claude-sonnet-5-5", msgs.clone().into()), all_on());
+    assert_eq!(v2["thread"]["type"], "create", "换了模型: {v2}");
+    let merged = v2["messages"].as_array().unwrap().last().unwrap()["content"][0]["text"].clone();
+    CcSessionLink::record_thread(
+        &p2.unwrap(),
+        "msg_S2",
+        Vec::new(),
+        reply_of("答二".into()),
+        40100,
+    );
+    msgs.push(serde_json::json!({ "role": "assistant", "content": "答二" }));
+    msgs.push(serde_json::json!({ "role": "user", "content": "第三问" }));
+    let body3 = thread_body("claude-sonnet-5-5", msgs.clone().into());
+    let (v3, p3) = thread_turn(&body3, all_on());
+    assert_eq!(v3["thread"]["type"], "continue", "{v3}");
+    CcSessionLink::drop_thread(&p3.unwrap());
+    let (v3, _) = thread_turn(&body3, all_on());
+    assert_eq!(v3["thread"]["type"], "create", "{v3}");
+    let out = v3["messages"].as_array().unwrap();
+    let sys = out.iter().find(|m| m["content"].to_string().contains("来访的说明")).unwrap();
+    assert_eq!(sys["content"][0]["text"], merged, "与那一轮发出去的逐字相同: {v3}");
+}
+
 /// fable-5-1 在 2.1.285 一条 `thread` 都不发（`cap/auto-2.1.285-20260930/00383`、`00554`），2.1.291 起
 /// 也发了（`cap/auto-2.1.291-20261006-full/00464` 首轮 `create`）——模拟路径用 2.1.291 表，跟着写；
 /// `<total_tokens>` 提醒两版都带；开关关着时两样都不写。

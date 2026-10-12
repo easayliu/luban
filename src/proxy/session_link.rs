@@ -120,7 +120,29 @@ struct ThreadState {
     ctx_tokens: u64,
     /// 这段对话 `<total_tokens>` 倒数的锚点与已用量，见 [`TotalTokens`]。
     budget: TotalTokens,
+    /// 这段对话每轮补过的 `<total_tokens>` 提醒，按轮次先后，见 [`TurnReminder`]。
+    reminders: Vec<TurnReminder>,
+    /// 接它的 `continue` 被上游拒了（线程过期之类）：不能再接，但历史提醒与倒数仍是这段对话的，
+    /// 下一轮 `create` 照它重建（[`history_reminders`]、[`find_lineage`]）。
+    dead: bool,
     seen: std::time::Instant,
+}
+
+/// 某一轮补进去的那条 `<total_tokens>` 提醒，`create` 重发完整历史时在原位重现。
+///
+/// 官方线程过期后的 `create`（`cap/auto-2.1.296-20261012-idle/00045`，先 `continue` 撞 404）把
+/// 历史里每轮那条提醒原样带着，缓存因此接得上（读 41618、只写 179）；漏了它们，前缀从第一条
+/// 提醒处就断，闲置前那段 1h 缓存再也读不到。
+///
+/// 不记当时的落法：重现时按**这一轮**模型的落法写，与环境说明、换模型说明同一规矩——跨模型族
+/// 换到不带 `mid-conversation-system` 的模型，照当时补成 `role: system` 消息上游会 400；换了模型
+/// 缓存本来也不共用，没有逐字对齐的必要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TurnReminder {
+    /// 那一轮来访 `messages` 的条数（插环境说明之前）：下一条就是那一轮的回复。
+    pub(super) turn_len: usize,
+    pub(super) tokens_left: u64,
+    pub(super) regular_prompt: bool,
 }
 
 /// 官方 `<total_tokens>N tokens left</total_tokens>` 提醒（`totalTokensReminder`，缺省
@@ -326,6 +348,8 @@ pub(crate) struct ThreadPending {
     continued_from: Option<String>,
     /// 这一轮算完之后的 `<total_tokens>` 倒数状态，提交时存进 [`ThreadState::budget`]。
     budget: TotalTokens,
+    /// 历史各轮补过、这一轮仍成立的提醒（[`history_reminders`]），这一轮补了就再追加一条。
+    reminders: Vec<TurnReminder>,
 }
 
 impl ThreadPending {
@@ -338,6 +362,16 @@ impl ThreadPending {
     /// 本来接得上、调用方另有理由改发 `create` 时（来访指定了 `tool_choice`）：不再算接了哪条。
     pub(super) fn into_create(self) -> Self {
         Self { continued_from: None, ..self }
+    }
+
+    /// 历史各轮补过的 `<total_tokens>` 提醒，`create` 时在原位重现。
+    pub(super) fn history_reminders(&self) -> &[TurnReminder] {
+        &self.reminders
+    }
+
+    /// 记下这一轮补的那条提醒。
+    pub(super) fn note_reminder(&mut self, r: TurnReminder) {
+        self.reminders.push(r);
     }
 }
 
@@ -353,7 +387,7 @@ fn find_continuable<'a>(
 ) -> Option<&'a ThreadState> {
     threads
         .iter()
-        .filter(|t| t.root == root && t.shape == shape)
+        .filter(|t| t.root == root && t.shape == shape && !t.dead)
         .filter(|t| {
             let n = t.msgs.len();
             let Some(reply) = msgs.get(n) else { return false };
@@ -386,6 +420,28 @@ fn find_lineage<'a>(
         .max_by_key(|t| t.msgs.len())
 }
 
+/// 这一轮历史里仍成立的那几条 `<total_tokens>` 提醒（[`TurnReminder`]），`create` 时原位重现。
+///
+/// 不用 [`find_lineage`]：它要求某条状态的 `msgs` 整段是这一轮的前缀、后面紧跟回复，客户端重新
+/// 生成最后一轮（历史与上一轮一样长）或改了最后一句时，上一轮的状态已经顶替了更早的，一条都找不到，
+/// 前面那段缓存就白丢了。这里取与这一轮公共前缀最长的那条，只留落点还在公共前缀里的：提醒排在
+/// 第 `turn_len` 条（那一轮的回复）之前，要求前 `turn_len` 条都没变、第 `turn_len` 条仍是 assistant。
+/// 那一轮的回复不进 `msgs`，整段都是前缀时它对应这一轮的第 `msgs.len()` 条。
+fn history_reminders(threads: &[ThreadState], root: u64, msgs: &[ThreadMsg]) -> Vec<TurnReminder> {
+    let keep_below = |t: &ThreadState| {
+        let common = t.msgs.iter().zip(msgs).take_while(|(a, m)| **a == m.fp).count();
+        let reply_follows = msgs.get(common).is_some_and(|m| m.assistant);
+        if common == t.msgs.len() && reply_follows { common + 1 } else { common }
+    };
+    threads
+        .iter()
+        .filter(|t| t.root == root)
+        .map(|t| (keep_below(t), t))
+        .max_by_key(|(n, t)| (*n, t.seen))
+        .map(|(n, t)| t.reminders.iter().copied().filter(|r| r.turn_len < n).collect())
+        .unwrap_or_default()
+}
+
 /// 这一轮的 `<total_tokens>` 倒数，规则见 [`TotalTokens`]。`lineage` 是 [`find_lineage`] 找到的
 /// 上一条；找不到（对话第一轮、状态已过期）时当前上下文按 0 算，与官方新会话首轮一致。
 fn total_tokens_for(lineage: Option<&ThreadState>, regular_prompt: bool) -> (TotalTokens, u64) {
@@ -413,13 +469,15 @@ pub(super) fn thread_decision(
     regular_prompt: bool,
 ) -> (ThreadDecision, ThreadPending, u64) {
     let root = msgs.first().map_or(0, |m| m.fp);
-    let (found, (budget, left)) = {
+    let (found, (budget, left), reminders) = {
         let map = CC_SESSIONS.lock();
         let threads = map.get(&key.owned()).map_or(&[][..], |e| &e.threads[..]);
+        let lineage = find_lineage(threads, root, msgs);
         (
             find_continuable(threads, root, shape, msgs)
                 .map(|t| (t.msgs.len() + 1, t.last_message_id.clone())),
-            total_tokens_for(find_lineage(threads, root, msgs), regular_prompt),
+            total_tokens_for(lineage, regular_prompt),
+            history_reminders(threads, root, msgs),
         )
     };
     let pending = ThreadPending {
@@ -430,6 +488,7 @@ pub(super) fn thread_decision(
         msgs: msgs.iter().map(|m| m.fp).collect(),
         continued_from: found.as_ref().map(|(_, id)| id.clone()),
         budget,
+        reminders,
     };
     let decision = match found {
         Some((from, previous_message_id)) => ThreadDecision::Continue { from, previous_message_id },
@@ -851,6 +910,8 @@ impl CcSessionLink {
             reply_fp,
             ctx_tokens,
             budget: pending.budget,
+            reminders: pending.reminders.clone(),
+            dead: false,
             seen: now,
         });
         entry.last_seen = now;
@@ -859,11 +920,16 @@ impl CcSessionLink {
     /// 一条 `continue` 失败（上游报错、流断在半截）：它接的那条线程作废，下一轮退回 `create`。
     /// 线程过期、`previous_message_id` 对不上这类错误，接着 `continue` 只会一直错下去。
     /// `create` 失败不用管——它本来就没接任何线程。
+    ///
+    /// 只标作废、不删：那段对话的历史提醒与倒数还要留给 `create` 重建（[`ThreadState::dead`]），
+    /// 下一次提交时随前缀一并换掉。
     pub(super) fn drop_thread(pending: &ThreadPending) {
         let Some(from) = &pending.continued_from else { return };
         let mut map = CC_SESSIONS.lock();
         if let Some(entry) = map.get_mut(&(pending.cred_id, pending.session_id.clone())) {
-            entry.threads.retain(|t| &t.last_message_id != from);
+            for t in entry.threads.iter_mut().filter(|t| &t.last_message_id == from) {
+                t.dead = true;
+            }
         }
     }
 }

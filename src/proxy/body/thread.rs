@@ -59,7 +59,7 @@ pub(super) fn apply_sim_thread(
     if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
         decision = ThreadDecision::Create;
     }
-    let pending = match &decision {
+    let mut pending = match &decision {
         ThreadDecision::Create => pending.into_create(),
         ThreadDecision::Continue { .. } => pending,
     };
@@ -110,15 +110,39 @@ pub(super) fn apply_sim_thread(
     }
     // 续轮上游线程里仍留着历史里那几条换模型说明（它们已经作为前几轮的回复附近记录），这一轮
     // 的完整上下文只有新增那几条消息，不必补。`create` 把完整历史整发一遍，缺的那几条就得补回去。
-    let placed = !is_create
-        || insert_historical_switch(v, env_note.historical_switch.as_ref(), env_note.mid_conv_sys);
+    // 历史各轮的 `<total_tokens>` 同理：上游线程里有，`create` 重发完整历史就得原位补回。带 beta
+    // 时换模型那一轮两者并在同一条 system 里（模型说明在前），交给 [`replay_history_notes`] 一并
+    // 重现；不带时两者各自写进用户消息、互不相干，先补模型说明。
+    let placed = !is_create || {
+        let switch = env_note.historical_switch.as_ref();
+        let reminders = pending.history_reminders();
+        if env_note.mid_conv_sys {
+            replay_history_notes(v, fps, reminders, true, switch)
+                .unwrap_or_else(|| insert_historical_switch(v, switch, true))
+        } else {
+            let placed = insert_historical_switch(v, switch, false);
+            replay_history_notes(v, fps, reminders, false, None);
+            placed
+        }
+    };
     let model_notice = env_note.model_notice_after(placed);
     let mcs = env_note.mid_conv_sys;
     let model_notice = model_notice.as_deref();
     if let Some(notice) = model_notice.filter(|_| !mcs) {
         place_model_notice(v, notice, false, regular_prompt);
     }
-    insert_total_tokens_reminder(v, tokens_left, regular_prompt, mcs, model_notice.filter(|_| mcs));
+    let msgs = v.get_mut("messages").and_then(|m| m.as_array_mut());
+    if let Some(msgs) = msgs
+        && insert_total_tokens_reminder(
+            msgs,
+            tokens_left,
+            regular_prompt,
+            mcs,
+            model_notice.filter(|_| mcs),
+        )
+    {
+        pending.note_reminder(TurnReminder { turn_len: fps.len(), tokens_left, regular_prompt });
+    }
     if threads {
         cap_thread_breakpoints(v);
     }
@@ -184,15 +208,17 @@ pub(super) fn cap_thread_breakpoints(v: &mut serde_json::Value) -> usize {
 /// 官方首轮那条会把它与环境说明、日期并进同一条 system 消息（`00032`、`00349`），那一份由
 /// [`insert_env_note`] 补：带 beta 的首轮末条是那条 system 消息、这里不再追加；haiku 首条用户消息里
 /// 已有一块 `<total_tokens>` 提醒，这里同样跳过。
+///
+/// 返回这一轮是否写进了一条 `<total_tokens>`（只补了模型说明、或整个跳过的都是 `false`）：写了的
+/// 才记进线程状态，`create` 时由 [`replay_total_tokens_reminders`] 在历史原位重现。
 fn insert_total_tokens_reminder(
-    v: &mut serde_json::Value,
+    msgs: &mut Vec<serde_json::Value>,
     tokens_left: u64,
     regular_prompt: bool,
     mid_conversation_system: bool,
     model_notice: Option<&str>,
-) {
+) -> bool {
     let text = format!("<total_tokens>{tokens_left} tokens left</total_tokens>");
-    let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return };
     // 带 beta：落在末尾那段指令与临时 system（`clear_at`）之前，它们原样留在最后——官方的
     // `<total_tokens>` 也排在 `clear_at` 那条前面、断点在它身上（`cap/auto-2.1.291-20261006-full/00465`），
     // 见 [`sticky_tail_start`]。那之前一条是 system（来访连发几条 user，环境说明或历史换模型说明
@@ -200,21 +226,24 @@ fn insert_total_tokens_reminder(
     // 只补模型说明；是 user 就另起一条，断点从它身上挪过来。
     if mid_conversation_system {
         let at = sticky_tail_start(msgs);
-        let Some(prev) = at.checked_sub(1).map(|i| &mut msgs[i]) else { return };
+        let Some(prev) = at.checked_sub(1).map(|i| &mut msgs[i]) else { return false };
         let with_notice = |t: String| match model_notice {
             Some(notice) => format!("{notice}\n\n{t}"),
             None => t,
         };
-        match prev.get("role").and_then(|r| r.as_str()) {
+        return match prev.get("role").and_then(|r| r.as_str()) {
             Some("system") => {
-                let text = match (is_env_note_msg(prev), model_notice) {
+                // 并进环境说明的只有模型说明，`<total_tokens>` 环境说明里本来就有。
+                let env = is_env_note_msg(prev);
+                let text = match (env, model_notice) {
                     (true, Some(notice)) => notice.to_string(),
-                    (true, None) => return,
+                    (true, None) => return false,
                     (false, _) => with_notice(text),
                 };
                 if !append_to_system(prev, &text) {
                     msgs.insert(at, system_text_msg(&text));
                 }
+                !env
             }
             Some("user") => {
                 let mut block = serde_json::json!({ "type": "text", "text": with_notice(text) });
@@ -222,14 +251,14 @@ fn insert_total_tokens_reminder(
                     block["cache_control"] = cc;
                 }
                 msgs.insert(at, serde_json::json!({ "role": "system", "content": [block] }));
+                true
             }
-            _ => {}
-        }
-        return;
+            _ => false,
+        };
     }
-    let Some(last) = msgs.last_mut() else { return };
+    let Some(last) = msgs.last_mut() else { return false };
     if last.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return;
+        return false;
     }
     let wrapped = format!("<system-reminder>\n{text}\n</system-reminder>");
     // 首轮那份环境说明（[`insert_env_note`]）已经把这条并进了首条用户消息，不再补第二条。
@@ -241,22 +270,22 @@ fn insert_total_tokens_reminder(
         })
     });
     if has_one {
-        return;
+        return false;
     }
     let content = last.get_mut("content");
-    let Some(content) = content else { return };
+    let Some(content) = content else { return false };
     if let serde_json::Value::String(s) = content {
         let s = std::mem::take(s);
         *content = serde_json::json!([{ "type": "text", "text": s }]);
     }
-    let Some(blocks) = content.as_array_mut() else { return };
+    let Some(blocks) = content.as_array_mut() else { return false };
     let ty = |b: &serde_json::Value| b.get("type").and_then(|t| t.as_str()).map(str::to_string);
     if regular_prompt {
         let at = blocks.iter().rposition(|b| ty(b).as_deref() == Some("text")).unwrap_or(0);
         blocks.insert(at, serde_json::json!({ "type": "text", "text": format!("{wrapped}\n") }));
-    } else if let Some(tr) =
-        blocks.iter_mut().rev().find(|b| ty(b).as_deref() == Some("tool_result"))
-    {
+        return true;
+    }
+    if let Some(tr) = blocks.iter_mut().rev().find(|b| ty(b).as_deref() == Some("tool_result")) {
         match tr.get_mut("content") {
             Some(serde_json::Value::String(s)) => {
                 s.push_str("\n\n");
@@ -269,7 +298,86 @@ fn insert_total_tokens_reminder(
                 tr["content"] = serde_json::Value::String(wrapped);
             }
         }
+        return true;
     }
+    false
+}
+
+/// `create` 重发完整历史时，把历史各轮补过的 `<total_tokens>` 提醒（[`TurnReminder`]）放回原位：
+/// 每一条都照当时的样子、在那一轮末尾（它的回复之前）重跑一遍 [`insert_total_tokens_reminder`]。
+/// 上游线程里每轮都有这么一条，官方线程过期后的 `create` 也原样带着
+/// （`cap/auto-2.1.296-20261012-idle/00045`）；漏了，前缀从第一条提醒处就和缓存对不上。
+///
+/// 落法（`mid_conv_sys`）按这一轮的模型，见 [`TurnReminder`]。
+///
+/// `switch` 是历史里要重现的那条换模型说明（[`EnvNoted::historical_switch`]，只在带 beta 时传）：
+/// 换模型那一轮当时是把说明与提醒拼成「说明\n\n提醒」一并写的（[`apply_sim_thread`]），这里照样
+/// 一并写；那一轮没补提醒就在原位单独插（[`insert_historical_switch_in`]）。不能先插说明再补提醒：
+/// 来访那一轮以自己的 `role: system` 收尾时说明会并进那一条，改了它的指纹就对不齐了，而且两样的
+/// 先后会反过来。返回说明放下了没有（同 [`insert_historical_switch`]）；没跑（没有要补的提醒、对不齐）
+/// 时返回 `None`，由调用方照旧单独补说明。
+///
+/// `raw` 是插环境说明之前的来访历史指纹（[`apply_sim_thread`] 的 `raw_fps`），拿来把「那一轮
+/// 来访第几条」换算成出站下标：luban 自己插的只有 system（环境说明、模型说明），指纹对不上又是
+/// system 的跳过；别的对不上的是被就地改过的（haiku 的提醒块塞进了用户正文），角色得对得上才
+/// 算同一条。对不齐就整段不补，退回原来的形态。
+fn replay_history_notes(
+    v: &mut serde_json::Value,
+    raw: &[ThreadMsg],
+    reminders: &[TurnReminder],
+    mid_conv_sys: bool,
+    switch: Option<&(usize, String)>,
+) -> Option<bool> {
+    if reminders.is_empty() {
+        return None;
+    }
+    let msgs = v.get_mut("messages").and_then(|m| m.as_array_mut())?;
+    let mut at = Vec::with_capacity(raw.len());
+    for (k, m) in msgs.iter().enumerate() {
+        let Some(r) = raw.get(at.len()) else { break };
+        let role = m.get("role").and_then(|r| r.as_str());
+        if message_fingerprint(m) == r.fp {
+            at.push(k);
+        } else if role != Some("system") {
+            if (role == Some("assistant")) != r.assistant {
+                return None;
+            }
+            at.push(k);
+        }
+    }
+    if at.len() != raw.len() {
+        return None;
+    }
+    let is_assistant =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("assistant");
+    let mut switch = switch;
+    let mut placed = true;
+    // 从后往前补，前面的下标不受后面插入的影响。那一轮之后的第一条应是它的回复，不是就跳过。
+    for r in reminders.iter().rev() {
+        let Some(&end) = at.get(r.turn_len).filter(|_| raw[r.turn_len].assistant) else {
+            continue;
+        };
+        // 换模型说明落在这一轮之后（那一轮没补提醒）：轮到它时就地单独插，再往前的插入不影响它。
+        if let Some(sw) = switch.filter(|(u, _)| *u >= end) {
+            placed = insert_historical_switch_in(msgs, Some(sw), mid_conv_sys);
+            switch = None;
+        }
+        // 换模型那一轮就是这一轮（说明之后到这一轮回复之间没有别的回复）：与提醒拼在一起写。
+        let notice = match switch {
+            Some((u, line)) if msgs[*u + 1..end].iter().all(|m| !is_assistant(m)) => {
+                switch = None;
+                Some(line.as_str())
+            }
+            _ => None,
+        };
+        let tail = msgs.split_off(end);
+        insert_total_tokens_reminder(msgs, r.tokens_left, r.regular_prompt, mid_conv_sys, notice);
+        msgs.extend(tail);
+    }
+    if let Some(sw) = switch {
+        placed = insert_historical_switch_in(msgs, Some(sw), mid_conv_sys);
+    }
+    Some(placed)
 }
 
 /// 摘下一条消息里最后一个缓存断点并交出来（没有就 `None`）。官方的断点在末条消息上，追加一条

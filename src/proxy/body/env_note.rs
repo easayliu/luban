@@ -551,8 +551,20 @@ pub(in crate::proxy) fn insert_historical_switch(
     switch: Option<&(usize, String)>,
     mid_conv_sys: bool,
 ) -> bool {
-    let Some((user_idx, notice)) = switch else { return true };
+    if switch.is_none() {
+        return true;
+    }
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return false };
+    insert_historical_switch_in(msgs, switch, mid_conv_sys)
+}
+
+/// [`insert_historical_switch`] 的本体，直接改 `messages` 数组。
+pub(super) fn insert_historical_switch_in(
+    msgs: &mut Vec<serde_json::Value>,
+    switch: Option<&(usize, String)>,
+    mid_conv_sys: bool,
+) -> bool {
+    let Some((user_idx, notice)) = switch else { return true };
     if msgs.get(*user_idx).and_then(|m| m.get("role")).and_then(|r| r.as_str()) != Some("user") {
         return false;
     }
