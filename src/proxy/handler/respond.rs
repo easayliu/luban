@@ -151,6 +151,10 @@ async fn relay_ok(
     // 注入了哪些工具、是不是替无工具来访补的：改写那一步按**出站体**对来访算好
     // （[`Upstream::shape_outbound`]），不在这里拿来访原文预判——`tool_choice:
     // "required"` 这类方言要先归一才知道补不补。
+    if upstream.sim.is_some() {
+        forensics.inbound_headers = inbound_headers_summary(&inb.headers);
+        forensics.inbound_shape = inb.body_json.as_ref().and_then(inbound_shape_summary);
+    }
     let injected_tools = sent_bits.injected_tools.clone();
     let tools_filled = sent_bits.tools_filled;
     fill_shape_forensics(&mut forensics, sent_bits);

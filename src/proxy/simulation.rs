@@ -394,6 +394,13 @@ pub(super) fn simulation_reason(
     if is_official_web_search_request(v) {
         return None;
     }
+    // 官方安全分类（[`is_official_classifier_request`]）：auto 模式下每次工具调用前发一条。关掉
+    // billing header 的客户端发出来没有 billing header 也没有身份句，过不了 `is_cc_shaped`；
+    // 放行透传，非模拟路径的 [`ensure_cc_system_prefix`] 会补上 billing header。UA 可信、身份
+    // 合法到这里已经判过，形态逐项对（含 `auto-mode-classifier` beta），第三方抄不全。
+    if is_official_classifier_request(v, &inbound_beta_list(headers)) {
+        return None;
+    }
     let prewarm = request_max_tokens(Some(v)) == Some(1);
     if !is_cc_shaped(v) {
         // 官方桌面端（`claude-desktop-3p`）的 cache 预热：`max_tokens=1`，system 缺失或只有
@@ -1148,26 +1155,30 @@ pub(super) fn is_official_title_request(v: &serde_json::Value, beta: &[String]) 
 
 /// 官方**安全分类**（`cap/2.1.260/00019`、`00030`）的完整样子：
 ///
-/// - system 恰好三块：billing header、不短于 1000 字节的分类提示词（抓包 123785）、以
-///   `## Session Context` 开头的会话上下文块（抓包 248 字节）；
+/// - system 是 `[billing header,] 分类提示词, 会话上下文`：分类提示词不短于 1000 字节（抓包
+///   123785），会话上下文以 `## Session Context` 开头（抓包 248 字节）。**billing header 可有可
+///   无**：抓包那台机器带，但关掉 attribution header 的真实客户端（线上 2.1.284/285/294/296
+///   的 auto 模式）整块没有，system 只剩后两块。没有它也没有身份句，[`is_cc_shaped`] 过不了，
+///   以前被当第三方送进模拟、分类提示词整个换成了主线程基座，分类器判不出结果；
 /// - body：`max_tokens` 恰为 64、`stop_sequences` 是非空且不含空串的字符串数组、
 ///   `thinking.type` 是 `disabled`、没有 `tools` 字段、非流式；
 /// - 头：带 `auto-mode-classifier` beta。
 ///
-/// 曾经只看第一块是 billing header，两块 system 就能装成分类请求；三块的结构与各块内容现在
-/// 都要对上。
+/// 曾经只看第一块是 billing header，两块 system 就能装成分类请求；现在块数、各块内容与 body
+/// 各项、beta 头都要对上，少了 billing header 不放松其余任何一项。
 pub(super) fn is_official_classifier_request(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
-    if blocks.len() != 3 {
-        return false;
-    }
     let text = |i: usize| blocks[i].get("text").and_then(|t| t.as_str()).unwrap_or_default();
+    let rest = match blocks.len() {
+        3 if text(0).starts_with("x-anthropic-billing-header:") => 1,
+        2 => 0,
+        _ => return false,
+    };
     let stop_ok = v.get("stop_sequences").and_then(|s| s.as_array()).is_some_and(|a| {
         !a.is_empty() && a.iter().all(|x| x.as_str().is_some_and(|t| !t.is_empty()))
     });
-    text(0).starts_with("x-anthropic-billing-header:")
-        && text(1).len() >= CC_BASE_PROMPT_MIN_LEN
-        && text(2).trim_start().starts_with("## Session Context")
+    text(rest).len() >= CC_BASE_PROMPT_MIN_LEN
+        && text(rest + 1).trim_start().starts_with("## Session Context")
         && request_max_tokens(Some(v)) == Some(64)
         && stop_ok
         && thinking_type(v) == Some("disabled")

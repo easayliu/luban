@@ -140,6 +140,8 @@ fn for_owner(mut log: store::UsageLog) -> store::UsageLog {
     f.shape = None;
     f.session_id = None;
     f.session_id_in = None;
+    f.inbound_headers = None;
+    f.inbound_shape = None;
     f.session_key = None;
     f.device_id_out = None;
     f.error_message = None;

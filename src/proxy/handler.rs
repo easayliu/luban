@@ -40,7 +40,7 @@ use super::learned_rules::{
 };
 use super::logging::{
     ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
-    record_early_failure, telemetry_capture,
+    inbound_headers_summary, inbound_shape_summary, record_early_failure, telemetry_capture,
 };
 use super::openai_marker::{find_openai_marker, remap_call_ids};
 use super::probe_detect::{probe_reply, probe_signature};

@@ -1007,6 +1007,65 @@ fn simulates_cc_agrees_with_detect() {
     assert!(!agrees(&plain, &cc_ua, sim_off), "开关关着一律不模拟");
 }
 
+/// auto 模式的安全分类：带不带 billing header 都是官方请求，不进模拟（线上 2.1.284/285/294/296
+/// 关掉 attribution header 的客户端 system 只有「提示词 + Session Context」两块，曾被当第三方
+/// 重建成主线程体）。少任何一项（beta、块内容、body 形态）照旧模拟。
+#[test]
+fn official_classifier_without_billing_header_is_not_simulated() {
+    use crate::proxy::SimulationReason::*;
+    const CC_UA: &str = "claude-cli/2.1.284 (external, cli)";
+    let mut cc_ua = platform_headers(Some(CC_UA));
+    cc_ua.insert(
+        "anthropic-beta",
+        crate::proxy::HeaderValue::from_static(config::CC_BETA_AUTO_MODE_CLASSIFIER),
+    );
+    let reason = |body: &str, headers: &crate::proxy::HeaderMap| {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        crate::proxy::simulation_reason(Some(&v), headers, true, all_on())
+    };
+    let long = "x".repeat(3000);
+    let ctx = r"## Session Context\n\n- **User identity**: `e`";
+    let meta = r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"9922ef8e-7945-4f5a-ab4f-cf5f521531df\",\"session_id\":\"4dc73702-d904-4887-809d-17b93cc5357c\"}"}"#;
+    let body = |system: &str| {
+        format!(
+            r#"{{"model":"claude-sonnet-5-5","max_tokens":64,"system":[{system}],"messages":[{{"role":"user","content":"x"}}],"stop_sequences":["</severity>"],"thinking":{{"type":"disabled"}},{meta}}}"#
+        )
+    };
+    let blk = |t: &str| format!(r#"{{"type":"text","text":"{t}"}}"#);
+    let no_billing = body(&format!("{},{}", blk(&long), blk(ctx)));
+    let with_billing = body(&format!(
+        "{},{},{}",
+        blk("x-anthropic-billing-header: cc_version=2.1.284.3de; cc_entrypoint=cli;"),
+        blk(&long),
+        blk(ctx)
+    ));
+    assert_eq!(reason(&no_billing, &cc_ua), None, "两块 system 的官方分类透传");
+    assert_eq!(reason(&with_billing, &cc_ua), None, "三块的官方分类透传");
+
+    let no_beta = platform_headers(Some(CC_UA));
+    assert_eq!(reason(&no_billing, &no_beta), Some(NotCcShaped), "缺 auto-mode-classifier beta");
+    assert_eq!(
+        reason(&no_billing.replace(r#""type":"disabled""#, r#""type":"adaptive""#), &cc_ua),
+        Some(NotCcShaped),
+        "thinking 不是 disabled"
+    );
+    assert_eq!(
+        reason(&no_billing.replace(&long, "short"), &cc_ua),
+        Some(NotCcShaped),
+        "提示词不够长"
+    );
+    assert_eq!(
+        reason(&no_billing.replace("## Session Context", "other"), &cc_ua),
+        Some(NotCcShaped),
+        "第二块不是 Session Context"
+    );
+    assert_eq!(
+        reason(&no_billing.replace(r#""max_tokens":64"#, r#""max_tokens":65"#), &cc_ua),
+        Some(NotCcShaped),
+        "max_tokens 不是 64"
+    );
+}
+
 /// [`simulation_reason`]：记的是三道判据里**第一道**没过的（UA → 身份 → 形态，形态内部
 /// CC 形态 → 基座 → 工具）；全过与官方额度探测为 `None`；`detect` 把同一个原因带进
 /// [`Simulation::reason`]，流水的 `sim_reason` 列与 SIMULATED 日志行都取它。

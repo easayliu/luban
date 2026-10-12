@@ -341,7 +341,11 @@ pub(super) fn rewrite_body_out(
     let prefix_injected = flags.simulate_cc
         && sim.is_none()
         && cc_kind.allows_system_prefix()
-        && ensure_cc_system_prefix(&mut v, client, !billing_only);
+        && ensure_cc_system_prefix(
+            &mut v,
+            client,
+            !billing_only && cc_kind.prefix_includes_identity(),
+        );
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
     // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。

@@ -811,6 +811,50 @@ pub(super) fn capture_forensics_without_body(
     }
 }
 
+/// 来访头的取证摘要（JSON 对象，键小写按字母序），落进流水的 `inbound_headers` 列。
+///
+/// 凭证类头（`authorization`、`x-api-key`、`cookie` 等）不记；值各截 600 字符，`anthropic-beta`
+/// 那串官方约 500 字节，够完整留下。只给走模拟的请求记（调用方判），这样判「来访带了什么头、
+/// 为什么没被当成官方」有据可查，又不给每条流水加几百字节。
+pub(in crate::proxy) fn inbound_headers_summary(headers: &HeaderMap) -> Option<String> {
+    const SKIP: [&str; 6] = [
+        "authorization",
+        "x-api-key",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-goog-api-key",
+    ];
+    let map: std::collections::BTreeMap<String, String> = headers
+        .iter()
+        .filter(|(k, _)| !SKIP.contains(&k.as_str()))
+        .map(|(k, v)| {
+            let v = String::from_utf8_lossy(v.as_bytes());
+            (k.as_str().to_string(), v.chars().take(600).collect::<String>())
+        })
+        .collect();
+    if map.is_empty() { None } else { serde_json::to_string(&map).ok() }
+}
+
+/// 来访体的结构摘要，落进流水的 `inbound_shape` 列：[`shape_summary_of`] 吃来访体得到的那份
+/// （键序、system 各块长度与断点、messages 块数、metadata、各参数取值），再补一个 `facts`：
+/// 来访 system 里有没有 billing header、身份句——判「为什么没被当成官方」最先要看的两项。
+/// 不含用户正文。只给走模拟的请求记（调用方判）。
+///
+/// **已知风险，待加强**：[`shape_summary_of`] 对不认识的顶层字段原样拷贝（`_ => val.clone()`），
+/// 出站体经过改写、这些值有界，来访体却没有——持有接入 Key 的人把几十 MB 塞进
+/// `thinking.display` 之类字段，出站被剥掉，这里却整段落库，翻流水时一页 100 条就能物化
+/// 数 GB。目前不常见，先记下；加强时改为字段白名单、逐字段截断并限摘要总长。
+pub(in crate::proxy) fn inbound_shape_summary(v: &serde_json::Value) -> Option<String> {
+    let mut shape: serde_json::Value = serde_json::from_str(&shape_summary_of(v).shape?).ok()?;
+    let f = super::simulation::inbound_facts(v);
+    shape.as_object_mut()?.insert(
+        "facts".into(),
+        serde_json::json!({"billing_header": f.billing_header, "identity": f.identity}),
+    );
+    serde_json::to_string(&shape).ok()
+}
+
 /// 把出站体的取证三项补进取证字段。
 ///
 /// 出站体里取到的 session_id 覆盖已有的（那是出站头里的兜底），取不到就留着原来的——

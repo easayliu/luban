@@ -94,6 +94,13 @@ pub struct Forensics {
     ///
     /// 本地拒绝的行只有这一个（没到上游，没有出站值）。0.3.139 之前的旧记录为 `None`。
     pub session_id_in: Option<String>,
+    /// 走模拟的请求的**来访头**（JSON 对象，键小写、去掉 `authorization` / `x-api-key` / `cookie`
+    /// 这类凭证头，值截断），见 `crate::proxy::inbound_headers_summary`。`shape` 记的是出站体，
+    /// 来访带了什么头改写之后就没处可查，判「为什么被当非官方」要靠它。非模拟路径为 `None`。
+    pub inbound_headers: Option<String>,
+    /// 走模拟的请求的**来访体结构摘要**（格式同 [`Self::shape`]，另带 `facts`：有没有 billing header、
+    /// 身份句），见 `crate::proxy::inbound_shape_summary`。非模拟路径为 `None`。
+    pub inbound_shape: Option<String>,
     /// 这条请求落在哪个**模拟会话绑定**上（`session_bindings.session_key`，形如
     /// `lb:v2:sid:<uuid>` / `lb:v2:pfx:<hex>`，见 `crate::proxy::session_binding_key`）；
     /// 带设备身份的来访与非模拟路径为 `None`。
@@ -260,7 +267,7 @@ pub(super) const USAGE_LOG_COLS: &str =
         cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
         request_id, upstream_request_id,
         proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
-        device_id_out, response_excerpt, sim_reason, session_key, session_id_in";
+        device_id_out, response_excerpt, sim_reason, session_key, session_id_in, inbound_headers, inbound_shape";
 
 /// 按字符截断（不是按字节：文案里有中文，按字节切会切在多字节中间）。
 pub(super) fn head_chars(s: &str, n: usize) -> String {
@@ -303,6 +310,8 @@ macro_rules! opt_texts {
             &$($m)? $r.forensics.error_message,
             &$($m)? $r.forensics.rewrites,
             &$($m)? $r.forensics.response_excerpt,
+            &$($m)? $r.forensics.inbound_headers,
+            &$($m)? $r.forensics.inbound_shape,
         ]
     };
 }
@@ -419,11 +428,11 @@ const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
          request_id, upstream_request_id,
          proxy, simulated, shape, session_id, error_type, error_message, third_party,
          rewrites, device_id_out, response_excerpt, sim_reason, session_key,
-         session_id_in)
+         session_id_in, inbound_headers, inbound_shape)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
              $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
              $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44,
-             $45)";
+             $45, $46, $47)";
 
 /// 落账（`credential_stats` 与 `device_costs`）的那条 SQL：不带额度快照的。设备账本在 CTE 里，
 /// `$4`（device_id）为 NULL 时不记。
@@ -602,6 +611,8 @@ impl CredentialStore {
             .bind(&rec.forensics.sim_reason)
             .bind(&rec.forensics.session_key)
             .bind(&rec.forensics.session_id_in)
+            .bind(&rec.forensics.inbound_headers)
+            .bind(&rec.forensics.inbound_shape)
             .execute(&mut *tx)
             .await?;
         // 落账与费用汇总。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属、号已删掉的
@@ -850,6 +861,8 @@ pub(super) fn usage_log_from_row(r: &PgRow) -> Result<UsageLog> {
             sim_reason: r.try_get(43)?,
             session_key: r.try_get(44)?,
             session_id_in: r.try_get(45)?,
+            inbound_headers: r.try_get(46)?,
+            inbound_shape: r.try_get(47)?,
         },
     })
 }

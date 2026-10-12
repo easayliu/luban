@@ -137,6 +137,52 @@ fn skips_thinking_display_without_the_beta() {
     assert!(!merged.contains("thinking-display-updates"), "老世代的串不补: {merged}");
 }
 
+/// 关掉 billing header 的客户端发来的安全分类（`[分类提示词, Session Context]` 两块）走透传：
+/// 只补回 billing header，不插身份句——官方那条是 `[billing, 提示词, Session Context]` 三块。
+/// 主线程类别照旧两块都补。
+#[test]
+fn classifier_prefix_gets_billing_header_without_identity() {
+    let long = "x".repeat(3000);
+    let ctx = "## Session Context";
+    let body = Bytes::from(format!(
+        r#"{{"model":"claude-sonnet-5","max_tokens":64,"system":[{{"type":"text","text":"{long}"}},{{"type":"text","text":"{ctx}"}}],"messages":[{{"role":"user","content":"hi"}}],"stop_sequences":["</severity>"],"thinking":{{"type":"disabled"}}}}"#
+    ));
+    let texts = |kind| {
+        let out = crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            false,
+            None,
+            None,
+            kind,
+            None,
+        )
+        .0;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let cls = texts(crate::proxy::CcRequestKind::Classifier);
+    assert_eq!(cls.len(), 3, "{cls:?}");
+    assert!(cls[0].starts_with("x-anthropic-billing-header:"));
+    assert!(!cls.iter().any(|t| t == config::CC_SYSTEM_IDENTITY), "分类不带身份句: {cls:?}");
+    assert_eq!((cls[1].len(), cls[2].as_str()), (3000, "## Session Context"));
+    let main = texts(crate::proxy::CcRequestKind::Main);
+    assert_eq!(main[1], config::CC_SYSTEM_IDENTITY, "主线程照旧补身份句: {main:?}");
+}
+
 /// 真 CC（API-key 三块形态）请求，工具五种形态各一个：内建、客户端显式写了 `false` 的内建、
 /// `mcp__*`、`defer_loading` 占位、服务端工具。
 fn eager_body(model: &str, with_identity: bool) -> Bytes {

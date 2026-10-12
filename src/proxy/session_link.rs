@@ -1177,6 +1177,14 @@ impl CcRequestKind {
         !matches!(self, Self::QuotaProbe | Self::CountTokens)
     }
 
+    /// 补 system 前缀时要不要连身份句一起补。**安全分类不补**：官方那条是 `[billing header, 分类
+    /// 提示词, Session Context]`（`cap/2.1.260/00019`、`00030`），没有身份句；关掉 billing header
+    /// 的客户端发来的只剩后两块，补回 billing header 即与官方一致，再插一句身份声明就成了官方
+    /// 从不发的四块。上游放行闸只要合法的 billing header 就够。
+    pub(super) fn prefix_includes_identity(self) -> bool {
+        !matches!(self, Self::Classifier)
+    }
+
     /// 缓存断点该不该按开关补 `ttl:"1h"`。订阅端官方：主线程与「猜下一句」全部断点 1h；分叉、
     /// 子代理（含其无工具辅助调用）、预热全部裸断点（`cap/auto-2.1.293-20261008-full` 等三批逐条
     /// 核过）——这几类不补。其余几类官方一个断点都不标：官方那一条本身由调用方按
