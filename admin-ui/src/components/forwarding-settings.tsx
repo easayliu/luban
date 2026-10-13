@@ -987,6 +987,9 @@ function OAuthScopes() {
   // 与后端同一口径：压空白、按输入顺序去重（不排序——顺序也是指纹的一部分）。
   const items = Array.from(new Set(draft.split(/\s+/).filter(Boolean)))
   const value = items.join(' ')
+  // 缺 user:profile 的号读不到账号资料：重新授权核对不了是不是同一个号，新号也记不下账号 ID。
+  // 留空 = 官方默认，本就含这一项。
+  const missingProfile = items.length > 0 && !items.includes('user:profile')
   const preset = value === official
     ? t('官方默认', 'Official default')
     : value === minimal
@@ -1000,16 +1003,16 @@ function OAuthScopes() {
           <FieldLabel htmlFor="oauth-scopes">{t('申请的 scope', 'Requested scopes')}</FieldLabel>
           <FieldDescription className="max-w-xl leading-5">
             {t(
-              '以空格分隔，原样发送，不做校验；留空即恢复官方默认。',
-              'Space separated and sent verbatim without validation; leave empty to restore the official default.',
+              '以空格分隔，原样发送，须包含 user:profile；留空即恢复官方默认。',
+              'Space separated and sent verbatim; must include user:profile. Leave empty to restore the official default.',
             )}{' '}
             <DetailsTrigger label={t('影响与限制', 'Impact & limitations')} open={impactOpen} onToggle={() => setImpactOpen((v) => !v)} />
           </FieldDescription>
           {impactOpen && (
             <DetailsBody>
               {t(
-              '以空格分隔，按填写内容原样发送。这里不做校验，是否接受由 Claude 的同意页决定（例如完全不带 scope 会返回 Missing scope parameter）。留空则恢复官方默认的整套 scope，与官方客户端逐字一致，scope 集合也是指纹的一部分。「精简」档只保留 Luban 实际需要的三项：user:inference 用于转发（移除后账号仅能登录并查看额度）、user:profile 决定能否读取邮箱与等级、user:file_upload 负责经 Files API 的上传。',
-                'Space separated, sent verbatim — nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota), user:profile for the email and tier, user:file_upload for uploads through the Files API.',
+              '以空格分隔，按填写内容原样发送。除 user:profile 外不做校验，其余是否接受由 Claude 的同意页决定（例如完全不带 scope 会返回 Missing scope parameter）。留空则恢复官方默认的整套 scope，与官方客户端逐字一致，scope 集合也是指纹的一部分。「精简」档只保留 Luban 实际需要的三项：user:inference 用于转发（移除后账号仅能登录并查看额度）；user:profile 用于读取邮箱、等级与账号 ID，重新授权时据此核对是否为同一账号，缺了它核对无从进行、刷新 token 也只能沿用原授权，故为必填；user:file_upload 负责经 Files API 的上传。',
+                'Space separated, sent verbatim. Apart from user:profile nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota); user:profile for the email, tier and account ID, which reauthorization uses to confirm it is the same account — without it that check cannot run and token refresh can only keep the original grant, so it is required; user:file_upload for uploads through the Files API.',
               )}
             </DetailsBody>
           )}
@@ -1021,7 +1024,16 @@ function OAuthScopes() {
           placeholder={official}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          aria-invalid={missingProfile || undefined}
         />
+        {missingProfile && (
+          <p className="text-xs leading-5 text-destructive-foreground">
+            {t(
+              '缺少 user:profile：读取不到账号资料，重新授权时无法核对是否为同一账号。补上此项方可保存。',
+              'Missing user:profile: account details cannot be read, so reauthorization cannot confirm it is the same account. Add it to save.',
+            )}
+          </p>
+        )}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="secondary" size="sm">
@@ -1039,7 +1051,7 @@ function OAuthScopes() {
           <Button
             size="sm"
             loading={save.isPending}
-            disabled={value === current}
+            disabled={value === current || missingProfile}
             onClick={() => save.mutate(value)}
           >
             <SaveIcon />
