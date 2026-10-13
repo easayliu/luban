@@ -116,6 +116,9 @@ pub(super) async fn prepare<'a>(
     } = *inb;
     let Prepared { ref url, ref tool_names, beta_ctx, upgrade_stream, .. } = *prepared;
     let Pick { ref token, ref cred, session_slot, .. } = *pick;
+    if let Some(probe) = &inb.probe_prewarm {
+        return prepare_probe_prewarm(cx, inb, probe, pick).await;
+    }
     // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定并随选号结果一起返回，
     // 见 [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、
     // 对话之间复用。换号重试后 `session_slot` 随新号一起换。没占槽位的（带设备身份的
@@ -246,35 +249,8 @@ pub(super) async fn prepare<'a>(
     // 模拟路径的出站 URL 补 `?beta=true`（见 [`ensure_beta_query`]）。非计费路径不补：
     // `count_tokens` 官方带不带这个参数，抓包里没有样本，没有依据的形态就别猜着改。
     let target = if sim.is_some() && billable { ensure_beta_query(url) } else { url.clone() };
-    // 这一轮用的是 `cred` 这个号，出站客户端就取它的：配了专用代理的号必须走它自己的
-    // 代理，否则真实出口 IP 会直接打到上游。取不出来（代理配错/建不出客户端）时直接
-    // 标记禁用踢出调度池——不退回直连，也不留在池里每次白吃一发 503。
-    let client = match state.clients.for_credential(cred) {
-        Ok(c) => c,
-        Err(e) => {
-            let reason = format!("[proxy] {e:#}");
-            tracing::warn!(
-                cred_id = cred.id, cred = %cred.label, error = %reason,
-                "proxy unusable, disabling the credential"
-            );
-            let (id, ctx) = (
-                cred.id,
-                store::BanContext {
-                    reason: reason.clone(),
-                    source: "proxy",
-                    error_message: Some(format!("{e:#}")),
-                    request_id: Some(request_id.to_string()),
-                    ..Default::default()
-                },
-            );
-            let _ = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await;
-            return Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                format!("{e:#}"),
-            ));
-        }
-    };
+    // 这一轮用的是 `cred` 这个号，出站客户端就取它的，见 [`client_for`]。
+    let client = client_for(state, cred, request_id).await?;
     let mut upstream = Upstream {
         _state: std::marker::PhantomData,
         client,
@@ -374,5 +350,71 @@ pub(super) async fn prepare<'a>(
         req_model.as_deref().unwrap_or("-"),
         req_max_tokens.unwrap_or(0),
     );
+    Ok(Attempt { upstream, sent, sent_bits, route_load })
+}
+
+/// 这一轮用的号的出站客户端：配了专用代理的号必须走它自己的代理，否则真实出口 IP 会直接打到
+/// 上游。取不出来（代理配错/建不出客户端）时直接标记禁用踢出调度池——不退回直连，也不留在池里
+/// 每次白吃一发 503。
+async fn client_for(
+    state: &AppState,
+    cred: &crate::credentials::Credential,
+    request_id: &str,
+) -> Result<wreq::Client, Response> {
+    match state.clients.for_credential(cred) {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            let reason = format!("[proxy] {e:#}");
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label, error = %reason,
+                "proxy unusable, disabling the credential"
+            );
+            let (id, ctx) = (
+                cred.id,
+                store::BanContext {
+                    reason: reason.clone(),
+                    source: "proxy",
+                    error_message: Some(format!("{e:#}")),
+                    request_id: Some(request_id.to_string()),
+                    ..Default::default()
+                },
+            );
+            let _ = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await;
+            Err(error_response(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")))
+        }
+    }
+}
+
+/// 改写成预热的探针（[`ProbePrewarm`]）这一轮：出站整条是 [`prewarm_upstream`] 那份官方 `/model`
+/// 预热，与连通性测试同一条。主线程那套都不做——不识别模拟、不补 fallbacks、不查出站形态规则、
+/// 不跑新会话的启动握手（官方的预热发在已经握过手的会话里，这条也不开新会话）。
+///
+/// 出站 URL 固定是 `/v1/messages`，**不沿用来访的路径与查询串**：计费路径按前缀认
+/// （`is_billable_messages`），来访打到
+/// `/v1/messages/batches`、或带着 `?beta=false` 之类的查询串，照搬就会把这条官方形态的预热发到
+/// 别处、或带上官方没有的参数。
+async fn prepare_probe_prewarm<'a>(
+    cx: &Ctx<'a>,
+    inb: &Inbound,
+    probe: &ProbePrewarm,
+    pick: &Pick,
+) -> Result<Attempt<'a>, Response> {
+    let Ctx { state, request_id, .. } = *cx;
+    let Inbound { ref client_ua, ref body, ref body_json, ref req_model, ref device_fp, .. } = *inb;
+    let Pick { ref token, ref cred, .. } = *pick;
+    let model = req_model.as_deref().unwrap_or_default();
+    let client = client_for(state, cred, request_id).await?;
+    let url = format!("{}/v1/messages", state.upstream_base);
+    let upstream = prewarm_upstream(client, url, cred, token, model);
+    let (sent, sent_bits) = upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+    tracing::info!(
+        cred_id = cred.id, cred = %cred.label,
+        ua = %client_ua,
+        model = %req_model.as_deref().unwrap_or("-"),
+        kind = probe.kind.tag(),
+        session_id = %upstream.session_out.as_deref().unwrap_or("-"),
+        "identity path: PROBE→PREWARM — sending this probe as an official /model prewarm"
+    );
+    let route_load = note_upstream_send(&state.upstream_load, cred.id, model, 1);
     Ok(Attempt { upstream, sent, sent_bits, route_load })
 }

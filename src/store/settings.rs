@@ -258,10 +258,14 @@ pub const REJECT_EMPTY_REPLIES: &str = "reject_empty_replies";
 /// 关掉即不学也不拦。见 [`ForwardFlags::reject_learned_shapes`]。
 pub const REJECT_LEARNED_SHAPES: &str = "reject_learned_shapes";
 
-/// 探针拒绝的**严格模式**：ping 不再要求无 tools，并新增「短开场」判据（无 system、无 tools、
+/// 探针判据的**严格模式**（本地应答与改写为预热都按它判）：ping 不再要求无 tools，并新增「短开场」判据（无 system、无 tools、
 /// 一条几个字的用户消息）。默认关——会误伤真人用裸聊天客户端发的第一句「你好」。
 /// 见 [`ForwardFlags::reject_probes_strict`] 与 `proxy::probe_signature`。
 pub const REJECT_PROBES_STRICT: &str = "reject_probes_strict";
+
+/// 探针拒绝关着时，把命中探针判据的请求改写成官方 `/model` 预热再发。默认关。
+/// 见 [`ForwardFlags::probe_as_prewarm`] 与 `proxy::probe_prewarm`。
+pub const PROBE_AS_PREWARM: &str = "probe_as_prewarm";
 
 /// 是否替每条转发的 `/v1/messages` 上报官方客户端形态的遥测（`tengu_api_*` 事件链、
 /// Datadog 日志、OTel 指标）的 settings 键名。缺省视为开启。见 [`ForwardFlags::api_telemetry`]。
@@ -771,6 +775,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_PROBES_STRICT) {
             flags.reject_probes_strict = v;
         }
+        if let Some(v) = on(PROBE_AS_PREWARM) {
+            flags.probe_as_prewarm = v;
+        }
         // 拆分前三件事共用 `reject_probes`：旧库只写过它的，两条新键沿用它的取值（关过 =
         // 用户当时把学到的规则也一起关了，升级不能悄悄开回来）；新键一旦写了就以新键为准。
         if let Some(v) = on(REJECT_REFUSALS).or_else(|| on(REJECT_PROBES)) {
@@ -1109,6 +1116,7 @@ mod tests {
             (REJECT_EMPTY_REPLIES, "0"),
             (REJECT_LEARNED_SHAPES, "0"),
             (REJECT_PROBES_STRICT, "0"),
+            (PROBE_AS_PREWARM, "0"),
             (API_TELEMETRY, "0"),
             (KEEPALIVE_TELEMETRY, "0"),
             (FABLE_REFUSAL_FALLBACK, "0"),
@@ -1153,6 +1161,7 @@ mod tests {
                 reject_session_conflict: false,
                 reject_probes: false,
                 reject_probes_strict: false,
+                probe_as_prewarm: false,
                 reject_refusals: false,
                 reject_empty_replies: false,
                 reject_learned_shapes: false,

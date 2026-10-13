@@ -85,6 +85,8 @@ fn sse_ok(text: &str) -> Reply {
 struct Seen {
     path: String,
     token: String,
+    headers: HeaderMap,
+    body: Bytes,
 }
 
 /// 本地模拟上游：按脚本依次回复（脚本用完回 500），记下每发请求。
@@ -98,7 +100,7 @@ impl MockUpstream {
         let script = Arc::new(Mutex::new(VecDeque::from(replies)));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (script_h, seen_h) = (script.clone(), seen.clone());
-        let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
+        let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
             let (script, seen) = (script_h.clone(), seen_h.clone());
             async move {
                 let token = headers
@@ -107,7 +109,7 @@ impl MockUpstream {
                     .and_then(|v| v.strip_prefix("Bearer "))
                     .unwrap_or_default()
                     .to_string();
-                seen.lock().push(Seen { path: uri.to_string(), token });
+                seen.lock().push(Seen { path: uri.to_string(), token, headers, body });
                 let reply = script.lock().pop_front().unwrap_or_else(|| {
                     Reply::json_error(500, "api_error", "mock upstream script exhausted")
                 });
@@ -152,6 +154,7 @@ async fn setup_tier(
     // 新会话的启动握手会打真上游，测试里关掉；探针拦截与这里要测的分支无关，也关掉。
     store.set_setting(store::API_TELEMETRY, "0").await.unwrap();
     store.set_setting(store::REJECT_PROBES, "0").await.unwrap();
+    store.set_setting(store::PROBE_AS_PREWARM, "0").await.unwrap();
     let far_future = crate::credentials::now_secs() + 30 * 24 * 3600;
     let mut ids = Vec::with_capacity(n);
     for i in 0..n {
@@ -1061,4 +1064,138 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["error"]["type"], "request_too_large");
     assert!(mock.seen().is_empty());
+}
+
+/// 一条下游中转的探活：`Go-http-client`、不带身份、无 tools、一句话、`max_tokens` 8（判据 ping）。
+fn go_probe(stream: bool) -> (HeaderMap, Bytes) {
+    let body = serde_json::json!({
+        "model": "claude-opus-5",
+        "max_tokens": 8,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "ping"}],
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+}
+
+/// 上游对 1 token 预热的整段 JSON 回复，正文是 `content`。
+fn prewarm_reply(content: serde_json::Value) -> Reply {
+    Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: serde_json::to_vec(&serde_json::json!({
+            "id": "msg_01upstream", "type": "message", "role": "assistant",
+            "model": "claude-opus-5", "content": content,
+            "stop_reason": "max_tokens", "stop_sequence": null,
+            "usage": {"input_tokens": 33, "output_tokens": 1}}))
+        .unwrap(),
+    }
+}
+
+/// 探针拒绝关、`probe_as_prewarm` 开：探活改写成官方 `/model` 预热发出——出站体是预热（`Hi`、
+/// `max_tokens` 1、billing header + 身份句、不带 tools 与 stream），头是官方 CLI 的，身份是这个号
+/// 自己的（头体同一个会话 id）。不带身份的探活不被设备身份闸拦下。上游回空正文时补一句「OK」，
+/// 其余照上游；流水标 `probe_prewarm:ping` 与 `probe_reply_filled`。
+#[sqlx::test]
+async fn a_probe_is_sent_as_a_prewarm_and_an_empty_reply_gets_ok(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![prewarm_reply(serde_json::json!([]))]).await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::PROBE_AS_PREWARM, "1").await.unwrap();
+
+    let (status, headers, body) = send(&state, go_probe(false)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert!(headers.get("x-luban-probe-kind").is_none(), "判据只记在流水里");
+    let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply["content"], serde_json::json!([{"type": "text", "text": "OK"}]));
+    assert_eq!(reply["id"], "msg_01upstream");
+    assert_eq!(reply["stop_reason"], "end_turn", "来访要 8 个 token，回一个字就停不是截断");
+    assert_eq!(reply["usage"]["input_tokens"], 33);
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].token, "tok-0");
+    assert!(seen[0].path.contains("beta=true"), "{}", seen[0].path);
+    let ua = seen[0].headers.get(header::USER_AGENT).unwrap().to_str().unwrap();
+    assert!(ua.starts_with("claude-cli/"), "{ua}");
+    let out: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(out["model"], "claude-opus-5");
+    assert_eq!(out["max_tokens"], 1);
+    assert!(out.get("stream").is_none() && out.get("tools").is_none(), "{out}");
+    let system = out["system"].as_array().unwrap();
+    assert_eq!(system.len(), 2);
+    assert!(system[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
+    assert_eq!(system[1]["text"], crate::config::CC_SYSTEM_IDENTITY);
+    assert_eq!(out["messages"][0]["content"][0]["text"], "Hi");
+    let user_id: serde_json::Value =
+        serde_json::from_str(out["metadata"]["user_id"].as_str().unwrap()).unwrap();
+    let header_sid =
+        seen[0].headers.get("x-claude-code-session-id").unwrap().to_str().unwrap().to_string();
+    assert_eq!(user_id["session_id"], header_sid, "头体同一个会话 id");
+
+    let rows = usage_logs(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cred_id, Some(ids[0]));
+    assert_eq!(
+        rows[0].forensics.rewrites.as_deref(),
+        Some("probe_prewarm:ping,probe_reply_filled")
+    );
+}
+
+/// 来访要流式就把上游那段整段 JSON 展成 SSE；旧一代模型回的那一个字原样交回，不补「OK」。
+/// 出站 URL 固定是 `/v1/messages?beta=true`：来访的路径（前缀匹配算计费的 `/v1/messages/…`）
+/// 与查询串（`beta=false` 之类）都不跟着出站。
+#[sqlx::test]
+async fn a_streamed_probe_gets_the_prewarm_reply_as_sse(pool: sqlx::PgPool) {
+    let hi = serde_json::json!([{"type": "text", "text": "Hi"}]);
+    let mock = MockUpstream::start(vec![prewarm_reply(hi)]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::PROBE_AS_PREWARM, "1").await.unwrap();
+
+    let (status, headers, body) =
+        send_to(&state, "/v1/messages/batches?beta=false&x=1", go_probe(true)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let ct = headers.get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+    assert!(ct.starts_with("text/event-stream"), "{ct}");
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.starts_with("event: message_start"), "{text}");
+    assert!(text.contains(r#""text":"Hi""#) && !text.contains(r#""text":"OK""#), "{text}");
+    assert!(text.trim_end().ends_with(r#"data: {"type":"message_stop"}"#), "{text}");
+    assert_eq!(mock.seen()[0].path, "/v1/messages?beta=true");
+    let out: serde_json::Value = serde_json::from_slice(&mock.seen()[0].body).unwrap();
+    assert!(out.get("stream").is_none(), "预热照官方非流式发");
+
+    let rows = usage_logs(&store, 1).await;
+    assert_eq!(rows[0].forensics.rewrites.as_deref(), Some("probe_prewarm:ping"));
+}
+
+/// 改写成预热的探针不学零输出：`reject_empty_replies` 开着、上游对预热回 0 输出的空正文（比实测的
+/// 1 个 token 更极端），也不学进规则；下一条同样的探活照常改写成预热发到上游，不被本地 403。
+#[sqlx::test]
+async fn a_probe_sent_as_a_prewarm_never_learns_an_empty_reply(pool: sqlx::PgPool) {
+    let zero = || {
+        let mut r = prewarm_reply(serde_json::json!([]));
+        let mut v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        v["usage"]["output_tokens"] = 0.into();
+        r.body = serde_json::to_vec(&v).unwrap();
+        r
+    };
+    let mock = MockUpstream::start(vec![zero(), zero()]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::PROBE_AS_PREWARM, "1").await.unwrap();
+    store.set_setting(store::REJECT_EMPTY_REPLIES, "true").await.unwrap();
+    store.set_setting(store::REJECT_REFUSALS, "true").await.unwrap();
+
+    for n in 1..=2 {
+        let (status, _, body) = send(&state, go_probe(false)).await;
+        assert_eq!(status, StatusCode::OK, "第 {n} 条: {}", String::from_utf8_lossy(&body));
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["content"][0]["text"], "OK");
+        usage_logs(&store, n).await;
+        store.drain_writes(std::time::Duration::from_secs(3)).await;
+        assert!(state.empty_replies.read().classes.is_empty(), "第 {n} 条后不该学到零输出");
+    }
+    assert_eq!(mock.seen().len(), 2, "第二条照常到上游");
 }

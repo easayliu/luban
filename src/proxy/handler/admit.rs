@@ -35,6 +35,24 @@ pub(super) struct Inbound {
     pub(super) plan: SessionPlan,
     /// 来访的接入 Key 能用哪些号（它绑定的分组，按优先顺序；空 = 全部号）。
     pub(super) key_access: store::KeyAccess,
+    /// 命中探针判据、改写成官方 `/model` 预热再发的那条（见 [`ProbePrewarm`]）；其余为 `None`。
+    pub(super) probe_prewarm: Option<ProbePrewarm>,
+}
+
+/// 探针拒绝关着、`probe_as_prewarm` 开着时命中探针判据的来访
+/// （[`store::ForwardFlags::probe_as_prewarm`]）：`body` / `body_json` 已换成官方 `/model` 预热
+/// （[`prewarm_body`]），设备与会话身份清空（来访的身份不出站），出站由 [`prewarm_upstream`] 组装，
+/// 回程由 `respond` 补正文、按来访要的形态交回。
+pub(super) struct ProbePrewarm {
+    /// 命中的是哪一条判据，进日志、流水与响应头。
+    pub(super) kind: ProbeKind,
+    /// 来访原本要不要流式：预热是非流式发的，回程按这一项决定要不要展成 SSE。
+    pub(super) wants_stream: bool,
+    /// 来访原本要的输出上限：回程据此改 `stop_reason`（[`probe_stop_reason`]）。
+    pub(super) req_max_tokens: Option<i64>,
+    /// 来访原本那份体的结构摘要（[`inbound_shape_summary`]）：`body_json` 已换成预热，流水里要
+    /// 留的是下游到底发来了什么。
+    pub(super) inbound_shape: Option<String>,
 }
 
 impl Inbound {
@@ -125,7 +143,7 @@ pub(super) async fn admit(
     // 自报 CC 的历史里混进了 `call_` id（会话中途切过别的后端）：改写成 `toolu_` 再往下走，
     // 不然这个会话此后每一轮都被 2.3a 拒掉。后面所有闸门与出站改写都看改写后的那份。
     let body = remap_foreign_tool_ids(state, body, &mut facts, &client_ua);
-    identity_gates(
+    let probe = identity_gates(
         state,
         &method,
         &path_and_query,
@@ -140,51 +158,81 @@ pub(super) async fn admit(
     )
     .await?;
 
+    // 改写成预热的探针不过这两道：形态拦截与学到的规则看的是来访那份体，而出站的是官方预热；
+    // 设备 RPM 管的是来访那台设备，而它的身份根本不出站。
+    if probe.is_none() {
+        shape_gates(state, &method, &path_and_query, &client_ua, &headers, &facts, log_state)?;
+        device_rpm_gate(state, &method, &path_and_query, &client_ua, &facts, log_state)?;
+    }
+
+    let Facts {
+        mut body_json,
+        mut device_id,
+        mut has_user_id,
+        mut cc_shaped,
+        from_cc_client,
+        req_model,
+        mut session_id,
+        billable,
+    } = facts;
+    // 来访自报的会话 id（校验过形态，见 [`incoming_session_id`]）：会话键与流水都要用，算一次。
+    // 走模拟时上游看到的是另一个 uuid（按槽位派生或按账号钉住），来访这个不落库就彻底丢了
+    // ——下游拿着自己那个 id 来查请求会一条都查不到，见 [`store::Forensics::session_id_in`]。
+    // 在下面把探针换成预热之前取：流水上记的仍是来访自己那个。
+    let inbound_session = incoming_session_id(&headers, body_json.as_ref());
+    // 2.1a 判成要改写成预热的探针：体换成官方 `/model` 预热（模型沿用来访的），来访的设备与会话
+    // 身份清掉——出站身份是这个号自己的（[`prewarm_upstream`]），选号也就不该按来访的设备粘、
+    // 不该替它占设备或会话名额，走裸请求那一档。
+    let probe_prewarm = probe.map(|kind| ProbePrewarm {
+        kind,
+        wants_stream: body_json.as_ref().is_some_and(stream_requested),
+        req_max_tokens: request_max_tokens(body_json.as_ref()),
+        inbound_shape: body_json.as_ref().and_then(inbound_shape_summary),
+    });
+    let body = match probe_prewarm {
+        Some(_) => {
+            let prewarm = prewarm_body(req_model.as_deref().unwrap_or_default());
+            body_json = serde_json::from_slice(&prewarm).ok();
+            device_id = None;
+            has_user_id = false;
+            cc_shaped = true;
+            session_id = None;
+            prewarm
+        }
+        None => body,
+    };
     // 这条请求声明的输出上限。只为日志：裸 429 那一档要拿它对上游那套「每分钟输出 token」
     // 限额，见 [`UpstreamLoad`]。算在这里是因为 `body_json` 只解析一次（见上面 2 那段），
     // 而这个值逐轮不变。
-    let req_max_tokens = request_max_tokens(facts.body_json.as_ref());
-    shape_gates(state, &method, &path_and_query, &client_ua, &headers, &facts, log_state)?;
-    device_rpm_gate(state, &method, &path_and_query, &client_ua, &facts, log_state)?;
-
-    let Facts {
-        body_json,
-        device_id,
-        has_user_id,
-        cc_shaped,
-        from_cc_client,
-        req_model,
-        session_id,
-        billable,
-    } = facts;
+    let req_max_tokens = request_max_tokens(body_json.as_ref());
     // 2.5) 转发形态开关一条 SQL 读齐（默认全开 = 加入开关前的既有行为），以及这条请求走不走
     //      模拟——两者在选号之前就要定下来：模拟路径的会话键参与选号（下面的 `session_key`），
     //      设备指纹又按走不走模拟取两套。
     let flags = state.store.forward_flags();
     // 走不走模拟的判据与 [`Simulation::detect`] 同源（都走 [`simulates_cc`]），不然指纹会把
     // 一条请求算到另一台设备名下。
-    let simulating = simulates_cc(body_json.as_ref(), &headers, from_cc_client, flags);
+    // 改写成预热的探针不走模拟：头由 [`prewarm_upstream`] 按 `Prewarm` profile 出，体按真实 CC
+    // 来访的预热改写。
+    let simulating = probe_prewarm.is_none()
+        && simulates_cc(body_json.as_ref(), &headers, from_cc_client, flags);
     // 设备指纹用于派生伪装 device_id。归一化开着时只取平台，关着时叠加客户端原始 device_id。
     // **模拟路径取实际发出去的那套头**（[`sim_device_fingerprint`]）：来访的平台头与 UA 一个
     // 都不会发出去，同一账号经模拟路径的全部请求是同一台设备；非模拟路径按来访的平台头与
     // UA 算（[`device_fingerprint`]，一台设备只能有一个客户端版本）。
     let fp_device = if flags.normalize_device_fp { None } else { device_id.as_deref() };
-    let device_fp = if simulating {
+    let device_fp = if simulating || probe_prewarm.is_some() {
         sim_device_fingerprint(fp_device)
     } else {
         device_fingerprint(fp_device, &headers, &client_ua)
     };
-    // 来访自报的会话 id（校验过形态，见 [`incoming_session_id`]）：会话键与流水都要用，算一次。
-    // 走模拟时上游看到的是另一个 uuid（按槽位派生或按账号钉住），来访这个不落库就彻底丢了
-    // ——下游拿着自己那个 id 来查请求会一条都查不到，见 [`store::Forensics::session_id_in`]。
-    let inbound_session = incoming_session_id(&headers, body_json.as_ref());
+    // 参与会话方案的来访会话 id：改写成预热的探针不带——它的会话不出站，不该粘号、占名额。
+    let plan_session = inbound_session.as_deref().filter(|_| probe_prewarm.is_none());
     // 缓存前缀加对话起点的指纹（[`sim_session_key`]，tools + system + 首条用户消息）：来访没带
     // 会话 id 时模拟路径用它派生出站的会话 id（[`Simulation::detect`]），按会话占名额而没带会话
     // id 的真实客户端也用它来分会话，见 [`needs_prefix_key`]。
-    let prefix_key =
-        needs_prefix_key(flags, simulating, device_id.is_some(), inbound_session.as_deref())
-            .then(|| body_json.as_ref().map(sim_session_key))
-            .flatten();
+    let prefix_key = needs_prefix_key(flags, simulating, device_id.is_some(), plan_session)
+        .then(|| body_json.as_ref().map(sim_session_key))
+        .flatten();
     // 参与选号的会话键（模拟路径，以及按会话占名额的带设备来访，见 [`session_plan`]）：
     // 来访自带合法会话 id 就用它——那正是出站会落的那条会话（按账号钉住之前的原值，键要跨账号
     // 稳定）；没带就用那个指纹。同一个键粘住同一个号（换号会连累 thinking 签名，理由同设备绑定）
@@ -195,10 +243,11 @@ pub(super) async fn admit(
     // **只有落库的这个键带前缀**，派生出站会话 id 的 seed 仍是裸的 `prefix_key`（下面的
     // `SimSessionSeed::Prefix`）——那是哈希的输入，动它会让在途对话的会话 id 全部换一遍。
     // 这条请求的会话键，以及选号时按设备还是按会话占名额，见 [`session_plan`]。
-    let cc_kind = body_json
-        .as_ref()
-        .map(|v| CcRequestKind::of(v, &inbound_beta_list(&headers)))
-        .unwrap_or(CcRequestKind::Main);
+    let cc_kind = match (&probe_prewarm, body_json.as_ref()) {
+        (Some(_), _) => CcRequestKind::Prewarm,
+        (None, Some(v)) => CcRequestKind::of(v, &inbound_beta_list(&headers)),
+        (None, None) => CcRequestKind::Main,
+    };
     // 一次性侧查询（标题、分类、探测……）：匿名来访的这几类只跟随、不占名额，见 [`session_plan`]。
     // **只有 `/v1/messages` 占会话**：`count_tokens` 这类不计费路径按路径认，不看体长什么样——
     // 体形态只认得出官方那一种（[`CcRequestKind::CountTokens`]），第三方的会被当成主线程去占名额。
@@ -211,7 +260,7 @@ pub(super) async fn admit(
         flags,
         simulating,
         device_id.is_some(),
-        inbound_session.as_deref(),
+        plan_session,
         prefix_key.as_deref(),
         cc_kind == CcRequestKind::QuotaProbe || !billable,
         side_class,
@@ -248,6 +297,7 @@ pub(super) async fn admit(
             cc_kind,
             plan,
             key_access,
+            probe_prewarm,
         },
         Guards { in_flight, session_concurrency: session_concurrency_guard },
     ))
@@ -509,7 +559,7 @@ async fn identity_gates(
     concurrency_limit: i64,
     session_concurrency_guard: &mut SessionConcurrencyGuard,
     log_state: &RequestLogState,
-) -> Result<(), Response> {
+) -> Result<Option<ProbeKind>, Response> {
     let Facts {
         ref body_json,
         ref device_id,
@@ -529,9 +579,9 @@ async fn identity_gates(
     //       0.3.101 之前回的是 403 permission_error：探活恰恰是下游中转用来判断「这个号还能
     //       不能用」的那条请求，luban 的 403 在它那侧与「号被封了」长得一样，整个 key 被摘下
     //       去、真流量跟着停——而这条请求根本没到上游、账号一点事没有。回 200 后探活看到的是
-    //       「健康」，上游那边一条请求都没多。是 luban 就地答的、没到上游这件事标在三处：
-    //       响应头 `x-luban-local: probe_reply` 与 `x-luban-probe-kind: <判据>`、Message id 的
-    //       `msg_luban` 前缀、以及流水里的 `probe_reply` 标签（花费 0）。
+    //       「健康」，上游那边一条请求都没多。回的 Message 与头照上游预热的真实回包造，与下面改写成
+    //       预热那条路回的同形态，不带任何 luban 的标记；是 luban 就地答的、命中哪条判据只记在流水里
+    //       （`probe_reply:<判据>` 标签，花费 0）。
     //       下游中转的探活脚本发一条无 tools 的单句小请求，每条在上游侧都是「一台设备开一个
     //       一次性会话只问一句话」——封号复盘里最显眼的判据。判据是形态与身份上的强特征，
     //       一条就够判，不做计数。**不限 UA**（0.3.99 起）：此前只判自报 claude-cli 的，
@@ -539,14 +589,22 @@ async fn identity_gates(
     //       1 token 探活（[`ProbeKind::OneTokenPing`]）对不可信 UA 一律算、对可信 UA 只在没带
     //       身份时算——官方的预热与额度探测都来自可信 UA。只判计费路径；`reject_probes` 关掉
     //       即放行。
+    //
+    //       `reject_probes` 关着而 `probe_as_prewarm` 开着时（[`store::ForwardFlags::probe_as_prewarm`]），
+    //       命中的不就地答、也不原样送进模拟（那会被装成「新设备一次性会话只问一句」的主线程），
+    //       而是**改写成官方 `/model` 预热再发**：这里返回命中的判据，体与身份由 [`admit`] 换掉、
+    //       出站由 [`prewarm_upstream`] 组装。下面 2.2～2.2c 的设备与会话闸同样跳过——来访身份不出站，
+    //       不带身份的探活撞上 2.2 那条 403，下游照样会把整个 key 摘掉。两个开关都关着才原样放行。
+    let flags = state.store.forward_flags();
+    let as_prewarm = !flags.reject_probes && flags.probe_as_prewarm;
     if billable
-        && state.store.forward_flags().reject_probes
+        && (flags.reject_probes || as_prewarm)
         && let Some(kind) = probe_signature(
             body_json.as_ref(),
             device_id.as_deref(),
             &inbound_beta_list(headers),
             from_cc_client,
-            state.store.forward_flags().reject_probes_strict,
+            flags.reject_probes_strict,
             async {
                 match device_id.as_deref() {
                     Some(d) => state.store.device_is_known(d).await,
@@ -560,14 +618,15 @@ async fn identity_gates(
         // 回 529 overloaded_error，与上游过载同一口径，下游的渠道自动禁用 / 切换才会生效。
         // 否则探活永远是 200、渠道一直挂着，真流量全落到这里的 503 / 429 上。查库出错时照旧
         // 本地作答——探活误报一次「健康」，好过因为一次查库失败把整条渠道摘掉。
-        let usable = state
+        let usable_ids = state
             .store
-            .has_usable_credential(key_groups, req_model.as_deref())
+            .usable_credential_ids(key_groups, req_model.as_deref())
             .await
-            .unwrap_or_else(|e| {
+            .map_err(|e| {
                 tracing::warn!(error = %e, "probe pool check failed, answering locally anyway");
-                true
-            });
+            })
+            .ok();
+        let usable = usable_ids.as_ref().is_none_or(|ids| !ids.is_empty());
         // 抑制键按「类别 + 设备」分桶：探活脚本多半几十秒一条，同一台设备反复撞这里；
         // 类别分开是因为同一台设备先撞 ping、再撞身份句重复，是两件事。
         let who = device_id.as_deref().or(session_id.as_deref()).unwrap_or("-");
@@ -575,12 +634,21 @@ async fn identity_gates(
             take_rejection_log_slot(&state.rejection_log, &format!("probe:{}:{who}", kind.tag()))
         {
             let device_short: String = who.chars().take(8).collect();
-            tracing::warn!(
-                %method, path = %path_and_query, ua = %client_ua,
-                model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
-                kind = kind.tag(), from_cc_client, suppressed, reason = kind.message(), pool_empty = !usable,
-                "not forwarded: request matches a probe / health-check signature; answered locally (minimal 200, or 529 when the pool has no usable account)"
-            );
+            if as_prewarm {
+                tracing::info!(
+                    %method, path = %path_and_query, ua = %client_ua,
+                    model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
+                    kind = kind.tag(), from_cc_client, suppressed, pool_empty = !usable,
+                    "request matches a probe / health-check signature; forwarding it as an official /model prewarm (529 when the pool has no usable account)"
+                );
+            } else {
+                tracing::warn!(
+                    %method, path = %path_and_query, ua = %client_ua,
+                    model = %req_model.as_deref().unwrap_or("-"), device = %device_short,
+                    kind = kind.tag(), from_cc_client, suppressed, reason = kind.message(), pool_empty = !usable,
+                    "not forwarded: request matches a probe / health-check signature; answered locally (minimal 200, or 529 when the pool has no usable account)"
+                );
+            }
         }
         if !usable {
             *log_state.local_reject.lock() = Some("unavailable");
@@ -590,11 +658,16 @@ async fn identity_gates(
                 "Overloaded",
             ));
         }
+        if as_prewarm {
+            return Ok(Some(kind));
+        }
         *log_state.local_replay.lock() = Some(REWRITE_PROBE_REPLY);
+        *log_state.probe_kind.lock() = Some(kind.tag());
         return Err(probe_reply(
-            kind,
             req_model.as_deref(),
+            request_max_tokens(body_json.as_ref()),
             body_json.as_ref().is_some_and(stream_requested),
+            cf_colo_for(usable_ids.as_deref().unwrap_or_default()).as_deref(),
         ));
     }
 
@@ -657,7 +730,7 @@ async fn identity_gates(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// 2.3～2.3a5：本地就能判的形态错误与学到的拒答，命中即拒或回放，不往上游送。

@@ -1,9 +1,9 @@
 use crate::proxy::{StatusCode, config};
 
-/// 探针命中时本地回的那条：200 + 一条最小的正常回复，按来访要的形态给（非流式整段 JSON、
-/// 流式展成 SSE 且能原样聚合回来），model 原样回来访声明的那个、没写就留空，正文里不带
-/// 任何「被拦了」的痕迹——探活看到的必须是「健康」。是 luban 就地答的这件事标在头上
-/// （`x-luban-local` / `x-luban-probe-kind`）与 Message id 的 `msg_luban` 前缀里。
+/// 探针命中时本地回的那条：200 + 一条与上游预热真实回包同形态的 Message，按来访要的形态给
+/// （非流式整段 JSON、流式展成 SSE 且能原样聚合回来），model 原样回来访声明的那个、没写就留空，
+/// 正文里不带任何「被拦了」的痕迹——探活看到的必须是「健康」。头上只多一个 `x-luban-probe-kind`
+/// （改写成预热那条同样带着），不再有「本地作答」的标记头。
 #[tokio::test]
 async fn probe_reply_is_a_minimal_200_in_the_shape_the_request_asks_for() {
     async fn parts(resp: crate::proxy::Response) -> (StatusCode, axum::http::HeaderMap, String) {
@@ -14,63 +14,78 @@ async fn probe_reply_is_a_minimal_200_in_the_shape_the_request_asks_for() {
     }
 
     // 非流式：整段 Message，字段齐全、状态 200。
-    let (status, headers, body) = parts(crate::proxy::probe_reply(
-        crate::proxy::ProbeKind::Ping,
-        Some("claude-opus-5"),
-        false,
-    ))
-    .await;
+    let (status, headers, body) =
+        parts(crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), false, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("content-type").unwrap(), "application/json");
-    // 标记：这条是 luban 就地答的、命中的是哪条判据。
-    assert_eq!(
-        headers.get(crate::proxy::LOCAL_REPLY_HEADER).unwrap(),
-        crate::proxy::REWRITE_PROBE_REPLY
-    );
-    assert_eq!(headers.get(crate::proxy::PROBE_KIND_HEADER).unwrap(), "ping");
+    // 只标命中的是哪条判据，不标「本地作答」。
+    assert!(headers.get("x-luban-local").is_none());
+    assert!(headers.get("x-luban-probe-kind").is_none());
     let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(msg["type"], "message");
     assert_eq!(msg["role"], "assistant");
     assert_eq!(msg["model"], "claude-opus-5");
-    assert_eq!(msg["stop_reason"], "end_turn");
+    assert_eq!(msg["stop_reason"], "max_tokens");
     assert_eq!(msg["content"][0]["type"], "text");
     assert_eq!(msg["content"][0]["text"], crate::proxy::PROBE_REPLY_TEXT);
     assert_eq!(msg["usage"]["output_tokens"], 1);
-    assert!(
-        msg["id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with(crate::proxy::PROBE_REPLY_ID_PREFIX) && id.len() > 16),
-        "id 要一眼认得出是本地答的：{body}"
+    // 形态照上游预热的真实回包（`cap/auto-2.1.296-20261013-prewarm/00081`）：键序、id 与
+    // `request-id` 的样子、`usage` 的整套子字段（新一代多 `output_tokens_details`）。
+    let keys: Vec<&str> = msg.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "model",
+            "id",
+            "type",
+            "role",
+            "content",
+            "container",
+            "stop_reason",
+            "stop_sequence",
+            "stop_details",
+            "usage",
+            "diagnostics",
+            "context_management"
+        ]
     );
-    // 正文里除了 id 的前缀不留别的痕迹：探活读到的必须是一条正常回复。
-    let without_id = body.replace(msg["id"].as_str().unwrap(), "");
+    let usage_keys: Vec<&str> =
+        msg["usage"].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        usage_keys,
+        [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation",
+            "output_tokens",
+            "output_tokens_details",
+            "service_tier",
+            "inference_geo"
+        ]
+    );
+    let base58 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b));
+    let id = msg["id"].as_str().unwrap();
+    assert!(id.len() == 28 && id.starts_with("msg_011C") && base58(&id[8..]), "{id}");
+    let rid = headers.get("request-id").unwrap().to_str().unwrap();
+    assert!(rid.len() == 28 && rid.starts_with("req_011C") && base58(&rid[8..]), "{rid}");
+    // 正文里不留任何痕迹：探活读到的必须是一条正常回复。
     for word in ["probe", "health", "forward", "luban", "403"] {
-        assert!(!without_id.contains(word), "本地回复不该露出被拦的痕迹：{word} in {body}");
+        assert!(!body.contains(word), "本地回复不该露出被拦的痕迹：{word} in {body}");
     }
     // 两条的 id 不同：探活一条接一条，同一个 id 在下游那侧会被当成同一条回复。
-    let (_, _, again) = parts(crate::proxy::probe_reply(
-        crate::proxy::ProbeKind::Ping,
-        Some("claude-opus-5"),
-        false,
-    ))
-    .await;
+    let (_, _, again) =
+        parts(crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), false, None)).await;
     let msg2: serde_json::Value = serde_json::from_str(&again).unwrap();
     assert_ne!(msg["id"], msg2["id"]);
 
     // 流式：展成 SSE，再聚合回来是同一条 Message。
-    let (status, headers, body) = parts(crate::proxy::probe_reply(
-        crate::proxy::ProbeKind::ShortOpener,
-        Some("claude-opus-5"),
-        true,
-    ))
-    .await;
+    let (status, headers, body) =
+        parts(crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), true, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers.get("content-type").unwrap(), crate::proxy::SSE_CONTENT_TYPE);
-    assert_eq!(
-        headers.get(crate::proxy::LOCAL_REPLY_HEADER).unwrap(),
-        crate::proxy::REWRITE_PROBE_REPLY
-    );
-    assert_eq!(headers.get(crate::proxy::PROBE_KIND_HEADER).unwrap(), "short-opener");
+    assert!(headers.get("x-luban-local").is_none());
+    assert!(headers.get("x-luban-probe-kind").is_none());
     assert!(body.starts_with("event: message_start\n"), "{body}");
     assert!(body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), "{body}");
     let mut agg = crate::proxy::SseAggregator::default();
@@ -79,33 +94,26 @@ async fn probe_reply_is_a_minimal_200_in_the_shape_the_request_asks_for() {
         panic!("本地回复的 SSE 应能聚合")
     };
     assert_eq!(back["content"][0]["text"], crate::proxy::PROBE_REPLY_TEXT);
-    assert_eq!(back["stop_reason"], "end_turn");
+    assert_eq!(back["stop_reason"], "max_tokens");
 
     // 来访没写 model：留空，不替它编一个。
-    let (_, _, body) =
-        parts(crate::proxy::probe_reply(crate::proxy::ProbeKind::DuplicateIdentity, None, false))
-            .await;
+    let (_, _, body) = parts(crate::proxy::probe_reply(None, Some(1), false, None)).await;
     let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(msg["model"], "");
 
-    // 1 token 探活：来访只要 1 个 token，真上游回的必是截断，stop_reason 给 max_tokens；
-    // 流式那条 message_delta 里同样是它。
-    let (_, headers, body) = parts(crate::proxy::probe_reply(
-        crate::proxy::ProbeKind::OneTokenPing,
-        Some("claude-opus-4-8"),
-        false,
-    ))
-    .await;
-    assert_eq!(headers.get(crate::proxy::PROBE_KIND_HEADER).unwrap(), "one-token-ping");
+    // 旧一代模型：`usage` 没有 `output_tokens_details`，`input_tokens` 照旧一代的预热给。
+    let (_, headers, body) =
+        parts(crate::proxy::probe_reply(Some("claude-sonnet-4-6"), Some(1), false, None)).await;
+    assert!(headers.get("x-luban-probe-kind").is_none());
     let msg: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(msg["stop_reason"], "max_tokens");
     assert_eq!(msg["usage"]["output_tokens"], 1);
-    let (_, _, body) = parts(crate::proxy::probe_reply(
-        crate::proxy::ProbeKind::OneTokenPing,
-        Some("claude-opus-4-8"),
-        true,
-    ))
-    .await;
+    assert_eq!(msg["usage"]["input_tokens"], 23);
+    assert!(msg["usage"].get("output_tokens_details").is_none());
+
+    // 流式那条 message_delta 里 stop_reason 同样是 max_tokens。
+    let (_, _, body) =
+        parts(crate::proxy::probe_reply(Some("claude-opus-4-8"), Some(1), true, None)).await;
     let mut agg = crate::proxy::SseAggregator::default();
     agg.feed(body.as_bytes());
     let crate::proxy::Aggregated::Message(back) = agg.finish() else {
@@ -536,4 +544,139 @@ fn probe_signature_matches_probes_and_spares_official_shapes() {
         r#"{{"model":"claude-opus-5","system":"{identity} {identity}","messages":{one_msg},"tools":[{{"name":"Bash"}}],"max_tokens":32000}}"#
     );
     assert_eq!(sig(&as_string, true, Some(DEV), true), None);
+}
+
+/// 本地应答的 `model` 与 `usage` 按模型族照真实预热回包给（`cap/auto-2.1.296-20261013-prewarm`）：
+/// 别名解析成带日期的全名，`input_tokens` 逐族对上，旧一代没有 `output_tokens_details`；表里没有的
+/// 模型按最新一代给。头照上游的样子带，`cf-ray` 的机房跟最近一次上游回包。
+#[tokio::test]
+async fn probe_reply_follows_the_real_prewarm_reply_per_model() {
+    async fn reply(model: &str) -> (axum::http::HeaderMap, serde_json::Value) {
+        let resp = crate::proxy::probe_reply(Some(model), Some(1), false, None);
+        let headers = resp.headers().clone();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (headers, serde_json::from_slice(&bytes).unwrap())
+    }
+    let ok = crate::proxy::PROBE_REPLY_TEXT;
+    for (model, out_model, input, text) in [
+        ("claude-opus-5-5", "claude-opus-5-5", 35, ok),
+        ("claude-haiku-5-5", "claude-haiku-5-5", 35, ok),
+        ("claude-fable-5-1", "claude-fable-5-1", 35, ok),
+        ("claude-opus-5", "claude-opus-5", 33, ok),
+        ("claude-fable-5", "claude-fable-5", 33, ok),
+        ("claude-opus-4-8", "claude-opus-4-8", 33, ok),
+        ("claude-opus-4-7", "claude-opus-4-7", 38, ok),
+        ("claude-opus-4-6", "claude-opus-4-6", 23, "Hi"),
+        ("claude-sonnet-4-6", "claude-sonnet-4-6", 23, "Hi"),
+        ("claude-opus-4-5", "claude-opus-4-5-20251101", 22, "Hi"),
+        ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929", 22, "Hello"),
+        ("claude-haiku-4-5", "claude-haiku-4-5-20251001", 22, "#"),
+        ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001", 22, "#"),
+        ("claude-opus-9", "claude-opus-9", 33, ok),
+    ] {
+        let (_, msg) = reply(model).await;
+        assert_eq!(msg["model"], out_model, "{model}");
+        assert_eq!(msg["usage"]["input_tokens"], input, "{model}");
+        assert_eq!(msg["content"][0]["text"], text, "{model}");
+        // 旧一代（回一个字的那些）没有 `output_tokens_details`。
+        assert_eq!(msg["usage"].get("output_tokens_details").is_some(), text == ok, "{model}");
+    }
+
+    let headers = crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), false, Some("HKG"))
+        .headers()
+        .clone();
+    for (name, value) in [
+        ("strict-transport-security", "max-age=31536000; includeSubDomains; preload"),
+        ("vary", "Accept-Encoding"),
+        ("server", "cloudflare"),
+        ("cf-cache-status", "DYNAMIC"),
+        ("x-robots-tag", "none"),
+        ("content-security-policy", "default-src 'none'; frame-ancestors 'none'"),
+    ] {
+        assert_eq!(headers.get(name).unwrap(), value, "{name}");
+    }
+    let ray = headers.get("cf-ray").unwrap().to_str().unwrap();
+    assert!(ray.len() == 20 && ray.ends_with("-HKG"), "{ray}");
+    let trace = headers.get("traceresponse").unwrap().to_str().unwrap();
+    assert!(trace.len() == 55 && trace.starts_with("00-") && trace.ends_with("-01"), "{trace}");
+    for name in ["x-luban-local", "x-luban-probe-kind", "anthropic-ratelimit-unified-status"] {
+        assert!(headers.get(name).is_none(), "{name}");
+    }
+}
+
+/// 本地应答的 `request-id`、Message id 与 `cf-ray` 按此刻造，规则与上游的一致：id 去掉 `<前缀>_0`
+/// 按 base58 解开右移 80 位是 Unix 毫秒，`msg_` 比 `req_` 晚几十到两百毫秒；`cf-ray` 高 36 位是
+/// 「10 毫秒刻度减 1350 亿」。`date` 打头。用流水里一条真 `request-id` 校一遍解法本身。
+#[tokio::test]
+async fn probe_reply_ids_carry_the_current_time_like_upstream() {
+    const A: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let ms_of = |id: &str| -> u128 {
+        let body = &id.split_once('_').unwrap().1[1..];
+        body.chars().fold(0u128, |n, c| n * 58 + A.find(c).unwrap() as u128) >> 80
+    };
+    // 解法本身：一条真 `request-id`（流水 424，记的请求时刻 1791855466 秒、按秒取整）。
+    let real = ms_of("req_011CfyP3VSyTj6QLcGC8sXhz");
+    assert!((1_791_855_465_000..1_791_855_468_000).contains(&real), "{real}");
+
+    let before = chrono::Utc::now().timestamp_millis() as u128;
+    let resp = crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), false, Some("HKG"));
+    let after = chrono::Utc::now().timestamp_millis() as u128;
+    let headers = resp.headers().clone();
+    assert_eq!(headers.keys().next().unwrap(), "date", "date 打头");
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let msg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let rid = headers.get("request-id").unwrap().to_str().unwrap();
+    let mid = msg["id"].as_str().unwrap();
+    assert!(rid.len() == 28 && rid.starts_with("req_0") && mid.len() == 28, "{rid} {mid}");
+    let (req_ms, msg_ms) = (ms_of(rid), ms_of(mid));
+    assert!((before..=after).contains(&req_ms), "{req_ms} not in {before}..={after}");
+    assert!((60..=200).contains(&(msg_ms - req_ms)), "msg 比 req 晚 {}", msg_ms - req_ms);
+
+    let ray = headers.get("cf-ray").unwrap().to_str().unwrap();
+    let ticks = u128::from(u64::from_str_radix(&ray[..16], 16).unwrap() >> 28);
+    assert_eq!(ticks + 135_000_000_000, req_ms / 10, "{ray}");
+}
+
+/// `stop_reason` 按来访要的输出上限给：只有 `max_tokens: 1` 回 `max_tokens`，其余（短开场常见的 50、
+/// 1024、32000，没写的也算）回一个字就停，是 `end_turn`——否则客户端会以为回答被截断。
+#[tokio::test]
+async fn probe_reply_stop_reason_follows_the_requested_max_tokens() {
+    use crate::proxy::probe_detect::probe_stop_reason;
+    assert_eq!(probe_stop_reason(Some(1)), "max_tokens");
+    for mt in [Some(8), Some(50), Some(1024), Some(32000), None] {
+        assert_eq!(probe_stop_reason(mt), "end_turn", "{mt:?}");
+    }
+    for (mt, want) in [(Some(1), "max_tokens"), (Some(1024), "end_turn")] {
+        let resp = crate::proxy::probe_reply(Some("claude-opus-5"), mt, true, None);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let mut agg = crate::proxy::SseAggregator::default();
+        agg.feed(&bytes);
+        let crate::proxy::Aggregated::Message(msg) = agg.finish() else { panic!("应能聚合") };
+        assert_eq!(msg["stop_reason"], want, "{mt:?}");
+    }
+}
+
+/// `cf-ray` 机房按号记：本地应答取这把 Key 能分到的那些号里最多的那个，一样多取 id 小的号的；
+/// 这些号都没到过上游就不带。号换了出口，记的跟着换。
+#[test]
+fn cf_colo_follows_the_credentials_the_key_can_use() {
+    use crate::proxy::probe_detect::{cf_colo_for, note_upstream_cf_ray};
+    let ray = |colo: &'static str| {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cf-ray", axum::http::HeaderValue::from_static(colo));
+        h
+    };
+    // 全局表：用别的用例碰不到的 id。
+    note_upstream_cf_ray(900_001, &ray("a49a3231df555df6-HKG"));
+    note_upstream_cf_ray(900_002, &ray("a49a3231df555df6-IAD"));
+    note_upstream_cf_ray(900_003, &ray("a49a3231df555df6-IAD"));
+    note_upstream_cf_ray(900_004, &ray("garbage"));
+    assert_eq!(cf_colo_for(&[900_001, 900_002, 900_003]).as_deref(), Some("IAD"), "取多数");
+    assert_eq!(cf_colo_for(&[900_001, 900_002]).as_deref(), Some("HKG"), "一样多取 id 小的");
+    assert_eq!(cf_colo_for(&[900_001, 900_009]).as_deref(), Some("HKG"), "没记过的号不算");
+    assert_eq!(cf_colo_for(&[900_004, 900_009]), None, "都没记过（或 cf-ray 认不出）就不带");
+    assert_eq!(cf_colo_for(&[]), None);
+    note_upstream_cf_ray(900_001, &ray("a49a3231df555df6-SJC"));
+    assert_eq!(cf_colo_for(&[900_001]).as_deref(), Some("SJC"), "换了出口跟着换");
 }

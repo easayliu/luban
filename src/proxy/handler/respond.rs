@@ -113,6 +113,8 @@ async fn relay_ok(
     // 读回来，`no_limit_headers()` 就此恒为 false，下面那个「裸 429 把响应体打出来」的
     // 分支永远不触发——而它正是为这一档写的。快照的来历见 `retry::on_response`。
     let ratelimit = upstream_limit.unwrap_or_else(|| RateLimitInfo::from_headers(up.headers()));
+    // 本地应答探针时 `cf-ray` 照这把 Key 能分到的号的机房造，见 [`note_upstream_cf_ray`]。
+    note_upstream_cf_ray(cred.id, up.headers());
     // 顺手看一眼额度：快用尽（默认 90%）就提前把这个号挪出调度池，别等下一条请求去撞
     // 429，见 [`park_if_quota_nearly_exhausted`]。本次响应照常回给客户端——它已经成了，
     // 停的是**之后**的调度。429 那条路不在这儿：上面已按账号/模型分档停过了，
@@ -127,16 +129,21 @@ async fn relay_ok(
     log_state.logged.store(true, std::sync::atomic::Ordering::Relaxed);
     // 只给计费路径备料：**含非 2xx**——失败的请求要报 `tengu_api_error`
     // （官方客户端对失败请求发的正是它），报不报由 Drop 里再判。
-    let telemetry = telemetry_capture(
-        state,
-        cred,
-        upstream,
-        sent,
-        started,
-        flags,
-        billable,
-        header_opt(up.headers(), "anthropic-organization-id"),
-    );
+    // 改写成预热的探针不报：它是 luban 替这个号发的一条预热，与连通性测试一样不进遥测。
+    let telemetry = if inb.probe_prewarm.is_some() {
+        None
+    } else {
+        telemetry_capture(
+            state,
+            cred,
+            upstream,
+            sent,
+            started,
+            flags,
+            billable,
+            header_opt(up.headers(), "anthropic-organization-id"),
+        )
+    };
     let mut forensics = store::Forensics {
         // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
         // 「看请求」按它筛，见 [`store::Forensics::session_key`]。
@@ -155,6 +162,15 @@ async fn relay_ok(
         forensics.inbound_headers = inbound_headers_summary(&inb.headers);
         forensics.inbound_shape = inb.body_json.as_ref().and_then(inbound_shape_summary);
     }
+    // 改写成预热的探针：`body_json` 已是预热，来访原本那份的摘要在 admit 时就留好了。
+    if let Some(probe) = &inb.probe_prewarm {
+        forensics.inbound_headers = inbound_headers_summary(&inb.headers);
+        forensics.inbound_shape = probe.inbound_shape.clone();
+        forensics.rewrites = Some(format!("{REWRITE_PROBE_PREWARM}:{}", probe.kind.tag()));
+    }
+    // 三把学规则的键都只给普通来访：改写成预热的探针出站的是官方预热，它的回复（新一代模型回
+    // 空正文）学到来访那份体名下，只会把下一条探针在本地拦掉。
+    let learns = billable && inb.probe_prewarm.is_none();
     let injected_tools = sent_bits.injected_tools.clone();
     let tools_filled = sent_bits.tools_filled;
     fill_shape_forensics(&mut forensics, sent_bits);
@@ -194,12 +210,12 @@ async fn relay_ok(
         cc_thread: upstream.sim.as_ref().and_then(|s| s.take_thread()),
         // 只给计费路径分类：count_tokens 之流没有「回复」可言。三把键各自跟着拦截开关走：
         // 开关关着不学，免得关着期间攒下的规则在打开那一刻全部生效。
-        empty_reply_key: if billable && flags.reject_empty_replies {
+        empty_reply_key: if learns && flags.reject_empty_replies {
             empty_reply_class(req_model.as_deref(), body_json.as_ref())
         } else {
             None
         },
-        prompt_key: if billable && flags.reject_refusals {
+        prompt_key: if learns && flags.reject_refusals {
             req_model
                 .as_deref()
                 .zip(body_json.as_ref().and_then(prompt_digest))
@@ -207,7 +223,7 @@ async fn relay_ok(
         } else {
             None
         },
-        app_key: if billable && session_less && flags.reject_refusals {
+        app_key: if learns && session_less && flags.reject_refusals {
             req_model
                 .as_deref()
                 .zip(body_json.as_ref().and_then(app_system_digest))
@@ -266,7 +282,76 @@ async fn relay_ok(
         return bare_429(cx, inb, prepared, pick, upstream, sent, up, rl).await;
     }
 
+    if let Some(probe) = &inb.probe_prewarm {
+        return relay_probe_prewarm(up, rl, probe).await;
+    }
     relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await
+}
+
+/// 改写成预热的探针（[`ProbePrewarm`]）的回程：读完上游那段整段 JSON，**正文为空时补一句**与本地
+/// 应答相同的「OK」（[`PROBE_REPLY_TEXT`]），来访要流式就展成 SSE（[`message_to_sse`]）。
+///
+/// 补正文是因为新一代模型（opus-4-7 起、5 系）的 1 token 预热上游回 `content: []`
+/// （`cap/auto-2.1.296-20261013-prewarm`），而下游中转的渠道测试多半把空回复判成失败——那正是
+/// 本地应答当初要避开的「渠道被摘」。其余一律是上游的：状态码、限流头、`id`、`model`、
+/// `stop_reason`（`max_tokens`）与 `usage`；旧一代回的那一个字（「Hi」「#」）原样交回。用量嗅探喂
+/// 的是上游原样字节。命中的判据只记在流水里（`probe_prewarm:<kind>`），回给下游的头里不带。
+///
+/// 上游回的不是 2xx 整段 JSON（报错、或哪天改成了流）就按普通回程原样交回，见 [`relay_upstream`]。
+async fn relay_probe_prewarm(up: wreq::Response, mut rl: ReqLog, probe: &ProbePrewarm) -> Response {
+    let (is_stream, _) = resp_shape(&up);
+    if !up.status().is_success() || is_stream {
+        return relay_upstream(up, rl, false, None).await;
+    }
+    if let Some(rid) = header_opt(up.headers(), "request-id") {
+        rl.upstream_request_id = Some(rid);
+    }
+    let json = resp_builder_as(&up, Some("application/json"));
+    let sse = resp_builder_as(&up, Some(SSE_CONTENT_TYPE));
+    let bytes = match up.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "reading the upstream prewarm reply failed; failing the request");
+            rl.stream_broke = Some(format!("[{}] {e}", upstream_error_kind(&e)));
+            rl.status = StatusCode::BAD_GATEWAY.as_u16();
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!("failed to read the upstream response: {e}"),
+            );
+        }
+    };
+    rl.ttft_ms = Some(rl.started.elapsed().as_millis());
+    rl.sniffer.feed(&bytes);
+    rl.upstream_done = true;
+    let mut msg = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) if v.get("content").is_some_and(|c| c.is_array()) => v,
+        // 不是一条 Message：原样交回，让来访自己看见上游给了什么。
+        _ => {
+            return json.body(Body::from(bytes)).unwrap_or_else(|e| {
+                error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string())
+            });
+        }
+    };
+    // 出站是 `max_tokens:1`，上游必回 `max_tokens`；来访要的上限不是 1 就照本地应答改成 `end_turn`。
+    if msg.get("stop_reason").is_some() {
+        msg["stop_reason"] = probe_stop_reason(probe.req_max_tokens).into();
+    }
+    if msg["content"].as_array().is_some_and(Vec::is_empty) {
+        msg["content"] = serde_json::json!([{ "type": "text", "text": PROBE_REPLY_TEXT }]);
+        let tags = rl.forensics.rewrites.get_or_insert_with(String::new);
+        if !tags.is_empty() {
+            tags.push(',');
+        }
+        tags.push_str(REWRITE_PROBE_REPLY_FILLED);
+    }
+    let (builder, body) = match probe.wants_stream.then(|| message_to_sse(&msg)).flatten() {
+        Some(events) => (sse, events.into_bytes()),
+        None => (json, serde_json::to_vec(&msg).unwrap_or_else(|_| bytes.to_vec())),
+    };
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|e| error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string()))
 }
 
 /// 400 / 401 / 403：读体、记错误、学规则、判账号级错误停号，按错误类型降级重试一次，
@@ -317,8 +402,10 @@ async fn client_error(
     }
     if !compressed && status == StatusCode::BAD_REQUEST {
         // 各自的开关关着就不学：关掉的意思是不处理，学了只会在开关打开那一刻冒出来。
+        // 改写成预热的探针也不学：出站的是 luban 造的固定预热，不是来访那份体，学到的规则
+        // 记在它名下没有意义，与 `relay_ok` 里那三把键同一个理由。
         let mut learned = Vec::new();
-        if flags.reject_learned_shapes {
+        if flags.reject_learned_shapes && inb.probe_prewarm.is_none() {
             // 按出站体判的那几条探针要看实际发出去的那份（非计费路径不学它们）。
             let outbound =
                 billable.then(|| serde_json::from_slice::<serde_json::Value>(sent).ok()).flatten();

@@ -320,7 +320,33 @@ function simReasonLabel(reason: string, t: (zh: string, en: string) => string): 
   }
 }
 
+/** 探针判据（流水 `probe_reply:<判据>` / `probe_prewarm:<判据>` 冒号后那段）。 */
+function probeKindLabel(kind: string, t: (zh: string, en: string) => string): string {
+  switch (kind) {
+    case 'ping':
+      return t('单句 ping', 'single-message ping')
+    case 'one-token-ping':
+      return t('1 token 探活', '1-token ping')
+    case 'throwaway-conversation':
+      return t('新设备一次性对话', 'throwaway conversation from a new device')
+    case 'duplicate-identity':
+      return t('身份句重复', 'duplicated identity sentence')
+    case 'short-opener':
+      return t('短开场白', 'short opener')
+    default:
+      return kind
+  }
+}
+
 function rewriteLabel(tag: string, t: (zh: string, en: string) => string): string {
+  if (tag.startsWith('probe_reply:')) {
+    const kind = probeKindLabel(tag.slice('probe_reply:'.length), t)
+    return t(`命中探针特征（${kind}），本地返回 200，未转发`, `Probe signature matched (${kind}), answered locally with a 200, not forwarded`)
+  }
+  if (tag.startsWith('probe_prewarm:')) {
+    const kind = probeKindLabel(tag.slice('probe_prewarm:'.length), t)
+    return t(`命中探针特征（${kind}），已改写为官方预热发出`, `Probe signature matched (${kind}), sent as an official prewarm`)
+  }
   switch (tag) {
     case 'rejected_locally':
       return t('本地拒绝，未转发', 'Rejected locally, not forwarded')
@@ -332,6 +358,8 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('本地回放按应用学到的上游拒答，未转发', 'Replayed a learned app-level upstream refusal locally, not forwarded')
     case 'probe_reply':
       return t('命中探针特征，本地返回最小 200 响应，未转发', 'Probe signature matched, answered locally with a minimal 200, not forwarded')
+    case 'probe_reply_filled':
+      return t('上游预热返回空正文，已补一句「OK」', 'Upstream prewarm returned an empty body; filled in "OK"')
     case 'upstream_401':
       return t('上游 401，没有可换的账号', 'Upstream 401, no account to switch to')
     case 'upstream_403':
@@ -374,7 +402,7 @@ function ForensicTags({ log }: { log: UsageLog }) {
       {tags.map((tag) => (
         <Hint key={tag} label={tag}>
           <Badge
-            variant={tag.startsWith('rejected_locally') || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' ? 'secondary' : 'outline'}
+            variant={tag.startsWith('rejected_locally') || tag === 'refusal_replay' || tag === 'app_refusal_replay' || tag === 'probe_reply' || tag.startsWith('probe_reply:') ? 'secondary' : 'outline'}
             size="sm"
           >
             {rewriteLabel(tag, t)}

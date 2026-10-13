@@ -113,10 +113,12 @@ export interface Settings {
   reject_openai_shape: boolean
   /** 会话 id 在请求头与 metadata 两处不一致时本地拒绝，不替客户端选一个。 */
   reject_session_conflict: boolean
-  /** 本地就地回答探针 / 探活类请求（200 + 一句「OK」，头上标 x-luban-local: probe_reply、id 以 msg_luban 开头、流水标 probe_reply 花费 0），不转发；不限 UA。 */
+  /** 本地就地回答探针 / 探活类请求（200 + 与上游预热真实回包同形态的一句「OK」，响应里不带 luban 的标记，流水标 probe_reply:<判据> 花费 0），不转发；不限 UA。 */
   reject_probes: boolean
-  /** 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据（无 system、无 tools、一条不超过 32 字节、中文约十个字的用户消息）。默认关。 */
+  /** 探针判据严格模式（本地应答与改写为预热都按它判）：ping 不要求无 tools，新增「短开场」判据（无 system、无 tools、一条不超过 32 字节、中文约十个字的用户消息）。默认关。 */
   reject_probes_strict: boolean
+  /** 「拒绝探针请求」停用时，命中探针判据的请求改写成官方 /model 预热（max_tokens 1、正文 Hi）再发；上游回空正文时补一句「OK」。默认关。 */
+  probe_as_prewarm: boolean
   /** 上游分类器已拒答过的那条提示词逐字重发时，本地原样回放上游那次的响应（200 + 同一段 stop_reason refusal 的体），不到上游；识别不了会话的来访另按「模型 + system」学，拒答至少 3 条且占该应用请求三成以上才学、之后同应用一律回放；出站带 fallbacks 的不拦。 */
   reject_refusals: boolean
   /** 本地拒绝上游回过 200 却零输出的请求类（403）。 */
@@ -168,6 +170,7 @@ export type ForwardingKey =
   | 'reject_session_conflict'
   | 'reject_probes'
   | 'reject_probes_strict'
+  | 'probe_as_prewarm'
   | 'reject_refusals'
   | 'reject_empty_replies'
   | 'reject_learned_shapes'

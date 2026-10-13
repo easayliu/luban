@@ -401,6 +401,7 @@ fn all_flags_off_only_injects_auth() {
         reject_session_conflict: false,
         reject_probes: false,
         reject_probes_strict: false,
+        probe_as_prewarm: true,
         reject_refusals: false,
         reject_empty_replies: false,
         reject_learned_shapes: false,

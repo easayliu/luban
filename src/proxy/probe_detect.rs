@@ -9,7 +9,7 @@ use super::simulation::{
     cc_identity_blocks, field_is_empty, is_official_classifier_request, is_official_helper_request,
     is_official_thread_continuation, is_official_title_request,
 };
-use super::{REWRITE_PROBE_REPLY, error_response, is_quota_probe_shaped, request_max_tokens};
+use super::{error_response, is_quota_probe_shaped, request_max_tokens};
 
 /// [`probe_signature`] 命中的哪一条判据。日志与错误消息按类写清楚，运维一眼能看出拦的是什么。
 ///
@@ -250,61 +250,290 @@ fn single_user_text_bytes(v: &serde_json::Value) -> Option<usize> {
 /// 一个字就够；严格模式下被短开场判据拦住的真人看到的也是它，下一句正常长度的话照常放行。
 pub(super) const PROBE_REPLY_TEXT: &str = "OK";
 
-/// 「这条是 luban 就地答的、没到上游」的标记头，值是流水里的那个标签（[`REWRITE_PROBE_REPLY`]）。
-/// 上游不会回这个头，所以它在抓包、下游面板与自己的日志里都是确定的证据；放在头上而不是体里，
-/// 是因为探活只看状态码与正文，头不影响它把这个号判成健康的。
-pub(super) const LOCAL_REPLY_HEADER: &str = "x-luban-local";
-/// 本地作答那条命中的是哪一条探针判据（[`ProbeKind::tag`]），与日志行里的 `kind` 同一个值。
-pub(super) const PROBE_KIND_HEADER: &str = "x-luban-probe-kind";
-/// 本地作答那条 Message 的 id 前缀：`msg_luban` + 随机串。官方的是 `msg_01…`，这里一眼能认出
-/// 来——下游面板与流水多半只记 id，正文未必留得下。
-pub(super) const PROBE_REPLY_ID_PREFIX: &str = "msg_luban";
+/// 上游 Message id 与 `request-id` 用的字母表（base58：没有 `0`、`O`、`I`、`l`）。
+const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-/// 探针 / 探活请求的本地回复：**200 + 一条最小的正常回复**，不到上游。
+/// 照上游的规则造一个 id：`<前缀>_0` + 23 位 base58，编的是「毫秒时间戳 << 80 | 80 位随机数」。
 ///
-/// 按来访要的形态给：要流式就把这条 Message 展成 SSE（[`message_to_sse`]，与回放学到的拒答
-/// 同一套），否则整段 JSON。`model` 原样回来访声明的那个（没写就留空——那种请求上游本会回
-/// 400，这里不替它编一个）；`usage` 记名义上的 1 进 1 出，流水里的花费记 0（见
-/// [`REWRITE_PROBE_REPLY`]）；`stop_reason` 按来访要的输出上限给——[`ProbeKind::OneTokenPing`]
-/// 那条只要 1 个 token，真上游回的必是 `max_tokens`，其余是 `end_turn`。为什么不回 403，见调用处 2.3a3 的说明。
-///
-/// **标出来是 luban 答的**：响应头 [`LOCAL_REPLY_HEADER`] + [`PROBE_KIND_HEADER`]，Message id 用
-/// [`PROBE_REPLY_ID_PREFIX`] 前缀（流式那条在 `message_start` 里同样带着）。三处都在正文的语义
-/// 之外——探活读到的仍是一条正常回复，而抓包、下游面板与自己的流水里这条认得出来、不会被当成
-/// 上游真答过一次。
-pub(super) fn probe_reply(kind: ProbeKind, model: Option<&str>, wants_stream: bool) -> Response {
+/// 规则是从流水里 401 条上游 `request-id` 对着请求时刻解出来的：`req_011CfyP3gz2FBSzQgQpVDqsa`
+/// 去掉 `req_0` 后按 base58 解成整数，右移 80 位就是上游收到请求那一刻的 Unix 毫秒（与流水时间
+/// 只差请求耗时）。所以今天的 id 都是 `011Cfy…` 开头、随时间递增——纯随机的后段在一串真 id 里
+/// 一眼就能挑出来。`Message` id 同一个规则，时刻是开始出字那一刻（比 `request-id` 晚几十到两百
+/// 毫秒，见 [`probe_reply`]）。
+fn upstream_like_id(prefix: &str, unix_ms: u64) -> String {
     use rand::RngExt;
-    use rand::distr::Alphanumeric;
-    let tail: String = rand::rng().sample_iter(Alphanumeric).take(16).map(char::from).collect();
-    // 来访只要 1 个 token 时上游必然是被截断的，回 `max_tokens`；其余照常收在 `end_turn`。
-    let stop_reason = match kind {
-        ProbeKind::OneTokenPing => "max_tokens",
-        _ => "end_turn",
+    let mut n = (u128::from(unix_ms) << 80) | (rand::rng().random::<u128>() & ((1 << 80) - 1));
+    let mut digits = [BASE58[0]; 23];
+    for d in digits.iter_mut().rev() {
+        *d = BASE58[(n % 58) as usize];
+        n /= 58;
+    }
+    format!("{prefix}_0{}", String::from_utf8_lossy(&digits))
+}
+
+/// 照 Cloudflare 的规则造 `cf-ray` 的十六进制段：高 36 位是「Unix 时间（10 毫秒为单位）减
+/// 135 000 000 000」，低 28 位随机。1806 份抓包（`cap/auto-2.1.29*`，`Date` 头对 `cf-ray`）全部
+/// 落在这条式子上，误差在 `Date` 那一秒的精度以内。
+fn cf_ray_hex(unix_ms: u64) -> String {
+    use rand::RngExt;
+    let ticks = (unix_ms / 10).saturating_sub(135_000_000_000);
+    let low = rand::rng().random::<u64>() & ((1 << 28) - 1);
+    format!("{:016x}", (ticks << 28) | low)
+}
+
+/// `n` 位小写十六进制随机串（`traceresponse` 的两段）。
+fn random_hex(n: usize) -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..n).map(|_| char::from(b"0123456789abcdef"[rng.random_range(0..16)])).collect()
+}
+
+/// 官方 `/model` 预热在一个模型族上的回包取值：上游回的 `model`（别名解析成带日期的全名）、
+/// `input_tokens`，以及旧一代回的那一个字。
+struct PrewarmReply {
+    prefix: &'static str,
+    /// 来访写的正是这个别名时上游回的全名；`None` 即原样回来访写的那个。
+    full_name: Option<&'static str>,
+    input_tokens: u64,
+    /// 旧一代（opus-4-6 及更早）：预热回一个可见的字，`usage` 里也没有 `output_tokens_details`。
+    /// 新一代为 `None`：上游回空正文、有 `output_tokens_details`，正文用 [`PROBE_REPLY_TEXT`]——
+    /// 与改写成预热那条路给空正文补的同一句。
+    old_gen_text: Option<&'static str>,
+}
+
+/// 各模型族的预热回包，逐个对过 `cap/auto-2.1.296-20261013-prewarm` 与
+/// `cap/auto-2.1.29{3,6}-20261010-model` 里的真实回包。按前缀匹配，**具体的排在前面**：
+/// `claude-opus-5-5` 必须先于 `claude-opus-5`。
+const PREWARM_REPLIES: &[PrewarmReply] = &[
+    PrewarmReply {
+        prefix: "claude-opus-5-5",
+        full_name: None,
+        input_tokens: 35,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-sonnet-5-5",
+        full_name: None,
+        input_tokens: 35,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-haiku-5-5",
+        full_name: None,
+        input_tokens: 35,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-fable-5-1",
+        full_name: None,
+        input_tokens: 35,
+        old_gen_text: None,
+    },
+    PrewarmReply { prefix: "claude-opus-5", full_name: None, input_tokens: 33, old_gen_text: None },
+    PrewarmReply {
+        prefix: "claude-sonnet-5",
+        full_name: None,
+        input_tokens: 33,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-fable-5",
+        full_name: None,
+        input_tokens: 33,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-opus-4-8",
+        full_name: None,
+        input_tokens: 33,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-opus-4-7",
+        full_name: None,
+        input_tokens: 38,
+        old_gen_text: None,
+    },
+    PrewarmReply {
+        prefix: "claude-opus-4-6",
+        full_name: None,
+        input_tokens: 23,
+        old_gen_text: Some("Hi"),
+    },
+    PrewarmReply {
+        prefix: "claude-sonnet-4-6",
+        full_name: None,
+        input_tokens: 23,
+        old_gen_text: Some("Hi"),
+    },
+    PrewarmReply {
+        prefix: "claude-opus-4-5",
+        full_name: Some("claude-opus-4-5-20251101"),
+        input_tokens: 22,
+        old_gen_text: Some("Hi"),
+    },
+    PrewarmReply {
+        prefix: "claude-sonnet-4-5",
+        full_name: Some("claude-sonnet-4-5-20250929"),
+        input_tokens: 22,
+        old_gen_text: Some("Hello"),
+    },
+    PrewarmReply {
+        prefix: "claude-haiku-4-5",
+        full_name: Some("claude-haiku-4-5-20251001"),
+        input_tokens: 22,
+        old_gen_text: Some("#"),
+    },
+];
+
+/// 这个模型的预热回包取值：`(上游回的 model, input_tokens, 旧一代回的那个字)`。表里没有的模型按
+/// 最新一代给（33、空正文那一类），`model` 原样回。
+fn prewarm_reply_of(model: &str) -> (&str, u64, Option<&'static str>) {
+    match PREWARM_REPLIES.iter().find(|r| model.starts_with(r.prefix)) {
+        Some(r) => {
+            let full = r.full_name.filter(|_| model == r.prefix).unwrap_or(model);
+            (full, r.input_tokens, r.old_gen_text)
+        }
+        None => (model, 33, None),
+    }
+}
+
+/// 各账号最近一次上游回包 `cf-ray` 里的机房代码（`a49a3231df555df6-HKG` 的 `HKG`），由转发回程与
+/// 连通性测试记下（[`note_upstream_cf_ray`]）。机房跟着号的出口走（同一份抓包经香港出口是 `HKG`、
+/// 经美国是 `IAD`），按号记，本地应答才能取这把 Key 真会分到的那些号的机房（[`cf_colo_for`]）。
+/// 进程内的，重启后要等号再到过一次上游才有。
+static UPSTREAM_CF_COLO: parking_lot::Mutex<std::collections::BTreeMap<i64, String>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// 记下 `cred_id` 这个号上游回包 `cf-ray` 的机房代码，见 [`UPSTREAM_CF_COLO`]。
+pub(super) fn note_upstream_cf_ray(cred_id: i64, headers: &axum::http::HeaderMap) {
+    let Some(colo) = headers
+        .get("cf-ray")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit_once('-'))
+        .map(|(_, colo)| colo)
+        .filter(|c| (3..=4).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_uppercase()))
+    else {
+        return;
     };
+    let mut map = UPSTREAM_CF_COLO.lock();
+    if map.get(&cred_id).map(String::as_str) != Some(colo) {
+        map.insert(cred_id, colo.to_string());
+    }
+}
+
+/// 这把 Key 此刻能分到的那些号（`cred_ids`，见 `store::CredentialStore::usable_credential_ids`）
+/// 最常见的机房：本地应答没落到具体哪个号上，取多数那个与真到上游的回包对上的机会最大；一样多取
+/// id 小的那个号的（`cred_ids` 按 id 升序给，打平时同一把 Key 前后几次取到的是同一个，不来回变）。这些号都还没到过上游时为 `None`，本地应答就不带 `cf-ray`。
+pub(super) fn cf_colo_for(cred_ids: &[i64]) -> Option<String> {
+    let map = UPSTREAM_CF_COLO.lock();
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for colo in cred_ids.iter().filter_map(|id| map.get(id)) {
+        match counts.iter_mut().find(|(c, _)| *c == colo.as_str()) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((colo.as_str(), 1)),
+        }
+    }
+    // `max_by_key` 取最后一个最大值；倒着找才是「一样多取先出现的」。
+    counts.iter().rev().max_by_key(|(_, n)| *n).map(|(c, _)| (*c).to_string())
+}
+
+/// 探针回包的 `stop_reason`：按**来访**要的输出上限给。来访只要 1 个 token 才是 `max_tokens`；其余
+/// （短开场常见的 50、1024、32000）回一个字就停，是 `end_turn`——回 `max_tokens` 会让客户端以为回答被
+/// 截断、提示或自动续写。本地应答与改写成预热（出站 `max_tokens:1`，上游必回 `max_tokens`）两条路
+/// 都按这一处改，下游看到的一致。
+pub(super) fn probe_stop_reason(req_max_tokens: Option<i64>) -> &'static str {
+    if req_max_tokens == Some(1) { "max_tokens" } else { "end_turn" }
+}
+
+/// 上游每条回包都带、与账号无关的那几个头，取值与先后照抓包（`cap/auto-2.1.296-20261013-prewarm`）：
+/// `date` 打头，然后是安全头与 Cloudflare 那几项，`request-id`、`cf-ray` 按时刻造（见
+/// [`upstream_like_id`]、[`cf_ray_hex`]；机房由调用方按 [`cf_colo_for`] 给，没有就不带 `cf-ray`），
+/// `traceresponse` 随机。限流头
+/// （`anthropic-ratelimit-unified-*`）与 `anthropic-organization-id` / `anthropic-workspace-id`
+/// **不造**：那是某个账号此刻的真实额度与归属，本地应答没落到任何账号上，编出来的额度会被下游
+/// 当真拿去调度。`date` 自己写上，hyper 就不再在队尾补一个。
+fn upstream_like_headers(
+    builder: axum::http::response::Builder,
+    now: chrono::DateTime<chrono::Utc>,
+    colo: Option<&str>,
+) -> axum::http::response::Builder {
+    let unix_ms = u64::try_from(now.timestamp_millis()).unwrap_or_default();
+    let builder = builder
+        .header(header::DATE, now.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+        .header("strict-transport-security", "max-age=31536000; includeSubDomains; preload")
+        .header("request-id", upstream_like_id("req", unix_ms))
+        .header("traceresponse", format!("00-{}-{}-01", random_hex(32), random_hex(16)))
+        .header("vary", "Accept-Encoding");
+    let builder = match colo {
+        Some(colo) => builder.header("cf-ray", format!("{}-{colo}", cf_ray_hex(unix_ms))),
+        None => builder,
+    };
+    builder
+        .header("server", "cloudflare")
+        .header("cf-cache-status", "DYNAMIC")
+        .header("x-robots-tag", "none")
+        .header("content-security-policy", "default-src 'none'; frame-ancestors 'none'")
+}
+
+/// 探针 / 探活请求的本地回复：**200 + 一条与改写成预热后上游真回的那条同形态的 Message**，
+/// 不到上游。
+///
+/// 正文照官方 `/model` 预热的真实回包逐字段造：键序、`container` / `stop_details` / `diagnostics` 置空、`context_management`，`model`、`input_tokens`、
+/// `usage` 的子字段与正文按模型族取（[`prewarm_reply_of`]）：新一代回 [`PROBE_REPLY_TEXT`]（改写成
+/// 预热那条路给空正文补的同一句），旧一代回上游真会回的那个字。`id` 按时刻造（[`upstream_like_id`]，
+/// 比 `request-id` 晚一个随机的出字耗时）。所以「拒绝探针」开着（本地答）还是关着（改写成预热发
+/// 上游），下游看到的是同一种回复。来访没写 `model` 就留空（那种请求上游本会回 400，这里不替它编
+/// 一个）。`stop_reason` 按来访要的输出上限给（[`probe_stop_reason`]）。要流式就展成 SSE
+/// （[`message_to_sse`]），否则整段 JSON。头照上游的样子带（[`upstream_like_headers`]，机房 `colo`
+/// 见 [`cf_colo_for`]）。为什么不回 403，见调用处 2.1a 的说明。
+///
+/// 回给下游的东西里**没有任何 luban 的标记**：命中的是哪条判据、是 luban 就地答的，都只记在自己的
+/// 流水里（`probe_reply:<判据>` 标签，花费记 0）。
+pub(super) fn probe_reply(
+    model: Option<&str>,
+    req_max_tokens: Option<i64>,
+    wants_stream: bool,
+    colo: Option<&str>,
+) -> Response {
+    use rand::RngExt;
+    let now = chrono::Utc::now();
+    // 上游开始出字比收到请求晚几十到两百毫秒（同一请求的 `msg_` 与 `req_` 解出来差 67～199）。
+    let msg_ms = u64::try_from(now.timestamp_millis()).unwrap_or_default()
+        + rand::rng().random_range(60..=200);
+    let (model, input_tokens, old_gen_text) = prewarm_reply_of(model.unwrap_or_default());
+    let mut usage = serde_json::json!({
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation": { "ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0 },
+        "output_tokens": 1});
+    if old_gen_text.is_none() {
+        usage["output_tokens_details"] = serde_json::json!({ "thinking_tokens": 0 });
+    }
+    usage["service_tier"] = "standard".into();
+    usage["inference_geo"] = "not_available".into();
     let msg = serde_json::json!({
-        "id": format!("{PROBE_REPLY_ID_PREFIX}{tail}"),
+        "model": model,
+        "id": upstream_like_id("msg", msg_ms),
         "type": "message",
         "role": "assistant",
-        "model": model.unwrap_or_default(),
-        "content": [{ "type": "text", "text": PROBE_REPLY_TEXT }],
-        "stop_reason": stop_reason,
+        "content": [{ "type": "text", "text": old_gen_text.unwrap_or(PROBE_REPLY_TEXT) }],
+        "container": serde_json::Value::Null,
+        "stop_reason": probe_stop_reason(req_max_tokens),
         "stop_sequence": serde_json::Value::Null,
-        "usage": {
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0}});
+        "stop_details": serde_json::Value::Null,
+        "usage": usage,
+        "diagnostics": serde_json::Value::Null,
+        "context_management": { "applied_edits": [] }});
     // 展不成 SSE 只可能是上面这段字面量被改坏了（没有 `content` 数组）；真走到那一步宁可回
     // 整段 JSON，也不回一段拼不齐的流。
     let (content_type, body) = match wants_stream.then(|| message_to_sse(&msg)).flatten() {
         Some(sse) => (SSE_CONTENT_TYPE, sse.into_bytes()),
         None => ("application/json", serde_json::to_vec(&msg).unwrap_or_default()),
     };
-    Response::builder()
-        .status(StatusCode::OK)
+    upstream_like_headers(Response::builder().status(StatusCode::OK), now, colo)
         .header(header::CONTENT_TYPE, content_type)
-        .header(LOCAL_REPLY_HEADER, REWRITE_PROBE_REPLY)
-        .header(PROBE_KIND_HEADER, kind.tag())
         .body(Body::from(body))
         .unwrap_or_else(|_| {
             error_response(

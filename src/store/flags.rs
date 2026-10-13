@@ -291,15 +291,15 @@ pub struct ForwardFlags {
     ///
     /// 命中回的是 200 而不是 403（0.3.101 起）：探活正是下游中转判断「这个号还能不能用」的
     /// 那条请求，luban 的 403 在它那侧与「号被封了」长得一样，整个 key 会被摘下去、真流量跟着
-    /// 停——而这条请求根本没到上游、账号一点事没有。本地作答的这条标得出来：响应头
-    /// `x-luban-local: probe_reply` 与 `x-luban-probe-kind: <判据>`、Message id 以 `msg_luban`
-    /// 开头、流水里标 `probe_reply` 且花费记 0。
+    /// 停——而这条请求根本没到上游、账号一点事没有。回的那条 Message 照上游预热的真实回包造
+    /// （与 [`Self::probe_as_prewarm`] 那条路回的同形态，头也照上游的样子带），回给下游的响应里没有
+    /// 任何 luban 的标记；本地作答这件事与命中的判据只记在流水里：标 `probe_reply:<判据>` 且花费记 0。
     ///
     /// 只管这三条形态判据。从响应学来的两类规则各有自己的开关（[`Self::reject_refusals`]、
     /// [`Self::reject_empty_replies`]）：三件事的依据、误伤面、该不该开都不一样，共用一个键
     /// 就没法单独关一件。默认开。
     pub reject_probes: bool,
-    /// 探针拒绝的**严格模式**（随 [`Self::reject_probes`] 一起才生效）：ping 不再要求无 tools
+    /// 探针判据的**严格模式**（[`Self::reject_probes`] 或 [`Self::probe_as_prewarm`] 生效时才起作用）：ping 不再要求无 tools
     /// （`max_tokens` 不超过 16 装不下一次 tool_use，带工具只给 16 个 token 只能是测活）；新增
     /// 「短开场」——无 system、无 tools、恰好一条不超过 32 字节（中文约十个字）的用户消息、`max_tokens != 1`
     /// （测活脚本的「hi」「ping」「test」）。覆盖封号复盘里默认判据放过去的那几批 Go-http-client
@@ -307,6 +307,26 @@ pub struct ForwardFlags {
     /// 裸聊天客户端经中转站发的第一句「你好」也会被拦下、收到探活那条一样的「OK」，
     /// 故**默认关**。
     pub reject_probes_strict: bool,
+    /// [`Self::reject_probes`] **关着**时，命中探针判据的请求不按原样（模拟成主线程）转发，而是
+    /// **改写成官方 `/model` 预热**再发（`proxy::probe_prewarm`）：`max_tokens:1`、system 只有
+    /// billing header 与身份句、正文 `Hi`，头按 `Prewarm` profile、会话取这个号固定的第 0 个槽位，
+    /// 与连通性测试同一条形态（`cap/auto-2.1.293-20261010-model/00031`）。来访自己的身份整份不用：
+    /// 上游看到的是这个号自己的一次模型预热，而不是「一台新设备开一个一次性会话只问一句话」。
+    ///
+    /// 新一代模型（opus-4-7 起、5 系）的预热上游回 `content: []`（`cap/auto-2.1.296-20261013-prewarm`），
+    /// 下游渠道测试见空回复多判失败，故回给来访前正文为空时补一句与本地应答相同的「OK」；来访
+    /// 要流式就展成 SSE。状态码、限流头、`usage` 与 `model` 都是上游真实的。不学空回复与拒答规则，
+    /// 不占设备 / 会话名额（来访身份不出站），走裸请求那套选号。判据同 [`Self::reject_probes`]，
+    /// 严格模式（[`Self::reject_probes_strict`]）在这里同样生效。
+    ///
+    /// 「新设备一次性对话」这条判据命中的设备不会因此登记成已知设备（改写路径不写设备绑定），这台设备
+    /// 之后同形态的请求（带 system、无 tools、单条消息）每条都照样改写，直到它发出别的形态、绑定了
+    /// 设备为止——与 `reject_probes` 开着时一直本地应答是同一个取舍。
+    ///
+    /// 关掉即原样转发（第三方形态照旧由模拟路径装成主线程）。**默认关**：设置表只存拨过的键，已有
+    /// 部署升级后这个键是缺的，默认开就等于替显式关过 `reject_probes`（要原样放行）的部署悄悄打开
+    /// 了改写——违背「开关关掉即不处理」。要改写就在后台主动打开。
+    pub probe_as_prewarm: bool,
     /// 是否本地拦下 **上游分类器已经拒答过的那条提示词**的逐字重发（`kind = "refusal"`，
     /// 见 `proxy::known_refused_prompt`）——拦下时**原样回放上游那次的响应**（200 + 同一段
     /// `stop_reason: "refusal"` 的体，见 [`LearnedReply`](super::LearnedReply)），不是 luban 自己造一条 403：客户端
@@ -418,6 +438,7 @@ impl Default for ForwardFlags {
             reject_session_conflict: true,
             reject_probes: true,
             reject_probes_strict: false,
+            probe_as_prewarm: false,
             reject_refusals: true,
             reject_empty_replies: true,
             reject_learned_shapes: true,

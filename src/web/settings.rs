@@ -139,10 +139,12 @@ struct ForwardingResp {
     reject_openai_shape: bool,
     /// 会话 id 头体不一致时本地拒绝，不替客户端选一个。
     reject_session_conflict: bool,
-    /// 本地就地回答探针 / 探活类请求（200 + 一句「OK」，头上标 x-luban-local），不转发。
+    /// 本地就地回答探针 / 探活类请求（200 + 与上游预热真实回包同形态的一句「OK」），不转发。
     reject_probes: bool,
-    /// 探针拒绝严格模式：ping 不要求无 tools，新增「短开场」判据。默认关。
+    /// 探针判据严格模式（本地应答与改写为预热都按它判）：ping 不要求无 tools，新增「短开场」判据。默认关。
     reject_probes_strict: bool,
+    /// 探针拒绝关着时，命中探针判据的请求改写成官方 `/model` 预热再发。默认关。
+    probe_as_prewarm: bool,
     /// 本地拦下上游分类器已拒答过的那条提示词的逐字重发，原样回放上游那次的响应（200）；
     /// 出站带 fallbacks 的不拦。
     reject_refusals: bool,
@@ -196,6 +198,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_session_conflict: f.reject_session_conflict,
             reject_probes: f.reject_probes,
             reject_probes_strict: f.reject_probes_strict,
+            probe_as_prewarm: f.probe_as_prewarm,
             reject_refusals: f.reject_refusals,
             reject_empty_replies: f.reject_empty_replies,
             reject_learned_shapes: f.reject_learned_shapes,

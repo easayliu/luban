@@ -698,27 +698,48 @@ export function ForwardingSettingsContent() {
       <SettingsGroup
         icon={ShieldBanIcon}
         title={t('本地拦截', 'Local interception')}
-        description={t('命中的请求在本地应答或拒绝，不发往上游。', 'Matching requests are answered or rejected locally and never reach upstream.')}
+        description={t('命中的请求在本地应答或拒绝，或改写成官方形态后再发。', 'Matching requests are answered or rejected locally, or rewritten into an official shape before being sent.')}
       >
         <ForwardingToggle
           k="reject_probes"
           label={t('拒绝探针请求', 'Reject probe requests')}
           summary={t(
-            '下游中转站用于探活、测活的请求，由本地直接返回一条最小的正常响应（200 加一句「OK」，响应头标注 x-luban-local: probe_reply），不发往上游，不限 UA。本开关只负责形态判据；从响应中学到的两类规则各有独立开关，见下面两条。',
-            'Health-check / channel-test requests that downstream relays send to probe the account are answered locally with a minimal 200 (a one-word "OK", marked with the x-luban-local: probe_reply header) and never reach upstream, regardless of UA. Shape signatures only; the two rule kinds learned from responses have their own switches below.',
+            '下游中转站用于探活、测活的请求，由本地直接返回一条与上游预热真实回包同形态的响应（200 加一句「OK」），不发往上游，不限 UA。本开关只负责形态判据；从响应中学到的两类规则各有独立开关，见下面两条。',
+            'Health-check / channel-test requests that downstream relays send to probe the account are answered locally with a 200 shaped like upstream\'s real prewarm reply (a one-word "OK") and never reach upstream, regardless of UA. Shape signatures only; the two rule kinds learned from responses have their own switches below.',
           )}
           description={
             <>
               {t(
-                '探活脚本发送的是不带 tools 的单句小请求，每条在上游看来都是「一台设备开一个一次性会话，只问一句话」，这是封号复盘中最显眼的特征。本开关按三条强特征判断，命中任意一条即拒绝，不限 UA：一是没有 tools、只有一条消息、max_tokens 在 2 到 16 之间（不要求带 system：官方没有这种形态，而 Go-http-client 的探活通常不带 system）；二是带 system、没有 tools、只有一条消息、不属于官方那两种无 tools 形态，且来自一台从未见过的设备；三是 system 里的 CC 身份句出现在不止一块中。0.3.99 之前仅判断自报 claude-cli UA 的请求，Go-http-client 的探活因此进入了模拟路径，被伪装成官方形态，每 3 到 6 秒一批发往上游。「没有 tools」按取值判断：缺失、null、[] 都算没有，添加空字段也无法绕过。官方 Claude Code 的三种无 tools 请求（cache 预热、haiku Helper、安全分类）按取值逐项比对，都不在判据之内。身份字段写错的请求（device_id 不是 64 位 hex、session_id 不是 UUID，如 channel-test）不算探针，不在这里拒绝，而是不被视为官方客户端，经模拟路径重建身份。只看形态，单条即判定，不做计数。边界：逐字照抄官方 haiku Helper 全部取值的探针，在形态上就是官方请求，这里无法区分。不带 metadata.user_id 的探针也在这里应答：这道判据排在设备身份校验之前，否则设备身份校验先返回的 403 在下游看来与「账号被封」一样，整个 key 同样会被摘除。命中后返回给客户端的是一条最小的正常回复：200、一个文本块「OK」、stop_reason end_turn；客户端请求流式时按 SSE 返回，model 原样返回客户端声明的那个，正文里没有任何被拦截过的痕迹。0.3.101 之前返回的是 403 permission_error，而探活请求恰恰是下游中转判断「该账号是否可用」的依据：luban 的 403 在下游看来与「账号被封」一样，整个 key 被摘除，真实流量随之中断，而该请求实际并未到达上游，账号本身完全正常。这类由 luban 本地应答、未到达上游的请求可从三处识别：响应头 x-luban-local: probe_reply 与 x-luban-probe-kind（命中的是哪条判据）；Message id 以 msg_luban 开头（流式响应在 message_start 里同样带着）；请求查询中带 probe_reply 标签且花费记为 0。这些标记均位于正文语义之外：探活读到的仍是一条正常回复，而在抓包与下游面板中可以识别出该请求，不会将其误认为上游真正作答过的请求。与其他开关的关系：本开关只负责上面三条形态判据；从响应学到的「已拒答的提示词」与「零输出请求类」两类规则各有自己的开关（见下面两条）。0.3.93 之前三者共用同一个键，停用探针拒绝会连同学到的规则一并放行。',
-                "Probe scripts send a single tool-less one-liner; upstream sees each one as \"a device opening a throwaway session to ask one question\", the most conspicuous pattern in the ban post-mortem. This switch checks three strong signatures, any one of which matches, regardless of UA: no tools, a single message and max_tokens between 2 and 16 (no system prompt required: official Claude Code has no such shape, and Go-http-client health checks usually carry none); a system prompt with no tools, a single message, not one of the two official tool-less shapes, and a never-seen device; the Claude Code identity sentence in more than one system block. Before 0.3.99 only requests claiming a claude-cli UA were judged, so Go-http-client health checks went through the simulation path instead and were sent upstream dressed as official traffic, in batches every 3 to 6 seconds. \"No tools\" is judged by value: missing, null and [] all count, so padding with empty fields does not help. The three tool-less shapes official Claude Code does send (cache prewarm, the haiku helper, the security classifier) are matched value by value and fall outside the signatures. Malformed identities (a device_id that is not 64-hex, a session_id that is not a UUID, e.g. channel-test) are not probes and are not rejected here; they are simply not treated as an official client and go through the simulation path, which rebuilds the identity. Shape only, decided per request, no counting. Limit: a probe that copies every value of the official haiku helper verbatim is, by shape, an official request and cannot be told apart here. Probes without metadata.user_id are answered here as well: this check runs before the device-identity check, which would otherwise return a 403 that a downstream relay cannot tell apart from a banned account, so the whole key would be pulled anyway. A hit is answered locally with a minimal normal reply: 200, one text block \"OK\", stop_reason end_turn, streamed as SSE if the client asked for a stream, echoing the model the client declared, with nothing in the body hinting it was intercepted. Before 0.3.101 the answer was a 403 permission_error, but a health check is exactly how a downstream relay decides whether the account still works: luban's 403 looks the same to it as a banned account, so the whole key gets pulled and real traffic stops with it, even though the request never reached upstream and the account is fine. Requests answered locally by luban without reaching upstream can be identified in three places: the response headers x-luban-local: probe_reply and x-luban-probe-kind (which signature matched), a message id starting with msg_luban (also carried in message_start when streaming), and the probe_reply tag with zero cost in request lookup. These markers sit outside the body's semantics, so a health check still reads a normal reply, while packet captures and downstream panels can recognize the request and never mistake it for a real upstream answer. Relation to other switches: this switch governs only the three shape signatures above; the two rule kinds learned from responses (refused prompts, empty-reply request classes) have their own switches below. Before 0.3.93 all three shared this one key, so turning probe rejection off also let the learned rules through.",
+                '探活脚本发送的是不带 tools 的单句小请求，每条在上游看来都是「一台设备开一个一次性会话，只问一句话」，这是封号复盘中最显眼的特征。本开关按三条强特征判断，命中任意一条即拒绝，不限 UA：一是没有 tools、只有一条消息、max_tokens 在 2 到 16 之间（不要求带 system：官方没有这种形态，而 Go-http-client 的探活通常不带 system）；二是带 system、没有 tools、只有一条消息、不属于官方那两种无 tools 形态，且来自一台从未见过的设备；三是 system 里的 CC 身份句出现在不止一块中。0.3.99 之前仅判断自报 claude-cli UA 的请求，Go-http-client 的探活因此进入了模拟路径，被伪装成官方形态，每 3 到 6 秒一批发往上游。「没有 tools」按取值判断：缺失、null、[] 都算没有，添加空字段也无法绕过。官方 Claude Code 的三种无 tools 请求（cache 预热、haiku Helper、安全分类）按取值逐项比对，都不在判据之内。身份字段写错的请求（device_id 不是 64 位 hex、session_id 不是 UUID，如 channel-test）不算探针，不在这里拒绝，而是不被视为官方客户端，经模拟路径重建身份。只看形态，单条即判定，不做计数。边界：逐字照抄官方 haiku Helper 全部取值的探针，在形态上就是官方请求，这里无法区分。不带 metadata.user_id 的探针也在这里应答：这道判据排在设备身份校验之前，否则设备身份校验先返回的 403 在下游看来与「账号被封」一样，整个 key 同样会被摘除。命中后返回给客户端的是一条与上游预热真实回包同形态的回复：200、一个文本块「OK」（旧一代模型回上游预热真会回的那个字，如「Hi」）、stop_reason max_tokens，model（别名按上游的习惯解析成带日期的全名）与 usage 各字段按模型照上游的样子生成，id 与 request-id 按上游的规则带上当前时刻，与「探针改写为预热」发往上游后返回的是同一种回复；客户端请求流式时按 SSE 返回，model 原样返回客户端声明的那个，正文里没有任何被拦截过的痕迹。0.3.101 之前返回的是 403 permission_error，而探活请求恰恰是下游中转判断「该账号是否可用」的依据：luban 的 403 在下游看来与「账号被封」一样，整个 key 被摘除，真实流量随之中断，而该请求实际并未到达上游，账号本身完全正常。这类由 luban 本地应答、未到达上游的请求只能在请求查询中识别：带 probe_reply 标签（后接命中的判据，如 probe_reply:ping），花费记为 0。返回给客户端的响应里没有任何 luban 的标记：响应头也照上游的样子生成（request-id、traceresponse、cf-ray 及 Cloudflare 与安全相关的头，cf-ray 的机房取最近一次上游响应的那个）；限流头与组织 ID 这类与账号相关的头不生成，以免编造的额度被下游拿去调度。与其他开关的关系：本开关只负责上面三条形态判据；从响应学到的「已拒答的提示词」与「零输出请求类」两类规则各有自己的开关（见下面两条）。0.3.93 之前三者共用同一个键，停用探针拒绝会连同学到的规则一并放行。停用本开关后，命中判据的请求交由「探针改写为预热」处理；两者都停用才原样转发。',
+                "Probe scripts send a single tool-less one-liner; upstream sees each one as \"a device opening a throwaway session to ask one question\", the most conspicuous pattern in the ban post-mortem. This switch checks three strong signatures, any one of which matches, regardless of UA: no tools, a single message and max_tokens between 2 and 16 (no system prompt required: official Claude Code has no such shape, and Go-http-client health checks usually carry none); a system prompt with no tools, a single message, not one of the two official tool-less shapes, and a never-seen device; the Claude Code identity sentence in more than one system block. Before 0.3.99 only requests claiming a claude-cli UA were judged, so Go-http-client health checks went through the simulation path instead and were sent upstream dressed as official traffic, in batches every 3 to 6 seconds. \"No tools\" is judged by value: missing, null and [] all count, so padding with empty fields does not help. The three tool-less shapes official Claude Code does send (cache prewarm, the haiku helper, the security classifier) are matched value by value and fall outside the signatures. Malformed identities (a device_id that is not 64-hex, a session_id that is not a UUID, e.g. channel-test) are not probes and are not rejected here; they are simply not treated as an official client and go through the simulation path, which rebuilds the identity. Shape only, decided per request, no counting. Limit: a probe that copies every value of the official haiku helper verbatim is, by shape, an official request and cannot be told apart here. Probes without metadata.user_id are answered here as well: this check runs before the device-identity check, which would otherwise return a 403 that a downstream relay cannot tell apart from a banned account, so the whole key would be pulled anyway. A hit is answered locally with a reply shaped exactly like upstream's real prewarm reply: 200, one text block \"OK\" (older models get the single token upstream really answers a prewarm with, e.g. \"Hi\"), stop_reason max_tokens, with the model (aliases resolved to the dated full name as upstream does) and every usage field generated per model the way upstream does and the id and request-id carrying the current time by upstream's own scheme, the same kind of reply \"Send probes as prewarm\" gets back from upstream; streamed as SSE if the client asked for a stream, echoing the model the client declared, with nothing in the body hinting it was intercepted. Before 0.3.101 the answer was a 403 permission_error, but a health check is exactly how a downstream relay decides whether the account still works: luban's 403 looks the same to it as a banned account, so the whole key gets pulled and real traffic stops with it, even though the request never reached upstream and the account is fine. Requests answered locally by luban without reaching upstream can be identified only in request lookup, by the probe_reply tag (followed by the signature that matched, e.g. probe_reply:ping) with zero cost. The response carries no luban marker at all: its headers are generated the way upstream sends them too (request-id, traceresponse, cf-ray and the Cloudflare and security headers, with the cf-ray colo taken from the latest upstream response); account-specific headers such as rate limits and the organization ID are not generated, so made-up quota never steers downstream scheduling. Relation to other switches: this switch governs only the three shape signatures above; the two rule kinds learned from responses (refused prompts, empty-reply request classes) have their own switches below. Before 0.3.93 all three shared this one key, so turning probe rejection off also let the learned rules through. With this switch off, matching requests are handled by “Send probes as prewarm”; only with both off are they forwarded as is.",
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="probe_as_prewarm"
+          label={t('探针改写为预热', 'Send probes as prewarm')}
+          inactiveWhileOn={{ key: 'reject_probes', label: t('拒绝探针请求', 'Reject probe requests') }}
+          summary={t(
+            '「拒绝探针请求」停用时，命中探针判据的请求不再原样转发，而是改写成官方 Claude Code 切换模型时发出的那条预热（max_tokens 1、正文「Hi」）再发往上游；上游回复的正文为空时补一句「OK」。停用后原样转发。',
+            'While “Reject probe requests” is off, requests matching the probe signatures are no longer forwarded as is; they are rewritten into the prewarm official Claude Code sends when switching models (max_tokens 1, body "Hi") and sent upstream, with a one-word "OK" filled in when upstream returns an empty body. Turned off, they are forwarded as is.',
+          )}
+          description={
+            <>
+              {t(
+                '原样转发时，第三方探活会进入模拟路径，被补上基座提示词与官方工具，在上游看来是「一台新设备开一个一次性会话，只问一句话」。改写后发出的是官方 /model 预热：system 只有 billing 标识与身份句，正文「Hi」，max_tokens 为 1，请求头按官方预热的形态生成，会话使用该账号固定的会话 ID，与连通性测试发出的是同一条请求，模型沿用客户端声明的那个。客户端自带的设备与会话身份不发往上游，因此不占设备与会话名额，按无身份请求选号并受无身份请求速率上限约束；设备身份校验与每设备、每会话的 RPM 限制同样跳过。实测 opus-4-7 起的新一代模型（含 5 系）对这条预热返回空正文，旧一代返回一个字（如「Hi」「#」）；正文为空时补一句「OK」，以免下游渠道测试将空回复判为失败。状态码、响应头、用量与 model 均为上游真实返回值，响应里没有任何 luban 的标记；客户端请求流式时按 SSE 返回；请求查询中带 probe_prewarm 标签（后接命中的判据，如 probe_prewarm:short-opener），补过正文的另带 probe_reply_filled；按实际用量计费。这类请求不参与学习零输出与拒答规则，也不发送逐请求遥测。判据与「拒绝探针请求」相同，「严格模式」在此同样生效。注意：命中「新设备一次性对话」这条判据的设备不会因此登记为已知设备，这台设备之后同样形态（带 system、无 tools、单条消息）的请求会一直被改写成预热，直到它发出其他形态的请求、完成设备绑定为止；这与「拒绝探针请求」启用时一直本地应答是同一个取舍。没带 metadata.user_id 的第三方单轮调用（翻译、摘要、分类脚本常是这个形态）因此始终拿不到真实回答，有这类流量时请停用本开关。',
+                'Forwarded as is, a third-party health check goes through the simulation path and gets the base prompt and official tools added, so upstream sees "a new device opening a throwaway session to ask one question". Rewritten, what goes out is the official /model prewarm: a system prompt holding only the billing identifier and the identity sentence, the body "Hi", max_tokens 1, headers generated in the official prewarm shape, and the account\'s fixed session ID. It is the same request the connectivity test sends, keeping the model the client declared. The client\'s own device and session identity never reach upstream, so no device or session slot is taken; the account is picked as for an identity-less request and the identity-less rate limit applies, while the device-identity check and the per-device and per-session RPM limits are skipped. Measured: newer models (opus-4-7 onward, including the 5 series) answer this prewarm with an empty body, older ones with a single token (e.g. "Hi", "#"); an empty body gets a one-word "OK" so downstream channel tests do not mark it as failed. Status code, response headers, usage and model are upstream\'s own, with no luban marker anywhere in the response; streamed as SSE if the client asked for a stream; request lookup shows the probe_prewarm tag followed by the signature that matched (e.g. probe_prewarm:short-opener), plus probe_reply_filled when the body was filled; billed at actual usage. These requests never feed the learned empty-reply or refusal rules and send no per-request telemetry. Same signatures as "Reject probe requests"; strict mode applies here too. Note: a device matched by the "throwaway conversation from a new device" signature is not registered as a known device as a result, so every later request of the same shape from it (a system prompt, no tools, a single message) keeps being sent as a prewarm until it sends some other shape and gets bound; the same trade-off as answering locally while "Reject probe requests" is on. Third-party single-turn calls without metadata.user_id (translation, summarisation and classification scripts often look like this) therefore never get a real answer; turn this off if you carry such traffic.',
               )}
             </>
           }
         />
         <ForwardingToggle
           k="reject_probes_strict"
-          label={t('探针拒绝：严格模式', 'Probe rejection: strict mode')}
+          label={t('探针判据：严格模式', 'Probe signatures: strict mode')}
+          requiresAny={[
+            { key: 'reject_probes', label: t('拒绝探针请求', 'Reject probe requests') },
+            { key: 'probe_as_prewarm', label: t('探针改写为预热', 'Send probes as prewarm') },
+          ]}
           summary={t(
             '在上面三条判据之外再增加两条：带 tools 但 max_tokens 为 2 到 16 的请求也视为 ping；无 system、无 tools、只有一条不超过 32 字节（中文约 10 个字）用户消息的请求也视为探活。可能误拦真实用户的首句问候（如「你好」），默认停用。',
             'Two more signatures on top of the three above: max_tokens 2 to 16 counts as a ping even with tools; a single user message of 32 bytes or fewer (about ten CJK characters) with no system prompt and no tools counts as a probe. It also catches a real user\'s first "hello", so it is off by default.',
@@ -726,8 +747,8 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '封号复盘（ban-37 / 38 / 42）中，Go-http-client 的探活有四种形态，默认判据只能拦截「无 tools、单条消息、max_tokens 2 到 16」这一种。另外三种被放行后进入模拟路径，被伪装成带基座的官方形态发往上游，每个账号上仍有一两百条：4 个 tools 配 max_tokens 16；无 system、只问一句「hi」，max_tokens 为 50、1024 或 32000。本开关增加两条判据来覆盖它们。第一条有硬依据：16 个 token 装不下一次 tool_use 调用，带着工具却只给 16 个 token，只可能是测活。第二条有代价：真实用户使用纯聊天客户端、经中转站发出的第一句「你好」同样是无 system、无 tools、一条短消息，会收到一条 200 的「OK」（与探活收到的是同一条最小回复），下一句正常长度的消息照常通过。带附件、多轮、带 system 的请求，以及 max_tokens 为 1 的预热，都不视为短开场白。需与「拒绝探针请求」一起启用才生效。',
-                'The ban post-mortems (ban-37 / 38 / 42) show four shapes of Go-http-client health checks; the default signatures catch only "no tools, single message, max_tokens 2 to 16". The other three were simulated into an official-looking body with a base prompt and sent upstream, still one or two hundred per account: 4 tools with max_tokens 16; no system prompt, a single "hi", and max_tokens 50, 1024 or 32000. This switch adds two signatures that cover them. The first rests on hard evidence: 16 tokens cannot hold a tool_use call, so tools plus a 16-token budget can only be a health check. The second has a cost: a real user\'s first "hello" sent through a relay from a plain chat client is also a single short message with no system prompt and no tools, so it gets the same minimal 200 \"OK\" a probe would, and the next normal-length message goes through. Attachments, multi-turn conversations, a system prompt, or a max_tokens of 1 (cache warm-up) never count as a short opener. Takes effect only together with "Reject probe requests".',
+                '封号复盘（ban-37 / 38 / 42）中，Go-http-client 的探活有四种形态，默认判据只能拦截「无 tools、单条消息、max_tokens 2 到 16」这一种。另外三种被放行后进入模拟路径，被伪装成带基座的官方形态发往上游，每个账号上仍有一两百条：4 个 tools 配 max_tokens 16；无 system、只问一句「hi」，max_tokens 为 50、1024 或 32000。本开关增加两条判据来覆盖它们。第一条有硬依据：16 个 token 装不下一次 tool_use 调用，带着工具却只给 16 个 token，只可能是测活。第二条有代价：真实用户使用纯聊天客户端、经中转站发出的第一句「你好」同样是无 system、无 tools、一条短消息，会收到一条 200 的「OK」（与探活收到的是同一条最小回复），下一句正常长度的消息照常通过（「探针改写为预热」生效时，这句问候会被改写成预热发出，收到的同样是一句「OK」）。带附件、多轮、带 system 的请求，以及 max_tokens 为 1 的预热，都不视为短开场白。需「拒绝探针请求」或「探针改写为预热」生效时才起作用。',
+                'The ban post-mortems (ban-37 / 38 / 42) show four shapes of Go-http-client health checks; the default signatures catch only "no tools, single message, max_tokens 2 to 16". The other three were simulated into an official-looking body with a base prompt and sent upstream, still one or two hundred per account: 4 tools with max_tokens 16; no system prompt, a single "hi", and max_tokens 50, 1024 or 32000. This switch adds two signatures that cover them. The first rests on hard evidence: 16 tokens cannot hold a tool_use call, so tools plus a 16-token budget can only be a health check. The second has a cost: a real user\'s first "hello" sent through a relay from a plain chat client is also a single short message with no system prompt and no tools, so it gets the same minimal 200 \"OK\" a probe would, and the next normal-length message goes through. (With “Send probes as prewarm” in effect, that greeting is sent as a prewarm instead and likewise answered with "OK".) Attachments, multi-turn conversations, a system prompt, or a max_tokens of 1 (cache warm-up) never count as a short opener. Takes effect only while "Reject probe requests" or "Send probes as prewarm" is in effect.',
               )}
             </>
           }
@@ -1245,6 +1266,8 @@ function ForwardingToggle({
   summary,
   description,
   requires,
+  requiresAny,
+  inactiveWhileOn,
   skippedByBillingOnly,
 }: {
   k: ForwardingKey
@@ -1257,6 +1280,14 @@ function ForwardingToggle({
    * 存储值不动，前置开关一开回来，本项还是原来那个状态。
    */
   requires?: ForwardingRequire | ForwardingRequire[]
+  /**
+   * 反向依赖：这一项只在它**停用**时才生效（后端同样这么判），开着时同样置灰并说明，存储值不动。
+   */
+  inactiveWhileOn?: ForwardingRequire
+  /**
+   * 几个前置开关**任一**开着才生效（后端同样这么判）：全关时置灰并说明，存储值不动。
+   */
+  requiresAny?: ForwardingRequire[]
   /**
    * 「仅注入 billing 标识」实际生效时本项被整个跳过（后端按 `billing_only` 门控）：同样置灰并
    * 说明原因，存储值不动。给字符串表示此时改由那一项决定，提示里指向它。
@@ -1271,9 +1302,17 @@ function ForwardingToggle({
   const blockedBy = (Array.isArray(requires) ? requires : requires ? [requires] : []).find(
     (r) => data?.[r.key] === false,
   )
-  const blocked = blockedBy != null
-  const suspended = !blocked && skippedByBillingOnly != null && billingOnlyActive(data)
-  const inactive = blocked || suspended
+  // 「任一」依赖：一个都没开就算挡住，提示里把几项都列出来。
+  const blockedByAny =
+    requiresAny != null && requiresAny.length > 0 && requiresAny.every((r) => data?.[r.key] === false)
+      ? requiresAny
+      : null
+  const blocked = blockedBy != null || blockedByAny != null
+  // 缺省值按后端默认：反向依赖的那几项（如拒绝探针请求）默认启用。
+  const overridden = !blocked && inactiveWhileOn != null && data?.[inactiveWhileOn.key] !== false
+  const suspended =
+    !blocked && !overridden && skippedByBillingOnly != null && billingOnlyActive(data)
+  const inactive = blocked || overridden || suspended
 
   const save = useSettingsSave((next: boolean) => setForwarding(k, next), {
     invalidateCredentials: true,
@@ -1292,8 +1331,18 @@ function ForwardingToggle({
       htmlFor={id}
       label={label}
       description={
-        blocked
+        blockedBy
           ? t(`需先启用「${blockedBy.label}」`, `Enable “${blockedBy.label}” first`)
+          : blockedByAny
+            ? t(
+                `需先启用${blockedByAny.map((r) => `「${r.label}」`).join('或')}`,
+                `Enable ${blockedByAny.map((r) => `“${r.label}”`).join(' or ')} first`,
+              )
+          : overridden
+            ? t(
+                `「${inactiveWhileOn.label}」启用期间不生效`,
+                `Inactive while “${inactiveWhileOn.label}” is enabled`,
+              )
           : suspended
             ? typeof skippedByBillingOnly === 'string'
               ? t(

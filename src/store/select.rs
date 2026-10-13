@@ -303,13 +303,14 @@ impl CredentialStore {
     /// 在 `groups` 里、没被判过「套餐不含 `model`」、不在冷却。只读——不放回到点的暂停号、
     /// 不写绑定、不占名额、不计裸请求与 RPM。
     ///
-    /// 给探活本地应答用（`crate::proxy::probe_reply`）：号池真空了还回 200，下游会一直以为
-    /// 渠道健康、不切走，真流量全部失败。名额满、RPM 满这类按请求的瞬时容量不算「没号」。
-    pub async fn has_usable_credential(
+    /// 返回这些号的 id（按 id 升序，空即没号）。给探活本地应答用（`crate::proxy::probe_reply`）：号池真空了还回
+    /// 200，下游会一直以为渠道健康、不切走，真流量全部失败。名额满、RPM 满这类按请求的瞬时容量不算
+    /// 「没号」。本地应答的 `cf-ray` 机房也从这些号里取（`crate::proxy::probe_detect::cf_colo_for`）。
+    pub async fn usable_credential_ids(
         &self,
         groups: Option<&[i64]>,
         model: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<Vec<i64>> {
         let model = model.map(nul_free);
         let model_key = model.as_deref().map(model_denial_key);
         let ids: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -320,13 +321,14 @@ impl CredentialStore {
                      (SELECT cred_id FROM credential_groups WHERE group_id = ANY($1::BIGINT[]))) \
                 AND NOT EXISTS (SELECT 1 FROM model_denials d \
                                  WHERE d.cred_id = credentials.id AND d.model = $2 \
-                                   AND (d.expires_at IS NULL OR d.expires_at > unixepoch()))"
+                                   AND (d.expires_at IS NULL OR d.expires_at > unixepoch())) \
+              ORDER BY id"
         )))
         .bind(groups)
         .bind(model_key.as_deref())
         .fetch_all(&self.pool)
         .await?;
-        Ok(ids.into_iter().any(|id| !self.cooldown.is_cooling(id, model.as_deref())))
+        Ok(ids.into_iter().filter(|&id| !self.cooldown.is_cooling(id, model.as_deref())).collect())
     }
 
     /// 同 [`Self::select_with_slot`]，只要号（测试用）。

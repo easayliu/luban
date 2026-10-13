@@ -29,21 +29,24 @@ use super::body::{
     remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
     stream_requested, trusted_cc_version, ua_of,
 };
-use super::connectivity::{session_start, spawn_session_handshake};
+use super::connectivity::{prewarm_body, prewarm_upstream, session_start, spawn_session_handshake};
 use super::digest::redact_headers;
 use super::headers::{BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta};
 use super::learned_rules::{
-    MODEL_DENIAL_MAX_SWAPS, RejectionLog, TRANSIENT_MAX_ATTEMPTS, app_system_digest,
-    empty_reply_class, has_outbound_shape_rules, is_max_plan, known_app_refusal, known_empty_reply,
-    known_refused_prompt, known_shape_rejection, next_transient_backoff, prompt_digest,
-    remember_shape_rejection, replay_refusal, take_rejection_log_slot,
+    MODEL_DENIAL_MAX_SWAPS, RejectionLog, SSE_CONTENT_TYPE, TRANSIENT_MAX_ATTEMPTS,
+    app_system_digest, empty_reply_class, has_outbound_shape_rules, is_max_plan, known_app_refusal,
+    known_empty_reply, known_refused_prompt, known_shape_rejection, next_transient_backoff,
+    prompt_digest, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 use super::logging::{
     ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
     inbound_headers_summary, inbound_shape_summary, record_early_failure, telemetry_capture,
 };
 use super::openai_marker::{find_openai_marker, remap_call_ids};
-use super::probe_detect::{probe_reply, probe_signature};
+use super::probe_detect::{
+    PROBE_REPLY_TEXT, ProbeKind, cf_colo_for, message_to_sse, note_upstream_cf_ray, probe_reply,
+    probe_signature, probe_stop_reason,
+};
 use super::rate_limit::{
     LimitScope, RateLimitInfo, park_if_quota_nearly_exhausted, park_rate_limited,
     rate_limit_scope_for,
@@ -61,15 +64,16 @@ use super::thinking::{
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,
-    note_upstream_send, rebuild_response, relay_upstream, resp_builder, resp_shape,
-    retry_thread_as_create, retry_without_fallbacks, try_acquire_session_concurrency,
+    note_upstream_send, rebuild_response, relay_upstream, resp_builder, resp_builder_as,
+    resp_shape, retry_thread_as_create, retry_without_fallbacks, try_acquire_session_concurrency,
     upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
     EarlyUpstreamFailure, MAX_BODY_BYTES, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY,
-    REWRITE_PROBE_REPLY, REWRITE_REFUSAL_REPLAY, RequestLogState, client_access, client_request_id,
-    error_response, header_opt, inbound_beta_list, log_early_upstream_failure, rate_limit_response,
-    request_max_tokens, request_model, request_speed,
+    REWRITE_PROBE_PREWARM, REWRITE_PROBE_REPLY, REWRITE_PROBE_REPLY_FILLED, REWRITE_REFUSAL_REPLAY,
+    RequestLogState, client_access, client_request_id, error_response, header_opt,
+    inbound_beta_list, log_early_upstream_failure, rate_limit_response, request_max_tokens,
+    request_model, request_speed,
 };
 
 mod admit;
@@ -78,7 +82,7 @@ mod respond;
 mod retry;
 mod select;
 
-use self::admit::{Guards, Inbound};
+use self::admit::{Guards, Inbound, ProbePrewarm};
 use self::attempt::{Attempt, Prepared};
 use self::retry::{Flow, Swaps, UpstreamResult};
 use self::select::select;

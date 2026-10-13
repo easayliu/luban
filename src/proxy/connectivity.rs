@@ -16,6 +16,7 @@ use super::body::{
 use super::headers::{build_forward_headers_for, orig_header_case};
 use super::learned_rules::is_max_plan;
 use super::logging::{ban_context, shape_summary, spawn_usage_log};
+use super::probe_detect::note_upstream_cf_ray;
 use super::rate_limit::{
     LimitScope, RateLimitInfo, park_if_quota_nearly_exhausted, park_rate_limited,
     rate_limit_scope_for,
@@ -223,75 +224,80 @@ pub async fn probe(
     // 等于给这个账号在上游多一台设备，而测试并不需要一个自己的身份。取模拟路径那份
     // （[`sim_device_fingerprint`]）：这条测试走模拟路径，平台段与 UA 段都是它发出去的那套。
     let device_fp = sim_device_fingerprint(None);
-    let flags = store::ForwardFlags::default();
-    // 直接构造 `Simulation` 而不走 `Simulation::detect`，见 [`probe_simulation`]。
-    let shape = ProbeShape::of(model);
-    let sim = probe_simulation(cred, model);
-    // 预热那条体按真实 CC 来访改写（`sim: None`），会话 id 由这里给：头上那个出自 `sim`，
-    // 体里 `metadata` 要与它同值。
-    let real_session = (shape == ProbeShape::Prewarm).then(|| sim.session_id.clone());
-    let headers = build_forward_headers_for(
-        &HeaderMap::new(),
-        &token,
-        flags,
-        Some(&sim),
-        None,
-        Some(model),
-        false,
-        super::headers::BetaCtx::MAIN,
-    );
-    // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端）。在 headers 被 move 进
-    // Upstream 之前取，取值规则与转发路径同一套。
-    let out_ua = ua_of(&headers);
     let probe_request_id = new_request_id();
-    let upstream = Upstream {
-        _state: std::marker::PhantomData,
-        // 测试也走这个号自己的代理——不然「测通了」测的是直连那条路，与真实转发不是一回事。
-        // 代理建不出来同样标记禁用：与转发/刷新/保活口径一致，坏代理不留在池里。
-        client: match state.clients.for_credential(cred) {
-            Ok(c) => c,
-            Err(e) => {
-                let reason = format!("[proxy] {e:#}");
-                let _ = state
-                    .store
-                    .record_ban(
-                        cred.id,
-                        &store::BanContext {
-                            reason: reason.clone(),
-                            source: "proxy",
-                            error_message: Some(format!("{e:#}")),
-                            request_id: Some(probe_request_id.clone()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}"));
-            }
-        },
-        method: Method::POST,
-        // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。
-        url: ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL)),
-        headers,
-        flags,
-        billable: true,
-        // 额度探测走模拟那条路，会话 id 在 Simulation 里。预热那条体已是官方原样，**按真实 CC
-        // 来访的预热改写**：模拟路径的整形是给主线程准备的（基座、1h 断点、`diagnostics`），
-        // 而真实来访那条路对预热只补身份与 `cch`、断点保持裸的——与官方逐字相同，也正是一个
-        // 真 2.1.293 客户端的预热经 luban 转发时走的那套改写。头已经按 `sim` 造好，不受影响。
-        sim: (shape == ProbeShape::Quota).then_some(sim),
-        bare_session: real_session.clone(),
-        session_out: real_session,
-        // 两种官方形态都是非流式（`keeps_nonstream`），下面那套读法（`up.bytes()` 一把梭 +
-        // [`probe_report`] 按整段 Message 解析出 model/error_type）也是照非流式响应写的。
-        force_stream: false,
-        // 探测体不带 `tools`（见 [`probe_body`]），没有可混淆的名字。
-        tool_names: None,
-        // 两种形态都不在会话链上。
-        client_link: None,
-        cc_kind: shape.cc_kind(),
-        // 探测不补 fallbacks：它要测的是这个号在**这个模型**上通不通，换模型作答等于没测。
-        refusal_fallbacks: None,
+    // 测试也走这个号自己的代理——不然「测通了」测的是直连那条路，与真实转发不是一回事。
+    // 代理建不出来同样标记禁用：与转发/刷新/保活口径一致，坏代理不留在池里。
+    let client = match state.clients.for_credential(cred) {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = format!("[proxy] {e:#}");
+            let _ = state
+                .store
+                .record_ban(
+                    cred.id,
+                    &store::BanContext {
+                        reason: reason.clone(),
+                        source: "proxy",
+                        error_message: Some(format!("{e:#}")),
+                        request_id: Some(probe_request_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            return ProbeReport::failed(started.elapsed().as_millis(), format!("{e:#}"));
+        }
     };
+    let upstream = match ProbeShape::of(model) {
+        // 预热那条与改写放行的探针同一份，见 [`prewarm_upstream`]。
+        ProbeShape::Prewarm => prewarm_upstream(
+            client,
+            format!("{}/v1/messages", config::UPSTREAM_BASE_URL),
+            cred,
+            &token,
+            model,
+        ),
+        // 额度探测走模拟那条路：直接构造 `Simulation` 而不走 `Simulation::detect`（见
+        // [`probe_simulation`]），会话 id 在 Simulation 里。
+        ProbeShape::Quota => {
+            let flags = store::ForwardFlags::default();
+            let sim = probe_simulation(cred, model);
+            let headers = build_forward_headers_for(
+                &HeaderMap::new(),
+                &token,
+                flags,
+                Some(&sim),
+                None,
+                Some(model),
+                false,
+                super::headers::BetaCtx::MAIN,
+            );
+            Upstream {
+                _state: std::marker::PhantomData,
+                client,
+                method: Method::POST,
+                // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。
+                url: ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL)),
+                headers,
+                flags,
+                billable: true,
+                sim: Some(sim),
+                bare_session: None,
+                session_out: None,
+                // 官方额度探测是非流式（`keeps_nonstream`），下面那套读法（`up.bytes()` 一把梭 +
+                // [`probe_report`] 按整段 Message 解析出 model/error_type）也是照非流式响应写的。
+                force_stream: false,
+                // 探测体不带 `tools`（见 [`probe_body`]），没有可混淆的名字。
+                tool_names: None,
+                // 不在会话链上。
+                client_link: None,
+                cc_kind: CcRequestKind::QuotaProbe,
+                // 探测不补 fallbacks：它要测的是这个号在**这个模型**上通不通，换模型作答等于没测。
+                refusal_fallbacks: None,
+            }
+        }
+    };
+    // 出站 UA 要随日志落库（入站那份没有——测试不来自任何客户端），取值规则与转发路径同一套。
+    let out_ua = ua_of(&upstream.headers);
 
     let body = probe_body(model);
     let shaped = upstream.shape(&body, cred, &device_fp);
@@ -322,6 +328,8 @@ pub async fn probe(
         ),
         Ok(Ok(up)) => {
             let status = up.status();
+            // 这个号的出口机房，本地应答探针时 `cf-ray` 照它造（见 [`note_upstream_cf_ray`]）。
+            note_upstream_cf_ray(cred.id, up.headers());
             // 限流头必须在 `bytes()` 之前读——它会把整个响应消费掉，之后就没有头可看了。
             // 200 与 429 都带这组头，后者尤其有用：能直接看出是哪个窗口满了、要等多久。
             let info = RateLimitInfo::from_headers(up.headers());
@@ -804,13 +812,6 @@ impl ProbeShape {
     pub(super) fn of(model: &str) -> Self {
         if model == QUOTA_PROBE_MODEL { Self::Quota } else { Self::Prewarm }
     }
-
-    fn cc_kind(self) -> CcRequestKind {
-        match self {
-            Self::Quota => CcRequestKind::QuotaProbe,
-            Self::Prewarm => CcRequestKind::Prewarm,
-        }
-    }
 }
 
 /// 连通性测试那条请求的 [`Simulation`]，profile 按 [`ProbeShape`] 直接指定。
@@ -827,10 +828,31 @@ impl ProbeShape {
 ///   造成官方原样，按真实 CC 来访的预热走改写（见 [`probe`]），不进模拟那套主线程整形——那会给它
 ///   补上基座、断点 ttl 与 `diagnostics`，官方的预热一个都没有。
 pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
-    let profile = config::cc_profile(match ProbeShape::of(model) {
-        ProbeShape::Quota => config::CcProfileKind::QuotaProbe,
-        ProbeShape::Prewarm => config::CcProfileKind::Prewarm,
-    });
+    header_simulation(
+        cred,
+        model,
+        match ProbeShape::of(model) {
+            ProbeShape::Quota => config::CcProfileKind::QuotaProbe,
+            ProbeShape::Prewarm => config::CcProfileKind::Prewarm,
+        },
+    )
+}
+
+/// 官方 `/model` 预热那条请求的 [`Simulation`]（`Prewarm` profile），**不看模型**：连通性测试对
+/// haiku-4.5 发的是额度探测（[`probe_simulation`]），而改写放行的探针（[`prewarm_upstream`]）对
+/// 任何模型都发预热——官方 `/model claude-haiku-4-5` 发的也是这条「Hi」
+/// （`cap/auto-2.1.296-20261013-prewarm/00078`）。
+fn prewarm_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
+    header_simulation(cred, model, config::CcProfileKind::Prewarm)
+}
+
+/// [`probe_simulation`] / [`prewarm_simulation`] 的本体：profile 由调用方指定。
+fn header_simulation(
+    cred: &crate::credentials::Credential,
+    model: &str,
+    kind: config::CcProfileKind,
+) -> Simulation {
+    let profile = config::cc_profile(kind);
     Simulation {
         // 两种形态都没有基座：额度探测连 `system` 都没有，预热只有 billing header 与身份句。
         base: None,
@@ -904,33 +926,93 @@ pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
 /// 那条路由 [`ensure_billing_cch`] 补在 `cc_entrypoint` 之后、出站前按最终字节重算；`metadata` 同样
 /// 交给那条路补（[`probe`] 给的 `bare_session`）。
 pub(super) fn probe_body(model: &str) -> Bytes {
-    let v = match ProbeShape::of(model) {
-        ProbeShape::Quota => serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{ "role": "user", "content": "quota" }]}),
-        ProbeShape::Prewarm => {
-            let messages = serde_json::json!([{ "role": "user", "content": [
-                { "type": "text", "text": "Hi", "cache_control": { "type": "ephemeral" } }]}]);
-            // 版本取 [`config::CC_VERSION_BASE`] 而非 Prewarm 那行的：出站 UA 是
-            // [`config::CC_USER_AGENT`]，两者约定同步；新版本表若没编 Prewarm 行，`cc_profile`
-            // 会落回旧表，取行上的版本就成了「UA 一个版本、billing header 另一个」。
-            let billing = billing_header_text(
-                &serde_json::json!({ "messages": messages }),
-                Some(config::CC_VERSION_BASE),
-                Some("cli"),
-            );
-            serde_json::json!({
+    match ProbeShape::of(model) {
+        ProbeShape::Quota => {
+            let v = serde_json::json!({
                 "model": model,
                 "max_tokens": 1,
-                "system": [
-                    { "type": "text", "text": billing },
-                    { "type": "text", "text": config::CC_SYSTEM_IDENTITY }],
-                "messages": messages})
+                "messages": [{ "role": "user", "content": "quota" }]});
+            // 常量结构，序列化不会失败；真失败了也会以上游 400 的形式如实报出来，不必在这里 panic。
+            Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
         }
-    };
+        ProbeShape::Prewarm => prewarm_body(model),
+    }
+}
+
+/// 官方 `/model` 预热的请求体（[`probe_body`] 的预热那一支），**不看模型**，见 [`prewarm_simulation`]。
+pub(super) fn prewarm_body(model: &str) -> Bytes {
+    let messages = serde_json::json!([{ "role": "user", "content": [
+        { "type": "text", "text": "Hi", "cache_control": { "type": "ephemeral" } }]}]);
+    // 版本取 [`config::CC_VERSION_BASE`] 而非 Prewarm 那行的：出站 UA 是
+    // [`config::CC_USER_AGENT`]，两者约定同步；新版本表若没编 Prewarm 行，`cc_profile`
+    // 会落回旧表，取行上的版本就成了「UA 一个版本、billing header 另一个」。
+    let billing = billing_header_text(
+        &serde_json::json!({ "messages": messages }),
+        Some(config::CC_VERSION_BASE),
+        Some("cli"),
+    );
+    let v = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "system": [
+            { "type": "text", "text": billing },
+            { "type": "text", "text": config::CC_SYSTEM_IDENTITY }],
+        "messages": messages});
     // 常量结构，序列化不会失败；真失败了也会以上游 400 的形式如实报出来，不必在这里 panic。
     Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
+}
+
+/// 一条官方 `/model` 预热的 [`Upstream`]：头按 [`prewarm_simulation`] 出（UA、
+/// `request-class: auxiliary`、那串 beta），体**按真实 CC 来访的预热改写**（`sim: None`、
+/// `cc_kind: Prewarm`）——只补身份与 `cch`、断点保持裸的，与官方逐字相同；模拟那套主线程整形会给它
+/// 补上基座、1h 断点与 `diagnostics`，官方的预热一个都没有。会话 id 取这个号第 0 个槽位那个：
+/// 头上那个出自 `sim`，体里 `metadata` 由 `bare_session` 补成同值。
+///
+/// 连通性测试（[`probe`]）与改写放行的探针（`handler::attempt`）共用这一份，两边发出去的是同一条。
+/// 形态开关一律按默认全开（[`store::ForwardFlags::default`]），理由同连通性测试：这条是 luban
+/// 替这个号发的固定形态，不该随用户拨过的开关漂。
+pub(super) fn prewarm_upstream<'a>(
+    client: wreq::Client,
+    url: String,
+    cred: &crate::credentials::Credential,
+    token: &str,
+    model: &str,
+) -> Upstream<'a> {
+    let flags = store::ForwardFlags::default();
+    let sim = prewarm_simulation(cred, model);
+    let session = sim.session_id.clone();
+    let headers = build_forward_headers_for(
+        &HeaderMap::new(),
+        token,
+        flags,
+        Some(&sim),
+        None,
+        Some(model),
+        false,
+        super::headers::BetaCtx::MAIN,
+    );
+    Upstream {
+        _state: std::marker::PhantomData,
+        client,
+        method: Method::POST,
+        // 这条请求整条都是照官方形态造的，URL 上那个 `?beta=true` 一并带上。
+        url: ensure_beta_query(&url),
+        headers,
+        flags,
+        billable: true,
+        sim: None,
+        bare_session: Some(session.clone()),
+        session_out: Some(session),
+        // 官方预热是非流式（`keeps_nonstream`）。
+        force_stream: false,
+        // 预热体不带 `tools`，没有可混淆的名字。
+        tool_names: None,
+        // 不在会话链上。
+        client_link: None,
+        cc_kind: CcRequestKind::Prewarm,
+        // 不补 fallbacks：探的是这个号在**这个模型**上通不通，换模型作答等于没探。
+        refusal_fallbacks: None,
+    }
 }
 
 /// 用量日志里标记「这条是连通性测试」的 device_id。

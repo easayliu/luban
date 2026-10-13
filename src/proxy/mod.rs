@@ -58,10 +58,7 @@ use session_id::{
 
 mod probe_detect;
 #[cfg(test)]
-use probe_detect::{
-    LOCAL_REPLY_HEADER, PROBE_KIND_HEADER, PROBE_REPLY_ID_PREFIX, PROBE_REPLY_TEXT, ProbeKind,
-    message_to_sse, probe_reply, probe_signature,
-};
+use probe_detect::{PROBE_REPLY_TEXT, ProbeKind, message_to_sse, probe_reply, probe_signature};
 
 mod thinking;
 #[cfg(test)]
@@ -212,7 +209,10 @@ pub async fn handle(
             rec.forensics.session_id_in = Some(sid);
         }
         if let Some(tag) = local_replay {
-            rec.forensics.rewrites = Some(tag.into());
+            rec.forensics.rewrites = Some(match log_state.probe_kind.lock().take() {
+                Some(kind) => format!("{tag}:{kind}"),
+                None => tag.into(),
+            });
             rec.cost_usd = Some(0.0);
         } else if let Some(kind) = log_state.local_reject.lock().take() {
             rec.forensics.rewrites = Some(format!("{REWRITE_REJECTED_LOCALLY}:{kind}"));
@@ -301,6 +301,9 @@ struct RequestLogState {
     /// 这类 200 若不标出来就从流水、请求查询与统计里消失——0.3.98 把本地 403 改成回放 200
     /// 时正是这样漏掉的。有标签的按本地流水补一条：无凭证、无用量、花费 0、`rewrites` 记标签。
     local_replay: parking_lot::Mutex<Option<&'static str>>,
+    /// 本地作答的探针命中的是哪条判据（[`ProbeKind::tag`]）：拼在 `local_replay` 那个标签后面
+    /// （`probe_reply:<判据>`）。回给下游的响应里不带它，只记在流水里。
+    probe_kind: parking_lot::Mutex<Option<&'static str>>,
     /// 本地拒绝的**原因分类**（`device-limit` / `session-limit` / `account-rpm` / `device-rpm` /
     /// `session-rpm` / `session-concurrency` / `bare-rate-limit` / `all-cooling-down` /
     /// `no-device-id` …）：拒绝那一处随手放下，[`handle`] 写流水时拼进 `rewrites`
@@ -331,9 +334,15 @@ pub(super) const REWRITE_REJECTED_LOCALLY: &str = "rejected_locally";
 const REWRITE_REFUSAL_REPLAY: &str = "refusal_replay";
 /// 流水 `rewrites` 里标「本地回放了按应用学到的上游拒答」（[`known_app_refusal`] 命中）。
 const REWRITE_APP_REFUSAL_REPLAY: &str = "app_refusal_replay";
-/// 流水 `rewrites` 里标「探针命中，本地回了一条最小的 200」（[`probe_signature`] 命中、
-/// [`probe_reply`] 作答）。
+/// 流水 `rewrites` 里标「探针命中，本地回了一条 200」（[`probe_signature`] 命中、[`probe_reply`]
+/// 作答），后接判据：`probe_reply:<kind>`（见 [`RequestLogState::probe_kind`]）。
 pub(super) const REWRITE_PROBE_REPLY: &str = "probe_reply";
+/// 流水 `rewrites` 里标「探针命中，改写成官方 `/model` 预热发了出去」，后接判据：
+/// `probe_prewarm:<kind>`（[`store::ForwardFlags::probe_as_prewarm`]）。正文为空、补了一句「OK」的
+/// 再打一个 [`REWRITE_PROBE_REPLY_FILLED`]。
+pub(super) const REWRITE_PROBE_PREWARM: &str = "probe_prewarm";
+/// 流水 `rewrites` 里标「上游预热回了空正文，回给来访前补了一句「OK」」。
+pub(super) const REWRITE_PROBE_REPLY_FILLED: &str = "probe_reply_filled";
 
 /// 从来访体里读出的、流水要用的三样。见 [`RequestLogState::parsed`]。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

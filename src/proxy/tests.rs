@@ -258,14 +258,15 @@ async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) 
     .await;
 
     assert_eq!(resp.status(), StatusCode::OK, "设备身份闸不该抢在探针前面回一条 403");
-    assert_eq!(resp.headers().get(super::LOCAL_REPLY_HEADER).unwrap(), "probe_reply");
-    assert_eq!(resp.headers().get(super::PROBE_KIND_HEADER).unwrap(), "ping");
+    assert!(resp.headers().get("x-luban-local").is_none(), "本地作答不再带标记头");
+    assert!(resp.headers().get("x-luban-probe-kind").is_none(), "判据只记在流水里");
     assert!(resp.headers().get("x-request-id").is_some(), "本地作答也要带请求 id");
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let msg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(msg["content"][0]["text"], super::PROBE_REPLY_TEXT);
     assert_eq!(msg["model"], "claude-opus-5");
-    assert!(msg["id"].as_str().unwrap().starts_with(super::PROBE_REPLY_ID_PREFIX));
+    assert!(msg["id"].as_str().unwrap().starts_with("msg_011C"), "id 照上游的样子造");
+    assert_eq!(msg["stop_reason"], "end_turn", "来访要 8 个 token，不是截断");
 
     // 流水是 `spawn_blocking` 写的，等它落下来（最多 2 秒，正常几毫秒）。
     let mut rows = Vec::new();
@@ -281,7 +282,7 @@ async fn a_device_less_probe_is_answered_locally_and_logged(pool: sqlx::PgPool) 
     assert_eq!(row.status, 200);
     assert_eq!(row.path, "/v1/messages");
     assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
-    assert_eq!(row.forensics.rewrites.as_deref(), Some(super::REWRITE_PROBE_REPLY));
+    assert_eq!(row.forensics.rewrites.as_deref(), Some("probe_reply:ping"));
     assert_eq!(row.cost_usd, Some(0.0));
     assert_eq!(row.cred_id, None, "没到上游，不该挂在任何账号上");
     assert!(!row.has_usage, "没到上游，没有用量");
@@ -338,7 +339,7 @@ async fn the_probe_reports_529_when_the_pool_is_empty(pool: sqlx::PgPool) {
     // 空池。
     let resp = send_go_probe(state.clone(), "claude-opus-5").await;
     assert_eq!(resp.status(), overloaded);
-    assert!(resp.headers().get(super::LOCAL_REPLY_HEADER).is_none(), "529 不是本地作答的那条 200");
+    assert!(resp.headers().get("request-id").is_none(), "529 不是本地作答的那条 200");
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
     let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(err["error"]["type"], "overloaded_error");
@@ -366,15 +367,14 @@ async fn the_probe_reports_529_when_the_pool_is_empty(pool: sqlx::PgPool) {
     assert_eq!(rows.len(), 4);
     assert_eq!(rows.iter().filter(|r| r.status == 529 && r.cred_id.is_none()).count(), 3);
     assert_eq!(
-        rows.iter()
-            .filter(|r| r.forensics.rewrites.as_deref() == Some(super::REWRITE_PROBE_REPLY))
-            .count(),
+        rows.iter().filter(|r| r.forensics.rewrites.as_deref() == Some("probe_reply:ping")).count(),
         1
     );
 }
 
 /// 开关关掉之后同一条探活照常往下走（走到没有可用账号那步），确认上面那条 200 是
-/// `reject_probes` 给的，而不是别的什么早退路径顺手回的。
+/// `reject_probes` 给的，而不是别的什么早退路径顺手回的。`probe_as_prewarm` 这里**不写**：库里
+/// 没有这个键（升级上来的部署就是这样）时它默认关，只关 `reject_probes` 就是原样放行。
 #[sqlx::test]
 async fn the_same_probe_goes_on_when_the_switch_is_off(pool: sqlx::PgPool) {
     let store = std::sync::Arc::new(store::CredentialStore::for_test(pool.clone()).await);
@@ -401,7 +401,7 @@ async fn the_same_probe_goes_on_when_the_switch_is_off(pool: sqlx::PgPool) {
     // 关掉之后这条探活照常往下走，最终停在「没有可用账号」那一步（本地库里一个号都没有），
     // 而不是由 2.1a 就地作答。
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(resp.headers().get(super::LOCAL_REPLY_HEADER).is_none());
+    assert!(resp.headers().get("request-id").is_none(), "不是本地作答的那条 200");
 }
 
 /// `max_tokens` 的读法：只认顶层的整数，读不出来一律 `None`（日志里落成 0）。
