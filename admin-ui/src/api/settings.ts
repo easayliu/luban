@@ -51,6 +51,10 @@ export interface Settings {
   quota_pause_pct: number
   /** 7d 窗口的同一档阈值，另算；0（默认）表示不按周用量停号。 */
   quota_pause_pct_7d: number
+  /** 上面三个数值参数的出厂默认值（后端 `DEFAULT_*` 常量），用途同 `forwarding_defaults`。 */
+  rate_limit_retry_max_default: number
+  quota_pause_pct_default: number
+  quota_pause_pct_7d_default: number
   /** 改写 metadata.user_id 里的 account_uuid/device_id 为凭证自洽身份；会话 id 按账号钉住（同一会话换账号即换 uuid）。 */
   spoof_identity: boolean
   /** 给 x-anthropic-billing-header 补 cch（订阅模式独有字段）。 */
@@ -133,6 +137,8 @@ export interface Settings {
   fable_refusal_fallback: boolean
   /** opus-5 族主线程请求补 luban 自定的 refusal fallback 链（4.8→4.6）。官方不发这个字段，实验开关，默认关。 */
   opus_refusal_fallback: boolean
+  /** 各转发开关的出厂默认值（后端 `ForwardFlags::default`），用来标出「已改动」与一键恢复默认。 */
+  forwarding_defaults: Record<ForwardingKey, boolean>
 }
 
 /** 转发开关的键（与后端 ForwardFlags 字段同名）。 */
@@ -356,6 +362,14 @@ export async function setOauthScopes(scopes: string): Promise<Settings> {
  */
 export async function setForwarding(key: ForwardingKey, enabled: boolean): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/forwarding', { [key]: enabled })
+  return data
+}
+
+/** 一次改多个转发开关（如「全部恢复默认」）；后端逐项写入，没列出的不动。 */
+export async function setForwardingMany(
+  patch: Partial<Record<ForwardingKey, boolean>>,
+): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/forwarding', patch)
   return data
 }
 

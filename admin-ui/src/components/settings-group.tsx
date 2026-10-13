@@ -4,9 +4,9 @@ import { ChevronDownIcon } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
+import { InfoHint } from '@/components/info-hint'
 import {
   Frame,
-  FrameDescription,
   FrameHeader,
   FramePanel,
   FrameTitle,
@@ -76,6 +76,42 @@ export function ClampedDescription({ text, className }: { text: string; classNam
   )
 }
 
+/** 「了解更多」展开按钮：行内跟在一句话说明后面，正文由 [`DetailsBody`] 落在整行底下。 */
+export function DetailsTrigger({
+  open,
+  onToggle,
+  label,
+}: {
+  open: boolean
+  onToggle: () => void
+  label?: string
+}) {
+  const { t } = useI18n()
+  return (
+    <button
+      aria-expanded={open}
+      className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-sm font-medium text-foreground/70 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      type="button"
+      onClick={onToggle}
+    >
+      {label ?? t('了解更多', 'Learn more')}
+      <ChevronDownIcon
+        aria-hidden="true"
+        className={cn('size-3 transition-transform', open && 'rotate-180')}
+      />
+    </button>
+  )
+}
+
+/** 展开后的长说明：左侧一道竖线，与上面的一句话说明区分开。 */
+export function DetailsBody({ children }: { children: ReactNode }) {
+  return (
+    <div className="mt-2 max-w-xl border-l-2 border-border pl-3 text-xs leading-5 text-muted-foreground [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
+      {children}
+    </div>
+  )
+}
+
 /**
  * 设置页里「一行参数」的统一骨架：说明在左、控件在右。
  *
@@ -110,6 +146,8 @@ export function SettingsRow({
   className,
   disabled,
   inlineControl = false,
+  details,
+  detailsLabel,
 }: {
   label: ReactNode
   htmlFor?: string
@@ -121,11 +159,21 @@ export function SettingsRow({
   className?: string
   disabled?: boolean
   inlineControl?: boolean
+  /**
+   * 展开后才看的长说明：`description` 只留一句话，细节放这里，句末挂一枚 [`DetailsTrigger`]，
+   * 正文落在整行底下。设置项说明的业界做法——一句话常显、细节按需展开，不收进悬停提示。
+   */
+  details?: ReactNode
+  /** 展开按钮的文案，缺省「了解更多」；转发页写「影响与限制」。 */
+  detailsLabel?: string
 }) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
   // 槽宽分两档：手机 16px、≥640px 20px。`page-frame` 在手机上已占去两侧各 16px，
   // 卡片再加 20px 正文就只剩 303px；收一档回来给内容。
   return (
-    <Field className={cn('p-4 sm:p-5', className)} disabled={disabled}>
+    // 开关行（`inlineControl`）上下各收一档：控件只有 20px 高，20px 的上下留白在四十个开关的页面上
+    // 一行就虚掉十来像素；带输入框、按钮的行仍用原来的留白。
+    <Field className={cn(inlineControl ? 'px-4 py-3 sm:px-5 sm:py-3.5' : 'p-4 sm:p-5', className)} disabled={disabled}>
       <div
         className={cn(
           'flex w-full items-start justify-between gap-x-6 gap-y-3',
@@ -141,9 +189,23 @@ export function SettingsRow({
               一行 80 个中文字读不动，这是设置页说明该有的行长。 */}
           {/* 纯文字说明走 ClampedDescription（手机上 60 字起收两行）；带 footer 的行（转发页那些
               挂着「影响与限制」的开关）不再套第二个展开器，原样铺开，理由见 ForwardingToggle。 */}
-          {description && (
+          {(description || details) && (
             <FieldDescription className="max-w-xl leading-5">
-              {typeof description === 'string' && !footer ? <ClampedDescription text={description} /> : description}
+              {details ? (
+                <>
+                  {description}
+                  {description && ' '}
+                  <DetailsTrigger
+                    label={detailsLabel}
+                    open={detailsOpen}
+                    onToggle={() => setDetailsOpen((v) => !v)}
+                  />
+                </>
+              ) : typeof description === 'string' && !footer ? (
+                <ClampedDescription text={description} />
+              ) : (
+                description
+              )}
             </FieldDescription>
           )}
           {note}
@@ -151,6 +213,7 @@ export function SettingsRow({
         {/* 窄屏 `max-sm:w-full`：控件整块换行并撑满，与原来 `sm:grid-cols-…` 那套的手机形态一致。 */}
         <div className={cn('flex shrink-0 items-center gap-2', !inlineControl && 'max-sm:w-full')}>{children}</div>
       </div>
+      {details && detailsOpen && <DetailsBody>{details}</DetailsBody>}
       {footer}
     </Field>
   )
@@ -170,12 +233,17 @@ export function SettingsGroup({
 }: {
   icon?: LucideIcon
   title: string
+  /**
+   * 「这组讲什么」：收进标题旁的 ⓘ 浮层，不再常显一行。标题已经交代了大半，十来张卡片各自
+   * 一两行说明光表头就吃掉一屏多；做决定要看的话写在各行的一句话说明里。
+   */
   description?: string
   children: ReactNode
 }) {
+  const { t } = useI18n()
   return (
     <Frame>
-      <FrameHeader className="gap-1.5">
+      <FrameHeader className="py-2.5 sm:py-3">
         <div className="flex items-center gap-2">
           {Icon && <Icon aria-hidden="true" className="size-4 text-muted-foreground" />}
           {/* 比行标签（FieldLabel，text-sm/medium）大一档：底座给的 text-sm + semibold 与行标签
@@ -183,17 +251,14 @@ export function SettingsGroup({
           <FrameTitle className="text-base">
             <h3>{title}</h3>
           </FrameTitle>
+          {description && (
+            <InfoHint label={t(`${title}：说明`, `About ${title}`)}>{description}</InfoHint>
+          )}
         </div>
-        {/* 卡片描述 text-sm、行描述 text-xs：同为 text-xs 时卡片头读起来就是又一行普通说明。
-            与标题对齐（让过图标那 24px）只在 sm 起做：窄屏上这 24px 会把本来就要换行的说明
-            再多挤出一行，还带出一道悬挂缩进；手机上让它从卡片槽宽起排。 */}
-        {description && (
-          <FrameDescription className={cn('text-sm leading-5', Icon && 'sm:pl-6')}>
-            <ClampedDescription text={description} />
-          </FrameDescription>
-        )}
       </FrameHeader>
-      <FramePanel className="divide-y p-0">{children}</FramePanel>
+      {/* `sm:p-0` 不能省：底座是 `p-4 sm:p-5`，只写 `p-0` 压不住 sm 那档，行外面会再套一圈
+          20px 内边距，分隔线也够不到卡片两边。 */}
+      <FramePanel className="divide-y p-0 sm:p-0">{children}</FramePanel>
     </Frame>
   )
 }

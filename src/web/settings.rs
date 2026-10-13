@@ -69,9 +69,17 @@ pub(super) struct SettingsResp {
     /// **7d 窗口**的同一档阈值，另算；0（默认）= 不按周用量停号，见
     /// [`crate::store::QUOTA_PAUSE_PCT_7D`]。
     quota_pause_pct_7d: i64,
+    /// 上面三个数值参数的出厂默认值（[`crate::store::DEFAULT_RATE_LIMIT_RETRY_MAX`] 等），
+    /// 用途同 [`Self::forwarding_defaults`]。
+    rate_limit_retry_max_default: i64,
+    quota_pause_pct_default: i64,
+    quota_pause_pct_7d_default: i64,
     /// 转发形态开关（默认全开）。
     #[serde(flatten)]
     forwarding: ForwardingResp,
+    /// 各转发开关的出厂默认值（[`crate::store::ForwardFlags::default`]），供页面标出「已改动」
+    /// 与一键恢复默认，免得前端另抄一份默认表、日后两边对不上。
+    forwarding_defaults: ForwardingResp,
 }
 
 /// 转发形态开关的对外形态；字段名与 [`crate::store::ForwardFlags`] 一一对应。
@@ -286,7 +294,11 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
             rate_limit_retry_max,
             quota_pause_pct,
             quota_pause_pct_7d,
+            rate_limit_retry_max_default: crate::store::DEFAULT_RATE_LIMIT_RETRY_MAX,
+            quota_pause_pct_default: crate::store::DEFAULT_QUOTA_PAUSE_PCT,
+            quota_pause_pct_7d_default: crate::store::DEFAULT_QUOTA_PAUSE_PCT_7D,
             forwarding,
+            forwarding_defaults: crate::store::ForwardFlags::default().into(),
         };
     }
     let api_key = state
@@ -321,7 +333,11 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
         rate_limit_retry_max,
         quota_pause_pct,
         quota_pause_pct_7d,
+        rate_limit_retry_max_default: crate::store::DEFAULT_RATE_LIMIT_RETRY_MAX,
+        quota_pause_pct_default: crate::store::DEFAULT_QUOTA_PAUSE_PCT,
+        quota_pause_pct_7d_default: crate::store::DEFAULT_QUOTA_PAUSE_PCT_7D,
         forwarding,
+        forwarding_defaults: crate::store::ForwardFlags::default().into(),
     }
 }
 

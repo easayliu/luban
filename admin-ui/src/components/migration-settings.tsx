@@ -89,8 +89,12 @@ function ExportPanel() {
     <SettingsRow
       label={t('导出账号与设置', 'Export accounts & settings')}
       description={t(
-        '将全部账号（含登录凭据）与系统设置导出为一个 JSON 文件，可在新机器上导入。文件不包含用量历史、设备绑定与管理密码。',
-        'Save every account (including its login credentials) and the system settings to one JSON file, then import it on the new machine. Usage history, device bindings, and the admin password are not included.',
+        '将全部账号（含登录凭据）与系统设置导出为一个 JSON 文件。',
+        'Save every account (with its login credentials) and the system settings to one JSON file.',
+      )}
+      details={t(
+        '导出的文件可在新机器上导入，不包含用量历史、设备绑定与管理密码。',
+        'The file can be imported on the new machine; usage history, device bindings and the admin password are not included.',
       )}
       note={
         <div className="flex flex-wrap items-center gap-2">
@@ -227,8 +231,12 @@ function ImportPanel() {
       <SettingsRow
         label={t('导入迁移文件', 'Import a migration file')}
         description={t(
-          '导入另一台机器导出的文件。本机已存在的相同账号（先按账号 UUID 匹配，其次按登录凭据）将被文件中的版本覆盖，其余账号作为新账号添加。',
-          'Read a file exported from another machine. An account already on this machine (matched by account UUID first, then by its login credentials) is overwritten by the version in the file; the rest are added as new accounts.',
+          '导入其他机器导出的文件；本机已有的相同账号将以文件中的版本覆盖。',
+          'Import a file exported from another machine; accounts already here are overwritten by the version in the file.',
+        )}
+        details={t(
+          '相同账号先按账号 UUID 匹配，其次按登录凭据；其余账号作为新账号添加。',
+          'Accounts are matched by account UUID first, then by login credentials; the rest are added as new accounts.',
         )}
       >
         <input

@@ -40,8 +40,9 @@ pub const SCOPES: &str = "org:create_api_key user:profile user:inference \
 /// 少要权限的代价是**授权请求与官方客户端不再逐字一致**——scope 集合也是指纹的一部分，
 /// 所以这不是默认值，是给「宁可少授权、不在意这点差异」的人留的一档。
 ///
-/// 还有一条要知道：这一档只管**登录那一刻**。刷新 token 发的是固定的 [`REFRESH_SCOPES`]
-/// （官方行为），后端允许刷新时扩展 scope，所以第一次刷新后这个号的 scope 就回到那五项了。
+/// 还有一条要知道：这一档只管**登录那一刻**。刷新 token 先发固定的 [`REFRESH_SCOPES`]
+/// （官方行为）；后端只许扩出部分 scope，扩不出时回 `invalid_scope`，luban 再不带 scope
+/// 重发一次、沿用原授权（见 [`crate::oauth::refresh`]）。
 pub const SCOPES_MINIMAL: &str = "user:file_upload user:inference user:profile";
 
 /// 刷新 token 时随请求发送的 `scope`。
@@ -52,8 +53,9 @@ pub const SCOPES_MINIMAL: &str = "user:file_upload user:inference user:profile";
 /// 就能拿到后来加进来的 `user:file_upload`。里面没有 `org:create_api_key`（那一项只在
 /// 授权 URL 上出现）。
 ///
-/// 副作用要知道：登录时选了 [`SCOPES_MINIMAL`] 的号，第一次刷新后 scope 会被扩回这五项。
-/// 那正是官方客户端的行为，刻意不做「按 settings 发」——那会造出一条官方从不产生的请求体。
+/// 刻意不做「按 settings 发」——那会造出一条官方从不产生的请求体。但后端并不总许扩：
+/// 只授了 `org:create_api_key user:inference` 的号刷新这五项会被回 `invalid_scope`
+/// （2026-10-13 实测），那时改发不带 scope 的一条，见 [`crate::oauth::refresh`]。
 pub const REFRESH_SCOPES: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 

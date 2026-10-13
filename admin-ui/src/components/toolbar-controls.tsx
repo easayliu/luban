@@ -32,8 +32,9 @@ export const ACTIVE_FILTER_CLASS =
  * 已经在输入的时候不抢键（否则打不出 `/`）；弹层/对话框打开时也不抢，
  * 否则焦点会跳到被遮住的输入框上，模态里反而按不动。
  */
-function useSearchHotkey(ref: RefObject<HTMLInputElement | null>): void {
+function useSearchHotkey(ref: RefObject<HTMLInputElement | null>, enabled = true): void {
   useEffect(() => {
+    if (!enabled) return
     const onKeyDown = (event: KeyboardEvent) => {
       const slash = event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey
       const commandK = (event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)
@@ -50,7 +51,7 @@ function useSearchHotkey(ref: RefObject<HTMLInputElement | null>): void {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [ref])
+  }, [ref, enabled])
 }
 
 /**
@@ -64,6 +65,7 @@ export function ToolbarSearch({
   ariaLabel,
   className,
   size,
+  hotkey = true,
 }: {
   value: string
   onChange: (value: string) => void
@@ -72,10 +74,12 @@ export function ToolbarSearch({
   className?: string
   /** 缺省与工具条其余控件同为默认档；放进紧凑的列表区时可用 `sm`。 */
   size?: 'sm' | 'default'
+  /** 接管 `/` 与 ⌘K。一页有两个搜索框时只给主的那个，否则按下去焦点落在后挂上的那个。 */
+  hotkey?: boolean
 }) {
   const { t } = useI18n()
   const ref = useRef<HTMLInputElement>(null)
-  useSearchHotkey(ref)
+  useSearchHotkey(ref, hotkey)
   return (
     <InputGroup className={className}>
       <InputGroupAddon><SearchIcon /></InputGroupAddon>
@@ -98,10 +102,10 @@ export function ToolbarSearch({
           <Button size="icon-xs" variant="ghost" onClick={() => onChange('')} aria-label={t('清除搜索', 'Clear search')}>
             <XIcon />
           </Button>
-        ) : (
+        ) : hotkey ? (
           // 只在指针设备上提示：触屏没有物理按键，画个 kbd 只是噪声。
           <Kbd aria-hidden className="hidden pointer-fine:inline-flex">/</Kbd>
-        )}
+        ) : null}
       </InputGroupAddon>
     </InputGroup>
   )

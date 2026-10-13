@@ -385,11 +385,16 @@ async fn refresh_detached(
     store
         .run_tracked(async move {
             let _guard = guard;
-            let tokens = match crate::oauth::refresh(&http, &refresh_token).await {
-                Ok(t) => t,
-                Err(e) => return Ok(Err(e)),
-            };
-            persist_tokens(&pool, cred_id, &tokens).await?;
+            let omit_scope = super::credential::refresh_omit_scope(&pool, cred_id).await?;
+            let (tokens, omitted) =
+                match crate::oauth::refresh(&http, &refresh_token, omit_scope).await {
+                    Ok(t) => t,
+                    Err(e) => return Ok(Err(e)),
+                };
+            if omitted && !omit_scope {
+                tracing::warn!(cred_id, "refresh needs the granted scope from now on");
+            }
+            persist_tokens(&pool, cred_id, &tokens, omitted).await?;
             Ok(Ok(tokens))
         })
         .await
@@ -401,6 +406,7 @@ async fn persist_tokens(
     pool: &sqlx::PgPool,
     id: i64,
     tokens: &crate::oauth::TokenSet,
+    omit_scope: bool,
 ) -> Result<()> {
     const ATTEMPTS: u32 = 5;
     let mut attempt = 1;
@@ -411,6 +417,7 @@ async fn persist_tokens(
             &tokens.access_token,
             &tokens.refresh_token,
             tokens.expires_at,
+            omit_scope,
         )
         .await;
         match r {
@@ -695,7 +702,8 @@ mod tests {
             organization_uuid: None,
         };
         let p = pool.clone();
-        let write = store.run_tracked(async move { super::persist_tokens(&p, id, &tokens).await });
+        let write =
+            store.run_tracked(async move { super::persist_tokens(&p, id, &tokens, false).await });
         // 调用方等不及、被取消。
         assert!(tokio::time::timeout(std::time::Duration::from_millis(200), write).await.is_err());
         assert_eq!(store.pending_writes.load(Ordering::SeqCst), 1, "被取消后任务仍在途");

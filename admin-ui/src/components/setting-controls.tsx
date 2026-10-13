@@ -90,6 +90,8 @@ interface SettingControlProps {
   /** 当前语言下的名称；也是输入框的读屏标签，加减按钮的标签由它拼出。 */
   label: string
   description: ReactNode | ((parsed: number, settings: Settings | undefined) => ReactNode)
+  /** 展开后才看的长说明（见 [`SettingsRow`] 的 `details`）；`description` 只留一句话。 */
+  details?: ReactNode
   /** 输入框旁的读数，拿到的是输入框里（规整后）的值与当前设置。 */
   note: (parsed: number, settings: Settings | undefined) => ReactNode
   success: (settings: Settings) => SaveToast
@@ -124,6 +126,7 @@ export function NumericSetting({
   save,
   label,
   description,
+  details,
   note,
   success,
   invalidateCredentials,
@@ -144,6 +147,7 @@ export function NumericSetting({
     <SettingsRow
       label={label}
       description={renderDescription(description, parsed, data)}
+      details={details}
       note={note(parsed, data)}
     >
       <NumberField
@@ -288,6 +292,7 @@ export function DurationSetting({
   defaultUnit,
   label,
   description,
+  details,
   note,
   success,
   invalidateCredentials,
@@ -311,6 +316,7 @@ export function DurationSetting({
     <SettingsRow
       label={label}
       description={renderDescription(description, parsed, data)}
+      details={details}
       note={note(parsed, data)}
     >
       <DurationField

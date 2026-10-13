@@ -720,7 +720,8 @@ impl CredentialStore {
         self.update_text("label", id, Some(label)).await
     }
 
-    /// 刷新后回写新的 token 三元组（单行 UPDATE，加密落库、同步更新 refresh_token 指纹）。
+    /// 重新授权后回写新的 token 三元组（单行 UPDATE，加密落库、同步更新 refresh_token 指纹）。
+    /// 授权换了，「刷新要省掉 scope」的记忆随之作废，复位成先照官方发。
     pub async fn update_tokens(
         &self,
         id: i64,
@@ -728,23 +729,35 @@ impl CredentialStore {
         refresh_token: &str,
         expires_at: u64,
     ) -> Result<bool> {
-        write_tokens(&self.pool, id, access_token, refresh_token, expires_at).await
+        write_tokens(&self.pool, id, access_token, refresh_token, expires_at, false).await
     }
 }
 
+/// 这个号刷新时要不要省掉 `scope`（之前回退成功过），见 [`crate::oauth::refresh`]。
+/// 号已被删时当 `false`，刷新落库那一步自然什么也不写。
+pub(super) async fn refresh_omit_scope(pool: &sqlx::PgPool, id: i64) -> Result<bool> {
+    let v: Option<bool> =
+        sqlx::query_scalar("SELECT refresh_omit_scope FROM credentials WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(v.unwrap_or(false))
+}
+
 /// [`CredentialStore::update_tokens`] 的实现，只要一个连接池：刷新落库在脱离请求的后台任务里
-/// 做，见 [`super::refresh`]。
+/// 做，见 [`super::refresh`]。`omit_scope` 一并写入：它描述的是这份 refresh_token 背后的授权。
 pub(super) async fn write_tokens(
     pool: &sqlx::PgPool,
     id: i64,
     access_token: &str,
     refresh_token: &str,
     expires_at: u64,
+    omit_scope: bool,
 ) -> Result<bool> {
     let n = sqlx::query(
         "UPDATE credentials
             SET access_token = $2, refresh_token = $3, expires_at = $4,
-                refresh_token_hash = $5, updated_at = unixepoch()
+                refresh_token_hash = $5, refresh_omit_scope = $6, updated_at = unixepoch()
           WHERE id = $1",
     )
     .bind(id)
@@ -752,6 +765,7 @@ pub(super) async fn write_tokens(
     .bind(seal(refresh_token))
     .bind(expires_at as i64)
     .bind(token_fingerprint(refresh_token))
+    .bind(omit_scope)
     .execute(pool)
     .await?;
     Ok(n.rows_affected() > 0)
@@ -852,6 +866,22 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(hash, token_fingerprint("rt-3"));
+    }
+
+    /// 「刷新省掉 scope」的记忆：新号默认照官方发；刷新回退成功后记住、再刷仍保持；
+    /// 重新授权（`update_tokens`）换了授权就复位。
+    #[sqlx::test]
+    async fn refresh_omit_scope_is_remembered_until_reauth(pool: PgPool) {
+        let (store, ids) = store_with(pool, &["a"]).await;
+        let id = ids[0];
+        assert!(!refresh_omit_scope(&store.pool, id).await.unwrap(), "新号先照官方发");
+        assert!(write_tokens(&store.pool, id, "at-2", "rt-2", 0, true).await.unwrap());
+        assert!(refresh_omit_scope(&store.pool, id).await.unwrap(), "回退成功后记住");
+        assert!(write_tokens(&store.pool, id, "at-3", "rt-3", 0, true).await.unwrap());
+        assert!(refresh_omit_scope(&store.pool, id).await.unwrap(), "之后的刷新保持");
+        assert!(store.update_tokens(id, "at-4", "rt-4", 0).await.unwrap());
+        assert!(!refresh_omit_scope(&store.pool, id).await.unwrap(), "重新授权后复位");
+        assert!(!refresh_omit_scope(&store.pool, 9999).await.unwrap(), "号不存在当 false");
     }
 
     /// 号主不存在（或是访客）时不插：上号要等几秒，期间号主可能被删。

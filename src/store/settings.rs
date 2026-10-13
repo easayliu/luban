@@ -326,8 +326,8 @@ pub const MIN_CLIENT_VERSION: &str = "min_client_version";
 ///
 /// 值是空格分隔的 scope 串本身，不是布尔。只在**新登录**时起作用：已存下来的凭证按当初授权
 /// 的范围来，改这一项不会追溯——要换范围就得把号重新登一次。刷新 token 发的是固定的
-/// [`crate::config::REFRESH_SCOPES`]（官方那五项），与这一项无关；也因此选了精简 scope 的号
-/// 会在第一次刷新后被扩回五项，见那个常量的注释。
+/// [`crate::config::REFRESH_SCOPES`]（官方那五项），与这一项无关；扩不出时回退成沿用原授权，
+/// 见 [`crate::oauth::refresh`]。
 ///
 /// 想少授权的一档现成值是 [`crate::config::SCOPES_MINIMAL`]，代价见那里的注释。
 pub const OAUTH_SCOPES: &str = "oauth_scopes";

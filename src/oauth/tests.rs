@@ -162,7 +162,7 @@ async fn release_cache_persists_the_newest_value_not_the_callers() {
 
 use super::{
     KeepaliveCtx, PkceChallenge, TokenEndpointError, exchange_body, parse_token_set, refresh_body,
-    tier_from, urlencode,
+    refresh_body_granted, tier_from, urlencode,
 };
 use crate::config;
 use wreq::StatusCode;
@@ -606,6 +606,22 @@ fn does_not_revoke_on_retryable_errors() {
     for (status, body) in cases {
         assert!(!err(status, body).is_grant_revoked(), "不应停用: {status} {body}");
     }
+}
+
+/// 刷新 scope 超出原授权（2026-10-13 线上原文）：认作 `invalid_scope` 改发不带 scope 的，
+/// 不当吊销停号。
+#[test]
+fn invalid_scope_is_retried_not_revoked() {
+    let body = r#"{"error": "invalid_scope", "error_description": "The requested scope is invalid, unknown, or malformed."}"#;
+    let e = err(StatusCode::BAD_REQUEST, body);
+    assert!(e.is_invalid_scope());
+    assert!(!e.is_grant_revoked());
+    assert!(!err(StatusCode::BAD_REQUEST, r#"{"error":"invalid_grant"}"#).is_invalid_scope());
+    assert!(!err(StatusCode::INTERNAL_SERVER_ERROR, body).is_invalid_scope());
+
+    let keys: Vec<String> =
+        refresh_body_granted("RT").as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["grant_type", "refresh_token", "client_id"], "回退那条不带 scope");
 }
 
 /// ban_reason 带上状态码、去掉首尾空白、截断至 200 字符。

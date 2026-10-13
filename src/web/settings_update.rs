@@ -378,8 +378,8 @@ pub(super) struct SetOAuthScopesReq {
 /// 设置登录时申请的 OAuth scope。
 ///
 /// 只影响之后新加的账号：已存下来的凭证按当初授权的范围来。刷新发的是固定的
-/// [`crate::config::REFRESH_SCOPES`]（官方那五项），不读这一项——所以选了精简 scope 的号
-/// 会在第一次刷新后被扩回五项。
+/// [`crate::config::REFRESH_SCOPES`]（官方那五项），不读这一项；扩不出时回退成沿用原授权，
+/// 见 [`crate::oauth::refresh`]。
 ///
 /// **不校验**，写什么存什么、原样发给上游（只做空白规整与去重，见
 /// [`crate::config::normalize_scopes`]）。这个框存在的意义就是拿来试上游认哪些 scope，

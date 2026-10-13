@@ -81,6 +81,7 @@ import { useNowSeconds } from '@/components/credential-workspace'
 import { OverviewMetric, OverviewMetricSkeleton } from '@/components/overview-metric'
 import { SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { DetailSection as Section } from '@/components/detail-section'
+import { InfoHint } from '@/components/info-hint'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
 import { GroupBadges, SetGroupsDialog, useGroups } from '@/components/group-picker'
 import { Fact } from '@/components/fact'
@@ -752,10 +753,11 @@ function QuotaSection({ cred, now }: { cred: Credential; now: number }) {
       title={t('用量限制', 'Usage limits')}
       className="min-w-0 lg:h-full"
       panelClassName="lg:flex-1"
-      description={snapshot
-        ? t('来自上游限流头的最新快照。', 'Latest snapshot from the upstream rate-limit headers.')
-        : t('暂无额度快照：该账号转发带限流头的请求后才会生成。', 'No usage snapshot yet: it appears once the account forwards a request that carries rate-limit headers.')}
-      mobileDescription={snapshot ? undefined : t('暂无额度快照', 'No usage snapshot yet')}
+      description={t(
+        '取自上游限流响应头的最新快照；账号转发过带限流头的请求后方才生成。',
+        'The latest snapshot from the upstream rate-limit headers; it appears once the account has forwarded a request that carries them.',
+      )}
+      summary={snapshot ? undefined : t('暂无额度快照', 'No usage snapshot yet')}
       // 更新时刻挂在标题右侧，与卡片「用量限制 … 🕐 更新于 刚刚」同一个位置：它是这一整块数据的
       // 时间戳，不是一句说明。原来在手机上它单独占标题下一整行（四个字），桌面上又埋在一长句说明里。
       action={snapshot ? (
@@ -1004,24 +1006,6 @@ function WindowDetail({
   )
 }
 
-/** 标题旁的 ⓘ：解释性的话收进悬浮提示，看懂一次就不必每次占一行。触屏上点一下即出。 */
-function InfoHint({ children }: { children: ReactNode }) {
-  const { t } = useI18n()
-  return (
-    <Tooltip>
-      <TooltipTrigger
-        render={<button type="button" />}
-        delay={0}
-        aria-label={t('说明', 'Explanation')}
-        className="relative inline-flex rounded-full text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring pointer-coarse:after:absolute pointer-coarse:after:-inset-3"
-      >
-        <InfoIcon aria-hidden className="size-3.5" />
-      </TooltipTrigger>
-      <TooltipPopup className="max-w-72 whitespace-normal text-left font-normal leading-5">{children}</TooltipPopup>
-    </Tooltip>
-  )
-}
-
 /**
  * 上游原话这类长文本：默认一行截断，末尾「原话 ⌄」展开。与页头状态提示同一套——原话要能查，
  * 但不该每次都摊成一大段（手机上一条「套餐不含」的原话就是五行）。一行放得下时不给按钮。
@@ -1090,13 +1074,11 @@ function RecentUsageSection({ cred, onViewAll }: { cred: Credential; onViewAll: 
     <Section
       icon={ScrollTextIcon}
       title={t('最近请求', 'Recent requests')}
-      description={usage.data
-        ? t(
-            `近 30 天共 ${total.toLocaleString(locale)} 条，费用 ${formatUsd(totalCost)}；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
-            `${total.toLocaleString(locale)} requests costing ${formatUsd(totalCost)} in the last 30 days; showing the newest ${RECENT_USAGE_LIMIT}.`,
-          )
-        : t('流水仅保留最近 30 天。', 'Logs are retained for 30 days.')}
-      mobileDescription={usage.data
+      description={t(
+        `流水仅保留最近 30 天；此处显示最新 ${RECENT_USAGE_LIMIT} 条。`,
+        `Logs are kept for 30 days; the newest ${RECENT_USAGE_LIMIT} are shown here.`,
+      )}
+      summary={usage.data
         ? t(
             `近 30 天 ${total.toLocaleString(locale)} 条 · ${formatUsd(totalCost)}`,
             `${total.toLocaleString(locale)} in 30 days · ${formatUsd(totalCost)}`,
@@ -1182,7 +1164,7 @@ function BindingsSection({ cred, onManage }: { cred: Credential; onManage: () =>
       icon={SmartphoneIcon}
       title={t('设备与会话', 'Devices & sessions')}
       description={t(
-        '带设备身份的客户端按设备占用名额；走模拟路径、无设备身份的请求按会话占用名额，两者相互独立。',
+        '带设备身份的客户端按设备占用名额；经模拟路径、无设备身份的请求按会话占用名额，两者相互独立。',
         'Clients with a device identity take a device slot; simulated requests without one take a session slot. The two are independent.',
       )}
       action={readOnly ? undefined : (

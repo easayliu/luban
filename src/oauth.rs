@@ -555,6 +555,13 @@ impl TokenEndpointError {
             && self.body.to_ascii_lowercase().contains("invalid_grant")
     }
 
+    /// 上游是否因为请求的 scope 超出原授权而拒绝（`invalid_scope`）。不是号坏了，
+    /// 换个 scope 重发即可，见 [`refresh`]。
+    pub fn is_invalid_scope(&self) -> bool {
+        self.status == wreq::StatusCode::BAD_REQUEST
+            && self.body.to_ascii_lowercase().contains("invalid_scope")
+    }
+
     /// 写入 `ban_reason` 的原因（截断至 200 字符，与 `classify_account_rejection` 的口径一致）。
     pub fn ban_reason(&self) -> String {
         format!("[refresh {}] {}", self.status.as_u16(), self.body.trim())
@@ -565,8 +572,42 @@ impl TokenEndpointError {
 }
 
 /// 用 refresh_token 刷新出新的 access_token。
-pub async fn refresh(client: &wreq::Client, refresh_token: &str) -> Result<TokenSet> {
-    post_token(client, refresh_body(refresh_token), Some(refresh_token)).await
+///
+/// 先照官方发固定的 [`config::REFRESH_SCOPES`]；上游回 `invalid_scope` 时再发一次**不带**
+/// `scope` 的。那是登录时只授了一小撮、且不含 `user:profile` 等项的号：后端只许刷新时
+/// 扩出部分 scope（2026-10-13 实测 `org:create_api_key user:inference` 登的号刷新被回
+/// `invalid_scope`），要那五项就整条拒掉。不带 `scope` 按 RFC 6749 §6 即「与原授权相同」。
+/// 400 不消耗 refresh_token（没轮换），重发安全。
+///
+/// `omit_scope` 是这个号之前已经回退成功过（库里记着，见 `credentials.refresh_omit_scope`）：
+/// 直接发不带 scope 的，免得每次刷新都先吃一个 400。返回值第二项是这次实际发的是不是
+/// 不带 scope 的那条，调用方据此落库。
+pub async fn refresh(
+    client: &wreq::Client,
+    refresh_token: &str,
+    omit_scope: bool,
+) -> Result<(TokenSet, bool)> {
+    if omit_scope {
+        let tokens =
+            post_token(client, refresh_body_granted(refresh_token), Some(refresh_token)).await?;
+        return Ok((tokens, true));
+    }
+    match post_token(client, refresh_body(refresh_token), Some(refresh_token)).await {
+        Ok(tokens) => Ok((tokens, false)),
+        Err(e)
+            if e.downcast_ref::<TokenEndpointError>()
+                .is_some_and(TokenEndpointError::is_invalid_scope) =>
+        {
+            tracing::warn!(
+                "refresh scope rejected upstream; retrying with the granted scope and remembering it"
+            );
+            let tokens =
+                post_token(client, refresh_body_granted(refresh_token), Some(refresh_token))
+                    .await?;
+            Ok((tokens, true))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 刷新的请求体。键序照官方 `refreshOAuthToken`：
@@ -578,6 +619,15 @@ fn refresh_body(refresh_token: &str) -> serde_json::Value {
         "refresh_token": refresh_token,
         "client_id": config::CLIENT_ID,
         "scope": config::REFRESH_SCOPES,
+    })
+}
+
+/// [`refresh_body`] 去掉 `scope`：沿用原授权的范围，只在固定 scope 被拒时用，见 [`refresh`]。
+fn refresh_body_granted(refresh_token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": config::CLIENT_ID,
     })
 }
 

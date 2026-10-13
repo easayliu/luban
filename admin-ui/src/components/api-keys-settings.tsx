@@ -51,6 +51,7 @@ import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/compone
 import { Switch } from '@/components/ui/switch'
 import { toastManager } from '@/components/ui/toast'
 import { GroupPickerSkeleton, OrderedGroupPicker, useGroups } from '@/components/group-picker'
+import { DetailsBody, DetailsTrigger } from '@/components/settings-group'
 
 /**
  * Claude Code 的接入片段。值按 shell 规则转义后再拼：Key 可能来自导入的迁移文件，带着
@@ -111,6 +112,7 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
   const { data: groups } = useGroups()
   const keys = keysQuery.data ?? []
   const groupName = (id: number) => groups?.find((g) => g.id === id)?.name ?? `#${id}`
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const [editing, setEditing] = useState<ApiKey | 'new' | null>(null)
   const [revealed, setRevealed] = useState<{ title: string; secret: string } | null>(null)
   const [deleting, setDeleting] = useState<ApiKey | null>(null)
@@ -153,12 +155,18 @@ export function ApiKeysSettings({ envKey }: { envKey: string | null }) {
             {t('接入 Key', 'Access keys')}{' '}
             <code className="font-mono text-xs font-normal text-muted-foreground">ANTHROPIC_AUTH_TOKEN</code>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t(
-              '供外部系统对接使用。可绑定账号分组：仅从所绑定分组的账号中调度，靠前的分组优先；未绑定时可使用全部账号。',
-              'For external systems. A key bound to account groups only uses accounts in those groups, earlier groups first; an unbound key can use every account.',
-            )}
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            {t('供外部系统对接使用，可绑定账号分组以限定调度范围。', 'For external systems; bind account groups to limit which accounts are used.')}{' '}
+            <DetailsTrigger open={detailsOpen} onToggle={() => setDetailsOpen((v) => !v)} />
           </p>
+          {detailsOpen && (
+            <DetailsBody>
+              {t(
+                '绑定分组后，仅从所绑定分组的账号中调度，靠前的分组优先；未绑定时可使用全部账号。',
+                'A key bound to account groups only uses accounts in those groups, earlier groups first; an unbound key can use every account.',
+              )}
+            </DetailsBody>
+          )}
         </div>
         <Button size="sm" onClick={() => setEditing('new')}>
           <PlusIcon />{t('新建 Key', 'New key')}

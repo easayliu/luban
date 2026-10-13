@@ -1,4 +1,4 @@
-import { useEffect, useId, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ActivityIcon,
@@ -7,18 +7,21 @@ import {
   BrainIcon,
   ChevronDownIcon,
   DatabaseIcon,
+  FilterIcon,
   FingerprintIcon,
-  InfoIcon,
   KeyRoundIcon,
+  LayersIcon,
   RefreshCwIcon,
+  RotateCcwIcon,
   RouteIcon,
   SaveIcon,
+  SearchIcon,
   ServerIcon,
   ShieldBanIcon,
   SlidersHorizontalIcon,
   TerminalIcon,
   Trash2Icon,
-  TriangleAlertIcon,
+  type LucideIcon,
 } from 'lucide-react'
 import {
   clearLearnedRejections,
@@ -26,15 +29,16 @@ import {
   forgetLearnedRejection,
   listLearnedRejections,
   setForwarding,
+  setForwardingMany,
   setOauthScopes,
   setQuotaPausePct,
   setRateLimitRetryMax,
   type ForwardingKey,
   type LearnedRejection,
+  type Settings,
 } from '@/api/settings'
 import { useI18n } from '@/lib/i18n'
 import { cn, extractError, formatFullTime, relativeTime } from '@/lib/utils'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
   AlertDialogHeader, AlertDialogPopup, AlertDialogTitle,
@@ -64,20 +68,24 @@ import {
 import {
   Select, SelectItem, SelectPopup, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
+import { Radio, RadioGroup } from '@/components/ui/radio-group'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { Toggle } from '@/components/ui/toggle'
 import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { toastManager } from '@/components/ui/toast'
-import { ClampedDescription, SettingsGroup, SettingsRow } from '@/components/settings-group'
+import { ClampedDescription, DetailsBody, DetailsTrigger, SettingsGroup, SettingsRow } from '@/components/settings-group'
 import { useSettingsQuery, useSettingsSave } from '@/components/setting-controls'
 import { ErrorState, LoadingState } from '@/components/state-placeholders'
-import { ToolbarSearch } from '@/components/toolbar-controls'
+import { ACTIVE_FILTER_CLASS, ToolbarSearch } from '@/components/toolbar-controls'
+import { InfoHint } from '@/components/info-hint'
 
 /**
  * 转发策略。
  *
- * 按请求经过的环节分组：身份与计费标识 → 请求头 → 请求体与系统提示词 → 非官方客户端模拟 →
- * 遥测 → 本地拦截 → 拒答换模型 → 限流与错误恢复，最后是登录授权范围。
+ * 页首是改写模式（完整对齐 / 仅 billing 标识）与搜索、只看已改动；其下按请求经过的环节分组：
+ * 身份与计费标识 → 请求头 → 请求体与系统提示词 → 非官方客户端模拟 → 遥测 → 本地拦截 →
+ * 拒答换模型 → 限流与错误恢复，最后是登录授权范围。
  *
  * 这些改动都不是「能不能用」的必需项，每一项都可以单独停用，用于排查上游兼容性。客户端自己
  * 写出的参数错误一律不修补，由上游原样返回官方报错。
@@ -117,6 +125,9 @@ export function ForwardingSettings({
 export function ForwardingSettingsContent() {
   const { t } = useI18n()
   const settingsQuery = useSettingsQuery()
+  const [query, setQuery] = useState('')
+  const [changedOnly, setChangedOnly] = useState(false)
+  const filter = useMemo(() => ({ query, changedOnly }), [query, changedOnly])
 
   if (settingsQuery.isPending) {
     return <LoadingState label={t('正在加载设置', 'Loading settings')} />
@@ -147,35 +158,79 @@ export function ForwardingSettingsContent() {
   ]
 
   return (
-    <div className="space-y-4">
-      <Alert variant="info">
-        <InfoIcon aria-hidden="true" />
-        <AlertTitle>{t('必要请求头不受影响', 'Required headers are unaffected')}</AlertTitle>
-        <AlertDescription>
-          <p>
-            {t('下列开关不影响必要的', 'The following toggles do not affect required')}{' '}
-            <code className="font-mono text-foreground">Authorization</code>{' '}
-            {t('注入。', 'injection.')}
-          </p>
-        </AlertDescription>
-      </Alert>
+    <ForwardingFilterContext.Provider value={filter}>
+    <div className="space-y-4" data-forwarding-list>
+      <ForwardingToolbar
+        query={query}
+        onQueryChange={setQuery}
+        changedOnly={changedOnly}
+        onChangedOnlyChange={setChangedOnly}
+      />
 
-      {billingOnlyActive(settingsQuery.data) && (
-        <Alert variant="warning">
-          <TriangleAlertIcon aria-hidden="true" />
-          <AlertTitle>{t('已启用「仅注入 billing 标识」', '“Inject billing identifier only” is enabled')}</AlertTitle>
-          <AlertDescription>
-            <p>
-              {t(
-                '置灰标注「启用期间不生效」的开关此时一概跳过，存储值保留，停用后恢复原状态。',
-                'Switches greyed out as inactive are skipped for now; their saved values are kept and take effect again once it is disabled.',
+      <Empty className="rounded-xl border border-dashed py-10" data-forwarding-empty>
+        <EmptyHeader>
+          <EmptyMedia variant="icon"><SearchIcon /></EmptyMedia>
+          <EmptyTitle>{changedOnly && !query.trim()
+            ? t('所有开关均为默认值', 'Every switch is at its default')
+            : t('没有匹配的设置项', 'No matching settings')}</EmptyTitle>
+          <EmptyDescription>
+            {changedOnly && !query.trim()
+              ? t('当前没有改动过的开关。', 'No switch has been changed.')
+              : t('换个关键词，或清除筛选后再看。', 'Try another keyword, or clear the filters.')}
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+
+      <RewriteModeGroup
+        simulateRequires={simulateRequires}
+        userIdToggles={
+          <>
+
+            <ForwardingToggle
+              k="sim_billing_keep_user_id"
+              label={t('模拟请求带 user_id', 'Send user_id on emulated requests')}
+              summary={t(
+                '自带者依身份规则改写，缺失者按官方形态补齐；停用后一并移除。',
+                'An existing one is rewritten by the identity rules, a missing one is added in the official shape; when disabled it is removed.',
               )}
-            </p>
-          </AlertDescription>
-        </Alert>
-      )}
+              description={
+                <>
+                  {t(
+                    '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时，按官方形态补一份（账号为池中账号、设备 ID 按设备指纹派生、会话段即出站会话 ID），需「身份一致性」启用。官方每条请求都带 user_id，抓包中「仅 billing 标识、无身份句」的续轮也不例外。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于模拟请求（第三方客户端，以及形态未被认作官方的请求），真实 Claude Code 客户端由「真实客户端带 user_id」单独控制。',
+                    'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid is replaced with the pool account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session ID header; with “Identity consistency” disabled it is sent unchanged. When the client sends none, one in the official shape is added (pool account, device ID derived from the device fingerprint, session segment equal to the outgoing session ID), which requires “Identity consistency” to be enabled. The official client sends user_id on every request, including the billing-only continuation turns without an identity line in the captures. Disabled: user_id is stripped entirely (metadata is removed too if left empty). Applies only to emulated requests (third-party clients and requests whose shape is not recognized as official); real Claude Code clients are controlled separately by “Send user_id on real clients”.',
+                  )}
+                </>
+              }
+            />
+            <ForwardingToggle
+              k="real_billing_keep_user_id"
+              label={t('真实客户端带 user_id', 'Send user_id on real clients')}
+              summary={t(
+                '自带者依身份规则改写，缺失者按官方形态补齐；停用后一并移除。',
+                'An existing one is rewritten by the identity rules, a missing one is added in the official shape; when disabled it is removed.',
+              )}
+              description={
+                <>
+                  {t(
+                    '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时，按官方形态补一份（账号为池中账号、设备 ID 按设备指纹派生、会话段即出站会话 ID），需「身份一致性」启用。官方每条请求都带 user_id，抓包中「仅 billing 标识、无身份句」的续轮也不例外。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于真实 Claude Code 客户端，启用期间代替「补齐设备身份」。官方本就有不带 user_id 的形态（Claude Desktop 不带，Claude Code 也可通过环境变量不带），剥离同样是官方会出现的形态。',
+                    'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid is replaced with the pool account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session ID header; with “Identity consistency” disabled it is sent unchanged. When the client sends none, one in the official shape is added (pool account, device ID derived from the device fingerprint, session segment equal to the outgoing session ID), which requires “Identity consistency” to be enabled. The official client sends user_id on every request, including the billing-only continuation turns without an identity line in the captures. Disabled: user_id is stripped entirely (metadata is removed too if left empty). Applies only to real Claude Code clients, and replaces “Fill missing device identity” while billing-only is enabled. Official clients already send requests without user_id (Claude Desktop never does, and Claude Code can omit it via an environment variable), so stripping is also a shape the official client produces.',
+                  )}
+                </>
+              }
+            />
+          </>
+        }
+        description={
+          <>
+                  {t(
+                    '上游放行须满足两项条件之一：请求 system 中带有身份句，或 system 首块中带有合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关使模拟请求仅满足后者——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 thread/diagnostics/output_config、不重排顶层键；metadata.user_id 由「模拟请求带 user_id」决定。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。本开关对真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：其自带的 billing 标识照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 由「真实客户端带 user_id」决定（代替「补齐设备身份」）；会话关联字段（cc_prompt_id、diagnostics 等）、工具名混淆、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过。收益：第三方客户端借用订阅额度时可保留自身的提示词与行为，模型依据客户端的 system 正常作答，不会被赋予 Claude Code 的角色设定。权衡：官方「仅 billing 标识、无身份句」的请求几乎全是 message thread 的续轮——会话首轮已带身份句建好线程，续轮的 system 只剩 billing 标识一块，同时带 thread、会话关联字段与完整的 thinking、output_config；唯一的例外是桌面端单轮、零工具的状态摘要辅助调用。「billing 标识 + 客户端自有 system + 完整多轮历史、不带 thread」的组合官方不会产生，本开关只保证过闸，不保证形态与官方一致。实测（2026-10-10）：客户端 system 长达 12KB、system 多达 9 块，均照常计入订阅额度，未被判为第三方应用。建议按需启用。与完整模拟并存，默认停用，可随时回退。',
+                    'Upstream admits a request that meets either of two conditions: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch makes emulated requests meet only the second — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no thread/diagnostics/output_config, and no top-level key reordering; metadata.user_id is governed by “Send user_id on emulated requests”. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. The switch applies equally to real Claude Code clients (including the VSCode extension, agent-sdk and subagents): their own billing identifier is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; metadata.user_id is governed by “Send user_id on real clients” (in place of “Fill missing device identity”); session-chain fields (cc_prompt_id, diagnostics, etc.), tool-name obfuscation, system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped. Benefit: a third-party client using subscription quota keeps its own prompt and behavior, and the model answers according to the client’s system prompt without taking on the Claude Code persona. Trade-off: official “billing-only, no identity line” requests are almost all message-thread continuations — the first turn of the session carries the identity line and creates the thread, and each continuation keeps only the billing identifier in system while also sending thread, the session-link fields and the full thinking and output_config; the only exception is the desktop app’s single-turn, zero-tool status-summary helper call. A billing identifier plus the client’s own system and the full multi-turn history without a thread is a combination the official client never produces, so this switch only gets requests admitted and does not make their shape match the official one. Tested on 2026-10-10: client system prompts up to 12KB and up to 9 system blocks were billed against plan limits as usual and were not classified as third-party apps. Enable it only as needed. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+                  )}
+          </>
+        }
+      />
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={FingerprintIcon}
         title={t('设备与会话身份', 'Device & session identity')}
         description={t('请求中的账号、设备与会话 ID 如何改写，使上游看到的身份与当前账号一致。', 'How the account, device and session IDs in a request are rewritten so upstream sees an identity consistent with the current account.')}
@@ -199,7 +254,6 @@ export function ForwardingSettingsContent() {
         {/* 紧跟「身份一致性」：它是本项的前置开关，挨着放才好一起改。 */}
         <ForwardingToggle
           k="fill_metadata"
-          skippedByBillingOnly={t('真实客户端带 user_id', 'Send user_id on real clients')}
           label={t('补齐设备身份', 'Fill missing device identity')}
           summary={t(
             '请求未携带设备身份时，按当前账号补一份；已携带的不改动。',
@@ -253,8 +307,8 @@ export function ForwardingSettingsContent() {
           k="reject_session_conflict"
           label={t('拒绝会话 ID 冲突', 'Reject session ID conflicts')}
           summary={t(
-            '请求头与 metadata 里的会话 ID 不一致时，在本地直接返回 400，不代替客户端择一。',
-            'When the session ID in the header and in metadata disagree, reject locally with 400 instead of picking one.',
+            '请求头与 metadata 中的会话 ID 不一致时，于本地返回 400，不代为取舍。',
+            'When the session IDs in the header and metadata disagree, reject locally with 400 rather than choosing one.',
           )}
           description={
             <>
@@ -265,9 +319,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={BadgeCheckIcon}
         title={t('计费标识', 'Billing identifier')}
         description={t('订阅请求 system 首块中的计费标识及其校验值。', 'The billing identifier in the first system block of subscription requests, and its checksum.')}
@@ -276,8 +330,8 @@ export function ForwardingSettingsContent() {
           k="billing_cch"
           label={t('订阅计费标识', 'Subscription billing identifier')}
           summary={t(
-            '补齐订阅客户端所需的计费标识。',
-            'Add the billing identifier required by subscription clients.',
+            '官方客户端以 API key 模式接入时，计费标识不含 cch，按订阅形态予以补齐。',
+            'In API-key mode the official client’s billing identifier lacks cch; add it to match the subscription shape.',
           )}
         />
         <ForwardingToggle
@@ -296,9 +350,18 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+        <ForwardingToggle
+          k="cch_sim_compute"
+          label={t('模拟请求 · 计算计费校验值', 'Emulated requests · Compute billing checksum')}
+          summary={t(
+            '依据实际发出的请求体计算 cch，与官方算法一致；停用后改填随机值。',
+            'Compute cch from the body actually sent, as the official client does; when disabled, a random value is used.',
+          )}
+          requires={simulateRequires}
+        />
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={ServerIcon}
         title={t('请求头', 'Request headers')}
         description={t('出站请求头的取值、拼写与顺序。', 'Values, spelling and order of outbound request headers.')}
@@ -327,9 +390,9 @@ export function ForwardingSettingsContent() {
             'Restore the official client’s request header casing and order; disable only when troubleshooting compatibility issues.',
           )}
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={BracesIcon}
         title={t('请求体形态', 'Request body shape')}
         description={t('请求体中与官方客户端存在差异的字段与写法。', 'Request body fields and forms that differ from the official client.')}
@@ -352,7 +415,6 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="strip_extra_fields"
-          skippedByBillingOnly
           label={t('移除多余字段', 'Strip extra fields')}
           summary={t(
             '删除官方客户端从不发送的请求字段；参数错误不做修补，由上游原样返回。',
@@ -369,11 +431,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="tool_name_mimic"
-          skippedByBillingOnly
           label={t('工具名混淆', 'Tool name obfuscation')}
           summary={t(
-            '将会被上游判定为第三方应用的工具名替换为 MCP 形式的别名后转发，响应返回时自动还原，对客户端透明。',
-            'Forward tool names that would flag the request as a third-party app under generated MCP-shaped aliases, restored transparently on the way back.',
+            '易被判为第三方应用的工具名改以 MCP 别名转发，响应时自动还原。',
+            'Tool names that would flag a third-party app are forwarded as MCP aliases and restored in responses.',
           )}
           description={
             <>
@@ -386,11 +447,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="eager_tool_streaming"
-          skippedByBillingOnly
           label={t('工具声明对齐 eager 流式', 'Match official eager tool streaming')}
           summary={t(
-            '为工具声明补充 eager_input_streaming:true，仅限抓包证实过的版本、模型与用途组合。',
-            'Add eager_input_streaming:true to tool declarations, only for version, model and purpose combinations confirmed by captures.',
+            '为工具声明补充 eager_input_streaming，仅限抓包证实过的组合。',
+            'Add eager_input_streaming to tool declarations, only for combinations confirmed by captures.',
           )}
           requires={{
             key: 'merge_beta',
@@ -405,16 +465,15 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={DatabaseIcon}
         title={t('系统提示词与缓存', 'System prompt & caching')}
         description={t('系统提示词的分块方式与缓存断点。', 'How the system prompt is split into blocks, and its cache breakpoints.')}
       >
         <ForwardingToggle
           k="system_shape"
-          skippedByBillingOnly
           label={t('分块与缓存形态', 'Block shape & caching')}
           summary={t(
             '按官方客户端对齐系统提示词的分块与缓存断点；同时将块数上限设为 4 块。',
@@ -431,7 +490,6 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="cache_scope_global"
-          skippedByBillingOnly
           label={t('基座缓存跨账号共享', 'Share base-prompt cache across accounts')}
           summary={t(
             '为官方基座块标记 scope:"global"，使所有账号共用同一份基座缓存。',
@@ -452,7 +510,6 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="cache_ttl_1h"
-          skippedByBillingOnly
           label={t('缓存时长对齐 1h', 'Match official cache duration')}
           summary={t(
             '为缓存断点写入 ttl:"1h"，与官方一致；停用后沿用客户端自带的时长。',
@@ -471,9 +528,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={TerminalIcon}
         title={t('非官方客户端模拟', 'Third-party client emulation')}
         description={t('SDK 与第三方客户端的请求按 Claude Code 形态重建后再转发。', 'Requests from SDKs and third-party clients are rebuilt in the Claude Code shape before forwarding.')}
@@ -500,12 +557,11 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="inject_thinking"
-          skippedByBillingOnly
           label={t('注入 Thinking', 'Inject thinking')}
           requires={simulateRequires}
           summary={t(
-            '在模拟路径下自动补充 thinking 与 context_management，与官方形态一致；同时强制 temperature=1。',
-            'Inject thinking and context_management in simulation mode to match the official shape; also forces temperature=1.',
+            '补齐 thinking 与 context_management，并将 temperature 定为 1。',
+            'Add thinking and context_management, with temperature fixed at 1.',
           )}
           description={
             <>
@@ -518,11 +574,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="simulate_full_system"
-          skippedByBillingOnly
           label={t('补齐官方 system 第四块', 'Fill the official fourth system block')}
           summary={t(
-            '模拟请求在基座之后再补上官方的 harness 提示词（opus、sonnet 约 4,700 字节，fable 约 10,800 字节，haiku 约 16,700 字节）；客户端自己的 system 仍单独占最后一块，但回答会受这段官方提示词影响，风格可能随之偏离。',
-            'Emulated requests get the official harness prompt after the base block (about 4.7 KB for opus and sonnet, 10.8 KB for fable, 16.7 KB for haiku). The client’s own system prompt still occupies the last block on its own, but the official prompt pulls the model’s answers towards its own style.',
+            '补上官方 harness 提示词（约 4.7–16.7 KB），回答风格将随之趋近 Claude Code。',
+            'Add the official harness prompt (about 4.7–16.7 KB); answers will lean towards the Claude Code style.',
           )}
           requires={simulateRequires}
           description={
@@ -536,11 +591,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="fill_absent_tools"
-          skippedByBillingOnly
           label={t('无工具请求也补齐官方工具', 'Add official tools to tool-less requests')}
           summary={t(
-            '客户端请求完全未携带 tools 时，同样补齐官方主线程工具（14 个，启用精简时 11 个）；模型可能调用这些工具，而此类客户端通常无法处理。',
-            'When a request carries no tools at all, add the official main-thread tools anyway (14, or 11 with trimming enabled); the model may call them, and such clients usually cannot handle that.',
+            '未携带 tools 的请求亦注入官方工具；模型若调用，此类客户端多半无法承接。',
+            'Inject official tools even when a request has none; if the model calls one, such clients usually cannot handle it.',
           )}
           requires={simulateRequires}
           description={
@@ -554,11 +608,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="sim_trim_tools"
-          skippedByBillingOnly
           label={t('精简注入的官方工具', 'Trim injected official tools')}
           summary={t(
-            '注入的官方工具去掉 Artifact、ListAgents、SendFeedback 三个，只注入 11 个；这三个工具官方用户本来就能自行关闭，关闭后的请求与遥测照官方的形态处理。',
-            'Drop Artifact, ListAgents and SendFeedback from the injected official tools, leaving 11. Official users can turn these three off themselves, and requests and telemetry follow the official shape for that setting.',
+            '注入的官方工具略去 Artifact、ListAgents、SendFeedback，仅保留 11 个。',
+            'Leave Artifact, ListAgents and SendFeedback out of the injected official tools, keeping 11.',
           )}
           requires={simulateRequires}
           description={
@@ -572,11 +625,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="sim_message_threads"
-          skippedByBillingOnly
           label={t('按官方 message threads 形态续轮', 'Follow the official message-threads shape')}
           summary={t(
-            '模拟的主线程请求携带 thread 字段：一段对话的首轮为 create，此后能与上一轮衔接的续轮为 continue，只发送新增消息；无法衔接时重新 create。每条请求末尾同时补上官方的 total_tokens 剩余量提醒。',
-            'Emulated main-thread requests carry a thread field: create on the first turn of a conversation, then continue with only the new messages whenever a turn follows on from the previous one, falling back to create otherwise. Each request also ends with the official total_tokens remaining reminder.',
+            '按官方 thread 形态续轮，仅发送新增消息，并附上 total_tokens 余量提醒。',
+            'Continue turns in the official thread shape, sending only new messages, with the total_tokens reminder appended.',
           )}
           requires={simulateRequires}
           description={
@@ -588,75 +640,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-        <ForwardingToggle
-          k="sim_billing_only"
-          label={t('仅注入 billing 标识', 'Inject billing identifier only')}
-          summary={t(
-            '实验性，默认停用。启用后对所有客户端生效：只保证 system 首块有一条合法 billing 标识，不再补身份句、官方基座、第四块、官方工具、thread 等；客户端自带的 system 块与参数原样透传，metadata.user_id 由下面两项决定。真实 Claude Code 客户端自带的 billing 标识照旧，缺失时只补 billing 标识。启用期间不生效的开关会置灰标出。',
-            'Experimental, disabled by default. When enabled it applies to every client: only a valid billing identifier is ensured as the first system block, and the identity line, official base prompt, fourth block, official tools, thread and the rest are skipped; the client’s own system blocks and parameters pass through unchanged, and metadata.user_id is governed by the two switches below. Real Claude Code clients keep their own billing identifier, and get only a billing identifier added when it is missing. Switches that have no effect while it is enabled are greyed out.',
-          )}
-          requires={simulateRequires}
-          description={
-            <>
-              {t(
-                '上游放行须满足两项条件之一：请求 system 中带有身份句，或 system 首块中带有合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关使模拟请求仅满足后者——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 thread/diagnostics/output_config、不重排顶层键；metadata.user_id 由「模拟请求带 user_id」决定。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。本开关对真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：其自带的 billing 标识照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 由「真实客户端带 user_id」决定（代替「补齐设备身份」）；会话关联字段（cc_prompt_id、diagnostics 等）、工具名混淆、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过。收益：第三方客户端借用订阅额度时可保留自身的提示词与行为，模型依据客户端的 system 正常作答，不会被赋予 Claude Code 的角色设定。权衡：官方「仅 billing 标识、无身份句」的请求几乎全是 message thread 的续轮——会话首轮已带身份句建好线程，续轮的 system 只剩 billing 标识一块，同时带 thread、会话关联字段与完整的 thinking、output_config；唯一的例外是桌面端单轮、零工具的状态摘要辅助调用。「billing 标识 + 客户端自有 system + 完整多轮历史、不带 thread」的组合官方不会产生，本开关只保证过闸，不保证形态与官方一致。实测（2026-10-10）：客户端 system 长达 12KB、system 多达 9 块，均照常计入订阅额度，未被判为第三方应用。建议按需启用。与完整模拟并存，默认停用，可随时回退。',
-                'Upstream admits a request that meets either of two conditions: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch makes emulated requests meet only the second — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no thread/diagnostics/output_config, and no top-level key reordering; metadata.user_id is governed by “Send user_id on emulated requests”. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. The switch applies equally to real Claude Code clients (including the VSCode extension, agent-sdk and subagents): their own billing identifier is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; metadata.user_id is governed by “Send user_id on real clients” (in place of “Fill missing device identity”); session-chain fields (cc_prompt_id, diagnostics, etc.), tool-name obfuscation, system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped. Benefit: a third-party client using subscription quota keeps its own prompt and behavior, and the model answers according to the client’s system prompt without taking on the Claude Code persona. Trade-off: official “billing-only, no identity line” requests are almost all message-thread continuations — the first turn of the session carries the identity line and creates the thread, and each continuation keeps only the billing identifier in system while also sending thread, the session-link fields and the full thinking and output_config; the only exception is the desktop app’s single-turn, zero-tool status-summary helper call. A billing identifier plus the client’s own system and the full multi-turn history without a thread is a combination the official client never produces, so this switch only gets requests admitted and does not make their shape match the official one. Tested on 2026-10-10: client system prompts up to 12KB and up to 9 system blocks were billed against plan limits as usual and were not classified as third-party apps. Enable it only as needed. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="sim_billing_keep_user_id"
-          label={t('模拟请求带 user_id', 'Send user_id on emulated requests')}
-          summary={t(
-            '仅注入 billing 标识时，模拟请求同样带 metadata.user_id：自带的按身份规则改写，未携带的按官方形态补一份；停用后整体剥离。',
-            'With billing-identifier-only injection, emulated requests still carry metadata.user_id: one sent by the client is rewritten by the identity rules, and one in the official shape is added when absent; when disabled it is stripped entirely.',
-          )}
-          requires={[
-            { key: 'sim_billing_only', label: t('仅注入 billing 标识', 'Inject billing identifier only') },
-            ...simulateRequires,
-          ]}
-          description={
-            <>
-              {t(
-                '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时，按官方形态补一份（账号为池中账号、设备 ID 按设备指纹派生、会话段即出站会话 ID），需「身份一致性」启用。官方每条请求都带 user_id，抓包中「仅 billing 标识、无身份句」的续轮也不例外。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于模拟请求（第三方客户端，以及形态未被认作官方的请求），真实 Claude Code 客户端由「真实客户端带 user_id」单独控制。',
-                'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid is replaced with the pool account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session ID header; with “Identity consistency” disabled it is sent unchanged. When the client sends none, one in the official shape is added (pool account, device ID derived from the device fingerprint, session segment equal to the outgoing session ID), which requires “Identity consistency” to be enabled. The official client sends user_id on every request, including the billing-only continuation turns without an identity line in the captures. Disabled: user_id is stripped entirely (metadata is removed too if left empty). Applies only to emulated requests (third-party clients and requests whose shape is not recognized as official); real Claude Code clients are controlled separately by “Send user_id on real clients”.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="real_billing_keep_user_id"
-          label={t('真实客户端带 user_id', 'Send user_id on real clients')}
-          summary={t(
-            '仅注入 billing 标识时，真实 Claude Code 客户端同样带 metadata.user_id：自带的按身份规则改写，未携带的按官方形态补一份；停用后整体剥离。',
-            'With billing-identifier-only injection, real Claude Code clients still carry metadata.user_id: one sent by the client is rewritten by the identity rules, and one in the official shape is added when absent; when disabled it is stripped entirely.',
-          )}
-          requires={[
-            { key: 'sim_billing_only', label: t('仅注入 billing 标识', 'Inject billing identifier only') },
-            ...simulateRequires,
-          ]}
-          description={
-            <>
-              {t(
-                '启用（默认）：客户端携带的 user_id 予以保留，并照常按「身份一致性」「改写设备 ID」「设备指纹归一化」的规则处理——account_uuid 替换为池中账号，device_id 按设备指纹派生，会话段与出站会话 ID 请求头对齐；「身份一致性」停用时原样发送。客户端未携带时，按官方形态补一份（账号为池中账号、设备 ID 按设备指纹派生、会话段即出站会话 ID），需「身份一致性」启用。官方每条请求都带 user_id，抓包中「仅 billing 标识、无身份句」的续轮也不例外。停用：user_id 整体剥离（metadata 剥离后为空则一并移除）。只作用于真实 Claude Code 客户端，启用期间代替「补齐设备身份」。官方本就有不带 user_id 的形态（Claude Desktop 不带，Claude Code 也可通过环境变量不带），剥离同样是官方会出现的形态。',
-                'Enabled (default): a user_id sent by the client is kept and handled by the usual “Identity consistency”, “Rewrite device ID” and “Normalize device fingerprint” rules: account_uuid is replaced with the pool account, device_id is derived from the device fingerprint, and the session segment matches the outgoing session ID header; with “Identity consistency” disabled it is sent unchanged. When the client sends none, one in the official shape is added (pool account, device ID derived from the device fingerprint, session segment equal to the outgoing session ID), which requires “Identity consistency” to be enabled. The official client sends user_id on every request, including the billing-only continuation turns without an identity line in the captures. Disabled: user_id is stripped entirely (metadata is removed too if left empty). Applies only to real Claude Code clients, and replaces “Fill missing device identity” while billing-only is enabled. Official clients already send requests without user_id (Claude Desktop never does, and Claude Code can omit it via an environment variable), so stripping is also a shape the official client produces.',
-              )}
-            </>
-          }
-        />
-        <ForwardingToggle
-          k="cch_sim_compute"
-          label={t('模拟请求计算计费校验值', 'Compute billing checksum for emulated requests')}
-          summary={t(
-            '模拟请求计费标识中的 cch 按最终发出的请求体计算，与官方客户端算法一致；停用时每条请求填入随机值。',
-            'The cch in the billing identifier of emulated requests is computed from the body actually sent, using the official client’s algorithm; when disabled, each request gets a random value.',
-          )}
-          requires={simulateRequires}
-        />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={ActivityIcon}
         title={t('遥测', 'Telemetry')}
         description={t('按官方客户端的字段与节奏补发遥测。', 'Send telemetry with the fields and cadence of the official client.')}
@@ -665,14 +651,14 @@ export function ForwardingSettingsContent() {
           k="api_telemetry"
           label={t('逐请求遥测', 'Per-request telemetry')}
           summary={t(
-            '为每条转发的请求上报官方客户端会发送的整套遥测：事件链、Datadog 日志与用量指标；失败的请求上报错误事件。',
-            'Report the telemetry the official client sends for every forwarded request: the event chain, Datadog logs, and usage metrics — with an error event for the ones that fail.',
+            '为每条请求补发官方客户端的整套遥测，失败的请求亦如实上报。',
+            'Report the official client’s full telemetry for every request, failures included.',
           )}
           description={
             <>
               {t(
-                '官方客户端每发一条请求，都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一组事件链（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。在此之前，luban 仅发送每 30 分钟一次的保活遥测，上游看到的是「API 用量很大，遥测中却没有任何一次 API 调用」。启用后，按 2.1.260 抓包的字段与节奏（事件每 30 秒、日志每 10 秒、指标每 5 分钟分批发送）为每个账号补发这些遥测；所用身份取自实际发往上游的请求，与请求保持一致。失败的请求同样上报：官方客户端对失败请求会发送 tengu_api_error 与 tengu_feature_bad，若只上报成功的请求，同样会留下一处可被比对出的差异。新会话的启动握手亦随此开关：首条请求发出前，按抓包顺序补发 policy_limits、settings、eval、额度探测与 bootstrap 等请求，免得账号只见对话请求、从无启动流量。额度探测仅为交互式 CLI 与模拟会话补发，-p（sdk-cli）与桌面端的官方客户端本不发送；真实客户端须「订阅计费标识」启用、「仅注入 billing 标识」停用方有会话链，握手方才进行。停用后只保留保活遥测，新会话亦不再握手。',
-                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Previously luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.260 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Failed requests are reported too — the official client sends tengu_api_error plus tengu_feature_bad for those, so reporting only the successes is itself a detectable discrepancy. It also drives the startup handshake of new sessions: before the first request goes out, luban sends policy_limits, settings, eval, the quota probe, bootstrap and the rest in captured order, so the account never shows conversation traffic without any startup traffic. The quota probe is sent only for interactive CLI and emulated sessions — the official client does not send it from -p (sdk-cli) or the desktop app; real clients only have a session chain, and so a handshake, while “Subscription billing identifier” is enabled and “Inject billing identifier only” is disabled. Turn it off to keep only the keepalive telemetry; new sessions then skip the handshake too.',
+                '官方客户端每发一条请求，都会上报 tengu_api_query → tengu_api_success → tengu_turn_end 这一组事件链（带上游 request-id、逐项 token 与花费），以及 Datadog 日志和 OTel 用量指标。在此之前，luban 仅发送每 30 分钟一次的保活遥测，上游看到的是「API 用量很大，遥测中却没有任何一次 API 调用」。启用后，按 2.1.260 抓包的字段与节奏（事件每 30 秒、日志每 10 秒、指标每 5 分钟分批发送）为每个账号补发这些遥测；所用身份取自实际发往上游的请求，与请求保持一致。失败的请求同样上报：官方客户端对失败请求会发送 tengu_api_error 与 tengu_feature_bad，若只上报成功的请求，同样会留下一处可被比对出的差异。新会话的启动握手亦随此开关：首条请求发出前，按抓包顺序补发 policy_limits、settings、eval、额度探测与 bootstrap 等请求，免得账号只见对话请求、从无启动流量。额度探测仅为交互式 CLI 与模拟会话补发，-p（sdk-cli）与桌面端的官方客户端本不发送；真实客户端须「订阅计费标识」启用、改写模式为「完整对齐」方有会话链，握手方才进行。停用后只保留保活遥测，新会话亦不再握手。',
+                'The official client reports a chain of events for every request it sends (tengu_api_query → tengu_api_success → tengu_turn_end, carrying the upstream request-id, per-type token counts and cost), plus Datadog logs and OTel usage metrics. Previously luban only sent the 30-minute keepalive telemetry, so upstream saw an account with heavy API usage and not a single API call in its telemetry. When enabled, luban fills this in for every account following the fields and cadence captured from 2.1.260 (events batched every 30s, logs every 10s, metrics every 5min), using the identity actually sent upstream so both sides agree. Failed requests are reported too — the official client sends tengu_api_error plus tengu_feature_bad for those, so reporting only the successes is itself a detectable discrepancy. It also drives the startup handshake of new sessions: before the first request goes out, luban sends policy_limits, settings, eval, the quota probe, bootstrap and the rest in captured order, so the account never shows conversation traffic without any startup traffic. The quota probe is sent only for interactive CLI and emulated sessions — the official client does not send it from -p (sdk-cli) or the desktop app; real clients only have a session chain, and so a handshake, while “Subscription billing identifier” is enabled and the rewrite mode is “Full alignment”. Turn it off to keep only the keepalive telemetry; new sessions then skip the handshake too.',
               )}
             </>
           }
@@ -681,8 +667,8 @@ export function ForwardingSettingsContent() {
           k="keepalive_telemetry"
           label={t('保活遥测', 'Keepalive telemetry')}
           summary={t(
-            '每 30 分钟为每个账号发送一组空闲版本检查事件与 Datadog 日志，每 6 小时上报一次画像。',
-            'Every 30 minutes send a set of idle version-check events and Datadog logs for each account, plus a profile report every 6 hours.',
+            '每 30 分钟为各账号发送空闲遥测，每 6 小时上报一次画像。',
+            'Send idle telemetry for each account every 30 minutes, and a profile report every 6 hours.',
           )}
           description={
             <>
@@ -693,9 +679,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={ShieldBanIcon}
         title={t('本地拦截', 'Local interception')}
         description={t('命中的请求在本地应答或拒绝，或改写成官方形态后再发。', 'Matching requests are answered or rejected locally, or rewritten into an official shape before being sent.')}
@@ -704,8 +690,8 @@ export function ForwardingSettingsContent() {
           k="reject_probes"
           label={t('拒绝探针请求', 'Reject probe requests')}
           summary={t(
-            '下游中转站用于探活、测活的请求，由本地直接返回一条与上游预热真实回包同形态的响应（200 加一句「OK」），不发往上游，不限 UA。本开关只负责形态判据；从响应中学到的两类规则各有独立开关，见下面两条。',
-            'Health-check / channel-test requests that downstream relays send to probe the account are answered locally with a 200 shaped like upstream\'s real prewarm reply (a one-word "OK") and never reach upstream, regardless of UA. Shape signatures only; the two rule kinds learned from responses have their own switches below.',
+            '中转站的探活请求由本地应答「OK」，不发往上游。',
+            'Health-check requests from relays are answered locally with "OK" and never reach upstream.',
           )}
           description={
             <>
@@ -721,8 +707,8 @@ export function ForwardingSettingsContent() {
           label={t('探针改写为预热', 'Send probes as prewarm')}
           inactiveWhileOn={{ key: 'reject_probes', label: t('拒绝探针请求', 'Reject probe requests') }}
           summary={t(
-            '「拒绝探针请求」停用时，命中探针判据的请求不再原样转发，而是改写成官方 Claude Code 切换模型时发出的那条预热（max_tokens 1、正文「Hi」）再发往上游；上游回复的正文为空时补一句「OK」。停用后原样转发。',
-            'While “Reject probe requests” is off, requests matching the probe signatures are no longer forwarded as is; they are rewritten into the prewarm official Claude Code sends when switching models (max_tokens 1, body "Hi") and sent upstream, with a one-word "OK" filled in when upstream returns an empty body. Turned off, they are forwarded as is.',
+            '上一项停用时，探活请求改写为官方 /model 预热后发往上游。',
+            'While the previous switch is off, health checks are rewritten into the official /model prewarm and sent upstream.',
           )}
           description={
             <>
@@ -741,8 +727,8 @@ export function ForwardingSettingsContent() {
             { key: 'probe_as_prewarm', label: t('探针改写为预热', 'Send probes as prewarm') },
           ]}
           summary={t(
-            '在上面三条判据之外再增加两条：带 tools 但 max_tokens 为 2 到 16 的请求也视为 ping；无 system、无 tools、只有一条不超过 32 字节（中文约 10 个字）用户消息的请求也视为探活。可能误拦真实用户的首句问候（如「你好」），默认停用。',
-            'Two more signatures on top of the three above: max_tokens 2 to 16 counts as a ping even with tools; a single user message of 32 bytes or fewer (about ten CJK characters) with no system prompt and no tools counts as a probe. It also catches a real user\'s first "hello", so it is off by default.',
+            '增设两条探活判据，或会误拦真实用户的首句问候，默认停用。',
+            'Two more probe signatures that may catch a real user’s opening greeting; off by default.',
           )}
           description={
             <>
@@ -757,8 +743,8 @@ export function ForwardingSettingsContent() {
           k="reject_refusals"
           label={t('拒绝已拒答的提示词', 'Reject refused prompts')}
           summary={t(
-            '上游分类器拒答过的提示词，逐字相同地重发时不再发往上游，由本地原样回放上游那次的响应（200 加同一段 stop_reason refusal 响应体）；无法识别会话的客户端（既不带会话 ID 也不带 device_id 的中转）另按「模型 + system」学习，拒答至少 3 条且占该应用请求 30% 以上才形成规则，此后同一应用的请求一律回放；出站带 fallbacks 的请求不拦截，由上游换用其他模型重新生成。停用时既不拦截也不学习。',
-            'A prompt the upstream classifier has already refused is not forwarded when resent verbatim; luban replays upstream\'s own refusal (200 with the same stop_reason refusal body). Session-less clients (relays sending neither a session ID nor a device_id) are additionally learned per model + system prompt once at least 3 refusals make up 30% or more of that app\'s requests, and every further request of that app is replayed. Requests that go out with fallbacks are not blocked, so upstream can rerun them on another model. Turned off, nothing is blocked and nothing is learned.',
+            '分类器拒答过的提示词再度发来时，于本地回放上次的拒答；停用后不拦截亦不学习。',
+            'A prompt the classifier has refused is answered locally with the earlier refusal when resent; when disabled, nothing is blocked or learned.',
           )}
           description={
             <>
@@ -773,8 +759,8 @@ export function ForwardingSettingsContent() {
           k="reject_empty_replies"
           label={t('拒绝零输出请求类', 'Reject empty-reply request classes')}
           summary={t(
-            '某模型对「无 tools 单条消息 + 某个 max_tokens」返回过 200 却零输出之后，同类请求在本地直接返回 403，不限 UA。停用时既不拦截也不学习。',
-            'Once a model has answered a tool-less single-message request with a given max_tokens with 200 and zero output, that request class is rejected locally with 403, regardless of UA. Turned off, nothing is blocked and nothing is learned.',
+            '上游零输出过的同类单句请求，于本地返回 403；停用后不拦截亦不学习。',
+            'Single-message request classes upstream answered with zero output get a local 403; when disabled, nothing is blocked or learned.',
           )}
           description={
             <>
@@ -789,8 +775,8 @@ export function ForwardingSettingsContent() {
           k="reject_learned_shapes"
           label={t('拒绝已学到的形态错误', 'Reject learned shape errors')}
           summary={t(
-            '上游以 400 拒过的「模型 + 某个取值」组合（如 effort: xhigh、role: system、某种 tool type、被废弃的 temperature 等采样参数、不支持的 assistant prefill），同样的请求再来时在本地直接返回 400。停用时既不拦截也不学习。',
-            'A model + value combination upstream has rejected with a 400 (such as effort: xhigh, role: system, a tool type, a deprecated sampling parameter like temperature, or an unsupported assistant prefill) is rejected locally with 400 when it comes again. Turned off, nothing is blocked and nothing is learned.',
+            '上游以 400 拒绝过的「模型 + 取值」组合，于本地返回 400；停用后不拦截亦不学习。',
+            'Model + value combinations upstream rejected with 400 get a local 400; when disabled, nothing is blocked or learned.',
           )}
           description={
             <>
@@ -805,7 +791,7 @@ export function ForwardingSettingsContent() {
           k="reject_openai_shape"
           label={t('拒绝 OpenAI 转换残留', 'Reject OpenAI-format residue')}
           summary={t(
-            '带有 OpenAI 格式转换痕迹的请求在本地直接返回 400，不修补、不转发。',
+            '带有 OpenAI 格式转换痕迹的请求，于本地返回 400，不作修补、不予转发。',
             'Requests carrying traces of OpenAI-format conversion are rejected locally with 400, never repaired or forwarded.',
           )}
           description={
@@ -817,22 +803,25 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <LearnedRejections />
+      <ForwardingFilterItem
+        texts={[t('从上游学到的规则', 'Rules learned from upstream'), t('拒答 零输出 形态错误', 'refusal empty reply shape error')]}
+      >
+        <LearnedRejections />
+      </ForwardingFilterItem>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={RouteIcon}
         title={t('拒答换模型', 'Refusal fallback')}
         description={t('上游分类器拒答时，由上游换用其他模型重新生成。', 'When the upstream classifier refuses, upstream regenerates the answer with another model.')}
       >
         <ForwardingToggle
           k="fable_refusal_fallback"
-          skippedByBillingOnly
           label={t('Fable 拒答自动换模型', 'Fable refusal fallback')}
           summary={t(
-            'fable 主线程请求带上官方的服务端 fallback：安全分类器拒答时，由上游在同一次调用中改用 opus-5 重新生成。形态与官方 2.1.260 逐字相同，默认停用。',
-            'Fable main-thread requests carry the official server-side fallback: when the safety classifier refuses, upstream reruns the same call on opus-5. Byte-for-byte the official 2.1.260 shape; off by default.',
+            'fable 拒答时由上游改用 opus-5 重新生成，与官方形态一致；默认停用。',
+            'When fable refuses, upstream regenerates with opus-5, matching the official shape; off by default.',
           )}
           description={
             <>
@@ -845,11 +834,10 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="opus_refusal_fallback"
-          skippedByBillingOnly
           label={t('Opus 拒答自动换模型（实验）', 'Opus refusal fallback (experimental)')}
           summary={t(
-            'opus-5 主线程请求带上 luban 自定义的 fallback 链：拒答时上游先回退到 4.8，再回退到 4.6。官方 opus 客户端不发送该字段，默认停用。',
-            'Opus-5 main-thread requests carry a luban-defined fallback chain: on refusal upstream falls to 4.8, then 4.6. The official opus client never sends this field; off by default.',
+            'opus-5 拒答时依次回退至 4.8、4.6；官方并不发送此字段，默认停用。',
+            'When opus-5 refuses, fall back to 4.8 then 4.6; the official client never sends this field; off by default.',
           )}
           description={
             <>
@@ -860,9 +848,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={RefreshCwIcon}
         title={t('限流与错误恢复', 'Rate limits & error recovery')}
         description={t('限流时切换账号，以及切换账号导致 thinking 校验失败后的重试。', 'Account switching on rate limits, and retries after thinking validation fails because of a switch.')}
@@ -888,8 +876,18 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-        <RetryMax />
-        <QuotaPausePct />
+        <ForwardingFilterItem
+          texts={[t('追加重试账号数', 'Additional retry accounts'), 'rate_limit_retry_max']}
+          changed={isNumericChanged(settingsQuery.data, 'rate_limit_retry_max')}
+        >
+          <RetryMax />
+        </ForwardingFilterItem>
+        <ForwardingFilterItem
+          texts={[t('提前暂停调度阈值', 'Early pause threshold'), t('用量 额度 5h 7d', 'usage quota 5h 7d'), 'quota_pause_pct']}
+          changed={isNumericChanged(settingsQuery.data, 'quota_pause_pct')}
+        >
+          <QuotaPausePct />
+        </ForwardingFilterItem>
         <ForwardingToggle
           k="thinking_signature_retry"
           label={t('thinking 签名兜底', 'thinking signature fallback')}
@@ -928,9 +926,9 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
-      </SettingsGroup>
+      </ForwardingGroup>
 
-      <SettingsGroup
+      <ForwardingGroup
         icon={KeyRoundIcon}
         title={t('登录授权范围', 'Login authorization scopes')}
         description={t(
@@ -938,9 +936,12 @@ export function ForwardingSettingsContent() {
           'Which permissions are requested from Claude when adding an account. Only affects accounts added from now on; existing ones are unchanged.',
         )}
       >
-        <OAuthScopes />
-      </SettingsGroup>
+        <ForwardingFilterItem texts={[t('申请的 scope', 'Requested scopes'), 'oauth scope']}>
+          <OAuthScopes />
+        </ForwardingFilterItem>
+      </ForwardingGroup>
     </div>
+    </ForwardingFilterContext.Provider>
   )
 }
 
@@ -949,7 +950,8 @@ export function ForwardingSettingsContent() {
  *
  * 默认与官方 Claude Code 逐字一致（scope 集合也是指纹的一部分）；想少授权就切到精简那一档，
  * 代价是授权请求与官方不再完全相同。改动只对之后的新登录生效——已有凭证的范围在授权那一刻
- * 就定了，刷新 token 不带 scope，改这里不会追溯。
+ * 就定了，刷新 token 发的是官方固定那五项（扩不出时后端回退成沿用原授权），与这里无关，
+ * 改这里不会追溯。
  *
  * **不校验**：填什么存什么，前后端都不判合法性。这个框就是拿来试上游认哪些 scope 的，
  * 拦一道就等于把它唯一的用途拦掉；认不认由同意页说。
@@ -958,6 +960,7 @@ function OAuthScopes() {
   const { t } = useI18n()
   const { data } = useSettingsQuery()
   const [draft, setDraft] = useState('')
+  const [impactOpen, setImpactOpen] = useState(false)
 
   useEffect(() => {
     if (data) setDraft(data.oauth_scopes)
@@ -996,11 +999,20 @@ function OAuthScopes() {
         <div className="min-w-0 space-y-1">
           <FieldLabel htmlFor="oauth-scopes">{t('申请的 scope', 'Requested scopes')}</FieldLabel>
           <FieldDescription className="max-w-xl leading-5">
-            <ClampedDescription text={t(
-              '以空格分隔，按填写内容原样发送。这里不做校验，是否接受由 Claude 的同意页决定（例如完全不带 scope 会返回 Missing scope parameter）。留空则恢复官方默认的整套 scope，与官方客户端逐字一致，scope 集合也是指纹的一部分。「精简」档只保留 Luban 实际需要的三项：user:inference 用于转发（移除后账号仅能登录并查看额度）、user:profile 决定能否读取邮箱与等级、user:file_upload 负责经 Files API 的上传。',
-              'Space separated, sent verbatim — nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota), user:profile for the email and tier, user:file_upload for uploads through the Files API.',
-            )} />
+            {t(
+              '以空格分隔，原样发送，不做校验；留空即恢复官方默认。',
+              'Space separated and sent verbatim without validation; leave empty to restore the official default.',
+            )}{' '}
+            <DetailsTrigger label={t('影响与限制', 'Impact & limitations')} open={impactOpen} onToggle={() => setImpactOpen((v) => !v)} />
           </FieldDescription>
+          {impactOpen && (
+            <DetailsBody>
+              {t(
+              '以空格分隔，按填写内容原样发送。这里不做校验，是否接受由 Claude 的同意页决定（例如完全不带 scope 会返回 Missing scope parameter）。留空则恢复官方默认的整套 scope，与官方客户端逐字一致，scope 集合也是指纹的一部分。「精简」档只保留 Luban 实际需要的三项：user:inference 用于转发（移除后账号仅能登录并查看额度）、user:profile 决定能否读取邮箱与等级、user:file_upload 负责经 Files API 的上传。',
+                'Space separated, sent verbatim — nothing is validated here; Claude\u2019s consent page decides what it accepts (omitting scope entirely, for instance, comes back as Missing scope parameter). Leave empty to restore the full official set, which is byte-for-byte what the official client requests, and the scope set is part of the fingerprint. The minimal preset keeps the three Luban actually uses: user:inference for forwarding (without it an account can only sign in and show quota), user:profile for the email and tier, user:file_upload for uploads through the Files API.',
+              )}
+            </DetailsBody>
+          )}
         </div>
         <Textarea
           id="oauth-scopes"
@@ -1165,12 +1177,15 @@ function QuotaPausePct() {
   return (
     <SettingsRow
       label={t('提前暂停调度阈值', 'Early pause threshold')}
-      description={
-        <ClampedDescription text={t(
-          '上游每条响应都带有账号的用量窗口使用率；达到阈值即将账号移出调度池，不必等下一条请求触发 429（那一条请求必定失败）。两个窗口各设一档，二者含义不同：因 5 小时窗口暂停调度的账号最多暂停数小时即自动恢复，因 7 天窗口暂停的则要暂停到下一次周重置。因此，周用量偏高的账号会被长时间移出调度池，即使该账号近 5 小时内未被使用。所以 7 天窗口阈值默认停用（周额度真正用完时上游会返回 429，账号级冷却照常接手）；如需启用，建议设得比 5 小时窗口阈值更高。超额用量（extra usage）接近上限时不计入判定。暂停后按触发的那个窗口的重置时刻自动恢复，也可手动启用或通过连通性测试恢复调度。填 0 表示该档不暂停调度。这里是全局值；单个账号可在账号菜单「提前暂停调度阈值」中逐档覆盖（跟随全局 / 该窗口停用 / 独立阈值）。',
-          'Every upstream response reports the account’s usage window utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold; do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. Extra usage nearing its limit never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (Use global / Off for this window / Custom threshold).',
-        )} />
-      }
+      description={t(
+        '用量达到阈值时提前将账号移出调度池，以免请求触发 429；两个窗口各设一档。',
+        'Take an account out of scheduling once usage reaches the threshold, before a request hits 429; each window has its own threshold.',
+      )}
+      details={t(
+        '上游每条响应都带有账号的用量窗口使用率；达到阈值即将账号移出调度池，不必等下一条请求触发 429（那一条请求必定失败）。两个窗口各设一档，二者含义不同：因 5 小时窗口暂停调度的账号最多暂停数小时即自动恢复，因 7 天窗口暂停的则要暂停到下一次周重置。因此，周用量偏高的账号会被长时间移出调度池，即使该账号近 5 小时内未被使用。所以 7 天窗口阈值默认停用（周额度真正用完时上游会返回 429，账号级冷却照常接手）；如需启用，建议设得比 5 小时窗口阈值更高。超额用量（extra usage）接近上限时不计入判定。暂停后按触发的那个窗口的重置时刻自动恢复，也可手动启用或通过连通性测试恢复调度。填 0 表示该档不暂停调度。这里是全局值；单个账号可在账号菜单「提前暂停调度阈值」中逐档覆盖（跟随全局 / 该窗口停用 / 独立阈值）。',
+        'Every upstream response reports the account’s usage window utilization; once it reaches the threshold the account leaves the scheduling pool, instead of waiting for the next request to hit a 429 (which is bound to fail). Each window gets its own threshold; do not treat them as one: a pause from the 5h window lasts a few hours at most, while a pause from the 7d window lasts until the weekly reset, so an account with heavy weekly usage would sit out entirely even when its 5h window is untouched. That is why the 7d threshold is off by default (when the weekly quota really runs out, upstream returns a 429 and the account-level cooldown takes over); if you do enable it, set it higher than the 5h one. Extra usage nearing its limit never counts. A paused account comes back automatically when the window that triggered it resets, and can also be re-enabled by hand or by a passing connectivity test. 0 turns that threshold off. These are the global values; each account can override either window from its menu under Early pause threshold (Use global / Off for this window / Custom threshold).',
+      )}
+      detailsLabel={t('影响与限制', 'Impact & limitations')}
     >
       {/* 两行的网格：第一行是两枚标签，第二行是两个数字框与保存按钮。
           按钮显式落在第二行第三列（`col-start-3 row-start-2`，列也必须钉——只写行的话，
@@ -1248,11 +1263,442 @@ function QuotaPausePct() {
   )
 }
 
+/**
+ * 页内筛选：搜索词与「只看已改动」。各行自己判断要不要渲染（[`ForwardingFilterItem`]），
+ * 分组与空状态的显隐交给 CSS（`index.css` 里的 `data-forwarding-*`）：一组里一项都没剩就整组
+ * 收起，整页一项都没剩才亮出空状态——这样不必把四十个开关改写成一张数据表才能算「剩几项」。
+ */
+type ForwardingFilter = { query: string; changedOnly: boolean }
+const ForwardingFilterContext = createContext<ForwardingFilter>({ query: '', changedOnly: false })
+/** 所在分组的标题命中了搜索词：组内各项一律显示（搜「遥测」应当看到整组）。 */
+const GroupMatchContext = createContext(false)
+
+/** 空格分隔的每个词都得在某段文字里出现（不分大小写）；空搜索词恒命中。 */
+function matchesQuery(query: string, texts: readonly (string | undefined)[]) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (terms.length === 0) return true
+  const haystack = texts.filter(Boolean).map((text) => text!.toLowerCase())
+  return terms.every((term) => haystack.some((text) => text.includes(term)))
+}
+
+/** 存储值与出厂默认值不同。后端没给默认表或缺这一项时一律当没改。 */
+function isChanged(data: Settings | undefined, k: ForwardingKey) {
+  const value = data?.[k]
+  const fallback = data?.forwarding_defaults?.[k]
+  return value != null && fallback != null && value !== fallback
+}
+
+/** 与出厂默认值不同、且当前模式下显示着的开关，顺序按默认表。 */
+function changedForwardingKeys(data: Settings | undefined): ForwardingKey[] {
+  if (!data?.forwarding_defaults) return []
+  return (Object.keys(data.forwarding_defaults) as ForwardingKey[]).filter(
+    (k) => isChanged(data, k) && !hiddenInCurrentMode(data, k),
+  )
+}
+
+/**
+ * 「全部恢复默认」实际要拨回的开关：当前显示着的改动项，加上拨回之后会**重新显示**的改动项。
+ *
+ * 「仅 billing 标识」生效时，拨回 `sim_billing_only` 会让模式回到「完整对齐」，原先被隐藏的
+ * 那些开关随之重新生效；只拨显示着的，点完它们就以「已改动」冒出来，一键恢复等于没恢复干净。
+ * 一轮就够：决定模式的三项（`sim_billing_only`/`simulate_cc`/`merge_beta`）从不隐藏，第一轮
+ * 已经拨回，新加进来的项不会再改变模式。
+ */
+function resetForwardingKeys(data: Settings | undefined): ForwardingKey[] {
+  if (!data?.forwarding_defaults) return []
+  const visible = changedForwardingKeys(data)
+  const after: Settings = { ...data }
+  for (const k of visible) after[k] = data.forwarding_defaults[k]
+  return (Object.keys(data.forwarding_defaults) as ForwardingKey[]).filter(
+    (k) => isChanged(data, k) && (visible.includes(k) || !hiddenInCurrentMode(after, k)),
+  )
+}
+
+/** 页内的数值参数：与开关一样计入「已改动」、随「全部恢复默认」拨回，默认值取后端给的。 */
+type NumericSettingKey = 'rate_limit_retry_max' | 'quota_pause_pct'
+
+function isNumericChanged(data: Settings | undefined, k: NumericSettingKey) {
+  if (!data) return false
+  switch (k) {
+    case 'rate_limit_retry_max':
+      return data.rate_limit_retry_max_default != null
+        && data.rate_limit_retry_max !== data.rate_limit_retry_max_default
+    case 'quota_pause_pct':
+      return data.quota_pause_pct_default != null
+        && (data.quota_pause_pct !== data.quota_pause_pct_default
+          || data.quota_pause_pct_7d !== data.quota_pause_pct_7d_default)
+  }
+}
+
+function changedNumericKeys(data: Settings | undefined): NumericSettingKey[] {
+  return (['rate_limit_retry_max', 'quota_pause_pct'] as const).filter((k) => isNumericChanged(data, k))
+}
+
+function ChangedBadge() {
+  const { t } = useI18n()
+  return (
+    <Badge variant="info" size="sm">
+      {t('已改动', 'Modified')}
+    </Badge>
+  )
+}
+
+/** 一行设置项的筛选外壳：不命中就不渲染；`data-forwarding-item` 供分组判断自己还剩没剩东西。 */
+function ForwardingFilterItem({
+  texts,
+  changed = false,
+  children,
+}: {
+  texts: readonly (string | undefined)[]
+  changed?: boolean
+  children: ReactNode
+}) {
+  const { query, changedOnly } = useContext(ForwardingFilterContext)
+  const groupMatched = useContext(GroupMatchContext)
+  if (changedOnly && !changed) return null
+  if (!groupMatched && !matchesQuery(query, texts)) return null
+  return <div data-forwarding-item>{children}</div>
+}
+
+/** 转发页的分组：在 [`SettingsGroup`] 外面挂上筛选需要的标记。 */
+function ForwardingGroup({
+  title,
+  ...props
+}: {
+  icon?: LucideIcon
+  title: string
+  description?: string
+  children: ReactNode
+}) {
+  const { query } = useContext(ForwardingFilterContext)
+  const matched = query.trim() !== '' && matchesQuery(query, [title])
+  return (
+    <div data-forwarding-group>
+      <GroupMatchContext.Provider value={matched}>
+        <SettingsGroup title={title} {...props} />
+      </GroupMatchContext.Provider>
+    </div>
+  )
+}
+
+/**
+ * 页首工具条：搜索、只看已改动、全部恢复默认。
+ *
+ * 这些开关多是排查上游兼容性时临时拨的，拨完容易忘了拨回；「只看已改动」把它们一次列出来，
+ * 「全部恢复默认」一次拨回出厂值。计数与列表同一口径：开关加页内的数值参数（重试账号数、
+ * 暂停阈值），当前模式下隐藏的开关不算；恢复在此之外再带上拨回后会重新显示的隐藏项，
+ * 见 [`resetForwardingKeys`]。
+ */
+function ForwardingToolbar({
+  query,
+  onQueryChange,
+  changedOnly,
+  onChangedOnlyChange,
+}: {
+  query: string
+  onQueryChange: (query: string) => void
+  changedOnly: boolean
+  onChangedOnlyChange: (changedOnly: boolean) => void
+}) {
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
+  const qc = useQueryClient()
+  const [confirmReset, setConfirmReset] = useState(false)
+  const changedToggles = changedForwardingKeys(data)
+  const changedNumeric = changedNumericKeys(data)
+  const changedCount = changedToggles.length + changedNumeric.length
+  // 恢复的范围比计数多出来的，是拨回后会重新显示的隐藏项；仍隐藏的改动项不动。
+  const resetToggles = resetForwardingKeys(data)
+  const resetCount = resetToggles.length + changedNumeric.length
+  const revealedCount = resetToggles.length - changedToggles.length
+  const untouchedCount =
+    (data?.forwarding_defaults
+      ? (Object.keys(data.forwarding_defaults) as ForwardingKey[]).filter((k) => isChanged(data, k)).length
+      : 0) - resetToggles.length
+
+  const reset = useSettingsSave(
+    async ({ toggles, numeric }: { toggles: ForwardingKey[]; numeric: NumericSettingKey[] }) => {
+      const d = data!
+      let settings: Settings | undefined
+      try {
+        if (toggles.length > 0) {
+          settings = await setForwardingMany(
+            Object.fromEntries(toggles.map((k) => [k, d.forwarding_defaults[k]])),
+          )
+        }
+        if (numeric.includes('rate_limit_retry_max')) {
+          settings = await setRateLimitRetryMax(d.rate_limit_retry_max_default)
+        }
+        if (numeric.includes('quota_pause_pct')) {
+          settings = await setQuotaPausePct(d.quota_pause_pct_default, d.quota_pause_pct_7d_default)
+        }
+      } catch (error) {
+        // 三个接口依次调，前面的可能已经写进去了：重新拉一次，页面别停在旧值上。
+        if (settings) qc.setQueryData(['settings'], settings)
+        void qc.invalidateQueries({ queryKey: ['settings'] })
+        throw error
+      }
+      return settings!
+    },
+    {
+      invalidateCredentials: true,
+      onSuccess: () => setConfirmReset(false),
+      success: (_settings, { toggles, numeric }) => {
+        const n = toggles.length + numeric.length
+        return {
+          title: t('已恢复默认', 'Defaults restored'),
+          description: t(
+            `${n} 项设置已恢复为出厂默认值。`,
+            `${n} ${n === 1 ? 'setting was' : 'settings were'} restored to the default.`,
+          ),
+        }
+      },
+    },
+  )
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <ToolbarSearch
+        ariaLabel={t('搜索转发策略', 'Search forwarding policy')}
+        className="min-w-0 basis-full sm:max-w-80 sm:flex-1 sm:basis-auto"
+        placeholder={t('搜索名称、说明或键名', 'Search name, summary or key')}
+        value={query}
+        onChange={onQueryChange}
+      />
+      <Toggle
+        variant="outline"
+        className={cn(changedOnly && ACTIVE_FILTER_CLASS)}
+        pressed={changedOnly}
+        onPressedChange={onChangedOnlyChange}
+      >
+        <FilterIcon />
+        {t('只看已改动', 'Modified only')}
+        <span className="tabular-nums text-muted-foreground">{changedCount}</span>
+      </Toggle>
+      {changedCount > 0 && (
+        <Button variant="ghost" className="text-muted-foreground" onClick={() => setConfirmReset(true)}>
+          <RotateCcwIcon />
+          {t('全部恢复默认', 'Restore all defaults')}
+        </Button>
+      )}
+      {/* 原来是页首一整条 Alert，一句话占一张卡；收成工具条上的提示图标，悬停看。 */}
+      <InfoHint label={t('必要请求头不受影响', 'Required headers are unaffected')}>
+        {t(
+          '必要请求头不受影响：下列开关都不影响 Authorization 的注入。',
+          'Required headers are unaffected: none of these switches affect Authorization injection.',
+        )}
+      </InfoHint>
+
+      <AlertDialog open={confirmReset} onOpenChange={setConfirmReset}>
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('全部恢复默认', 'Restore all defaults')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                `将把 ${resetCount} 项改动过的设置（含重试账号数、暂停阈值等数值参数）恢复为出厂默认值，立即对之后的请求生效。`,
+                `${resetCount} modified ${resetCount === 1 ? 'setting' : 'settings'} (including numeric ones such as retry accounts and pause thresholds) will return to the default, taking effect for subsequent requests.`,
+              )}
+              {revealedCount > 0 && t(
+                `改写模式随之回到「完整对齐」，其中 ${revealedCount} 项是此前隐藏、届时重新生效的开关，一并恢复。`,
+                ` The rewrite mode returns to Full alignment, so this includes ${revealedCount} previously hidden ${revealedCount === 1 ? 'switch' : 'switches'} that take effect again.`,
+              )}
+              {untouchedCount > 0 && t(
+                `另有 ${untouchedCount} 项在当前模式下隐藏的开关保持不变。`,
+                ` ${untouchedCount} hidden ${untouchedCount === 1 ? 'switch stays' : 'switches stay'} as is.`,
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>{t('取消', 'Cancel')}</AlertDialogClose>
+            <Button
+              loading={reset.isPending}
+              onClick={() => reset.mutate({ toggles: resetToggles, numeric: changedNumeric })}
+            >
+              {t('恢复默认', 'Restore defaults')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </div>
+  )
+}
+
+/**
+ * 改写模式：完整对齐，或只保证一条 billing 标识。
+ *
+ * 存的仍是 `sim_billing_only` 这一个开关，判据也与后端 `ForwardFlags::billing_only` 一致（还要
+ * 「模拟 Claude Code」与「Beta 标记」开着）。之所以从「非官方客户端模拟」组里提到页首：它对
+ * **所有**来访生效、一开就让十几项形态开关失效，是决定整页怎么读的总开关，不是模拟的一个子项。
+ * 两项 `user_id` 子开关只在这一档生效，随模式收进这张卡，完整对齐时不显示。
+ */
+function RewriteModeGroup({
+  simulateRequires,
+  userIdToggles,
+  description,
+}: {
+  simulateRequires: ForwardingRequire[]
+  userIdToggles: ReactNode
+  description: ReactNode
+}) {
+  const { t } = useI18n()
+  const { data } = useSettingsQuery()
+  const blockedBy = simulateRequires.find((r) => data?.[r.key] === false)
+  const effective = billingOnlyActive(data)
+  const [impactOpen, setImpactOpen] = useState(false)
+  const fullLabel = t('完整对齐', 'Full alignment')
+  const billingLabel = t('仅 billing 标识', 'Billing identifier only')
+
+  const save = useSettingsSave((next: boolean) => setForwarding('sim_billing_only', next), {
+    invalidateCredentials: true,
+    success: (settings) => ({
+      title: t(
+        `改写模式已切换为「${settings.sim_billing_only ? billingLabel : fullLabel}」`,
+        `Rewrite mode switched to “${settings.sim_billing_only ? billingLabel : fullLabel}”`,
+      ),
+    }),
+  })
+
+  return (
+    <ForwardingGroup
+      icon={LayersIcon}
+      title={t('改写模式', 'Rewrite mode')}
+      description={t(
+        '决定转发时改写请求的幅度，对所有客户端生效。',
+        'How far requests are rewritten on the way upstream; applies to every client.',
+      )}
+    >
+      <ForwardingFilterItem
+        texts={[fullLabel, billingLabel, 'billing', 'sim_billing_only']}
+        changed={isChanged(data, 'sim_billing_only')}
+      >
+        <div className="space-y-3 p-4 sm:p-5">
+          <RadioGroup
+            aria-label={t('改写模式', 'Rewrite mode')}
+            className="grid gap-3 sm:grid-cols-2"
+            disabled={blockedBy != null || save.isPending}
+            value={effective ? 'billing' : 'full'}
+            onValueChange={(value) => save.mutate(value === 'billing')}
+          >
+            <ModeOption
+              value="full"
+              title={fullLabel}
+              badge={<Badge variant="secondary" size="sm">{t('默认', 'Default')}</Badge>}
+              description={t(
+                '按官方客户端形态对齐每条请求，第三方客户端按 Claude Code 完整模拟。',
+                'Align every request with the official client; third-party clients are fully emulated as Claude Code.',
+              )}
+            />
+            <ModeOption
+              value="billing"
+              title={billingLabel}
+              badge={
+                <>
+                  <Badge variant="warning" size="sm">{t('实验', 'Experimental')}</Badge>
+                  {/* 按存储值标：选了本模式但前置开关关着、没生效时也标，与计数口径一致。 */}
+                  {isChanged(data, 'sim_billing_only') && <ChangedBadge />}
+                </>
+              }
+              description={t(
+                '只补一条合法的 billing 标识，其余原样透传，保留客户端自己的提示词。',
+                'Only add a valid billing identifier and pass the rest through, keeping the client’s own prompt.',
+              )}
+            />
+          </RadioGroup>
+          <p className="text-xs leading-5 text-muted-foreground">
+            {blockedBy
+              ? data?.sim_billing_only
+                ? t(
+                    `已选「${billingLabel}」，但「${blockedBy.label}」停用期间不生效，目前按「${fullLabel}」转发。`,
+                    `“${billingLabel}” is selected but has no effect while “${blockedBy.label}” is disabled; requests are forwarded with “${fullLabel}” for now.`,
+                  )
+                : t(
+                    `需先启用「${blockedBy.label}」才能切换到「${billingLabel}」。`,
+                    `Enable “${blockedBy.label}” first to switch to “${billingLabel}”.`,
+                  )
+              : effective
+                ? t(
+                    '本模式下不生效的形态开关已隐藏，存储值保留，切回「完整对齐」后恢复。',
+                    'Switches with no effect in this mode are hidden; saved values are kept and return after switching back to “Full alignment”.',
+                  )
+                : null}{' '}
+            <DetailsTrigger label={t('影响与限制', 'Impact & limitations')} open={impactOpen} onToggle={() => setImpactOpen((v) => !v)} />
+          </p>
+          {impactOpen && <DetailsBody>{description}</DetailsBody>}
+        </div>
+      </ForwardingFilterItem>
+      {effective && userIdToggles}
+    </ForwardingGroup>
+  )
+}
+
+function ModeOption({
+  value,
+  title,
+  badge,
+  description,
+}: {
+  value: string
+  title: string
+  badge?: ReactNode
+  description: string
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors hover:bg-accent/40 has-data-checked:border-primary/48 has-data-checked:bg-accent/40 has-data-disabled:cursor-not-allowed has-data-disabled:opacity-64 has-data-disabled:hover:bg-transparent">
+      <Radio value={value} className="mt-0.5" />
+      <span className="min-w-0 space-y-1">
+        <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+          {title}
+          {badge}
+        </span>
+        <span className="block text-xs leading-5 text-muted-foreground">{description}</span>
+      </span>
+    </label>
+  )
+}
+
+/**
+ * 改写模式「仅 billing 标识」实际生效时后端整个跳过的开关（按 `billing_only` 门控）：此时不显示，
+ * 存储值不动，切回「完整对齐」后原样回来；一组全被跳过时整组随之收起（`data-forwarding-*`）。
+ * 「只看已改动」的计数同样不算它们；「全部恢复默认」只在会把模式拨回「完整对齐」时一并拨回
+ * （届时它们重新生效），见 [`resetForwardingKeys`]。
+ */
+const BILLING_ONLY_SKIPPED: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>([
+  'fill_metadata',
+  'strip_extra_fields',
+  'tool_name_mimic',
+  'eager_tool_streaming',
+  'system_shape',
+  'cache_scope_global',
+  'cache_ttl_1h',
+  'inject_thinking',
+  'simulate_full_system',
+  'fill_absent_tools',
+  'sim_trim_tools',
+  'sim_message_threads',
+  'fable_refusal_fallback',
+  'opus_refusal_fallback',
+])
+
+function billingOnlyHides(data: Settings | undefined, k: ForwardingKey) {
+  return BILLING_ONLY_SKIPPED.has(k) && billingOnlyActive(data)
+}
+
+/** 只在「仅 billing 标识」实际生效时才显示的开关（改写模式卡里的两项 `user_id` 子开关）。 */
+const BILLING_ONLY_EXCLUSIVE: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>([
+  'sim_billing_keep_user_id',
+  'real_billing_keep_user_id',
+])
+
+/** 当前改写模式下页面不显示这一项：「已改动」计数与「全部恢复默认」都跳过它。 */
+function hiddenInCurrentMode(data: Settings | undefined, k: ForwardingKey) {
+  return billingOnlyActive(data) ? BILLING_ONLY_SKIPPED.has(k) : BILLING_ONLY_EXCLUSIVE.has(k)
+}
+
 /** 开关的一项前置条件：它关着时本项不生效。 */
 type ForwardingRequire = { key: ForwardingKey; label: string }
 
 /**
- * 「仅注入 billing 标识」是否实际生效：开关本身开着，且模拟与 Beta 标记都开着——与后端
+ * 改写模式「仅 billing 标识」是否实际生效：开关本身开着，且模拟与 Beta 标记都开着——与后端
  * `ForwardFlags::billing_only` 同一判据（缺省值按后端默认：billing-only 停用、其余启用）。
  */
 function billingOnlyActive(data: Partial<Record<ForwardingKey, boolean>> | undefined) {
@@ -1268,7 +1714,6 @@ function ForwardingToggle({
   requires,
   requiresAny,
   inactiveWhileOn,
-  skippedByBillingOnly,
 }: {
   k: ForwardingKey
   label: string
@@ -1288,11 +1733,6 @@ function ForwardingToggle({
    * 几个前置开关**任一**开着才生效（后端同样这么判）：全关时置灰并说明，存储值不动。
    */
   requiresAny?: ForwardingRequire[]
-  /**
-   * 「仅注入 billing 标识」实际生效时本项被整个跳过（后端按 `billing_only` 门控）：同样置灰并
-   * 说明原因，存储值不动。给字符串表示此时改由那一项决定，提示里指向它。
-   */
-  skippedByBillingOnly?: true | string
 }) {
   const { t } = useI18n()
   const id = useId()
@@ -1310,9 +1750,10 @@ function ForwardingToggle({
   const blocked = blockedBy != null || blockedByAny != null
   // 缺省值按后端默认：反向依赖的那几项（如拒绝探针请求）默认启用。
   const overridden = !blocked && inactiveWhileOn != null && data?.[inactiveWhileOn.key] !== false
-  const suspended =
-    !blocked && !overridden && skippedByBillingOnly != null && billingOnlyActive(data)
-  const inactive = blocked || overridden || suspended
+  // 「仅 billing 标识」生效时这一项后端整个跳过：拨了也没用，直接不显示（见下面的 return null）。
+  const skipped = billingOnlyHides(data, k)
+  const inactive = blocked || overridden
+  const changed = isChanged(data, k)
 
   const save = useSettingsSave((next: boolean) => setForwarding(k, next), {
     invalidateCredentials: true,
@@ -1324,56 +1765,37 @@ function ForwardingToggle({
     }),
   })
 
+  if (skipped) return null
+
   return (
+    <ForwardingFilterItem texts={[label, summary, k]} changed={changed}>
     <SettingsRow
       disabled={inactive}
       inlineControl
       htmlFor={id}
       label={label}
+      badge={changed && <ChangedBadge />}
       description={
-        blockedBy
-          ? t(`需先启用「${blockedBy.label}」`, `Enable “${blockedBy.label}” first`)
-          : blockedByAny
-            ? t(
-                `需先启用${blockedByAny.map((r) => `「${r.label}」`).join('或')}`,
-                `Enable ${blockedByAny.map((r) => `“${r.label}”`).join(' or ')} first`,
-              )
-          : overridden
-            ? t(
-                `「${inactiveWhileOn.label}」启用期间不生效`,
-                `Inactive while “${inactiveWhileOn.label}” is enabled`,
-              )
-          : suspended
-            ? typeof skippedByBillingOnly === 'string'
+          blockedBy
+            ? t(`需先启用「${blockedBy.label}」`, `Enable “${blockedBy.label}” first`)
+            : blockedByAny
               ? t(
-                  `「仅注入 billing 标识」启用期间不生效，改由「${skippedByBillingOnly}」决定`,
-                  `Inactive while “Inject billing identifier only” is enabled; “${skippedByBillingOnly}” decides instead`,
+                  `需先启用${blockedByAny.map((r) => `「${r.label}」`).join('或')}`,
+                  `Enable ${blockedByAny.map((r) => `“${r.label}”`).join(' or ')} first`,
                 )
-              : t(
-                  '「仅注入 billing 标识」启用期间不生效',
-                  'Inactive while “Inject billing identifier only” is enabled',
+            : overridden
+              ? t(
+                  `「${inactiveWhileOn.label}」启用期间不生效`,
+                  `Inactive while “${inactiveWhileOn.label}” is enabled`,
                 )
-          : description
-            // 这一行底下已经挂了「影响与限制」，摘要就不再自带第二个展开器：同一个标签下面
-            // 一枚文字按钮「了解更多」加一个 details「影响与限制」是两套交互、两种长相。
-            // 全部 38 条摘要里只有一条超过收起阈值，多出的那一两行铺开就是了。
-            ? summary
-            : <ClampedDescription text={summary} />
+            : description
+              // 挂着「影响与限制」的行，摘要不再自带第二个展开器（「了解更多」）：同一行两套
+              // 展开交互。全部摘要里只有一条超过收起阈值，多出的一两行铺开就是了。
+              ? summary
+              : <ClampedDescription text={summary} />
       }
-      footer={description && (
-        <details className="group text-xs text-muted-foreground">
-          <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 rounded-sm font-medium transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
-            {t('影响与限制', 'Impact & limitations')}
-            <ChevronDownIcon
-              aria-hidden="true"
-              className="size-3 transition-transform group-open:rotate-180"
-            />
-          </summary>
-          <div className="mt-2 max-w-xl border-l-2 border-border pl-3 leading-5 [&_code]:rounded-sm [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-foreground">
-            {description}
-          </div>
-        </details>
-      )}
+      details={description}
+      detailsLabel={t('影响与限制', 'Impact & limitations')}
     >
       <Switch
         id={id}
@@ -1382,6 +1804,7 @@ function ForwardingToggle({
         onCheckedChange={(next) => save.mutate(next)}
       />
     </SettingsRow>
+    </ForwardingFilterItem>
   )
 }
 
@@ -1873,9 +2296,11 @@ function LearnedRejections() {
     <SettingsGroup
       icon={BrainIcon}
       title={t('从上游学到的规则', 'Rules learned from upstream')}
+      // 紧凑表头的说明进 ⓘ 浮层，原来那段六百字放不下；各类规则的细节在「本地拦截」里对应开关的
+      // 「影响与限制」中都有，这里只留一句「这是什么、怎么处理」。
       description={t(
-        '上游明确拒绝过的组合会被记录下来：某模型不接受的取值（400，目前识别 effort 档位、messages 里的 role、tools 里的工具类型、被废弃的采样参数、末尾的 assistant prefill 五种；后两种只对 /v1/messages 生效），下次在本地直接拒绝；luban 替客户端补的 fallbacks 被某模型以 400 拒绝的，此后不再为该模型补充；某模型对「无 tools 的单条消息 + 某个 max_tokens」返回过 200 却零输出的，同类请求下次在本地直接拒绝；某模型的分类器拒答过（stop_reason refusal 且 stop_details 带 category，如 cyber）的提示词，逐字相同地重发时在本地直接拒绝，只拦截那一条内容，同形态的其他请求不受影响。模型自己拒答的（无 category）或 fallback 没有执行成功的（带 recommended_model）不学习。命中拒答规则时本地回放上游那次的拒答（200 加同一段 stop_reason refusal），命中零输出规则时本地返回 403，两类分别受「拒绝已拒答的提示词」与「拒绝零输出请求类」开关控制；出站带 fallbacks 的请求不拦截。拒答规则的文案为「[类别] + 上游 stop_details 原文」，零输出规则的文案则为上游回复的开头。规则存入数据库、重启后保留，7 天后自动丢弃并重新验证。拒答规则不设数量上限，按「模型 + 类别」分组折叠，展开后可分页查看每条，也可整组删除；顶部可按模型 / 哈希 / 原文搜索，筛选到某一类时可只清空那一类。若上游已解除限制而本地仍在拦截，可在此删除对应规则。',
-        'Combinations upstream has called out are remembered: a value a model refuses (400; currently the effort level, a role in messages, a tool type in tools, a deprecated sampling parameter, and a trailing assistant prefill — the last two apply to /v1/messages only) is rejected locally next time; fallbacks that luban added for the client and a model rejected with 400 are no longer added for that model; a tool-less single-message request class (model + max_tokens) that upstream answered with 200 and zero output tokens is rejected locally next time; a prompt the upstream classifier refused (stop_reason refusal with a stop_details category such as cyber) is rejected locally when resent verbatim, and only that one prompt, never other requests of the same shape. Refusals the model made on its own (no category) and refusals whose fallback could not run (recommended_model present) are not learned. A refused-prompt hit replays the original upstream refusal locally (200 with the same stop_reason refusal body), while an empty-reply hit answers 403; the two are governed by “Reject refused prompts” and “Reject empty-reply request classes” respectively; requests going out with fallbacks are not blocked. Refusal rules keep “[category] ” plus the upstream stop_details verbatim as their text; only empty-reply rules keep the start of the upstream reply. Rules persist across restarts and expire after 7 days. Refused prompts are unbounded and folded into one group per model and category; expand a group to page through its prompts or remove the whole group, search by model / hash / text at the top, and with a kind filter active you can clear just that kind. If upstream has since allowed something, remove the rule here.',
+        '上游明确拒绝过的组合（400 形态错误、零输出请求类、分类器拒答的提示词、被拒的 fallbacks）会记在这里，下次在本地直接处理，不再发往上游。规则 7 天后自动过期；上游放开后仍在拦截的，可在此删除。',
+        'Combinations upstream has explicitly rejected (400 shape errors, empty-reply request classes, classifier-refused prompts, rejected fallbacks) are recorded here and handled locally next time instead of going upstream. Rules expire after 7 days; delete one here if upstream has since allowed it.',
       )}
     >
       {query.isPending ? (
@@ -1930,6 +2355,7 @@ function LearnedRejections() {
               <ToolbarSearch
                 ariaLabel={t('搜索规则', 'Search rules')}
                 className="w-52"
+                hotkey={false}
                 placeholder={t('模型 / 哈希 / 原文', 'Model / hash / text')}
                 size="sm"
                 value={search}

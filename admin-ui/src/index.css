@@ -496,3 +496,13 @@
     background-color: color-mix(in srgb, var(--muted-foreground) 58%, transparent);
   }
 }
+
+/* 转发策略页的筛选（forwarding-settings.tsx）：一组里一项都没剩就整组收起；整页还剩东西时
+   空状态不显示。故意写在所有 @layer 之外——分组与空状态自带 flex 之类的工具类，层内规则压不过它们。 */
+[data-forwarding-group]:not(:has([data-forwarding-item])) {
+  display: none;
+}
+
+[data-forwarding-list]:has([data-forwarding-item]) > [data-forwarding-empty] {
+  display: none;
+}
