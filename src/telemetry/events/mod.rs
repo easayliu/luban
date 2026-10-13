@@ -349,6 +349,7 @@ impl<'a> EventEnv<'a> {
             sdk: self.shape.sdk,
             tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
+            lucky_cerf: f.lucky_cerf.clone(),
         }
     }
 }

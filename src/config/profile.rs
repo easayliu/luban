@@ -105,11 +105,12 @@ pub struct CcProfile {
     /// 出站头 `x-claude-code-request-class` 的取值。2.1.277 起官方每条 `/v1/messages` 都带
     /// （`cap/2.1.277`）：主线程与「猜下一句」是 `main`，SDK 子代理是 `subagent`，标题生成与
     /// 额度探测是 `auxiliary`（无工具 helper 与安全分类没有 2.1.277 样本，按用途归入后两者）。
-    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.293）。
+    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.296）。
     pub request_class: &'static str,
     /// 顶层 `output_config.effort` 的取值：2.1.277 起 opus / fable / sonnet 主线程恒带
     /// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`），2.1.280 的 opus 变成
     /// `medium`（`cap/2.1.280/00021`），haiku 主线程与全部辅助请求不带。`None` 即不补，见 [`crate::proxy::ensure_output_config`]。
+    /// 模拟路径实际发的档按模型取官方默认（[`cc_outbound_effort`]），这里的值只管「带不带」与老一代的档。
     pub effort: Option<&'static str>,
 }
 
@@ -332,6 +333,85 @@ pub fn cc_haiku_is_5_5_family(model: &str) -> bool {
     cc_model_family_version(model).is_none_or(|(_, v)| v >= (5, 5))
 }
 
+/// 模型的官方默认 effort：opus-5-5、sonnet-5-5 与 haiku-5-5 是 `medium`，opus-4-7 是 `xhigh`，其余带
+/// effort 的都是 `high`。出处：可执行文件模型表的 `default_effort`（2.1.296：没写的按 `high` 算），
+/// 抓包里 `tengu_api_success.default_effort_level`（`cap/2.1.285` 11 个模型、`cap/auto-2.1.293-20261008-full`
+/// 的 haiku-5-5），以及 `cap/auto-2.1.296-20261013-full` 主线程实际发出的值（opus / sonnet / haiku-5-5
+/// medium、fable-5-1 high）。
+pub fn cc_default_effort(model: &str) -> &'static str {
+    if model.starts_with("claude-opus-5-5")
+        || model.starts_with("claude-sonnet-5-5")
+        || model.starts_with("claude-haiku-5-5")
+    {
+        "medium"
+    } else if model.starts_with("claude-opus-4-7") {
+        "xhigh"
+    } else {
+        "high"
+    }
+}
+
+/// 模拟路径给这个模型发的 `output_config.effort`：profile 不带 effort 的（haiku-4.5、辅助请求）不发；
+/// 带的按模型取官方默认档（[`cc_default_effort`]）——opus-5-5 / sonnet-5-5 / haiku-5-5 发 `medium`。
+/// opus-4-7 例外仍发 `high`：它的默认档虽是 `xhigh`，`cap/2.1.285/00077` 实际发出的是 `high`。
+pub fn cc_outbound_effort(profile: &CcProfile, model: &str) -> Option<&'static str> {
+    let effort = profile.effort?;
+    Some(if cc_default_effort(model) == "medium" { "medium" } else { effort })
+}
+
+/// 服务端开关 `tengu_lucky_cerf` 下发的模型清单（`cap/auto-2.1.296-20261013-full/00007` 的 eval 响应：
+/// `claude-opus-5`、`claude-fable-5`、`claude-fable-5-1`、`claude-mythos-5`、`claude-mythos-5-1`、
+/// `claude-sonnet-5-5`、`claude-haiku-5-5`），按（族, 版本）记；mythos 不在 luban 认得的四族里，略去。
+/// 清单里的模型，`Agent` 工具的「何时用」那段换成另一套更长的说明（[`cc_agent_uses_cerf_text`]）。
+/// 这是按 `accountUUID` 分组的实验，抓包那个号在第 1 组；这份只给还没见过 eval 的号兜底，见过的按
+/// 它自己那份（[`cc_agent_uses_cerf_text_in`]，`crate::proxy::lucky_cerf`）。
+const CC_LUCKY_CERF_MODELS: &[(&str, (u32, u32))] = &[
+    ("opus", (5, 0)),
+    ("fable", (5, 0)),
+    ("fable", (5, 1)),
+    ("sonnet", (5, 5)),
+    ("haiku", (5, 5)),
+];
+
+/// 这个模型的 `Agent` 工具说明用不用 `tengu_lucky_cerf` 那一版（可执行文件 2.1.294 起就有这段文字，
+/// 按模型开关）。客户端的判据是规范化后的模型 id 与清单里某一项相等（忽略大小写与 `[1m]` 后缀、日期
+/// 段），这里按（族, 版本）比，效果相同。2.1.296 抓包里 sonnet-5-5（`00258`）、haiku-5-5（`00344`）、
+/// fable-5-1（`00541`）是这一版，opus-5-5（`00418`）不是；2.1.293 那次三族都还是老的那版，可见清单是
+/// 后来下发的。读不出版本的模型一律不算。
+pub fn cc_agent_uses_cerf_text(model: &str) -> bool {
+    cc_model_lean_prompt(model)
+        && cc_model_family_version(model).is_some_and(|fv| CC_LUCKY_CERF_MODELS.contains(&fv))
+}
+
+/// 同 [`cc_agent_uses_cerf_text`]，清单换成这个号 eval 里下发的那份（`tengu_lucky_cerf` 是按
+/// `accountUUID` 分组的实验，第 0 组是空清单）。逐项比：两边都认得出（族, 版本）就比这个，
+/// 认不出的（mythos 之类）按去掉 `[1m]` 后不分大小写的全名比——客户端 `EH()` 的口径。
+pub fn cc_agent_uses_cerf_text_in(model: &str, list: &[String]) -> bool {
+    if !cc_model_lean_prompt(model) {
+        return false;
+    }
+    let bare = |m: &str| m.to_ascii_lowercase().replace("[1m]", "");
+    let fv = cc_model_family_version(model);
+    list.iter().any(|item| match (fv, cc_model_family_version(item)) {
+        (Some(a), Some(b)) => a == b,
+        _ => bare(model) == bare(item),
+    })
+}
+
+/// 这个模型走不走客户端的精简提示词（模型表 capability `lean_prompt`）。2.1.296 客户端只在精简
+/// 提示词的模型上才去读 `tengu_lucky_cerf`（拼 `Agent` 说明那步 `ut = leanPrompt && …`），所以它
+/// 既决定换不换 `Agent` 说明，也决定会话里有没有那条实验曝光。模型表里带 `lean_prompt` 的：
+/// haiku-5-5、sonnet-5-5、opus-4-8 / 5 / 5-5、fable-5 / 5-1；客户端 `de()` 把 claude-3、haiku-4.5、
+/// sonnet-4.x / 5、opus-4-7 及更老明列为完整提示词。读不出族或版本的按不走算（少一条曝光比多一条稳）。
+pub fn cc_model_lean_prompt(model: &str) -> bool {
+    match cc_model_family_version(model) {
+        Some(("haiku", v)) | Some(("sonnet", v)) => v >= (5, 5),
+        Some(("opus", v)) => v >= (4, 8),
+        Some(("fable", _)) => true,
+        _ => false,
+    }
+}
+
 /// 模拟路径给这个模型发的 beta 串：`profile.beta` 按 [`cc_model_tier`] 去掉那一代不发的项。
 /// 只动主线程三族（opus / fable / sonnet）与 haiku 的 `/model` 预热；haiku、额度探测等其余 profile
 /// 原样返回——代际的证据只有这三族的主线程。
@@ -365,15 +445,16 @@ pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'stat
     )
 }
 
-/// 按 kind 取**当前模拟版本**（2.1.293，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
-/// 落回 [`CC_PROFILES_2_1_291`]、[`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
+/// 按 kind 取**当前模拟版本**（2.1.296，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
+/// 落回 [`CC_PROFILES_2_1_293`]、[`CC_PROFILES_2_1_291`]、[`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
 /// [`CC_PROFILES_2_1_260`]（安全分类）。表是常量，三张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus`
 /// 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
 ///
-/// 模拟路径只发主线程五行（四族，haiku 分 4.5 与 5.5），2.1.293 表里都有；落回旧表的 kind 只用作认来访形态的参照。
+/// 模拟路径只发主线程五行（四族，haiku 分 4.5 与 5.5），2.1.296 表里都有；落回旧表的 kind 只用作认来访形态的参照。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
     CC_PROFILES
         .iter()
+        .chain(CC_PROFILES_2_1_293)
         .chain(CC_PROFILES_2_1_291)
         .chain(CC_PROFILES_2_1_285)
         .chain(CC_PROFILES_2_1_280)
@@ -398,8 +479,8 @@ pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static C
         .find(|p| p.kind == kind && p.version == version)
 }
 
-/// 八张 profile 表，按版本从旧到新。
-pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 8] {
+/// 九张 profile 表，按版本从旧到新。
+pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 9] {
     [
         CC_PROFILES_2_1_258,
         CC_PROFILES_2_1_260,
@@ -408,6 +489,7 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 8] {
         CC_PROFILES_2_1_280,
         CC_PROFILES_2_1_285,
         CC_PROFILES_2_1_291,
+        CC_PROFILES_2_1_293,
         CC_PROFILES,
     ]
 }
@@ -417,7 +499,8 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 8] {
 /// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。分档：
 /// - 低于 2.1.260 取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的
 ///   客户端还不是 2.1.260，猜新的一版等于给它们集体换一套形态；
-/// - 2.1.293 及以上查 [`CC_PROFILES`]，没行的 kind（SDK 子代理）依次再查 2.1.291、2.1.285、2.1.280、2.1.277 表；
+/// - 2.1.296 及以上查 [`CC_PROFILES`]，没行的 kind（SDK 子代理）依次再查 2.1.293、2.1.291、2.1.285、2.1.280、2.1.277 表；
+/// - 2.1.293 ~ 2.1.295 查 [`CC_PROFILES_2_1_293`]，同样依次落回；
 /// - 2.1.291 ~ 2.1.292 查 [`CC_PROFILES_2_1_291`]，没行的 kind 依次再查 2.1.285、2.1.280、2.1.277 表；
 /// - 2.1.285 ~ 2.1.290 查 [`CC_PROFILES_2_1_285`]，没行的 kind 依次再查 2.1.280、2.1.277 表；
 /// - 2.1.280 ~ 2.1.284 查 [`CC_PROFILES_2_1_280`]，没行的 kind（子代理、标题）再查 2.1.277 表；
@@ -442,7 +525,14 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
     // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
     let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 293) => find(CC_PROFILES)
+        Some(v) if v >= (2, 1, 296) => find(CC_PROFILES)
+            .or_else(|| find(CC_PROFILES_2_1_293))
+            .or_else(|| find(CC_PROFILES_2_1_291))
+            .or_else(|| find(CC_PROFILES_2_1_285))
+            .or_else(|| find(CC_PROFILES_2_1_280))
+            .or_else(|| find(CC_PROFILES_2_1_277))
+            .unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 293) => find(CC_PROFILES_2_1_293)
             .or_else(|| find(CC_PROFILES_2_1_291))
             .or_else(|| find(CC_PROFILES_2_1_285))
             .or_else(|| find(CC_PROFILES_2_1_280))

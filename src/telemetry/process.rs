@@ -290,10 +290,19 @@ impl Telemetry {
         // 2.1.293：标题生成换成 haiku-5-5，它头一次用也报 `sleepy_snowflake_applied`；haiku-5-5 的
         // 会话多一条 `heron_brook_applied`（`cap/auto-2.1.293-20261008-full`）。
         let v293 = version_at_least(&version, "2.1.293");
+        // 2.1.296：权限弹框上被拒的工具，拒绝那条多两个时长键（`cap/auto-2.1.296-20261013-full`）。
+        let v296 = version_at_least(&version, "2.1.296");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
         let first_prompt_tpl = new_prompt && !injected && !sess.first_prompt_tpl_done;
+        // 2.1.296 模板才有那条曝光；分组取这个会话钉住的那份，与模拟出站的 `Agent` 说明同源。
+        let lucky_cerf = (v296 && new_prompt && !sess.lucky_cerf_exposed)
+            .then(|| crate::proxy::lucky_cerf_exposure(call.cred_id, &session_id, &shape.model))
+            .flatten();
+        if lucky_cerf.is_some() {
+            sess.lucky_cerf_exposed = true;
+        }
         if first_prompt_tpl {
             sess.first_prompt_tpl_done = true;
         }
@@ -459,6 +468,8 @@ impl Telemetry {
             v285,
             v291,
             v293,
+            v296,
+            lucky_cerf,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
             anchor_tool_call: if is_main {

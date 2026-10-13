@@ -183,10 +183,10 @@ pub(in crate::proxy) fn ensure_context_management(v: &mut serde_json::Value) -> 
     true
 }
 
-/// 模拟路径下按 profile 补顶层 `output_config`：2.1.277 起 opus / fable / sonnet 主线程每条都是
-/// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带；opus-5-5 与
-/// sonnet-5-5 的官方默认是 `medium`，`cap/2.1.280/00021`、`cap/2.1.285/00045`，模拟路径照旧按
-/// `high` 发），haiku
+/// 模拟路径下按 profile 补顶层 `output_config`：2.1.277 起 opus / fable / sonnet 主线程每条都带
+/// `{"effort": …}`（`cap/2.1.277/00023`、`00031`、`00357`，首轮与工具续轮都带），取值是模型的官方默认档
+/// （[`config::cc_outbound_effort`]：opus-5-5 / sonnet-5-5 / haiku-5-5 是 `medium`，`cap/auto-2.1.296-
+/// 20261013-full/00418`、`00258`、`00344`；fable 与老一代是 `high`）；haiku-4.5
 /// 主线程与全部辅助请求不带（[`config::CcProfile::effort`] 为 `None`，这里什么都不做）。
 ///
 /// 客户端自己带了 `output_config`（不论写的是 `effort` 还是 `format`）就不动——那是它自己的
@@ -199,7 +199,8 @@ pub(in crate::proxy) fn ensure_output_config(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,
 ) -> bool {
-    let Some(effort) = profile.effort else { return false };
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    let Some(effort) = config::cc_outbound_effort(profile, model) else { return false };
     let Some(obj) = v.as_object() else { return false };
     if obj.contains_key("output_config") {
         return false;

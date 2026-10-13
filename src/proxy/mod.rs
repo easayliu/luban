@@ -79,6 +79,8 @@ use rate_limit::{
     rate_limit_scope, rate_limit_scope_for,
 };
 pub(crate) use usage_grace::note_eval_features;
+mod lucky_cerf;
+pub(crate) use lucky_cerf::{LUCKY_CERF_FEATURE, exposure as lucky_cerf_exposure};
 use usage_grace::{note_overage, usage_limit_wanted};
 
 mod body;
@@ -87,10 +89,10 @@ use body::ua_of;
 use body::{
     CacheShape, CcClient, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
-    cc_tools_core, cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint,
-    ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id, extract_session_id,
-    is_billable_messages, is_fallback_rejection, known_latest_release, misplaced_system_role,
-    outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
+    cc_tools_core, cc_tools_core_for, cc_ua_entrypoint, client_supplied_fallbacks,
+    device_fingerprint, ensure_beta_query, ensure_billing_cch, ensure_fallbacks, extract_device_id,
+    extract_session_id, is_billable_messages, is_fallback_rejection, known_latest_release,
+    misplaced_system_role, outbound_carries_fallbacks, outbound_identity, refusal_fallbacks_for,
     remember_fallback_rejection, replace_json_str_field, rewrite_body_out, sim_device_fingerprint,
     sim_device_id, sim_session_key, stream_requested, strip_extra_fields, sync_metadata_session,
     trusted_cc_version, trusted_cc_version_against, with_outbound_identity,

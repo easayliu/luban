@@ -3129,6 +3129,75 @@ fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
     assert!(names.contains(&"TaskCreate"), "老版本多出来的不删");
 }
 
+/// `tengu_lucky_cerf` 清单里的模型注的是换了 `Agent` 说明的那份：只有 `Agent.description` 不同，
+/// 名字、先后与其余 13 条逐字节同资产；清单外的模型与 haiku-4.5 那套照旧
+/// （`cap/auto-2.1.296-20261013-full/00258` sonnet-5-5 ↔ `00418` opus-5-5）。
+#[test]
+fn agent_description_follows_the_lucky_cerf_model_list() {
+    use config::CcProfileKind::*;
+    for (model, cerf) in [
+        ("claude-sonnet-5-5", true),
+        ("claude-haiku-5-5", true),
+        ("claude-fable-5-1", true),
+        ("claude-fable-5", true),
+        ("claude-opus-5", true),
+        ("claude-opus-5-20260512", true),
+        ("claude-sonnet-5-5[1m]", true),
+        ("claude-opus-5-5", false),
+        ("claude-opus-5-5[1m]", false),
+        ("claude-sonnet-5", false),
+        ("claude-opus-4-8", false),
+        ("claude-haiku-4-5", false),
+        ("sonnet", false),
+    ] {
+        assert_eq!(config::cc_agent_uses_cerf_text(model), cerf, "{model}");
+    }
+    // 没见过 eval 的号按抓包那个号的分组（第 1 组、默认清单）。
+    const UNSEEN: i64 = -92_001;
+    let cerf_of = |id, model| crate::proxy::lucky_cerf::agent_uses_cerf_text(id, "s", model);
+    let opus = config::cc_profile(MainOpus);
+    let plain = crate::proxy::cc_tools_core(opus, false);
+    let cerf = crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-sonnet-5-5"), false);
+    assert_eq!(cerf.len(), plain.len());
+    for (a, b) in cerf.iter().zip(plain) {
+        assert_eq!(a["name"], b["name"]);
+        if a["name"] == "Agent" {
+            assert_ne!(a["description"], b["description"]);
+            let desc = a["description"].as_str().unwrap();
+            assert!(desc.contains("A fresh agent costs more than it looks."), "{desc}");
+            let (mut a, mut b) = (a.clone(), b.clone());
+            a.as_object_mut().unwrap().remove("description");
+            b.as_object_mut().unwrap().remove("description");
+            assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+        } else {
+            assert_eq!(serde_json::to_string(a).unwrap(), serde_json::to_string(b).unwrap());
+        }
+    }
+    let trim = crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-sonnet-5-5"), true);
+    assert!(trim.iter().all(|t| t["name"] != "Artifact") && trim.len() == plain.len() - 3);
+    assert!(std::ptr::eq(
+        crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-opus-5-5"), false),
+        plain
+    ));
+    let haiku = config::cc_profile(MainHaiku);
+    assert!(std::ptr::eq(
+        crate::proxy::cc_tools_core_for(haiku, cerf_of(UNSEEN, "claude-haiku-5-5"), false),
+        crate::proxy::cc_tools_core(haiku, false)
+    ));
+    // 分在实验第 0 组（空清单）的号：清单里的模型也发老的那版。
+    let v0 = -92_002;
+    let eval: serde_json::Value = serde_json::from_str(
+        r#"{"tengu_lucky_cerf":{"value":[],"experiment":{"key":"tengu_lucky_cerf_experiment_v3"},
+        "experimentResult":{"inExperiment":true,"variationId":0}}}"#,
+    )
+    .unwrap();
+    crate::proxy::lucky_cerf::note_eval(v0, eval.as_object().unwrap());
+    assert!(std::ptr::eq(
+        crate::proxy::cc_tools_core_for(opus, cerf_of(v0, "claude-sonnet-5-5"), false),
+        plain
+    ));
+}
+
 /// 客户端把 14 个全声明了，但次序不是官方的、其中一条键序不同（内容全同）：出站仍要是
 /// 按官方序排列的 14 条逐字节官方声明。`Value` 相等忽略键序，按它跳过替换会把客户端键序
 /// 原样发出去；只缺几条时把缺的插头部则会把次序排乱。
@@ -3155,7 +3224,8 @@ fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     );
     declared[0] = scrambled;
     declared.push(serde_json::json!({"name": "my_tool", "input_schema": {"type": "object"}}));
-    let mut v = serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": declared});
+    // opus-5-5 不在 `tengu_lucky_cerf` 清单里，用的就是资产原样那份。
+    let mut v = serde_json::json!({"model": "claude-opus-5-5", "messages": [], "tools": declared});
     assert!(super::cc_tools_to_inject(&v, profile, false, false).is_empty(), "一个都不缺");
     assert!(super::inject_cc_tools(&mut v, profile, false, false, who()), "次序与键序都要改");
     let tools = v["tools"].as_array().unwrap();
@@ -4155,7 +4225,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 293)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 296)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

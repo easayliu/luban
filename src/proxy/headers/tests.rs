@@ -732,7 +732,7 @@ fn fallback_beta_is_added_once_after_effort() {
 /// 按 2.1.285 表产出的 `anthropic-beta` 必须**逐字节**等于官方那串——这是
 /// [`config::CC_PROFILES_2_1_285`] 里几串 beta 与 [`config::cc_model_beta`] 按代际去项的唯一正确性
 /// 依据。官方串逐字取自 `cap/2.1.285`（同一会话里 `/model` 切了 11 个模型，各一轮主线程），
-/// 去掉动态的 `afk-mode`。模拟路径现在用的 2.1.293 表见 [`simulated_beta_matches_2_1_293`]。
+/// 去掉动态的 `afk-mode`。模拟路径现在用的 2.1.296 表见 [`simulated_beta_matches_2_1_296`]。
 ///
 #[test]
 fn simulated_beta_matches_official() {
@@ -913,12 +913,13 @@ fn simulated_beta_matches_official() {
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
 }
 
-/// 模拟路径（2.1.293 表）主线程的 `anthropic-beta` 逐字节等于 2.1.293 **默认权限模式**的官方
-/// 串（`cap/auto-2.1.293-20261008-full`：`00419` opus-5-5、`00256` sonnet-5-5、`00383` haiku-4.5、
-/// `00344` haiku-5-5；fable 默认模式没样本，与 opus 同串，见 [`config::CC_PROFILES`]）。auto 模式
+/// 模拟路径（2.1.296 表）主线程的 `anthropic-beta` 逐字节等于 2.1.296 **默认权限模式**的官方
+/// 串（`cap/auto-2.1.296-20261013-full`：`00418` opus-5-5、`00258` sonnet-5-5、`00382` haiku-4.5、
+/// `00344` haiku-5-5；与 2.1.293 的 `00419`、`00256`、`00383`、`00344` 逐字相同；fable 默认模式没样本，
+/// 与 opus 同串，见 [`config::CC_PROFILES_2_1_293`]）。auto 模式
 /// 那串多 `dangerous-tool-use` 与 `afk-mode`，模拟请求不带 `safeguards`，两项都不该出现。
 #[test]
-fn simulated_beta_matches_2_1_293() {
+fn simulated_beta_matches_2_1_296() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          thinking-token-count-2026-05-13,context-management-2025-06-27,\
          prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\
@@ -941,16 +942,16 @@ fn simulated_beta_matches_2_1_293() {
          thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
          extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00419", "claude-opus-5-5", opus),
-        ("00256", "claude-sonnet-5-5", opus),
-        ("00546 同串", "claude-fable-5-1", opus),
-        ("00383", "claude-haiku-4-5-20251001", haiku),
-        ("00383", "claude-haiku-4-5", haiku),
+        ("00418", "claude-opus-5-5", opus),
+        ("00258", "claude-sonnet-5-5", opus),
+        ("00541 同串", "claude-fable-5-1", opus),
+        ("00382", "claude-haiku-4-5-20251001", haiku),
+        ("00382", "claude-haiku-4-5", haiku),
         ("00344", "claude-haiku-5-5", haiku_5_5),
         ("00305 同串", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.293");
+        assert_eq!(profile.version, "2.1.296");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -994,19 +995,20 @@ fn profile_betas_match_the_2_1_277_captures() {
         assert_eq!(p.version, "2.1.277", "{kind:?}");
         assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
     }
-    // 2.1.293 的额度探测（`cap/auto-2.1.293-20261008-full/00017`）与 2.1.277 逐字相同。
+    // 2.1.296 的额度探测（`cap/auto-2.1.296-20261013-full/00012`，2.1.293 的 `00017` 同）与 2.1.277 逐字相同。
     let quota = config::cc_profile(QuotaProbe);
-    assert_eq!((quota.version, quota.beta), ("2.1.293", cases[2].2));
+    assert_eq!((quota.version, quota.beta), ("2.1.296", cases[2].2));
     // 2.1.291 的标题生成（默认模式下 13 条）与 2.1.277 逐字相同。
     let title = config::cc_profile_at(SessionTitleHaiku, Some((2, 1, 291)));
     assert_eq!((title.version, title.beta), ("2.1.291", cases[1].2));
     // 2.1.293 换成 haiku-5-5：`prompt-caching-scope` 与 `advisor` 之间多了一串，`structured-outputs`
     // 挪到 `effort` 之后（`cap/auto-2.1.293-20261008-full/00030`）。
+    // 2.1.296（`cap/auto-2.1.296-20261013-full/00029`）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.293",
+            "2.1.296",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,\

@@ -250,8 +250,8 @@ pub(super) fn rewrite_body_out(
         && display_beta
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && !billing_only && ensure_context_management(&mut v);
-    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带（模拟路径三族都按 `high`），
-    // 按 profile 补（[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
+    // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带，按模型的官方默认档补
+    // （[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
     let effort_filled =
         !billing_only && sim.is_some_and(|s| ensure_output_config(&mut v, s.profile));
     // `diagnostics.previous_message_id`：官方主线程**每条**都带（首轮是 null），

@@ -4043,3 +4043,66 @@ fn tether_anchors_do_not_carry_over_a_clear() {
     assert_eq!(live[0]["threadIdleMonotonicMs"], -1);
     assert_eq!(live[0]["anchorHasToolCall"], false, "不看旧会话的回复");
 }
+
+/// 2.1.296 的 `tengu_lucky_cerf` 曝光：会话从完整提示词的 haiku-4.5 开头时不发，中途切到精简提示词
+/// 的 sonnet-5-5、头一次输入时补一条（分组照这个会话钉住的那份），之后不再发。
+#[test]
+fn lucky_cerf_exposure_follows_the_first_lean_prompt_model() {
+    const CRED: i64 = 9_301;
+    let body = |model: &str| {
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["model"] = json!(model);
+        v["system"][0]["text"] = json!(
+            "x-anthropic-billing-header: cc_version=2.1.296.1e2; cc_entrypoint=cli; cch=0f7f8;"
+        );
+        serde_json::to_vec(&v).unwrap()
+    };
+    let turn = |model: &str, req: &str, at: SystemTime| {
+        let mut c = call(body(model), req, "end_turn");
+        c.cred_id = CRED;
+        c.ua_out = "claude-cli/2.1.296 (external, cli)".into();
+        c.resp_model = Some(model.into());
+        c.started_at = at;
+        c
+    };
+    let exposures = |t: &Telemetry| -> Vec<Value> {
+        let st = t.0.state.lock();
+        st.pending[&(CRED, SESSION.to_string())]
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_lucky_cerf_experiment_v3")
+            .map(|(_, e)| e.clone())
+            .collect()
+    };
+    let t = Telemetry::default();
+    t.ingest(turn("claude-haiku-4-5-20251001", "req_1", frozen_now() - Duration::from_secs(30)));
+    assert!(exposures(&t).is_empty(), "haiku-4.5 不读这个开关");
+    t.ingest(turn("claude-sonnet-5-5", "req_2", frozen_now() - Duration::from_secs(15)));
+    let ex = exposures(&t);
+    assert_eq!(ex.len(), 1, "切到 sonnet-5-5 那次输入补一条");
+    assert_eq!(ex[0]["event_data"]["variation_id"], 1, "没见过 eval：按抓包那组");
+    assert_eq!(ex[0]["event_data"]["experiment_metadata"], "{\"feature_id\":\"tengu_lucky_cerf\"}");
+    t.ingest(turn("claude-sonnet-5-5", "req_3", frozen_now()));
+    assert_eq!(exposures(&t).len(), 1, "一个会话只发一次");
+}
+
+/// `/clear` 换会话不换进程：`tengu_lucky_cerf` 曝光在旧会话发过，新会话不再发；新进程才重新算。
+#[test]
+fn lucky_cerf_exposure_is_not_repeated_after_a_clear() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let s2 = "55555555-5555-4555-8555-555555555555";
+    let at_296 = |sid: &str, rid: &str, msg: &str, at: SystemTime| {
+        let mut c = main_call(sid, rid, msg, at);
+        c.ua_out = "claude-cli/2.1.296 (external, cli)".into();
+        c
+    };
+    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
+    t.ingest(at_296(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
+    t.ingest(at_296(s2, "req_2", "msg_2", base + Duration::from_secs(30)));
+    let count = |sid: &str| {
+        events_of(&t, sid).iter().filter(|(n, ..)| n == "tengu_lucky_cerf_experiment_v3").count()
+    };
+    assert_eq!(count(SESSION), 1, "旧会话首次输入发一条");
+    assert_eq!(count(s2), 0, "/clear 之后的新会话不再发");
+}

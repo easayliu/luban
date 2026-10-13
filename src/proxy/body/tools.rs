@@ -173,6 +173,24 @@ pub(in crate::proxy) const CC_TRIMMED_TOOLS: &[&str] = &["Artifact", "ListAgents
 
 static CC_TOOLS_CORE_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE));
+
+/// [`CC_TOOLS_CORE`] 换上 `tengu_lucky_cerf` 那版 `Agent` 说明（[`config::cc_agent_uses_cerf_text`]）：
+/// `cap/auto-2.1.296-20261013-full/00258`（sonnet-5-5）、`00344`（haiku-5-5）、`00541`（fable-5-1）的
+/// `Agent` 只有 `description` 与 opus 那份不同（1811 → 3049 字符：「何时用」那段换成先讲代价、再讲
+/// 何时派、何时自己做、怎么写交代），其余 13 条与 [`CC_TOOLS_CORE`] 逐字节相同。
+static CC_TOOLS_CORE_CERF: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| {
+        let mut tools = CC_TOOLS_CORE.clone();
+        let agent = tools
+            .iter_mut()
+            .find(|t| t["name"] == "Agent")
+            .expect("cc_tools_core.json must declare Agent");
+        agent["description"] =
+            serde_json::Value::from(include_str!("../../assets/cc_agent_desc_cerf.txt"));
+        tools
+    });
+static CC_TOOLS_CORE_CERF_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
+    std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE_CERF));
 static CC_TOOLS_CORE_HAIKU_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE_HAIKU));
 
@@ -187,7 +205,9 @@ fn trimmed(all: &[serde_json::Value]) -> Vec<serde_json::Value> {
 /// 那一对与服务端工具 `advisor` 之后的 14 条；MCP 工具 2.1.293 起已不在 `tools` 里）：haiku-4.5 一份
 /// （[`CC_TOOLS_CORE_HAIKU`]），其余——含 haiku-5-5——同一份（[`CC_TOOLS_CORE`]，
 /// `cap/auto-2.1.293-20261008-full/00344` 与 `00419` 的工具逐字节相同）。2.1.293 的 `Agent` 多了
-/// `effort` 参数，`Artifact` 改了一段措辞，其余逐字未变。`trim` 是开关
+/// `effort` 参数，`Artifact` 改了一段措辞，其余逐字未变。2.1.296（`cap/auto-2.1.296-20261013-full/00418`、`00382`）
+/// 的 `Read` 多了 `allow_large` 参数（两份都有），其余逐字未变；`Agent` 另有按模型换说明的一版，见
+/// [`cc_tools_core_for`]。`trim` 是开关
 /// `sim_trim_tools`，开着去掉 [`CC_TRIMMED_TOOLS`] 那三条、剩 11 条，先后不变。
 pub(in crate::proxy) fn cc_tools_core(
     profile: &config::CcProfile,
@@ -199,6 +219,21 @@ pub(in crate::proxy) fn cc_tools_core(
         (false, false) => &CC_TOOLS_CORE,
         (false, true) => &CC_TOOLS_CORE_TRIM,
     }
+}
+
+/// 实际注进出站体的那份声明：[`cc_tools_core`] 再挑 `Agent` 说明——`cerf` 是这个会话钉住的
+/// `tengu_lucky_cerf` 分组里这个模型换不换（[`crate::proxy::lucky_cerf::agent_uses_cerf_text`]），换就用
+/// [`CC_TOOLS_CORE_CERF`]。haiku-4.5 不走精简提示词、客户端根本不读这个开关，不受影响。工具名与
+/// 先后两份相同，只看名字的地方仍用 [`cc_tools_core`]。
+pub(in crate::proxy) fn cc_tools_core_for(
+    profile: &config::CcProfile,
+    cerf: bool,
+    trim: bool,
+) -> &'static [serde_json::Value] {
+    if profile.kind == config::CcProfileKind::MainHaiku || !cerf {
+        return cc_tools_core(profile, trim);
+    }
+    if trim { &CC_TOOLS_CORE_CERF_TRIM } else { &CC_TOOLS_CORE_CERF }
 }
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
@@ -385,6 +420,7 @@ pub(super) fn inject_cc_tools(
         return false;
     }
     let missing = cc_tools_to_inject(v, profile, fill_absent, trim);
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_owned();
     // 没带 `tools` 键或是 `null`、又要补：先按官方键序放一个空数组（`system` 之后，没有
     // `system` 就跟 `messages`；`null` 原位换掉），下面照「全缺」对齐。补不出东西时不动。
     if !missing.is_empty() && v.get("tools").is_none_or(|t| t.is_null()) {
@@ -393,7 +429,8 @@ pub(super) fn inject_cc_tools(
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
-    let stubs = cc_tools_core(profile, trim);
+    let cerf = crate::proxy::lucky_cerf::agent_uses_cerf_text(who.cred_id, who.session, &model);
+    let stubs = cc_tools_core_for(profile, cerf, trim);
     let official_names: Vec<&str> =
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
     let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);

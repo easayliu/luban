@@ -251,18 +251,9 @@ pub(super) fn fill_attachment_estimates(
 /// 模型的默认 effort（`tengu_api_success.default_effort_level`）：opus-5-5、sonnet-5-5 与 haiku-5-5
 /// 是 `medium`，opus-4-7 是 `xhigh`，其余带 effort 的都是 `high`（`cap/2.1.285` 11 个模型、
 /// `cap/2.1.280` 的 opus-5-5[1m]；haiku-5-5 见 `cap/auto-2.1.293-20261008-full` 18 条 `medium` /
-/// `is_default_effort: true`）。模拟请求自己发的是 high，那是另一回事，这里只报模型的默认档。
+/// `is_default_effort: true`）。表在 [`crate::config::cc_default_effort`]，模拟出站也按它发。
 pub(super) fn default_effort_of(model: &str) -> &'static str {
-    if model.starts_with("claude-opus-5-5")
-        || model.starts_with("claude-sonnet-5-5")
-        || model.starts_with("claude-haiku-5-5")
-    {
-        "medium"
-    } else if model.starts_with("claude-opus-4-7") {
-        "xhigh"
-    } else {
-        "high"
-    }
+    crate::config::cc_default_effort(model)
 }
 
 /// 工具跑完那条 `tengu_feature_ok` 的名字：`tool_` + 工具名的 snake_case（`WebFetch` →

@@ -121,6 +121,7 @@ impl EventBuilder<'_> {
             ref prev_main_request_id,
             prev_main_depth,
             prev_end,
+            v296,
             ..
         } = *env.f;
         let EventEnv { t0, .. } = *env;
@@ -151,19 +152,23 @@ impl EventBuilder<'_> {
                 );
                 self.push_dd(t_rej, "tengu_feature_ok", feature("permission_user_deny"));
                 self.push(t_rej, "tengu_permission_request_escape", json!({}));
-                self.push(
-                    t_rej,
-                    "tengu_tool_use_can_use_tool_rejected",
-                    json!({
-                        "messageID": &prev_msg,
-                        "toolName": &c.name,
-                        "deniedBy": "user_reject",
-                        "decisionReasonType": "unknown",
-                        "queryChainId": &prev_turn.0,
-                        "queryDepth": prev_main_depth,
-                        "requestId": &prev_req
-                    }),
-                );
+                let mut can_use = json!({
+                    "messageID": &prev_msg,
+                    "toolName": &c.name,
+                    "deniedBy": "user_reject",
+                    "decisionReasonType": "unknown"
+                });
+                // 2.1.296 起在 `decisionReasonType` 之后多 PreToolUse 钩子与权限判定两段耗时（`cap/
+                // auto-2.1.296-20261013-full` B1：`preToolHookDurationMs: 1`、`permissionDurationMs: 3178`，
+                // 后者就是弹框挂着的那段，与下面 `waiting_for_user_permission_ms` 同一个量）。
+                if v296 {
+                    can_use["preToolHookDurationMs"] = json!(1);
+                    can_use["permissionDurationMs"] = json!(wait);
+                }
+                can_use["queryChainId"] = json!(&prev_turn.0);
+                can_use["queryDepth"] = json!(prev_main_depth);
+                can_use["requestId"] = json!(&prev_req);
+                self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
                 let mut rejected = json!({
                     "messageID": &prev_msg,
                     "isMcp": false,
@@ -280,6 +285,25 @@ impl EventBuilder<'_> {
                 self.take_tpl(&tpl.first_prompt, t0);
             } else {
                 self.take_tpl(&tpl.prompt_next, t0);
+            }
+            // `tengu_lucky_cerf` 曝光：首次输入那段模板里有它（`-p` 的在启动那段），位置照模板；
+            // 别的输入（中途切到精简提示词的模型、注入的一轮）模板里没有，这里按模板那条的偏移
+            // （提交前 7ms）补。这一轮模板已经发过就不补。
+            let from_tpl = self.tpl_events.iter().any(|(_, e)| {
+                e["event_data"]["experiment_metadata"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(crate::proxy::LUCKY_CERF_FEATURE))
+            });
+            if !from_tpl && let Some((key, var)) = &self.subst.lucky_cerf {
+                let t = ms(t0, -7);
+                let ev = env.f.base_identity.growth_event(
+                    t,
+                    key,
+                    *var,
+                    crate::proxy::LUCKY_CERF_FEATURE,
+                    &env.f.version,
+                );
+                self.tpl_events.push((t, ev));
             }
             // 用户敲的报 `typed`，同伴会话发来的（peer）、后台任务完成的通知
             // （task-notification）这类由客户端自己注入的报 `system`（`cap/2.1.277` 1 条、

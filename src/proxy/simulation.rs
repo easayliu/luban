@@ -550,7 +550,9 @@ pub(super) const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 /// 这条请求是不是**官方 WebSearch 子调用**。CC 的 WebSearch 工具不在主线程里直接调 server
 /// tool，而是另发一条请求：一条用户消息（要搜的问题）、`tools` 只有 `web_search_*` 这一个
 /// server tool、`tool_choice` 强制它、`system` 只有一句「You are an assistant for performing a
-/// web search tool use」（57 字节，前面可能还有一块 billing header）。它没有基座、没有身份句，
+/// web search tool use」（57 字节，前面可能还有一块 billing header；2.1.296 起换成「You run a web
+/// search for another Claude model, which is waiting on the result and can search again. Search once,
+/// then reply with a brief summary of the results.」160 字节，`cap/auto-2.1.296-20261013-full/00053`）。它没有基座、没有身份句，
 /// 按 [`simulation_reason`] 的判据会落到 `no_base_prompt`（带 billing header）或
 /// `not_cc_shaped`（不带），被重建成带基座与 14 个官方工具的主线程体，出站 UA 换成模拟那版、
 /// device_id 与会话 id 也换成模拟派生的——一条 `claude-cli/2.1.220` 的主线程会话中途冒出一台

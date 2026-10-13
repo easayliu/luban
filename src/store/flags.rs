@@ -125,12 +125,12 @@ pub struct ForwardFlags {
     ///   `output_config`，不重排顶层键（`metadata.user_id` 另由两项子开关管）；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
     ///   换头照旧；`cch` 跟随 [`Self::cch_sim_compute`]（开算真值、关填随机值）。上游放行只认
     ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。
-    ///   代价：官方「仅 billing header、无身份句」的请求几乎全是 message thread 的 `continue` 续轮
-    ///   （`cap/auto-2.1.291-20261006-full` 68 条、`auto-2.1.293-20261008-full` 81 条无一例外）：
-    ///   首轮已带身份句建好线程，续轮 system 只剩 billing header 一块，同时带 `thread`、会话链字段
-    ///   （`cc_prev_req` 等）与完整的 `thinking` / `output_config`；唯一例外是桌面端单轮、0 工具的
-    ///   状态摘要 helper（`cap/auto-desktop-2.1.295-20261010-sub`）。「billing header + 客户端自有
-    ///   system + 完整多轮历史、无 `thread`」官方不产生，这个开关只保证过闸、不保证形态。
+    ///   形态：官方辅助调用正是这样——2.1.296 的 `Tno` → `p_s` 在 `skipSystemPromptPrefix` 时
+    ///   发 `[三段 billing header, ...调用方自有 system]`、不带身份句与 `thread`（自动模式分类器
+    ///   两段、记忆筛选（带多轮历史）、`hook_prompt`、`agent_classifier`、`agent_namer` 等；抓包
+    ///   `cap/2.1.260/00030` 分类器即此形态，带 `metadata.user_id`）。header 字段、次序与版本后缀
+    ///   算法与官方 `ymo` / `ug` 一致（2.1.296 非续轮 122 条后缀全中）。差别只在官方辅助调用不带
+    ///   工具，第三方客户端带自己的工具。
     ///   2026-10-10 实测：客户端 system 12KB、出站 system 9 块均照常走订阅额度、未判第三方，
     ///   故这条路不跑完整模拟那两道防线（`cap_system_blocks` 块数封顶、`relocate_long_client_system`
     ///   长 system 挪进首条消息）。

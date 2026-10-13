@@ -1,9 +1,9 @@
-//! 2.1.293 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.293 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.293 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.293 来访的
-/// beta 参照（[`cc_profile_at`]）。beta 串逐字取自 `cap/auto-2.1.293-20261008-full`，去掉 `oauth`。
+/// 2.1.293 的 profile 表：2.1.293 ~ 2.1.295 来访的 beta 参照（[`cc_profile_at`]）。2.1.296 的表
+/// （[`CC_PROFILES`]）各行与它相同、只换了版本号。beta 串逐字取自 `cap/auto-2.1.293-20261008-full`，去掉 `oauth`。
 ///
 /// 与 2.1.291 一样按**默认权限模式**的抓包定（不带 `safeguards` / `afk-mode` / `dangerous-tool-use`）：
 ///
@@ -15,7 +15,7 @@ use super::*;
 /// | haiku-5-5 | `00344`（`00305` 是 `--model haiku`） | default | medium¹ | 128000 | 同 opus |
 /// | haiku-4.5 | `00383` | default | — | 32000 | 长描述那一套，见 [`CC_SYSTEM_BASE_HAIKU`] |
 ///
-/// ¹ 官方默认 medium；模拟路径一律按 high 发，理由同 [`CC_PROFILES_2_1_285`]。
+/// ¹ 官方默认 medium；2.1.296 之前模拟路径一律按 high 发，现按模型发官方默认档（[`cc_outbound_effort`]）。
 /// ² fable 这一版仍没抓到默认模式的主线程，auto 模式下的串与 opus 逐字相同（`00546` ↔ `00032`），
 ///   默认模式按 opus 那条（`00419`）记，同 2.1.291。
 ///
@@ -40,7 +40,7 @@ use super::*;
 ///   'claude-haiku-4-5-20251001'` 换成 `Haiku 5.5: 'claude-haiku-5-5'`；haiku-5-5 的第四块是 opus 那份
 ///   把 EndConversation 那段换成几段「effort 不改变要做完多少」的说明，见 [`CC_SYSTEM_REST_HAIKU_5_5`]；
 /// - **工具**：`Agent` 多了 `effort` 参数，`Artifact` 改了一段措辞、`asset_ids` 上限 50 → 200。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_293: &[CcProfile] = &[
     CcProfile {
         kind: CcProfileKind::MainOpus,
         version: "2.1.293",
@@ -236,7 +236,7 @@ pub const CC_PROFILES: &[CcProfile] = &[
 /// **2.1.293 还缺的抓包**（`cap/auto-2.1.293-20261008-full`：场景同 2.1.291，另加 haiku-5-5 的
 /// 默认 / auto / `-p` 主线程、haiku-4-5 主线程与 haiku-5-5 的 Explore 子代理）。
 ///
-/// 1. **fable 的默认权限模式主线程**——按 opus 那串记（见 [`CC_PROFILES`] 表头注 ²）；
+/// 1. **fable 的默认权限模式主线程**——按 opus 那串记（见 [`CC_PROFILES_2_1_293`] 表头注 ²）；
 /// 2. **haiku-5-5 的 1M 会话**——它原生 1M（`native_1m`），没抓 `[1m]` 后缀的会话；
 /// 3. **SDK 子代理（claude-code-guide）**——仍没触发，[`cc_profile_at`] 对 `SdkSubagentHaiku` 落回 2.1.285；
 /// 4. 安全分类与 API-key 端任何一族，理由同 [`cc_2_1_280_missing_samples`]。

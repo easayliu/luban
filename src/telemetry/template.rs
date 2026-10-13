@@ -134,11 +134,31 @@ pub(super) static TEMPLATE_2_1_293_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_293_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.293 起用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 2.1.296 的两份模板（交互式 / `-p`）：以 2.1.293 那两份为底，按 `cap/auto-2.1.296-20261013-full`
+/// 生成（`_driver/build_tpl_296.py`）。相对 2.1.293：可执行文件里删掉的 `artifact_five_class_asks`、
+/// `artifact_text_variant` 与两条 `signed_cache_identity` 去掉；`signed_cache_shadow` 换了两个键
+/// （`identity_state` → `absence`、`states_lifetime`）；首轮多一条 `tengu_lucky_cerf_experiment_v3` 曝光。
+pub(super) static TEMPLATE_2_1_296: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_296.json"))
+            .expect("assets/cc_telemetry_template_2_1_296.json must parse")
+    });
+
+/// 2.1.296 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_296`]。
+pub(super) static TEMPLATE_2_1_296_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_296_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_296_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.296 起用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
     let at = |v: &str| version_at_least(version, v);
+    if at("2.1.296") {
+        return if sdk { &TEMPLATE_2_1_296_SDK } else { &TEMPLATE_2_1_296 };
+    }
     match (at("2.1.293"), at("2.1.291"), at("2.1.285"), sdk) {
         (true, _, _, true) => &TEMPLATE_2_1_293_SDK,
         (true, _, _, false) => &TEMPLATE_2_1_293,
@@ -258,6 +278,10 @@ pub(super) struct Subst<'a> {
     /// 正文里关着的那几个用户可关的工具（[`RequestShape::tools_off`]）。`-p` 不看它：打印模式本来就
     /// 不带 Artifact / SendFeedback（不是用户关的），也没有关掉之后的样本。
     pub(super) tools_off: ToolsOff,
+    /// 这一轮那条 `tengu_lucky_cerf` 实验曝光的（实验名, 分组），`None` 即不发——按会话钉住的
+    /// 分组与「模型走不走精简提示词」见 [`crate::proxy::lucky_cerf_exposure`]，一个会话一次见
+    /// [`super::session::TurnFacts::lucky_cerf`]。
+    pub(super) lucky_cerf: Option<(String, i64)>,
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -296,6 +320,12 @@ impl ToolFamily {
 /// 这 91 全是 Agent，余下 17 记在 Artifact 头上）；haiku-5-5 是 33 / 13912，比 opus 少一个工具
 /// （EndConversation）、30 token；`-p` 的 haiku 也是 haiku-5-5，同 `-p` 那份。`-p` 的 haiku-4.5 没有
 /// 样本，按 2.1.291 那份加 Agent 的 91 估。
+/// 2.1.296 起 `Read` 多了 `allow_large` 参数，`non_mcp_tools_tokens` 各族（含 `-p`）一律多 83，工具数
+/// 不变（`cap/auto-2.1.296-20261013-full`：opus 等 14025、haiku-5-5 13995、haiku-4.5 14496、`-p` 6573，
+/// 对 2.1.293 的 13942、13912、14413、6490）。`Agent` 按模型换的那段说明（`tengu_lucky_cerf`）不进这个
+/// 估算：sonnet-5-5、haiku-5-5 与 opus 多出来的都只是这 83。
+const READ_ALLOW_LARGE_TOKENS: u64 = 83;
+
 fn context_tool_counts(v293: bool, sdk: bool, family: ToolFamily, off: ToolsOff) -> (u64, u64) {
     use ToolFamily::*;
     let (count, tokens) = match (v293, sdk, family) {
@@ -450,6 +480,25 @@ where
         let t = anchor + chrono::Duration::milliseconds(e.off);
         for _ in 0..e.repeat.unwrap_or(1).max(1) {
             if e.kind == "growth" {
+                // `tengu_lucky_cerf`（`Agent` 按模型换说明）的曝光：客户端只在精简提示词的模型上读这个
+                // 开关（haiku-4.5、sonnet-4.x / 5、opus-4-7 及更老都不读，`cap/auto-2.1.296-20261013-full`
+                // B3c 两个会话里 haiku-5-5 那个有、haiku-4.5 那个没有），读了且这个号在实验里才有这条，
+                // 实验名与分组照这个号的 eval（[`Subst::lucky_cerf`]）。
+                if e.feature.as_deref() == Some(crate::proxy::LUCKY_CERF_FEATURE) {
+                    if let Some((key, var)) = &subst.lucky_cerf {
+                        events.push((
+                            t,
+                            id.growth_event(
+                                t,
+                                key,
+                                *var,
+                                crate::proxy::LUCKY_CERF_FEATURE,
+                                subst.version,
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 events.push((
                     t,
                     id.growth_event(
@@ -515,7 +564,11 @@ where
                 && let Some(o) = meta.as_object_mut()
             {
                 let v293 = version_at_least(subst.version, "2.1.293");
-                let (count, tokens) = context_tool_counts(v293, subst.sdk, subst.tool_family, off);
+                let (count, mut tokens) =
+                    context_tool_counts(v293, subst.sdk, subst.tool_family, off);
+                if version_at_least(subst.version, "2.1.296") {
+                    tokens += READ_ALLOW_LARGE_TOKENS;
+                }
                 o.insert("non_mcp_tools_count".into(), json!(count));
                 o.insert("non_mcp_tools_tokens".into(), json!(tokens));
             }

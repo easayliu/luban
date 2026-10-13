@@ -18,6 +18,7 @@ mod v2_1_280;
 mod v2_1_285;
 mod v2_1_291;
 mod v2_1_293;
+mod v2_1_296;
 
 pub use betas::*;
 pub use client::*;
@@ -34,6 +35,7 @@ pub use v2_1_280::*;
 pub use v2_1_285::*;
 pub use v2_1_291::*;
 pub use v2_1_293::*;
+pub use v2_1_296::*;
 
 #[cfg(test)]
 mod tests {
@@ -71,6 +73,11 @@ mod tests {
     fn stainless_version_follows_the_client_version() {
         assert_eq!(cc_stainless_version("2.1.291"), Some("0.128.0"));
         assert_eq!(cc_stainless_version("2.1.293"), Some("0.128.0"), "可执行文件里仍是 0.128.0");
+        assert_eq!(
+            cc_stainless_version("2.1.296"),
+            Some("0.128.0"),
+            "`cap/auto-2.1.296-20261013-full` 仍是 0.128.0"
+        );
         assert_eq!(cc_stainless_version("2.1.300"), Some("0.128.0"));
         assert_eq!(cc_stainless_version("2.1.285"), Some("0.127.0"));
         assert_eq!(
@@ -187,8 +194,16 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 291))).version, "2.1.291", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 292))).version, "2.1.291", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 293))).version, "2.1.293", "{kind:?}");
-            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.293", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.293", "模拟路径用 2.1.293 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 295))).version, "2.1.293", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 296))).version, "2.1.296", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.296", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.296", "模拟路径用 2.1.296 表: {kind:?}");
+            // 2.1.296 表除版本号外逐行同 2.1.293。
+            let (old, new) = (cc_profile_at(kind, Some((2, 1, 293))), cc_profile(kind));
+            assert_eq!(
+                (old.beta, old.effort, old.request_class),
+                (new.beta, new.effort, new.request_class)
+            );
         }
         // haiku-5-5 只有 2.1.293 起的表里有；更老的版本（或读不出版本）落回那一版的 haiku-4.5 行。
         assert_eq!(cc_profile(MainHaiku55).kind, MainHaiku55);
@@ -215,6 +230,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.285").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.291").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.293").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.296").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");
@@ -285,6 +301,25 @@ mod tests {
         ] {
             assert_eq!(cc_haiku_is_5_5_family(model), h55, "{model}");
         }
+        // 模拟出站的 effort 按模型取官方默认档：5.5 三个 medium，其余带 effort 的 high（opus-4-7 默认
+        // xhigh，但抓包里发的是 high）；haiku-4.5 与辅助 profile 不带。
+        use CcProfileKind::*;
+        for (kind, model, want) in [
+            (MainOpus, "claude-opus-5-5", Some("medium")),
+            (MainOpus, "claude-opus-5-5[1m]", Some("medium")),
+            (MainSonnet, "claude-sonnet-5-5", Some("medium")),
+            (MainHaiku55, "claude-haiku-5-5", Some("medium")),
+            (MainFable, "claude-fable-5-1", Some("high")),
+            (MainOpus, "claude-opus-5", Some("high")),
+            (MainSonnet, "claude-sonnet-5", Some("high")),
+            (MainOpus, "claude-opus-4-7", Some("high")),
+            (MainHaiku, "claude-haiku-4-5", None),
+            (SessionTitleHaiku, "claude-haiku-5-5", Some("medium")),
+            (QuotaProbe, "claude-haiku-4-5", None),
+        ] {
+            assert_eq!(cc_outbound_effort(cc_profile(kind), model), want, "{kind:?} {model}");
+        }
+        assert_eq!(cc_default_effort("claude-opus-4-7"), "xhigh");
         // haiku 与非主线程 profile 不去项。
         let haiku = cc_profile(CcProfileKind::MainHaiku);
         assert_eq!(cc_model_beta(haiku, "claude-haiku-3-5"), haiku.beta);

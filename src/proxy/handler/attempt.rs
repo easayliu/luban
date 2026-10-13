@@ -272,7 +272,34 @@ pub(super) async fn prepare<'a>(
     // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
     // 出站体 + 它的取证摘要一并拿：摘要借改写刚建好的那份 `Value` 算，
     // 不再为它把同一份 JSON 第二次解析一遍，见 [`Upstream::shape_outbound`]。
-    let (sent, sent_bits) = upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+    // 新会话的首条请求下面要跑启动握手（条件同那里）；先算出来，`tengu_lucky_cerf` 分组要在整形前占住。
+    let session_start_at = || {
+        session_start(
+            upstream.sim.as_ref(),
+            upstream.client_link.as_ref(),
+            &trusted_cc_version(client_ua)
+                .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+                .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),
+            cc_ua_entrypoint(client_ua),
+        )
+    };
+    let handshakes = billable && flags.api_telemetry && session_start_at().is_some();
+    // `tengu_lucky_cerf` 的分组（`Agent` 说明与曝光）：首条请求占住会话、握手后用那次 eval 确认；
+    // 同会话别的请求先等确认，免得照没确认的分组发、遥测却读确认后的那份，见 [`crate::proxy::lucky_cerf`]。
+    let cerf_first = match upstream.sim.as_ref() {
+        Some(sim) if handshakes => {
+            Some(crate::proxy::lucky_cerf::begin_first_request(cred.id, &sim.session_id))
+        }
+        // 只有主线程用途会注工具、报曝光；标题、无工具 helper 这类辅助请求官方与首条并发发出，
+        // 不该被拖到握手之后。
+        Some(sim) if sim.profile.request_class == "main" => {
+            crate::proxy::lucky_cerf::wait_settled(cred.id, &sim.session_id).await;
+            None
+        }
+        _ => None,
+    };
+    let (mut sent, mut sent_bits) =
+        upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
     // 按**出站体**判的那几条学到的规则（废弃的采样参数、prefill，见 [`ShapeProbe::on_outbound`]）：
     // 改写之后、发送之前才查。入口那道只查来访原件判得准的那几条——模拟路径注入 thinking 时会
     // 剥掉冲突的 `temperature` / `top_p`，拿来访原件去拦会拦下一条出站本来不会触犯规则的请求。
@@ -320,17 +347,7 @@ pub(super) async fn prepare<'a>(
     //
     // 唯一会重复的情形是「客户端登录的正是 luban 代理的那个账号」（自代理），
     // 那种部署本来就不该存在。
-    if billable
-        && flags.api_telemetry
-        && let Some(start) = session_start(
-            upstream.sim.as_ref(),
-            upstream.client_link.as_ref(),
-            &trusted_cc_version(client_ua)
-                .map(|(a, b, c)| format!("{a}.{b}.{c}"))
-                .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),
-            cc_ua_entrypoint(client_ua),
-        )
-    {
+    if handshakes && let Some(start) = session_start_at() {
         spawn_session_handshake(
             state,
             cred,
@@ -341,6 +358,19 @@ pub(super) async fn prepare<'a>(
             req_model.as_deref(),
         )
         .await;
+        // 整形时用的是占住会话那一刻的分组（暂定值或旧缓存）；握手刚把这次的 eval 拉回来，用它
+        // 确认，分组改变了这条的 `Agent` 说明就在发出前重新整形，让这个会话从首条起就是这次的分组
+        // （曝光也跟这份，见 [`crate::proxy::lucky_cerf`]）。重试路径同样会二次整形，改写可重入。
+        if let Some(first) = cerf_first {
+            let model = serde_json::from_slice::<serde_json::Value>(&sent)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            if first.settle(&model) {
+                (sent, sent_bits) =
+                    upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+            }
+        }
     }
     // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
     // [`note_upstream_send`]。纯记录，不影响这条请求走向。

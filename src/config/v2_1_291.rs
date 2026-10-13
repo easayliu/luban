@@ -19,7 +19,7 @@ use super::*;
 /// | fable-5-1 | `00464` | auto² | high | 64000 | 同 opus（Bash 是 auto 那版） |
 /// | haiku-4.5 | `00303`、`00553` | default | — | 32000 | 长描述那一套，见 [`CC_SYSTEM_BASE_HAIKU`] |
 ///
-/// ¹ 官方默认 medium；模拟路径三族一律按 high 发，理由同 [`CC_PROFILES_2_1_285`]。
+/// ¹ 官方默认 medium；2.1.296 之前模拟路径三族一律按 high 发，现按模型发官方默认档（[`cc_outbound_effort`]）。
 /// ² fable 这一版没抓到默认模式的主线程。它在 auto 模式下的串与 opus 逐字相同（`00464` ↔ `00032`），
 ///   `-p`（`00809` ↔ `00695`）也逐字相同，故默认模式按 opus 那条（`00340`）记。
 ///
