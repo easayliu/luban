@@ -7,7 +7,8 @@ use super::*;
 /// 首条用户消息的附件发出，之后每轮作为历史原样带着（`cap/auto-2.1.291-20261006-full/00217`）。
 /// 模拟路径的来访每轮都发完整历史、却从来没有这一段，于是每轮都在同一个位置补同一份：
 ///
-/// - **带 `mid-conversation-system`**（opus / sonnet / fable 新几代）：首条用户消息之后插一条
+/// - **能写中途 system 消息**（opus / sonnet / fable / haiku-5-5，见
+///   [`crate::proxy::simulation::sim_has_mid_conversation_system`]）：首条用户消息之后插一条
 ///   `role: system` 消息，各段空一行拼成一个文本块（`00340`、`00253`、`00464`）。首轮它就是末条，
 ///   末条断点随后由 [`align_message_shape`] 落在它身上，与官方同位；
 /// - **不带**（haiku 与老一代）：每段各裹一个 `<system-reminder>` 块插到首条用户消息最前面，
@@ -53,8 +54,7 @@ pub(in crate::proxy) fn insert_env_note(
     if first.get("role").and_then(|r| r.as_str()) != Some("user") || has_env_note(msgs) {
         return none;
     }
-    let mid_conv_sys =
-        crate::proxy::simulation::sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM);
+    let mid_conv_sys = crate::proxy::simulation::sim_has_mid_conversation_system(sim);
     // 换模型记在末条**用户**消息上：来访以 system（指令之类）收尾时末条不是那句话。
     let last_fp = msgs
         .iter()
@@ -98,7 +98,7 @@ pub(in crate::proxy) fn insert_env_note(
         mid_conv_sys,
         added_msgs: 0,
     };
-    // 落位按**这一轮**模型自带的 beta，而非首轮那份：切回不支持 `mid-conversation-system` 的旧模型
+    // 落位按**这一轮**模型自带的 beta，而非首轮那份：切回不支持中途 system 消息的旧模型
     // （opus 5.5 → opus 4.6）后，照首轮形态补一条 `role: system` 下去上游会 400。历史指纹跨模型族
     // 不漂的那层保证挪到 [`apply_sim_thread`]：fps 用 insert 之前的 `msgs` 算（见 `raw_fps`），
     // 环境说明换形态不影响前缀匹配。
@@ -155,9 +155,11 @@ pub(in crate::proxy) struct EnvNoted {
     /// （[`ThreadDecision::Continue`]）时上游线程里仍留着那条，重发只有新增消息，不用重补；
     /// `create` 与关着线程时把完整历史重发，就得补上。见 [`insert_historical_switch`]。
     pub(in crate::proxy) historical_switch: Option<(usize, String)>,
-    /// 这一轮环境说明的落位：当前模型带 `mid-conversation-system` beta（opus / sonnet / fable）
-    /// 时为 `true`——每条模型说明都作为独立 `role: system` 消息补；不带（haiku、不支持这项的旧
-    /// 模型）时为 `false`——写成用户消息里的 `<system-reminder>` 块。按**本轮**模型取值，模型族
+    /// 这一轮环境说明的落位：当前模型能写中途 system 消息（opus / sonnet / fable / haiku-5-5，带
+    /// `mid-conversation-system` 或 2.1.299 起只剩的 `-clear-at`，见
+    /// [`crate::proxy::simulation::sim_has_mid_conversation_system`]）时为 `true`——每条模型说明都作为
+    /// 独立 `role: system` 消息补；不能（haiku-4.5、不支持这项的旧模型）时为 `false`——写成用户消息里的
+    /// `<system-reminder>` 块。按**本轮**模型取值，模型族
     /// 之间切换时跟着切——不然切回不支持这项的旧模型会被上游 400 拒。
     pub(in crate::proxy) mid_conv_sys: bool,
     /// 环境说明给 `messages` 加了多少条新 msg（0 或 1）：`mid_conv_sys` 分支补了一条 `role: system`
@@ -539,9 +541,9 @@ fn locate_switch(
 /// - 关着 message thread 时 [`crate::proxy::rewrite_body`] 走的那条路（完整历史每轮重发，必补）。
 ///
 /// `switch.0` 是触发换模型那条用户消息在出站 `messages` 里的下标（[`locate_switch`] 核对过）。
-/// 落位同 [`place_model_notice`]：`mid_conv_sys` 为 `true`（opus/sonnet/fable）时作为独立
+/// 落位同 [`place_model_notice`]：`mid_conv_sys` 为 `true`（opus/sonnet/fable/haiku-5-5）时作为独立
 /// `role: system` 消息插在那条用户消息之后的第一个合法落点，落点前一条已经是 system（环境说明
-/// 之类）就并进去；为 `false`（haiku）时裹成 `<system-reminder>` 塞进那条用户消息，`tool_result`
+/// 之类）就并进去；为 `false`（haiku-4.5 与老一代）时裹成 `<system-reminder>` 塞进那条用户消息，`tool_result`
 /// 开头的那种放最后、其余放最前。
 ///
 /// 那个下标上不是用户消息（中间又有步骤动了消息条数）时不补，返回 `false`，由调用方改按

@@ -137,7 +137,19 @@ pub const CC_BETA_INLINE_TOOLS: &str = "inline-tools-2026-09-15";
 /// `messages` 中途允许 `role: system` 消息。2.1.285 的 opus / sonnet / fable 主线程带它，把
 /// `<total_tokens>` 提醒这类附件写成独立的 system 消息（`cap/auto-2.1.285-20260930/00036`）；
 /// haiku 不带，同样的附件落成 user 消息里的 `<system-reminder>`（`00411`、`00412`）。
+///
+/// **2.1.299 起转为正式能力、客户端不再发这个头**（可执行文件里的注册项改成 `header: null`，
+/// `cap/auto-2.1.299-20261014-full` 没有一条带它），中途的 system 消息照旧发。判断「这条请求能不能
+/// 写中途 system 消息」要连 [`CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT`] 一起看，见
+/// [`crate::proxy::simulation`] 的 `sim_has_mid_conversation_system`。
 pub const CC_BETA_MID_CONVERSATION_SYSTEM: &str = "mid-conversation-system-2026-04-07";
+
+/// `mid-conversation-system-clear-at-2026-08-21`：[`CC_BETA_MID_CONVERSATION_SYSTEM`] 的子项，
+/// 两者在同样那几族上一起出现（opus / sonnet / fable / haiku-5-5 的主线程、子代理、标题与 helper，
+/// haiku-4.5 主线程与额度探测都不发）。2.1.299 起前者不再发、它照发，就成了「中途 system 消息可用」
+/// 唯一还看得见的标记。
+pub const CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT: &str =
+    "mid-conversation-system-clear-at-2026-08-21";
 
 /// `count_tokens` 的 beta（`cap/auto-2.1.285-20260930/00104` 起 35 条）：官方 ToolSearch 给延迟
 /// 工具与 MCP 说明数 token 时发，体只有 `model` / `messages` / `tools`。

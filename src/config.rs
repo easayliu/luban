@@ -19,6 +19,7 @@ mod v2_1_285;
 mod v2_1_291;
 mod v2_1_293;
 mod v2_1_296;
+mod v2_1_299;
 
 pub use betas::*;
 pub use client::*;
@@ -36,6 +37,7 @@ pub use v2_1_285::*;
 pub use v2_1_291::*;
 pub use v2_1_293::*;
 pub use v2_1_296::*;
+pub use v2_1_299::*;
 
 #[cfg(test)]
 mod tests {
@@ -196,14 +198,29 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 293))).version, "2.1.293", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 295))).version, "2.1.293", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 296))).version, "2.1.296", "{kind:?}");
-            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.296", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.296", "模拟路径用 2.1.296 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 298))).version, "2.1.296", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 299))).version, "2.1.299", "{kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 300))).version, "2.1.299", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.299", "模拟路径用 2.1.299 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
-            let (old, new) = (cc_profile_at(kind, Some((2, 1, 293))), cc_profile(kind));
+            let (old, mid) =
+                (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
             assert_eq!(
                 (old.beta, old.effort, old.request_class),
-                (new.beta, new.effort, new.request_class)
+                (mid.beta, mid.effort, mid.request_class)
             );
+            // 2.1.299 表只是去掉了 `mid-conversation-system`（转正不发头），其余逐项同序。
+            let new = cc_profile(kind);
+            let without = |b: &str| {
+                b.split(',')
+                    .map(str::trim)
+                    .filter(|p| *p != CC_BETA_MID_CONVERSATION_SYSTEM)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            assert_eq!(without(mid.beta), new.beta.replace(' ', ""), "{kind:?}");
+            assert!(!new.beta.contains(CC_BETA_MID_CONVERSATION_SYSTEM), "{kind:?}");
+            assert_eq!((mid.effort, mid.request_class), (new.effort, new.request_class));
         }
         // haiku-5-5 只有 2.1.293 起的表里有；更老的版本（或读不出版本）落回那一版的 haiku-4.5 行。
         assert_eq!(cc_profile(MainHaiku55).kind, MainHaiku55);
@@ -231,6 +248,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.291").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.293").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.296").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.299").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

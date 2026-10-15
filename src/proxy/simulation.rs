@@ -148,6 +148,15 @@ pub(super) fn sim_has_beta(sim: &Simulation, name: &str) -> bool {
     has_beta(&parts, name)
 }
 
+/// 这条模拟请求能不能在 `messages` 中途写 `role: system` 消息：带
+/// [`config::CC_BETA_MID_CONVERSATION_SYSTEM`]，或带它的子项
+/// [`config::CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT`]——2.1.299 起前者转正不发了，同样那几族
+/// 仍照发后者（`cap/auto-2.1.299-20261014-full/00418` 的首轮环境说明仍是一条 system 消息）。
+pub(super) fn sim_has_mid_conversation_system(sim: &Simulation) -> bool {
+    sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM)
+        || sim_has_beta(sim, config::CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+}
+
 /// 一条请求被模拟路径接管的原因：[`simulates_cc`] 要求 UA 可信、身份合法、形态完整三样
 /// 同时成立才原样转发，这里记的是**第一道**没过的判据（按 UA → 身份 → 形态的顺序查）。
 ///

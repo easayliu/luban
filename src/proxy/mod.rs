@@ -80,7 +80,9 @@ use rate_limit::{
 };
 pub(crate) use usage_grace::note_eval_features;
 mod lucky_cerf;
-pub(crate) use lucky_cerf::{LUCKY_CERF_FEATURE, exposure as lucky_cerf_exposure};
+pub(crate) use lucky_cerf::{
+    Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,
+};
 use usage_grace::{note_overage, usage_limit_wanted};
 
 mod body;

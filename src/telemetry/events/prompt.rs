@@ -251,6 +251,7 @@ impl EventBuilder<'_> {
             v285,
             v291,
             v293,
+            v299,
             injected,
             first_prompt_tpl,
             sleepy,
@@ -294,16 +295,18 @@ impl EventBuilder<'_> {
                     .as_str()
                     .is_some_and(|m| m.contains(crate::proxy::LUCKY_CERF_FEATURE))
             });
-            if !from_tpl && let Some((key, var)) = &self.subst.lucky_cerf {
-                let t = ms(t0, -7);
-                let ev = env.f.base_identity.growth_event(
-                    t,
-                    key,
-                    *var,
-                    crate::proxy::LUCKY_CERF_FEATURE,
-                    &env.f.version,
-                );
-                self.tpl_events.push((t, ev));
+            if !from_tpl {
+                for x in &self.subst.lucky_cerf {
+                    let t = ms(t0, -7);
+                    let ev = env.f.base_identity.growth_event(
+                        t,
+                        &x.key,
+                        x.var,
+                        x.feature,
+                        &env.f.version,
+                    );
+                    self.tpl_events.push((t, ev));
+                }
             }
             // 用户敲的报 `typed`，同伴会话发来的（peer）、后台任务完成的通知
             // （task-notification）这类由客户端自己注入的报 `system`（`cap/2.1.277` 1 条、
@@ -381,6 +384,9 @@ impl EventBuilder<'_> {
                     );
                     if v293 {
                         bash_meta_v293(&mut meta, "");
+                    }
+                    if v299 {
+                        bash_meta_v299(&mut meta, cmd, "", &shape.model, true);
                     }
                     self.push_dd_snake(ms(t0, -6), "tengu_bash_tool_command_executed", meta);
                 }

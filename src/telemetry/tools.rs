@@ -228,6 +228,387 @@ pub(super) fn bash_meta_v293(meta: &mut Value, result_head: &str) {
     insert_after(meta, "executor_shell_overridden", vec![("zsh_nomatch_error", json!(nomatch))]);
 }
 
+/// 2.1.299 的 Bash 命令画像多几项（`cap/auto-2.1.299-20261014-full` 21 条）：事件开头报这条命令跑在哪个
+/// 模型的会话里（`[1m]` 不带）；`interrupted` 之后报 `zsh_note_in_prompt`（提示词里有没有那段 zsh 说明，
+/// 抓包恒 false；用户在输入框里 `!` 跑的那种不报）；`zsh_nomatch_error` 之后报 `zsh_equals_error`
+/// （输出里有 `(eval):N: xxx not found` 那种行）、`bash_pipestatus_use`（命令真用了 `$PIPESTATUS`，见
+/// [`bash_pipestatus_use`]）、`bash_word_split_use`（命令里有会被 zsh / bash 拆词差异影响的无引号展开，见
+/// [`bash_word_split_use`]）。先调 [`bash_meta_v293`] 再调它。
+pub(super) fn bash_meta_v299(
+    meta: &mut Value,
+    command: &str,
+    result_head: &str,
+    model: &str,
+    user_typed: bool,
+) {
+    let Some(o) = meta.as_object_mut() else { return };
+    let mut m = Map::new();
+    m.insert("model".into(), json!(model.trim_end_matches("[1m]")));
+    m.extend(std::mem::take(o));
+    *o = m;
+    if !user_typed {
+        insert_after(meta, "interrupted", vec![("zsh_note_in_prompt", json!(false))]);
+    }
+    let equals = result_head.split(['\n', '\r', '\u{2028}', '\u{2029}']).any(zsh_equals_line);
+    insert_after(
+        meta,
+        "zsh_nomatch_error",
+        vec![
+            ("zsh_equals_error", json!(equals)),
+            ("bash_pipestatus_use", json!(bash_pipestatus_use(command))),
+            ("bash_word_split_use", json!(bash_word_split_use(command))),
+        ],
+    );
+}
+
+/// `bash_pipestatus_use`：命令里真的用了 `$PIPESTATUS`（照官方 2.1.299 的
+/// `e.includes("PIPESTATUS") && /\$\{?PIPESTATUS\b/.test(Fdt(e))`）。`Fdt`（[`strip_shell_quotes`]）先把
+/// 单引号内容、转义掉的 `$` 去掉，所以 `echo '$PIPESTATUS'`、`echo \$PIPESTATUS`、`echo $PIPESTATUS_x`、
+/// `echo ${PIPESTATUS_x}` 都是 false，`echo $PIPESTATUS`、`echo ${PIPESTATUS[0]}` 才是 true。
+pub(super) fn bash_pipestatus_use(cmd: &str) -> bool {
+    if !cmd.contains("PIPESTATUS") {
+        return false;
+    }
+    let f = strip_shell_quotes(cmd.as_bytes());
+    let w = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < f.len() {
+        if f[i] == b'$' {
+            let mut j = i + 1;
+            if j < f.len() && f[j] == b'{' {
+                j += 1;
+            }
+            if f[j..].starts_with(b"PIPESTATUS") {
+                let k = j + b"PIPESTATUS".len();
+                if k >= f.len() || !w(f[k]) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 官方 2.1.299 的 `Fdt`：去掉引号与转义，只留会影响 `$PIPESTATUS` 判定的字节。单引号内的内容整段
+/// 丢掉（只留两个 `'`）；双引号切换状态、保留 `"`；反斜杠转义下一个字符——下一个不是 `$ ' " ` \` 时留它
+/// 本身、是则连同一起去掉。只特判 ASCII，多字节字节（≥0x80）原样留下。
+fn strip_shell_quotes(e: &[u8]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(e.len());
+    let (mut single, mut double) = (false, false);
+    let mut i = 0;
+    while i < e.len() {
+        let c = e[i];
+        if single {
+            if c == b'\'' {
+                single = false;
+                t.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\\' {
+            let l = e.get(i + 1).copied();
+            i += 2;
+            if let Some(l) = l
+                && !matches!(l, b'$' | b'\'' | b'"' | b'`' | b'\\')
+            {
+                t.push(l);
+            }
+            continue;
+        }
+        if c == b'"' {
+            double = !double;
+            t.push(c);
+        } else if c == b'\'' && !double {
+            single = true;
+            t.push(c);
+        } else {
+            t.push(c);
+        }
+        i += 1;
+    }
+    t
+}
+
+/// `bash_word_split_use`：命令里有一处无引号的变量展开，在 zsh（默认不拆词）与 bash（会拆词）下结果
+/// 不同——官方 2.1.299 的 `z8r`：先过几道便宜的前置判据，再用官方自带的 bash 解析器（[`bash_ast`]，逐函数
+/// 移植）解析成语法树，照官方的遍历（`Qjn`）收集四类变量后求交集。
+///
+/// 命中条件是下面任一（`split ∩ lists` 或 `iterated ∩ captured`）：
+/// - 某变量被赋了**含内部空格的引号字面量**（`v='a b'` / `v="a b"`），又在命令参数位置被**不加引号**展开
+///   （`cat $v`；`echo`/`print`/`eval` 这几个「拆不拆都一样」的不算，引号里、重定向目标、条件表达式里的也不算）；
+/// - 某变量被赋了**命令替换**（`v=$(...)` / 反引号），又出现在 `for`/`select … in $v` 或单元素数组里。
+///
+/// 前置判据（任一不过直接 false）：命令里有 `$`、长度 ≤ 10000（按 UTF-16 码元，同 JS 的 `length`）、匹配
+/// `=["'$\`]` 或 `\bfor|select\s`、且**不**匹配 `sh_?word_?split` 或 `emulate … sh/ksh/bash`（已经开了 zsh 拆词
+/// / sh 模拟，两边一样）。解析器放弃（定界符不合规、超时、超限）时判 false，与官方一致。
+pub(super) fn bash_word_split_use(cmd: &str) -> bool {
+    if !cmd.contains('$')
+        || cmd.encode_utf16().count() > 10_000
+        || !ws_prefilter(cmd)
+        || disables_word_split(cmd)
+    {
+        return false;
+    }
+    let Some(tree) = bash_ast::parse(cmd) else { return false };
+    let v = split_vars(&tree);
+    !v.split.is_disjoint(&v.lists) || !v.iterated.is_disjoint(&v.captured)
+}
+
+/// JS 正则里的 `\s`。
+fn js_space(c: u32) -> bool {
+    matches!(
+        c,
+        0x09..=0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+    )
+}
+
+fn is_js_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// `B8r = /=["'$`]|\b(?:for|select)\s/`：有 `=` 紧跟引号 / `$` / 反引号，或有 `for` / `select` 单词后跟空白。
+fn ws_prefilter(cmd: &str) -> bool {
+    let c: Vec<char> = cmd.chars().collect();
+    for i in 0..c.len() {
+        if c[i] == '=' && matches!(c.get(i + 1), Some('"' | '\'' | '$' | '`')) {
+            return true;
+        }
+        if i > 0 && is_js_word(c[i - 1]) {
+            continue;
+        }
+        for kw in ["for", "select"] {
+            let n = kw.len();
+            if c[i..].iter().take(n).copied().eq(kw.chars())
+                && c.get(i + n).is_some_and(|s| js_space(*s as u32))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `H8r = /sh_?word_?split|\bemulate\s+(?:-\w+\s+)*(?:sh|ksh|bash)\b/i`：已经把 zsh 拆词打开、或在 sh 模拟
+/// 里跑——两种 shell 下结果一样，官方据此判 false。
+fn disables_word_split(cmd: &str) -> bool {
+    let low = cmd.to_ascii_lowercase();
+    if ["shwordsplit", "sh_wordsplit", "shword_split", "sh_word_split"]
+        .iter()
+        .any(|v| low.contains(v))
+    {
+        return true;
+    }
+    let c: Vec<char> = low.chars().collect();
+    let kw: Vec<char> = "emulate".chars().collect();
+    (0..c.len()).any(|p| {
+        c[p..].starts_with(&kw)
+            && (p == 0 || !is_js_word(c[p - 1]))
+            && emulates_posix_shell(&c[p + kw.len()..])
+    })
+}
+
+/// `emulate` 之后是不是 `\s+(?:-\w+\s+)*(?:sh|ksh|bash)\b`。
+fn emulates_posix_shell(b: &[char]) -> bool {
+    let ws = |b: &[char]| b.iter().take_while(|c| js_space(**c as u32)).count();
+    let n = ws(b);
+    if n == 0 {
+        return false;
+    }
+    let mut b = &b[n..];
+    while b.first() == Some(&'-') {
+        let w = b[1..].iter().take_while(|c| is_js_word(**c)).count();
+        let s = ws(&b[1 + w..]);
+        if w == 0 || s == 0 {
+            return false;
+        }
+        b = &b[1 + w + s..];
+    }
+    ["sh", "ksh", "bash"].iter().any(|sh| {
+        let sh: Vec<char> = sh.chars().collect();
+        b.starts_with(&sh) && b.get(sh.len()).is_none_or(|c| !is_js_word(*c))
+    })
+}
+
+/// `z8r` 收集的四类变量，命中条件是 `split ∩ lists` 或 `iterated ∩ captured`（见 [`bash_word_split_use`]）。
+#[derive(Default)]
+struct SplitVars {
+    /// 被赋了含内部空格的引号字面量的变量（`v='a b'`）。
+    lists: std::collections::HashSet<String>,
+    /// 被赋了命令替换的变量（`v=$(...)`）。
+    captured: std::collections::HashSet<String>,
+    /// 在命令参数位置被无引号展开的变量（`cat $v`）。
+    split: std::collections::HashSet<String>,
+    /// 在 `for`/`select … in $v` 或单元素数组里被迭代的变量。
+    iterated: std::collections::HashSet<String>,
+}
+
+/// 遍历时的父节点：节点类型，或「拆不拆都一样」的命令（`echo`/`print`/`eval`，原文 `Vjn`）。
+#[derive(Clone, Copy)]
+enum Parent<'a> {
+    Kind(&'a str),
+    SameEither,
+}
+
+/// `j8r`：展开的父节点是这几类时才算「命令参数位置」。
+const WS_ARG_PARENTS: [&str; 6] =
+    ["command", "command_name", "declaration_command", "unset_command", "for_statement", "array"];
+/// `G8r`：拆不拆都一样的命令。
+const WS_SAME_EITHER: [&str; 3] = ["echo", "print", "eval"];
+
+/// 官方 `Qjn`：遍历语法树收集四类变量（集合运算与顺序无关，这里用显式栈代替递归）。
+fn split_vars(t: &bash_ast::Tree) -> SplitVars {
+    let name = |id| String::from_utf16_lossy(t.text(id));
+    let mut v = SplitVars::default();
+    let mut stack = vec![(t.root, Parent::Kind(""))];
+    while let Some((e, n)) = stack.pop() {
+        let kind = t.kind(e);
+        let ch = t.children(e);
+        let mut s = Parent::Kind(kind);
+        match kind {
+            "simple_expansion" | "expansion" => {
+                if let Some(h) = expansion_var(t, e)
+                    && matches!(n, Parent::Kind(k) if WS_ARG_PARENTS.contains(&k))
+                {
+                    v.split.insert(h);
+                }
+                continue;
+            }
+            "concatenation" => s = n,
+            "command" => {
+                let name_is_same_either =
+                    ch.iter().find(|c| t.kind(**c) == "command_name").is_some_and(|h| {
+                        let txt = t.text(*h);
+                        WS_SAME_EITHER.iter().any(|w| txt.iter().copied().eq(w.encode_utf16()))
+                    });
+                if name_is_same_either {
+                    s = Parent::SameEither;
+                }
+            }
+            "variable_assignment" => {
+                let in_command = matches!(n, Parent::Kind("command") | Parent::SameEither);
+                if let (false, Some(&h), Some(&b)) = (in_command, ch.first(), ch.get(2))
+                    && t.kind(h) == "variable_name"
+                {
+                    let y = ch.get(1).map(|y| t.kind(*y));
+                    let inner = if t.kind(b) == "string" && t.children(b).len() == 3 {
+                        t.children(b)[1]
+                    } else {
+                        b
+                    };
+                    if t.kind(inner) == "command_substitution" {
+                        v.captured.insert(name(h));
+                    } else if space_literal(t, b, y == Some("+=")) {
+                        v.lists.insert(name(h));
+                    } else if t.kind(b) == "array" && y == Some("=") {
+                        // `children.slice(1, -1)`：去掉两头的括号。
+                        let items = t.children(b);
+                        let hi = items.len().saturating_sub(1);
+                        single_item(t, if 1 < hi { &items[1..hi] } else { &[] }, &mut v.iterated);
+                    }
+                }
+            }
+            "for_statement" => {
+                if let Some(h) = ch.iter().find(|w| t.kind(**w) == "variable_name")
+                    && ch.iter().any(|w| space_literal(t, *w, false))
+                {
+                    v.lists.insert(name(*h));
+                }
+                let y = ch.iter().position(|w| t.kind(*w) == "in").map_or(0, |p| p + 1);
+                // `findIndex` 找不到是 -1，`slice(y, -1)` 取到倒数第二个。
+                let b = ch.iter().position(|w| matches!(t.kind(*w), ";" | "do_group"));
+                let end = b.unwrap_or(ch.len().saturating_sub(1));
+                single_item(t, if y < end { &ch[y..end] } else { &[] }, &mut v.iterated);
+            }
+            _ => {}
+        }
+        stack.extend(ch.iter().map(|c| (*c, s)));
+    }
+    v
+}
+
+/// 官方 `Jjn`：`$name` / `${name}`（不带运算符）的变量名。
+fn expansion_var(t: &bash_ast::Tree, e: bash_ast::Id) -> Option<String> {
+    let n = match t.kind(e) {
+        "simple_expansion" => 2,
+        "expansion" => 3,
+        _ => 0,
+    };
+    let ch = t.children(e);
+    let r = *ch.get(1)?;
+    (ch.len() == n && t.kind(r) == "variable_name").then(|| String::from_utf16_lossy(t.text(r)))
+}
+
+/// 官方 `Yjn`：只有一个元素、且它就是一个 `$name` 时记下。
+fn single_item(
+    t: &bash_ast::Tree,
+    items: &[bash_ast::Id],
+    set: &mut std::collections::HashSet<String>,
+) {
+    if let [one] = items
+        && let Some(v) = expansion_var(t, *one)
+    {
+        set.insert(v);
+    }
+}
+
+/// 官方 `Xjn`：引号字面量（`'a b'` / `"a b"`）去掉引号、里面的展开各换成一个 `x` 后，有没有内部空白
+/// （`\S\s+\S`）；`+=` 在前面补一个 `x`（接在已有值后面，接缝处可能产生内部空白）。
+fn space_literal(t: &bash_ast::Tree, e: bash_ast::Id, plus_eq: bool) -> bool {
+    if !matches!(t.kind(e), "string" | "raw_string") {
+        return false;
+    }
+    let txt = t.text(e);
+    let mut r: Vec<u16> = if txt.len() > 2 { txt[1..txt.len() - 1].to_vec() } else { Vec::new() };
+    for &c in t.children(e) {
+        if matches!(t.kind(c), "\"" | "string_content") {
+            continue;
+        }
+        let needle = t.text(c);
+        let at = if needle.is_empty() {
+            Some(0)
+        } else {
+            r.windows(needle.len()).position(|w| w == needle)
+        };
+        if let Some(at) = at {
+            r.splice(at..at + needle.len(), [u16::from(b'x')]);
+        }
+    }
+    if plus_eq {
+        r.insert(0, u16::from(b'x'));
+    }
+    has_inner_whitespace(&r)
+}
+
+/// `\S\s+\S`（JS 的 `\s`，按 UTF-16 码元）。
+fn has_inner_whitespace(s: &[u16]) -> bool {
+    let (mut seen, mut gap) = (false, false);
+    for &c in s {
+        if js_space(u32::from(c)) {
+            gap |= seen;
+        } else if gap {
+            return true;
+        } else {
+            seen = true;
+        }
+    }
+    false
+}
+
+/// 一行是不是 zsh 的「`=cmd` 展开找不到命令」诊断，照 2.1.299 可执行文件里的判据：
+/// `/^\(eval\):\d+: \S+ not found$/m`。
+pub(super) fn zsh_equals_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("(eval):") else { return false };
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let Some(rest) = rest[digits..].strip_prefix(": ") else { return false };
+    let Some(word) = rest.strip_suffix(" not found") else { return false };
+    !word.is_empty() && !word.chars().any(char::is_whitespace)
+}
+
 /// 一行是不是 zsh 的「通配符没匹配上」诊断，照 2.1.293 可执行文件里的判据逐字实现：
 /// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: no matches found: /m`——行首是 `(eval)` 或一个名字
 /// （`zsh`、报错的函数名 `scan_py` 之类），可带 `:行号`，紧跟 `: no matches found: `。只看子串会把

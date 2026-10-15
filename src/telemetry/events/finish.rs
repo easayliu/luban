@@ -322,17 +322,19 @@ impl EventBuilder<'_> {
             // `-p` 的只在带 `mid-conversation-system` 的模型上记（fable / opus 那两条有、haiku 那条没有）；
             // 2.1.291 起交互式也是——haiku-4.5 的会话一条都没有（`cap/auto-2.1.291-20261006-full` B3 / E4，
             // `cap/auto-2.1.293-20261008-full` 的 haiku-4-5 会话），带它的 haiku-5-5 有。
+            // 2.1.299 起 `mid-conversation-system` 转正不发头了，同样那几族照发它的子项 `-clear-at`，
+            // `systemTurns` 仍是 true（`cap/auto-2.1.299-20261014-full` 每个会话一条），故两项按前缀一起认。
             let v291 = version_at_least(&env.f.version, "2.1.291");
             if first_main
                 && v285
-                && (!(shape.sdk || v291) || betas_full.contains("mid-conversation-system-2"))
+                && (!(shape.sdk || v291) || betas_full.contains("mid-conversation-system-"))
             {
                 let has = |p: &str| betas_full.split(',').any(|b| b.trim().starts_with(p));
                 self.push(
                     ms(t_end, 1),
                     "tengu_wire_shape_recorded",
                     json!({
-                        "systemTurns": has("mid-conversation-system-2"),
+                        "systemTurns": has("mid-conversation-system-"),
                         "toolChangeHeader": has("mid-conversation-tool-changes-"),
                         "inlineTools": has(config::CC_BETA_INLINE_TOOLS
                             .trim_end_matches(|c: char| c.is_ascii_digit() || c == '-')),
@@ -457,6 +459,7 @@ impl EventBuilder<'_> {
             v280,
             v285,
             v291,
+            v299,
             ref dd_model,
             sess_turn_tools,
             sess_turn_api_calls,
@@ -542,10 +545,7 @@ impl EventBuilder<'_> {
                         "tool_pool_reused": false
                     }),
                 );
-                self.push(
-                    t4,
-                    "tengu_sdk_result",
-                    json!({
+                let mut result = json!({
                         "subtype": "success",
                         "is_error": false,
                         "num_turns": sess_turn_api_calls,
@@ -560,8 +560,12 @@ impl EventBuilder<'_> {
                         "turn_index": 0,
                         "mcp_pending_at_start": 0,
                         "mcp_pending_at_end": 0
-                    }),
-                );
+                });
+                // 2.1.299：末尾多报进程里加载了几个 mod（`cap/auto-2.1.299-20261014-full` 的 `-p` 全是 0）。
+                if v299 {
+                    result["installed_mods"] = json!(0);
+                }
+                self.push(t4, "tengu_sdk_result", result);
                 self.push(
                     ms(t_end, 748),
                     "tengu_cache_eviction_hint",

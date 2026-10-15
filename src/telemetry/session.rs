@@ -51,8 +51,9 @@ pub(super) struct Session {
     /// 首次输入那段模板（`prompt` + `first_prompt`）已经发过：客户端注入的一轮（peer /
     /// task-notification）不套模板，第一次真正的用户输入才是「首次」。
     pub(super) first_prompt_tpl_done: bool,
-    /// `tengu_lucky_cerf` 的实验曝光已经发过（一个进程一次，`/clear` 接着算，见 [`TurnFacts::lucky_cerf`]）。
-    pub(super) lucky_cerf_exposed: bool,
+    /// 已经发过曝光的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text`（按 feature 记，一个进程每个一次，
+    /// `/clear` 接着算，见 [`TurnFacts::lucky_cerf`]）。
+    pub(super) lucky_cerf_exposed: Vec<&'static str>,
     /// 模板 `background` 段已经补发到第几条。
     pub(super) background_done: usize,
     /// 最近几条请求的完成时刻（不分类别）。`timeSinceLastApiCallMs` 取「在这条之前完成的最近
@@ -537,10 +538,12 @@ pub(super) struct TurnFacts {
     pub(super) v291: bool,
     pub(super) v293: bool,
     pub(super) v296: bool,
-    /// 这一轮要发的 `tengu_lucky_cerf` 实验曝光（实验名, 分组）。客户端头一次给精简提示词的模型
-    /// 拼 `Agent` 说明时读这个开关、记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词模型开头、
-    /// 中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮。
-    pub(super) lucky_cerf: Option<(String, i64)>,
+    pub(super) v299: bool,
+    /// 这一轮要发的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text` 实验曝光。客户端头一次给精简提示词
+    /// 的模型拼 `Agent` 说明时读这两个开关、各记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词
+    /// 模型开头、中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮；从 opus-5-5（不在
+    /// 清单里、只读清单）切到 sonnet-5-5 时，正文那条落在切过去之后。
+    pub(super) lucky_cerf: Vec<crate::proxy::LuckyCerfExposure>,
     /// 会话主线程最近一条的 effort，见 [`Session::main_effort`]。
     pub(super) main_effort: Option<String>,
     /// 同一条线（主线程 / 这个子代理）上一条回复里有工具调用（`tether_live_outcome.anchorHasToolCall`）。
@@ -683,7 +686,9 @@ impl Session {
             main_requests: 0,
             first_prompt_tpl_done: false,
             // 曝光按进程记：`/clear` 接着旧会话的，新进程（含 `--continue` / `--resume`）从头算。
-            lucky_cerf_exposed: cleared_prev.is_some_and(|p| p.lucky_cerf_exposed),
+            lucky_cerf_exposed: cleared_prev
+                .map(|p| p.lucky_cerf_exposed.clone())
+                .unwrap_or_default(),
             // `/clear` 换的是会话不是进程：运行时长与后台任务的进度接着上一个会话的算。
             background_done: cleared_prev.map_or(0, |p| p.background_done),
             recent_ends: VecDeque::new(),
@@ -747,8 +752,9 @@ pub(super) struct ClearedPrev {
     pub(super) started_wall: SystemTime,
     /// 进程里已经补发过的后台任务数，新会话接着算。
     pub(super) background_done: usize,
-    /// 进程里已经发过 `tengu_lucky_cerf` 曝光：GrowthBook 的曝光按进程记，`/clear` 之后不再发。
-    pub(super) lucky_cerf_exposed: bool,
+    /// 进程里已经发过的 `tengu_lucky_cerf` 一系曝光（按 feature）：GrowthBook 的曝光按进程记，
+    /// `/clear` 之后不再发。
+    pub(super) lucky_cerf_exposed: Vec<&'static str>,
     // tether 的两个锚点**不**从旧会话接：`/clear` 之后新会话的第一条主线程请求报
     // `create/no_continue_pointer`、`threadIdleMs: -1`、`anchorHasToolCall: false`
     // （`cap/auto-2.1.291-20261006-full/00356`，会话 `271f3652`）。
@@ -846,7 +852,7 @@ impl State {
                 last_call_end: p.last_call_end,
                 started_wall: p.started_wall,
                 background_done: p.background_done,
-                lucky_cerf_exposed: p.lucky_cerf_exposed,
+                lucky_cerf_exposed: p.lucky_cerf_exposed.clone(),
             })
         });
         let parent_session_id = cleared_from

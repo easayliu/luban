@@ -1,6 +1,8 @@
 //! 工具声明：注入官方工具、schema 拍平、去重与 eager 工具流式。
 
 use super::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// 这条请求的客户端工具该不该补 `eager_input_streaming: true`。证据与规则见
 /// [`config::CcEagerTools`]，两条路径的**条件来源不同**：
@@ -174,23 +176,86 @@ pub(in crate::proxy) const CC_TRIMMED_TOOLS: &[&str] = &["Artifact", "ListAgents
 static CC_TOOLS_CORE_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE));
 
-/// [`CC_TOOLS_CORE`] 换上 `tengu_lucky_cerf` 那版 `Agent` 说明（[`config::cc_agent_uses_cerf_text`]）：
-/// `cap/auto-2.1.296-20261013-full/00258`（sonnet-5-5）、`00344`（haiku-5-5）、`00541`（fable-5-1）的
-/// `Agent` 只有 `description` 与 opus 那份不同（1811 → 3049 字符：「何时用」那段换成先讲代价、再讲
-/// 何时派、何时自己做、怎么写交代），其余 13 条与 [`CC_TOOLS_CORE`] 逐字节相同。
+/// cerf 那版 `Agent` 说明里客户端内置的「何时用」正文（可执行文件里的 `vHt`，2.1.296 与 2.1.299
+/// 逐字相同）。服务端 `tengu_lucky_cerf_text` 下发了非空正文时整段换成那一段，见 [`cerf_desc`]。
+const CC_AGENT_CERF_BUILTIN: &str = "A fresh agent costs more than it looks.";
+const CC_AGENT_CERF_BUILTIN_END: &str =
+    "you do not understand the task well enough to hand it off.";
+
+/// cerf 那版 `Agent` 说明：`text` 是号下发的正文（`None` 用内置的）。内置正文在资产里从
+/// [`CC_AGENT_CERF_BUILTIN`] 开头、到 [`CC_AGENT_CERF_BUILTIN_END`] 结尾，换的就是这一整段——客户端
+/// 拼说明时就是把这一段整个换成下发的值（`(w ?? Xfe())`）。`cap/auto-2.1.299-20261014-full/00246`
+/// （sonnet-5-5）的 `Agent` 说明与「资产里这段换成那个号 eval 里 v4 第 1 组正文」逐字节相同。
+fn cerf_desc(text: Option<&str>) -> String {
+    let asset = include_str!("../../assets/cc_agent_desc_cerf.txt");
+    let Some(text) = text else { return asset.to_owned() };
+    let start = asset.find(CC_AGENT_CERF_BUILTIN).expect("cerf asset carries the builtin text");
+    let end = asset[start..].find(CC_AGENT_CERF_BUILTIN_END).expect("builtin text end")
+        + start
+        + CC_AGENT_CERF_BUILTIN_END.len();
+    format!("{}{}{}", &asset[..start], text, &asset[end..])
+}
+
+fn with_agent_desc(desc: String) -> Vec<serde_json::Value> {
+    let mut tools = CC_TOOLS_CORE.clone();
+    let agent = tools
+        .iter_mut()
+        .find(|t| t["name"] == "Agent")
+        .expect("cc_tools_core.json must declare Agent");
+    agent["description"] = serde_json::Value::from(desc);
+    tools
+}
+
+/// [`CC_TOOLS_CORE`] 换上 cerf 那版 `Agent` 说明（内置正文）：`cap/auto-2.1.296-20261013-full/00258`
+/// （sonnet-5-5）、`00344`（haiku-5-5）、`00541`（fable-5-1）的 `Agent` 只有 `description` 与 opus 那份
+/// 不同（1811 → 3049 字符：「何时用」那段换成先讲代价、再讲何时派、何时自己做、怎么写交代），其余 13 条
+/// 与 [`CC_TOOLS_CORE`] 逐字节相同。号下发了正文的那几版见 [`cerf_with_text`]。
 static CC_TOOLS_CORE_CERF: std::sync::LazyLock<Vec<serde_json::Value>> =
-    std::sync::LazyLock::new(|| {
-        let mut tools = CC_TOOLS_CORE.clone();
-        let agent = tools
-            .iter_mut()
-            .find(|t| t["name"] == "Agent")
-            .expect("cc_tools_core.json must declare Agent");
-        agent["description"] =
-            serde_json::Value::from(include_str!("../../assets/cc_agent_desc_cerf.txt"));
-        tools
-    });
+    std::sync::LazyLock::new(|| with_agent_desc(cerf_desc(None)));
 static CC_TOOLS_CORE_CERF_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE_CERF));
+
+/// [`cc_tools_core_for`] 交出的那份声明：资产里那几份是静态的，号下发了正文的那几版在共享缓存里。
+#[derive(Clone)]
+pub(in crate::proxy) enum CcTools {
+    Static(&'static [serde_json::Value]),
+    Shared(Arc<[serde_json::Value]>),
+}
+
+impl std::ops::Deref for CcTools {
+    type Target = [serde_json::Value];
+    fn deref(&self) -> &[serde_json::Value] {
+        match self {
+            Self::Static(t) => t,
+            Self::Shared(t) => t,
+        }
+    }
+}
+
+/// 号下发了正文的 cerf 那版，按（正文, 是否精简）缓存。实验的分组只有寥寥几份正文，表很小；
+/// 留个上限防服务端哪天每号一份：满了整表清掉重建（正在用的那几份由各自的 `Arc` 撑着，不受影响）。
+/// 不退回内置正文——那样发出去的说明就和这个会话的曝光、确认时比的正文对不上了。
+fn cerf_with_text(text: &Arc<str>, trim: bool) -> CcTools {
+    type Cache = HashMap<(Arc<str>, bool), Arc<[serde_json::Value]>>;
+    static CACHE: std::sync::LazyLock<parking_lot::Mutex<Cache>> =
+        std::sync::LazyLock::new(Default::default);
+    const MAX: usize = 32;
+    let mut cache = CACHE.lock();
+    if let Some(t) = cache.get(&(text.clone(), trim)) {
+        return CcTools::Shared(t.clone());
+    }
+    if cache.len() >= MAX {
+        tracing::warn!(
+            entries = cache.len(),
+            "too many distinct Agent texts from the server, clearing the cache"
+        );
+        cache.clear();
+    }
+    let all = with_agent_desc(cerf_desc(Some(text)));
+    let tools: Arc<[serde_json::Value]> = if trim { trimmed(&all) } else { all }.into();
+    cache.insert((text.clone(), trim), tools.clone());
+    CcTools::Shared(tools)
+}
 static CC_TOOLS_CORE_HAIKU_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE_HAIKU));
 
@@ -221,19 +286,25 @@ pub(in crate::proxy) fn cc_tools_core(
     }
 }
 
-/// 实际注进出站体的那份声明：[`cc_tools_core`] 再挑 `Agent` 说明——`cerf` 是这个会话钉住的
-/// `tengu_lucky_cerf` 分组里这个模型换不换（[`crate::proxy::lucky_cerf::agent_uses_cerf_text`]），换就用
-/// [`CC_TOOLS_CORE_CERF`]。haiku-4.5 不走精简提示词、客户端根本不读这个开关，不受影响。工具名与
-/// 先后两份相同，只看名字的地方仍用 [`cc_tools_core`]。
+/// 实际注进出站体的那份声明：[`cc_tools_core`] 再挑 `Agent` 说明——`desc` 是这个会话钉住的分组里
+/// 这个模型用哪一版（[`crate::proxy::lucky_cerf::agent_desc`]）：清单命中就用 cerf 那版
+/// （[`CC_TOOLS_CORE_CERF`]），号下发了正文就换上那段（[`cerf_with_text`]）。haiku-4.5 不走精简提示词、
+/// 客户端根本不读这两个开关，不受影响。工具名与先后几份相同，只看名字的地方仍用 [`cc_tools_core`]。
 pub(in crate::proxy) fn cc_tools_core_for(
     profile: &config::CcProfile,
-    cerf: bool,
+    desc: &crate::proxy::lucky_cerf::AgentDesc,
     trim: bool,
-) -> &'static [serde_json::Value] {
-    if profile.kind == config::CcProfileKind::MainHaiku || !cerf {
-        return cc_tools_core(profile, trim);
+) -> CcTools {
+    use crate::proxy::lucky_cerf::AgentDesc;
+    match desc {
+        _ if profile.kind == config::CcProfileKind::MainHaiku => {
+            CcTools::Static(cc_tools_core(profile, trim))
+        }
+        AgentDesc::Plain => CcTools::Static(cc_tools_core(profile, trim)),
+        AgentDesc::Cerf(Some(text)) => cerf_with_text(text, trim),
+        AgentDesc::Cerf(None) if trim => CcTools::Static(&CC_TOOLS_CORE_CERF_TRIM),
+        AgentDesc::Cerf(None) => CcTools::Static(&CC_TOOLS_CORE_CERF),
     }
-    if trim { &CC_TOOLS_CORE_CERF_TRIM } else { &CC_TOOLS_CORE_CERF }
 }
 
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
@@ -429,8 +500,8 @@ pub(super) fn inject_cc_tools(
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
-    let cerf = crate::proxy::lucky_cerf::agent_uses_cerf_text(who.cred_id, who.session, &model);
-    let stubs = cc_tools_core_for(profile, cerf, trim);
+    let desc = crate::proxy::lucky_cerf::agent_desc(who.cred_id, who.session, &model);
+    let stubs = cc_tools_core_for(profile, &desc, trim);
     let official_names: Vec<&str> =
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
     let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);
@@ -438,7 +509,7 @@ pub(super) fn inject_cc_tools(
     // 客户端的同名声明与官方那条差在哪：只为日志与计数，落位一律用官方对象。
     let mut replaced = 0usize;
     let mut surface_differs: Vec<&str> = Vec::new();
-    for stub in stubs {
+    for stub in stubs.iter() {
         let Some(name) = stub.get("name").and_then(|n| n.as_str()) else { continue };
         for t in tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)) {
             if serde_json::to_string(t).ok() != serde_json::to_string(stub).ok() {

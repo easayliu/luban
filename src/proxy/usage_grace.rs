@@ -51,7 +51,7 @@ pub(super) fn note_overage(cred_id: i64, info: &RateLimitInfo) {
 pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
     let Some(features) = v.get("features").and_then(|f| f.as_object()) else { return };
-    // 同一份 eval 里另记按号分组的 `tengu_lucky_cerf`（`Agent` 说明与那条实验曝光）。
+    // 同一份 eval 里另记按号分组的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text`（`Agent` 说明与实验曝光）。
     super::lucky_cerf::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)

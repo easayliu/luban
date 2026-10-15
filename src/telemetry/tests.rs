@@ -4044,23 +4044,32 @@ fn tether_anchors_do_not_carry_over_a_clear() {
     assert_eq!(live[0]["anchorHasToolCall"], false, "不看旧会话的回复");
 }
 
-/// 2.1.296 的 `tengu_lucky_cerf` 曝光：会话从完整提示词的 haiku-4.5 开头时不发，中途切到精简提示词
-/// 的 sonnet-5-5、头一次输入时补一条（分组照这个会话钉住的那份），之后不再发。
+/// 2.1.299 抓包那个号的 eval 里那两项：清单是默认值，正文在实验 v4 第 1 组。
+const CERF_V4_EVAL: &str = r#"{"features":{"tengu_lucky_cerf":{"value":["claude-opus-5",
+    "claude-fable-5","claude-fable-5-1","claude-sonnet-5-5","claude-haiku-5-5"],"source":"defaultValue"},
+    "tengu_lucky_cerf_text":{"value":"Text.","source":"experiment",
+    "experiment":{"key":"tengu_lucky_cerf_experiment_v4"},
+    "experimentResult":{"inExperiment":true,"variationId":1}}}}"#;
+
+/// `tengu_lucky_cerf` 一系的曝光（号的 eval 同 2.1.299 抓包那个号）：会话从完整提示词的 haiku-4.5 开头时
+/// 不发；切到 opus-5-5（精简提示词，只读清单）时清单不在实验里，不发；再切到清单里的 sonnet-5-5、头一次
+/// 输入时补正文那条（v4，分组照这个会话钉住的那份），之后不再发。
 #[test]
 fn lucky_cerf_exposure_follows_the_first_lean_prompt_model() {
     const CRED: i64 = 9_301;
+    crate::proxy::note_eval_features(CRED, CERF_V4_EVAL.as_bytes());
     let body = |model: &str| {
         let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
         v["model"] = json!(model);
         v["system"][0]["text"] = json!(
-            "x-anthropic-billing-header: cc_version=2.1.296.1e2; cc_entrypoint=cli; cch=0f7f8;"
+            "x-anthropic-billing-header: cc_version=2.1.299.1e2; cc_entrypoint=cli; cch=0f7f8;"
         );
         serde_json::to_vec(&v).unwrap()
     };
     let turn = |model: &str, req: &str, at: SystemTime| {
         let mut c = call(body(model), req, "end_turn");
         c.cred_id = CRED;
-        c.ua_out = "claude-cli/2.1.296 (external, cli)".into();
+        c.ua_out = "claude-cli/2.1.299 (external, cli)".into();
         c.resp_model = Some(model.into());
         c.started_at = at;
         c
@@ -4070,20 +4079,26 @@ fn lucky_cerf_exposure_follows_the_first_lean_prompt_model() {
         st.pending[&(CRED, SESSION.to_string())]
             .events
             .iter()
-            .filter(|(_, e)| ev_name(e) == "tengu_lucky_cerf_experiment_v3")
+            .filter(|(_, e)| ev_name(e).starts_with("tengu_lucky_cerf_experiment"))
             .map(|(_, e)| e.clone())
             .collect()
     };
     let t = Telemetry::default();
-    t.ingest(turn("claude-haiku-4-5-20251001", "req_1", frozen_now() - Duration::from_secs(30)));
-    assert!(exposures(&t).is_empty(), "haiku-4.5 不读这个开关");
-    t.ingest(turn("claude-sonnet-5-5", "req_2", frozen_now() - Duration::from_secs(15)));
+    t.ingest(turn("claude-haiku-4-5-20251001", "req_1", frozen_now() - Duration::from_secs(45)));
+    assert!(exposures(&t).is_empty(), "haiku-4.5 不读这两个开关");
+    t.ingest(turn("claude-opus-5-5", "req_2", frozen_now() - Duration::from_secs(30)));
+    assert!(exposures(&t).is_empty(), "opus-5-5 只读清单，清单不在实验里");
+    t.ingest(turn("claude-sonnet-5-5", "req_3", frozen_now() - Duration::from_secs(15)));
     let ex = exposures(&t);
     assert_eq!(ex.len(), 1, "切到 sonnet-5-5 那次输入补一条");
-    assert_eq!(ex[0]["event_data"]["variation_id"], 1, "没见过 eval：按抓包那组");
-    assert_eq!(ex[0]["event_data"]["experiment_metadata"], "{\"feature_id\":\"tengu_lucky_cerf\"}");
-    t.ingest(turn("claude-sonnet-5-5", "req_3", frozen_now()));
-    assert_eq!(exposures(&t).len(), 1, "一个会话只发一次");
+    assert_eq!(ev_name(&ex[0]), "tengu_lucky_cerf_experiment_v4");
+    assert_eq!(ex[0]["event_data"]["variation_id"], 1, "按号的 eval");
+    assert_eq!(
+        ex[0]["event_data"]["experiment_metadata"],
+        "{\"feature_id\":\"tengu_lucky_cerf_text\"}"
+    );
+    t.ingest(turn("claude-sonnet-5-5", "req_4", frozen_now()));
+    assert_eq!(exposures(&t).len(), 1, "一个进程只发一次");
 }
 
 /// `/clear` 换会话不换进程：`tengu_lucky_cerf` 曝光在旧会话发过，新会话不再发；新进程才重新算。
@@ -4092,17 +4107,586 @@ fn lucky_cerf_exposure_is_not_repeated_after_a_clear() {
     let t = Telemetry::default();
     let base = frozen_now() - Duration::from_secs(300);
     let s2 = "55555555-5555-4555-8555-555555555555";
-    let at_296 = |sid: &str, rid: &str, msg: &str, at: SystemTime| {
+    // `main_call` 是 opus-5：在清单里，按号的 eval 发正文那条（v4）。用独立的号，不动别的用例共用的 7 号。
+    const CRED: i64 = 9_302;
+    crate::proxy::note_eval_features(CRED, CERF_V4_EVAL.as_bytes());
+    let at_299 = |sid: &str, rid: &str, msg: &str, at: SystemTime| {
         let mut c = main_call(sid, rid, msg, at);
-        c.ua_out = "claude-cli/2.1.296 (external, cli)".into();
+        c.ua_out = "claude-cli/2.1.299 (external, cli)".into();
+        c.cred_id = CRED;
         c
     };
-    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
-    t.ingest(at_296(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
-    t.ingest(at_296(s2, "req_2", "msg_2", base + Duration::from_secs(30)));
+    let mut probe = quota_probe_call("11111111-1111-4111-8111-111111111111", base);
+    probe.cred_id = CRED;
+    t.ingest(probe);
+    t.ingest(at_299(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
+    t.ingest(at_299(s2, "req_2", "msg_2", base + Duration::from_secs(30)));
     let count = |sid: &str| {
-        events_of(&t, sid).iter().filter(|(n, ..)| n == "tengu_lucky_cerf_experiment_v3").count()
+        let st = t.0.state.lock();
+        st.pending.get(&(CRED, sid.to_string())).map_or(0, |p| {
+            p.events.iter().filter(|(_, e)| ev_name(e) == "tengu_lucky_cerf_experiment_v4").count()
+        })
     };
     assert_eq!(count(SESSION), 1, "旧会话首次输入发一条");
     assert_eq!(count(s2), 0, "/clear 之后的新会话不再发");
+}
+
+/// 2.1.299 起交互式会话退出时，`config_cache_stats` 前多一条 `tengu_resume_hint_printed`（同一毫秒，
+/// `cap/auto-2.1.299-20261014-full` 每个交互式会话一条）；更早的版本没有。
+#[test]
+fn idle_exit_prints_the_resume_hint_from_2_1_299() {
+    for (ua, want) in [
+        ("claude-cli/2.1.299 (external, cli)", true),
+        ("claude-cli/2.1.296 (external, cli)", false),
+    ] {
+        let t = Telemetry::default();
+        let mut last = call(cc_body(true), "req_last", "end_turn");
+        last.started_at = frozen_now() - Duration::from_secs(60);
+        last.ua_out = ua.into();
+        t.ingest(last);
+        let later = Instant::now() + Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS + 1);
+        t.gc(later);
+        let due = t.take_due(later);
+        let f = &due[0];
+        let names: Vec<&str> = f.events.iter().map(ev_name).collect();
+        let at = names.iter().position(|n| *n == "tengu_config_cache_stats").unwrap();
+        assert_eq!(names[at - 1] == "tengu_resume_hint_printed", want, "{ua}");
+        if want {
+            let m = meta_of(&f.events[at - 1]);
+            assert_eq!(
+                (&m["arg"], &m["title"], &m["worktree"], &m["advice"]),
+                (&json!("id"), &json!("absent"), &json!("absent"), &json!(false))
+            );
+        }
+    }
+}
+
+/// 2.1.299 的遥测（`cap/auto-2.1.299-20261014-full`，交互式默认模式的单轮会话）：
+/// - 出站头不带 `mid-conversation-system` 了，会话级 `betas` 随之止于 `prompt-caching-scope`；
+/// - `wire_shape_recorded` 照报、`systemTurns` 仍是 true（靠 `-clear-at` 认），haiku-4.5 照旧不报；
+/// - tether 收尾多 `searchResultHistory: false`；启动段的配置拉取多 `stored_copy` 一系。
+#[test]
+fn version_2_1_299_telemetry_shape() {
+    let run = |model: &str, effort: Option<&str>, betas: &str| {
+        let t = Telemetry::default();
+        let mut c = call(body_for(model, effort, true), "req_299", "end_turn");
+        c.ua_out = "claude-cli/2.1.299 (external, cli)".into();
+        c.betas = Some(betas.into());
+        c.resp_model = Some(model.into());
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .map(|(_, e)| {
+                let d = &e["event_data"];
+                let name = d["event_name"].as_str().or_else(|| d["experiment_id"].as_str());
+                let meta =
+                    if d["additional_metadata"].is_string() { meta_of(e) } else { Value::Null };
+                (name.unwrap_or("?").to_string(), meta, d["betas"].clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let opus_betas = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+        thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+        per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,\
+        advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+        effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
+        extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let h45_betas = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+        context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,\
+        advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,\
+        thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
+        cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let opus = run("claude-opus-5-5", Some("medium"), opus_betas);
+    let h45 = run("claude-haiku-4-5-20251001", None, h45_betas);
+    let meta = |ev: &[(String, Value, Value)], n: &str| {
+        ev.iter().find(|(x, ..)| x == n).map(|(_, m, _)| m.clone()).unwrap_or(Value::Null)
+    };
+    let wire = meta(&opus, "tengu_wire_shape_recorded");
+    assert_eq!(wire["systemTurns"], true, "{wire}");
+    assert_eq!(wire["keptReminders"], true);
+    assert!(!h45.iter().any(|(n, ..)| n == "tengu_wire_shape_recorded"));
+    let session = opus.iter().find(|(n, ..)| n == "tengu_started").unwrap().2.clone();
+    assert_eq!(
+        session,
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+         prompt-caching-scope-2026-01-05",
+        "抓包里主线程会话 4841 条事件的那串"
+    );
+    let live = meta(&opus, "tengu_tether_live_outcome");
+    let keys: Vec<&String> = live.as_object().unwrap().keys().collect();
+    let at = keys.iter().position(|k| *k == "serverToolHistory").unwrap();
+    assert_eq!(keys[at + 1], "searchResultHistory");
+    let fetch = meta(&opus, "tengu_remote_settings_fetch");
+    assert_eq!(fetch["stored_copy_gate"], "shadow", "{fetch}");
+}
+
+/// 2.1.299 的 Bash 命令画像：开头报模型（不带 `[1m]`），`interrupted` 后报 `zsh_note_in_prompt`（`!` 跑的
+/// 不报），`zsh_nomatch_error` 后报三项判定；判据照可执行文件。
+#[test]
+fn bash_meta_v299_adds_the_new_judgements() {
+    use super::tools::{bash_executed_meta, bash_meta_v293, bash_meta_v299, bash_profile};
+    let cmd = "make test; echo ${PIPESTATUS[0]}";
+    let mut m =
+        bash_executed_meta(&bash_profile(cmd), 10, Some("toolu_1"), false, false, "default");
+    bash_meta_v293(&mut m, "");
+    bash_meta_v299(&mut m, cmd, "ok\n(eval):1: foo not found", "claude-opus-5-5[1m]", false);
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys[0], "model");
+    assert_eq!(m["model"], "claude-opus-5-5");
+    let after = |k: &str| keys[keys.iter().position(|x| *x == k).unwrap() + 1];
+    assert_eq!(after("interrupted"), "zsh_note_in_prompt");
+    assert_eq!(after("zsh_nomatch_error"), "zsh_equals_error");
+    assert_eq!(after("zsh_equals_error"), "bash_pipestatus_use");
+    assert_eq!(after("bash_pipestatus_use"), "bash_word_split_use");
+    assert_eq!((&m["zsh_equals_error"], &m["bash_pipestatus_use"]), (&json!(true), &json!(true)));
+
+    let mut typed = bash_executed_meta(&bash_profile("ls"), 3, None, false, true, "default");
+    bash_meta_v293(&mut typed, "");
+    bash_meta_v299(&mut typed, "ls", "", "claude-sonnet-5-5", true);
+    assert!(typed.get("zsh_note_in_prompt").is_none(), "`!` 跑的不报");
+    assert_eq!(typed["zsh_equals_error"], false);
+
+    use super::tools::zsh_equals_line;
+    assert!(zsh_equals_line("(eval):12: =python not found"));
+    assert!(!zsh_equals_line("(eval):1: two words not found"));
+    assert!(!zsh_equals_line("zsh: command not found: foo"));
+    assert!(!zsh_equals_line("(eval): foo not found"));
+}
+
+/// `bash_pipestatus_use` 与 `bash_word_split_use` 照官方 2.1.299 的判定，取值逐条核对可执行文件里那两个
+/// 判定函数（本机把它们的原文连同官方自带的解析器拎出来当判题器；`bash_word_split_use` 的解析器是照它逐函数
+/// 移植的，在约 12 万条命令——历次审查的反例、按语法上下文构造的、随机拼接的——上与官方逐条一致）。
+#[test]
+fn bash_judgements_match_the_official_logic() {
+    use super::tools::{bash_pipestatus_use, bash_word_split_use};
+
+    // --- bash_pipestatus_use：单引号 / 转义 / 更长变量名都是 false，真用了才 true。 ---
+    for (cmd, want) in [
+        ("echo '$PIPESTATUS'", false),
+        ("echo \\$PIPESTATUS", false),
+        ("echo $PIPESTATUS_backup", false),
+        ("echo ${PIPESTATUS_backup}", false),
+        ("echo $PIPESTATUS", true),
+        ("echo ${PIPESTATUS}", true),
+        ("make; echo ${PIPESTATUS[0]}", true),
+        ("x=$PIPESTATUS; echo $x", true),
+        ("echo \"$PIPESTATUS\"", true),
+        ("echo $PIPESTATUS.bak", true),
+        ("set -o pipefail", false),
+    ] {
+        assert_eq!(bash_pipestatus_use(cmd), want, "pipestatus: {cmd:?}");
+    }
+
+    // --- bash_word_split_use ---
+    for (cmd, want) in [
+        // 空格字面量 + 命令位置的无引号展开 → true；加引号 / echo / 没空格 → false。
+        ("files='a b'; cat $files", true),
+        ("files=\"a b\"; cat $files", true),
+        ("files='a b'; cat \"$files\"", false),
+        ("files='a b'; echo $files", false),
+        ("name='John'; echo $name", false),
+        ("single='word'; cat $single", false),
+        ("v='two words'; grep -r $v .", true),
+        // 命令替换 + for/select 迭代 → true。
+        ("out=$(ls); for f in $out; do echo $f; done", true),
+        ("out=$(ls); select f in $out; do break; done", true),
+        ("files=$(ls); cat $files", false),
+        // 声明命令按 declaration_command 计入赋值。
+        ("declare x='a b'; cat $x", true),
+        ("export f=$(ls); for a in $f; do :; done", true),
+        ("declare -a x=$v; v='a b'", false),
+        // 数组、+= 接缝、双引号里命令替换缩成 x。
+        ("files=($v); v='two words'", true),
+        ("v+=' b'; cat $v", true),
+        ("v=' b'; cat $v", false),
+        ("y=\"$(a b)c\"; cat $y", false),
+        ("y=\"$(ls) more\"; cat $y", true),
+        // 前置过滤：开了 zsh 拆词 / sh 模拟 → false；没有 $ / for / select / =quote → false。
+        ("setopt shwordsplit; files='a b'; cat $files", false),
+        ("emulate sh; files='a b'; cat $files", false),
+        ("emulate -L bash; files='a b'; cat $files", false),
+        ("ls -la", false),
+        ("x='a b'", false),
+        // 命令前缀赋值不计入；a=$a 这类非字面量不计入。
+        ("files='a b' cat $files", false),
+        ("a='x y'; b=$a; cat $b", false),
+        // 递归子命令：子壳 / 命令组 / 命令替换 / 函数体里的赋值与展开都要收集。
+        ("(files='a b'; cat $files)", true),
+        ("{ files='a b'; cat $files; }", true),
+        ("x=$(files='a b'; cat $files); echo $x", true),
+        ("out=`files='a b'; cat $files`", true),
+        ("f() { files='a b'; cat $files; }", true),
+        ("g() ( files='a b'; cat $files )", true),
+        // 注释到行尾：注释里的用法不计入。
+        ("files='a b'; # cat $files", false),
+        ("files='a b'; cat $files # done", true),
+        ("# files='a b'; cat $files", false),
+        // 双引号里的 `\"` 是转义，不结束引号——里面的 $files 仍在引号内、不算 split。
+        ("files=\"a b\"; cat \"x\\\"$files\"", false),
+        // ${...} 里的命令替换官方不按命令解析。
+        ("cat ${x:-$(files='a b'; cat $files)}", false),
+        // 算术不是命令，不收集。
+        ("(( x=1 )); cat $x", false),
+        // $(...) 平衡要认引号：括号在引号里不算闭合。
+        ("x=$(echo \"(\"; files='a b'; cat $files)", true),
+        ("x=$(echo ')'; files='a b'; cat $files)", true),
+        ("files='a b'; cat $(echo \")\")$files", true),
+        // 命令不完整也不 panic（多字节、未闭合）——只要不崩就行。
+        ("files='a b'; cat $files; x=$(", true),
+        ("x=$(files='a b'; cat $files", true),
+        ("files='a b'; cat $(\u{4f60}\u{597d}", false),
+        ("x=$(\u{6587}\u{4ef6}='a b'", false),
+        // 子命令边界认引号 / 转义 / 注释（问题 2）：引号里、转义的、注释里的括号都不算闭合。
+        ("echo $(printf ')'; files='a b'; cat $files)", true),
+        ("x=$(echo \\); files='a b'; cat $files)", true),
+        ("x=\"$(echo \")\"; files='a b'; cat $files)\"", true),
+        ("x=$(# )\nfiles='a b'; cat $files)", true),
+        ("f() { echo '}'; files='a b'; cat $files; }", true),
+        ("f() { echo \"}\"; files='a b'; cat $files; }", true),
+        // 外层双引号包着的 `$(...)`：注释里的 `)` 不能提前闭合，否则内层整段被双引号分支跳过。
+        ("x=\"$(# )\nfiles='a b'; cat $files)\"", true),
+        ("x=\"$(echo ')' # )\nfiles='a b'; cat $files)\"", true),
+        ("x=\"$(echo a#b)\"; files='a b'; cat $files", true),
+        ("echo ${#files}; files='a b'; cat $files", true),
+        // 重定向目标不是命令参数；命令名之后第一处重定向起都算目标，命令名之前的只吃一个词。
+        ("files='a b'; cat < $files", false),
+        ("files='a b'; cat <$files", false),
+        ("files='a b'; cat 2>$files", false),
+        ("files='a b'; cat &> $files", false),
+        ("files='a b'; cat >& $files", false),
+        ("files='a b'; cat <<< $files", false),
+        ("files='a b'; cat a>$files", false),
+        ("files='a b'; cat < $files $files", false),
+        ("files='a b'; cat 2>&1 $files", false),
+        ("files='a b'; cat {fd}> $files", false),
+        ("files='a b'; cat $files > out", true),
+        ("files='a b'; cat $files>out", true),
+        ("files='a b'; > $files cat $files", true),
+        ("v='x y'; <in cat $v", true),
+        ("files='a b'; cat <(ls) $files", true),
+        // 条件表达式（`[[ ]]` 与 `[ ]` 都是 test_command）、`case WORD`、算术都不是命令参数；`test` 是普通命令。
+        ("files='a b'; [[ $files == foo ]]", false),
+        ("files='a b'; [ $files = foo ]", false),
+        ("files='a b'; test $files", true),
+        ("files='a b'; [[ -n $files ]] && cat $files", true),
+        ("files='a b'; case $files in a) :;; esac", false),
+        ("files='a b'; case x in a) cat $files;; esac", true),
+        ("files='a b'; (( $files > 1 ))", false),
+        // `if` / `elif` / `while` / `until` / `!` 后面是一条普通命令：echo 照样「拆不拆都一样」。
+        ("files='a b'; if echo $files; then :; fi", false),
+        ("files='a b'; if cat $files; then :; fi", true),
+        ("files='a b'; until echo $files; do :; done", false),
+        ("files='a b'; while cat $files; do :; done", true),
+        ("files='a b'; if true; then :; elif echo $files; then :; fi", false),
+        ("files='a b'; ! echo $files", false),
+        ("files='a b'; ! cat $files", true),
+        // here-doc 正文不是命令；不加引号的定界符正文里的命令替换照样递归。
+        ("files='a b'; cat <<EOF\n$files\nEOF", false),
+        ("files='a b'; cat <<'EOF'\n$files\nEOF", false),
+        ("files='a b'; cat <<-EOF\n\t$files\n\tEOF", false),
+        ("files='a b'; cat <<EOF\n$files\nEOF\ncat $files", true),
+        ("files='a b'; cat <<EOF\n$(cat $files)\nEOF", true),
+        ("files='a b'; cat <<EOF | grep $files\nx\nEOF", true),
+        ("files='a b'; (( n = 1 << 2 )); cat $files", true),
+        // `[[ … ]]` 整段是一个单元：里面的 `&&` / `||` 不切段；命令替换照样递归（单引号里的不算）。
+        ("files='a b'; [[ -n $files && -f $files ]]", false),
+        ("files='a b'; [[ -n $files || -f $files ]]", false),
+        ("files='a b'; if [[ -n $files && -f $files ]]; then :; fi", false),
+        ("files='a b'; ! [[ $files && $files ]]", false),
+        ("files='a b'; [[ $files == ']]' && $files ]]", false),
+        ("files='a b'; [[ -n $files && -f $files ]] && cat $files", true),
+        ("files='a b'; [[ -n x && $(cat $files) ]]", true),
+        ("files='a b'; [[ -n `cat $files` && x ]]", true),
+        ("files='a b'; [[ '$(cat $files)' ]]", false),
+        // here-doc 正文里的命令替换可以跨行；`${…}` 整段 opaque；正文里的反引号官方不认。
+        ("files='a b'; cat <<EOF\n$(\ncat $files\n)\nEOF", true),
+        ("files='a b'; cat <<EOF\nx $(cat\n$files) y\nEOF", true),
+        ("files='a b'; cat <<'EOF'\n$(\ncat $files\n)\nEOF", false),
+        ("files='a b'; cat <<EOF\n${x:-$(cat $files)}\nEOF", false),
+        ("files='a b'; cat <<EOF\n${#x} $(cat $files)\nEOF", true),
+        ("files='a b'; cat <<EOF\n`cat $files`\nEOF", false),
+        // 括号边界扫描跳过 here-doc 字面正文：正文里的 `}` / `)` 不闭合函数体 / 命令替换。
+        ("f() { cat <<'EOF'\n} v='a b'; cat $v\nEOF\n}", false),
+        ("f() { cat <<EOF\n} v='a b'; cat $v\nEOF\n}", false),
+        ("x=$(cat <<'EOF'\n) v='a b'; cat $v\nEOF\n)", false),
+        ("f() { cat <<'EOF'\n}\nEOF\nv='a b'; cat $v; }", true),
+        ("x=$(cat <<EOF\n)\nEOF\nv='a b'; cat $v)", true),
+        ("f() { (( x = 1 << 2 )); v='a b'; cat $v; }", true),
+        ("x=$(echo $((1<<2)); v='a b'; cat $v)", true),
+        // 关键字之后的 `(( … ))` / `( … )` 照命令起始处理：算术里的命令替换递归、展开不计入。
+        ("files='a b'; if (( $(cat $files) )); then :; fi", true),
+        ("files='a b'; while (( $(cat $files) )); do :; done", true),
+        ("files='a b'; until (( `cat $files` )); do :; done", true),
+        ("files='a b'; ! (( $(cat $files) ))", true),
+        ("files='a b'; if (( $files )); then :; fi", false),
+        ("files='a b'; if (cat $files); then :; fi", true),
+        // 双引号里的单引号是字面；`[[` 里的注释不算；续行后照样认出 `[[` / `((`。
+        ("files='a b'; [[ \"it's $(cat $files)\" ]]", true),
+        ("files='a b'; [[ -n x # $(cat $files)\n]]", false),
+        ("files='a b'; [[ -n x # '\n]]; cat $files", true),
+        ("files='a b'; if \\\n [[ -n $files && -f $files ]]; then :; fi", false),
+        ("files='a b'; if \\\n (( $(cat $files) )); then :; fi", true),
+        // 子壳里的 here-doc 正文、空定界符、正文里算术展开中的命令替换、case 后续分支的模式。
+        ("f() { (cat <<'EOF'\n} v='a b'; cat $v\nEOF\n)\n}", false),
+        ("files='a b'; cat <<''\ncat $files\n\n", false),
+        ("files='a b'; cat <<EOF\n$(( $(cat $files) ))\nEOF", true),
+        ("files='a b'; case x in a) :;; $files) :;; esac", false),
+        // 官方解析器自己的怪癖也照样复现：一行两个 here-doc、here-doc 同一行后面的命令、`[ … -a … ]`。
+        ("files='a b'; cat <<A <<B\n$files\nA\n$files\nB", true),
+        ("files='a b'; cat <<EOF; cat $files\nbody\nEOF", false),
+        ("files='a b'; [ -n $files -a -f $files ]", true),
+    ] {
+        assert_eq!(bash_word_split_use(cmd), want, "word_split: {cmd:?}");
+    }
+    // 不完整 / 多字节命令绝不 panic（问题 1：panic 会中断整条遥测消费）。
+    for cmd in [
+        "cat $(\u{4f60}\u{597d}",
+        "x=$(\u{6587}",
+        "files='a b'; cat ${\u{672a}",
+        "v='a b'; (cat $v \u{6587}",
+        "`\u{672a}\u{95ed} files='a b'",
+        "cat \"\u{672a} $(files='a b'",
+        "${x:-$(cat",
+        "$((",
+        "$(((",
+        "`",
+        "${",
+        "$(",
+        // 末尾单反斜杠：`\` 让下标顶过末尾，取段切片会越界（问题 1 的另一面）。
+        "files='a b'; cat $files\\",
+        "x='a b'\\",
+        "cat \\",
+        "\\",
+        // 反引号内容以 `\` 结尾：截出的内层递归进去同样会顶过末尾。
+        "`\\`",
+        "x=`ls \\`; cat $x",
+        "files='a b'; echo `cat $files\\`",
+        "\"`\\`\"",
+        "files='a b'; (cat $x)\\",
+        "x=$(ls)\\",
+        "files='a b'; cat ${x}\\",
+    ] {
+        let _ = bash_word_split_use(cmd);
+        let _ = bash_pipestatus_use(cmd);
+    }
+    // 兜底：各种被截断 / 多字节的尾巴接在常见命令后都不该 panic。
+    for tail in ["\\", "'", "\"", "`", "$(", "${", "$((", "\\\\", " \\", "\u{4f60}", "\"\u{672a}"] {
+        for base in ["files='a b'; cat $files", "x='a b'", "cat $(echo", "for a in"] {
+            let _ = bash_word_split_use(&format!("{base}{tail}"));
+            let _ = bash_pipestatus_use(&format!("{base}{tail}"));
+        }
+    }
+
+    // 极深的嵌套：超过栈预算就放弃（判 false，官方爆栈时同样被 catch 成 false），不能把线程栈压穿。tokio 的
+    // 阻塞线程默认 2MiB 栈，这里照那个大小起线程跑。
+    let deep = [
+        format!("files='a b'; {}cat $files", "! ".repeat(5000)),
+        format!("files='a b'; {}cat $files;{}", "{ ".repeat(5000), " }".repeat(5000)),
+        format!("files='a b'; echo $(({}1{})); cat $files", "(".repeat(5000), ")".repeat(5000)),
+        format!("files='a b'; [[ {}x{} ]]; cat $files", "( ".repeat(3000), " )".repeat(3000)),
+        format!("files='a b'; x={}cat $files{}", "$(".repeat(3000), ")".repeat(3000)),
+    ];
+    for cmd in deep {
+        let r = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || bash_word_split_use(&cmd))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!r, "极深嵌套超过栈预算应判 false");
+    }
+}
+
+/// 2.1.299 会话里第一条 Bash 同批报 `shell_snapshot_create`：快照那段算进这次调用的准备时长
+/// （`cap/auto-2.1.299-20261014-full`：快照 799 → 1017 = 外部 60 + 准备 938；842 → 879 = 26 + 850），不会
+/// 报出准备只有十几毫秒、快照却要一秒的组合。快照与这次调用都在上一条回复结束到这条请求发出的那段
+/// 间隔里：间隔短时快照跟着缩，时长不撑过间隔。
+#[test]
+fn first_bash_of_a_session_carries_the_shell_snapshot_time() {
+    // 两条请求之间隔 `gap` 毫秒（上一条回复结束到这条请求发出），返回（快照, 时长, 外部, 准备）。
+    let run = |gap: u64| {
+        let t = Telemetry::default();
+        let ua = "claude-cli/2.1.299 (external, cli)";
+        let start = frozen_now() - Duration::from_secs(20);
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.text_chars = 0;
+        first.started_at = start;
+        first.ua_out = ua.into();
+        let end = start + Duration::from_millis(first.total_ms);
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la","description":"list"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"total 8\nfile"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.started_at = end + Duration::from_millis(gap);
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let snap = metas("tengu_feature_ok")
+            .into_iter()
+            .find(|m| m["feature_name"] == "shell_snapshot_create")
+            .unwrap()["duration_ms"]
+            .as_i64()
+            .unwrap();
+        let ok = &metas("tengu_tool_use_success")[0];
+        let n = |k: &str| ok[k].as_i64().unwrap();
+        (snap, n("durationMs"), n("externalWallMs"), n("preExternalMs"))
+    };
+
+    // 间隔约 900ms（抓包里第一条 Bash 的间隔 734～1903ms，都是快命令）：总时长 ≈ 间隔减几十毫秒，快照
+    // 填满准备、外部只剩二三十到六十几毫秒，准备占九成以上（`cap/auto-2.1.299-20261014-full`：间隔 891 →
+    // 879 = 外部 26 + 准备 850、快照 842）。
+    let (snap, dur, ext, pre) = run(900);
+    assert_eq!(dur, 850, "间隔减 50ms 的收尾");
+    assert!(pre > snap && pre < snap + 140, "准备 ≈ 快照再加几十毫秒: {pre} / {snap}");
+    assert!((20..65).contains(&ext), "{ext}");
+    assert!(pre * 100 / dur >= 90, "准备占九成以上");
+
+    // 间隔宽（跑了好几秒的命令）：快照照常 700～1300，余量全算外部，总时长仍是间隔减收尾。
+    let (snap, dur, ext, pre) = run(10_000);
+    assert_eq!(dur, 9_950);
+    assert!((700..1300).contains(&snap), "{snap}");
+    assert!(pre > snap && pre < snap + 140, "{pre} / {snap}");
+    assert!(dur - pre - ext < 15 && ext > 8_000, "余量在外部: {ext}");
+
+    // 间隔只有几百毫秒：时长不撑过间隔，快照跟着缩，仍是准备的一部分。
+    for gap in [300, 40] {
+        let (snap, dur, ext, pre) = run(gap);
+        assert!(dur <= gap as i64, "gap {gap}: {dur}");
+        assert!(snap <= pre && pre + ext <= dur, "gap {gap}: {snap} {pre} {ext} {dur}");
+        assert!(pre * 100 / dur.max(1) >= 80, "gap {gap}: 按比例分、取整: {pre}/{dur}");
+    }
+
+    use super::events::bash_timing;
+    // 性质：任意扰动与时长，各段都在时长之内，快照不超过准备；第一条放得下像样快照时准备恒占九成以上。
+    for h in 0..100 {
+        for duration in [1, 12, 300, 720, 829, 900, 2_000, 6_000] {
+            let t = bash_timing(duration, h, Some(1_300));
+            assert_eq!(t.duration, duration.max(1), "总时长就是推出来的那份: {h} {t:?}");
+            assert!(t.pre + t.external <= t.duration, "{h} {duration} {t:?}");
+            let snap = t.snapshot.unwrap();
+            assert!(snap <= t.pre, "{h} {duration} {t:?}");
+            if snap >= 700 && duration <= 1_500 {
+                assert!(
+                    t.pre * 100 / t.duration >= 90,
+                    "快命令准备占九成以上: {h} {duration} {t:?}"
+                );
+            }
+        }
+        let t = bash_timing(110, h, None);
+        assert_eq!((t.duration, t.snapshot), (110, None), "之后的 Bash 总时长照旧");
+        assert!((14..=50).contains(&(t.pre * 100 / 110)), "准备占两到五成（取整）: {t:?}");
+        assert!(t.external + t.pre <= 110);
+    }
+}
+
+/// 问题 3：default 模式下要用户点头的首条 Bash，间隔里大部分是盯着弹框的等待。官方把等待记进
+/// `permissionDurationMs`、不进 `durationMs` / `externalWallMs`。重建把超出「批准后合理执行」的部分挪进
+/// `permissionDurationMs`，不让 `externalWallMs` 吞下整段等待。
+#[test]
+fn a_prompted_bash_keeps_the_dialog_wait_out_of_external_time() {
+    // `make test` 不是只读命令，default 模式下要弹框点头；间隔 `gap` 毫秒里大半是等待。
+    let run = |gap: u64| {
+        let t = Telemetry::default();
+        let ua = "claude-cli/2.1.299 (external, cli)";
+        let start = frozen_now() - Duration::from_secs(30);
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.text_chars = 0;
+        first.started_at = start;
+        first.ua_out = ua.into();
+        let end = start + Duration::from_millis(first.total_ms);
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["system"][3]["text"] = json!("base rules"); // 去掉 auto 标记 → default 模式
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"make test","description":"build"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.started_at = end + Duration::from_millis(gap);
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let ok = p
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_tool_use_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        let shown =
+            p.events.iter().any(|(_, e)| ev_name(e) == "tengu_tool_use_show_permission_request");
+        assert!(shown, "非只读 Bash 在 default 模式下要弹框");
+        let n = |k: &str| ok[k].as_i64().unwrap();
+        (n("durationMs"), n("externalWallMs"), n("preExternalMs"), n("permissionDurationMs"))
+    };
+
+    // 用户盯着弹框等了约 10 秒：externalWallMs 封顶（不会报出八九秒），等待进 permissionDurationMs。
+    let (dur, ext, pre, perm) = run(10_000);
+    assert!(ext <= 80, "外部执行封顶，不吞等待: {ext}");
+    assert!((700..1400).contains(&pre), "快照照旧: {pre}");
+    assert!(dur < 1_500, "时长是批准后执行（快照 + 小外部），不含等待: {dur}");
+    assert!(perm > 8_000, "约 10 秒的等待进了 permissionDurationMs: {perm}");
+
+    // 点头很快（间隔短）：行为与没弹框时相近，不硬塞一段假等待。
+    let (dur, ext, _pre, perm) = run(900);
+    assert!(ext <= 80 && dur <= 900, "{ext} {dur}");
+    assert!(perm < 200, "没怎么等，permissionDurationMs 不虚高: {perm}");
+}
+
+/// 问题 3（混合批次）：一批里既有自动放行的 Read、又有要点头的 Bash 时，盯弹框的等待只进 Bash 的
+/// `permissionDurationMs`，不摊到 Read 的时长上——Read 仍报它自己那点执行时长。
+#[test]
+fn a_mixed_batch_keeps_the_dialog_wait_off_the_auto_approved_tool() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.299 (external, cli)";
+    let start = frozen_now() - Duration::from_secs(30);
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.text_chars = 0;
+    first.started_at = start;
+    first.ua_out = ua.into();
+    let end = start + Duration::from_millis(first.total_ms);
+    t.ingest(first);
+    // 一批两个工具：Read（只读、自动放行）+ 非只读 Bash（default 模式要点头）；间隔约 10 秒。
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["system"][3]["text"] = json!("base rules"); // default 模式
+    body["messages"][1] = json!({"role":"assistant","content":[
+        {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x"}},
+        {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"make test","description":"build"}}
+    ]});
+    body["messages"][2] = json!({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"t1","content":"file"},
+        {"type":"tool_result","tool_use_id":"t2","content":"ok"}
+    ]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.started_at = end + Duration::from_millis(10_000);
+    second.ua_out = ua.into();
+    t.ingest(second);
+
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let by_tool = |name: &str| -> Value {
+        p.events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_tool_use_success")
+            .map(|(_, e)| meta_of(e))
+            .find(|m| m["toolName"] == name)
+            .unwrap()
+    };
+    let read = by_tool("Read");
+    let bash = by_tool("Bash");
+    // Read 自动放行：时长很小、permissionDurationMs 不含等待。
+    assert!(read["durationMs"].as_i64().unwrap() < 300, "Read 不该分到弹框等待: {read}");
+    assert_eq!(read["permissionDurationMs"], 11);
+    // 等待进了 Bash 的 permissionDurationMs。
+    assert!(
+        bash["permissionDurationMs"].as_i64().unwrap() > 8_000,
+        "等待进 Bash 的 permissionDurationMs: {bash}"
+    );
+    assert!(bash["durationMs"].as_i64().unwrap() < 1_500, "Bash 时长不含等待: {bash}");
 }

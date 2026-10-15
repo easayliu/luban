@@ -24,7 +24,7 @@ use super::*;
 ///
 /// `env_note` 带这一轮换了模型时新模型那行（[`EnvNoted::model_notice`]）、更早一轮换过模型要在
 /// 历史原位重现的那条（[`EnvNoted::historical_switch`]），以及这一轮的落位（`mid_conv_sys`）。
-/// 落位按**当前**模型自带的 beta——跨模型族时切回不支持 `mid-conversation-system` 的旧模型，
+/// 落位按**当前**模型自带的 beta——跨模型族时切回不支持中途 system 消息的旧模型，
 /// 按这一轮的 beta 自然就落成提醒块，不会给上游发它拒绝的 `role: system` 消息。
 ///
 /// `raw_fps` 是**插环境说明之前**的 `messages` 指纹（见 [`rewrite_body`] 里采样）。线程前缀匹配
@@ -198,11 +198,12 @@ pub(super) fn cap_thread_breakpoints(v: &mut serde_json::Value) -> usize {
 
 /// 官方主线程每条请求末尾的 `<total_tokens>N tokens left</total_tokens>` 提醒（数怎么算见
 /// [`crate::proxy::session_link::TotalTokens`]），只跟在 user 消息（新输入或工具结果）后面。落法随
-/// `mid-conversation-system` beta 分两种：
+/// 能不能写中途 system 消息分两种（`mid_conv_sys`：带 `mid-conversation-system`，或 2.1.299 起只剩的
+/// `-clear-at`，见 [`crate::proxy::simulation::sim_has_mid_conversation_system`]）：
 ///
-/// - **带那项 beta**（opus / sonnet / fable）：追加一条独立的 `role: system` 消息，末条消息的
+/// - **能**（opus / sonnet / fable / haiku-5-5）：追加一条独立的 `role: system` 消息，末条消息的
 ///   缓存断点挪到它身上（`cap/auto-2.1.285-20260930/00033`、`00036`、`00405`）；
-/// - **不带**（haiku）：写成 `<system-reminder>`——工具续轮拼在最后一个 `tool_result` 正文的
+/// - **不能**（haiku-4.5 与老一代）：写成 `<system-reminder>`——工具续轮拼在最后一个 `tool_result` 正文的
 ///   末尾（`00412`），新输入则作为一个文本块插在用户那句话前面（`00411`）。
 ///
 /// 官方首轮那条会把它与环境说明、日期并进同一条 system 消息（`00032`、`00349`），那一份由

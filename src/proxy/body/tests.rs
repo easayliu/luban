@@ -3152,12 +3152,12 @@ fn agent_description_follows_the_lucky_cerf_model_list() {
     ] {
         assert_eq!(config::cc_agent_uses_cerf_text(model), cerf, "{model}");
     }
-    // 没见过 eval 的号按抓包那个号的分组（第 1 组、默认清单）。
+    // 没见过 eval 的号按抓包那个号的分组（默认清单、v4 第 1 组的正文）。
     const UNSEEN: i64 = -92_001;
-    let cerf_of = |id, model| crate::proxy::lucky_cerf::agent_uses_cerf_text(id, "s", model);
+    let cerf_of = |id, model| crate::proxy::lucky_cerf::agent_desc(id, "s", model);
     let opus = config::cc_profile(MainOpus);
     let plain = crate::proxy::cc_tools_core(opus, false);
-    let cerf = crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-sonnet-5-5"), false);
+    let cerf = crate::proxy::cc_tools_core_for(opus, &cerf_of(UNSEEN, "claude-sonnet-5-5"), false);
     assert_eq!(cerf.len(), plain.len());
     for (a, b) in cerf.iter().zip(plain) {
         assert_eq!(a["name"], b["name"]);
@@ -3173,15 +3173,15 @@ fn agent_description_follows_the_lucky_cerf_model_list() {
             assert_eq!(serde_json::to_string(a).unwrap(), serde_json::to_string(b).unwrap());
         }
     }
-    let trim = crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-sonnet-5-5"), true);
+    let trim = crate::proxy::cc_tools_core_for(opus, &cerf_of(UNSEEN, "claude-sonnet-5-5"), true);
     assert!(trim.iter().all(|t| t["name"] != "Artifact") && trim.len() == plain.len() - 3);
     assert!(std::ptr::eq(
-        crate::proxy::cc_tools_core_for(opus, cerf_of(UNSEEN, "claude-opus-5-5"), false),
+        &*crate::proxy::cc_tools_core_for(opus, &cerf_of(UNSEEN, "claude-opus-5-5"), false),
         plain
     ));
     let haiku = config::cc_profile(MainHaiku);
     assert!(std::ptr::eq(
-        crate::proxy::cc_tools_core_for(haiku, cerf_of(UNSEEN, "claude-haiku-5-5"), false),
+        &*crate::proxy::cc_tools_core_for(haiku, &cerf_of(UNSEEN, "claude-haiku-5-5"), false),
         crate::proxy::cc_tools_core(haiku, false)
     ));
     // 分在实验第 0 组（空清单）的号：清单里的模型也发老的那版。
@@ -3193,8 +3193,41 @@ fn agent_description_follows_the_lucky_cerf_model_list() {
     .unwrap();
     crate::proxy::lucky_cerf::note_eval(v0, eval.as_object().unwrap());
     assert!(std::ptr::eq(
-        crate::proxy::cc_tools_core_for(opus, cerf_of(v0, "claude-sonnet-5-5"), false),
+        &*crate::proxy::cc_tools_core_for(opus, &cerf_of(v0, "claude-sonnet-5-5"), false),
         plain
+    ));
+}
+
+/// `tengu_lucky_cerf_text`：cerf 那版里客户端内置的四段正文整段换成号下发的那段，前后（「Launch a
+/// new agent…」到「## When to use」、「When you do spawn…」之后）不动；没下发用内置的，即资产原样。
+/// `cap/auto-2.1.299-20261014-full/00246`（sonnet-5-5）的 `Agent` 说明就是资产里这段换成那个号 v4 第 1 组
+/// 的正文（`assets/cc_agent_cerf_text_v4.txt`），3141 字符。
+#[test]
+fn agent_cerf_text_replaces_the_builtin_paragraphs() {
+    use crate::proxy::lucky_cerf::AgentDesc;
+    let opus = config::cc_profile(config::CcProfileKind::MainOpus);
+    let agent = |d: &AgentDesc| {
+        crate::proxy::cc_tools_core_for(opus, d, false)
+            .iter()
+            .find(|t| t["name"] == "Agent")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let asset = include_str!("../../assets/cc_agent_desc_cerf.txt");
+    assert_eq!(agent(&AgentDesc::Cerf(None)), asset);
+    let v4 = include_str!("../../assets/cc_agent_cerf_text_v4.txt").trim();
+    let got = agent(&AgentDesc::Cerf(Some(v4.into())));
+    assert_eq!(got.chars().count(), 3141, "与抓包那条等长");
+    assert!(got.contains("## When to use\n\nA fresh agent costs more than it looks."));
+    assert!(got.contains("hand it off.\n\nA fork runs in the background"), "后面那段接得上");
+    assert!(!got.contains("Several at once spend tokens in a burst"), "内置那句换掉了");
+    assert!(got.contains("one brief can ask a lot"));
+    // 同一段正文只建一次。
+    assert!(std::ptr::eq(
+        &*crate::proxy::cc_tools_core_for(opus, &AgentDesc::Cerf(Some(v4.into())), true),
+        &*crate::proxy::cc_tools_core_for(opus, &AgentDesc::Cerf(Some(v4.into())), true),
     ));
 }
 
@@ -4225,7 +4258,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 296)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 299)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6782,4 +6815,26 @@ fn sim_threads_continue_after_a_server_tool_search_reply() {
         serde_json::json!({ "type": "continue", "previous_message_id": "msg_SRV" }),
         "{v2}"
     );
+}
+
+/// 号下发的正文超过缓存上限（32 份）时整表清掉重建，拿到的始终是这一段——不退回内置正文，免得说明
+/// 和这个会话的曝光、确认时比的正文对不上。
+#[test]
+fn agent_text_cache_overflow_still_serves_the_given_text() {
+    use crate::proxy::lucky_cerf::AgentDesc;
+    let opus = config::cc_profile(config::CcProfileKind::MainOpus);
+    for k in 0..40 {
+        let text = format!("Overflow text number {k}.");
+        let tools = crate::proxy::cc_tools_core_for(
+            opus,
+            &AgentDesc::Cerf(Some(text.as_str().into())),
+            false,
+        );
+        let desc = tools.iter().find(|t| t["name"] == "Agent").unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(desc.contains(&text), "{k}");
+        assert!(!desc.contains("Several at once spend tokens in a burst"), "{k}: 不退回内置正文");
+    }
 }

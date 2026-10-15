@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.296.406; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -403,7 +403,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.296.406; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1539,26 +1539,37 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.296-20261013-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.299-20261014-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
 /// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00418`、`00258`、`00382`、`00344`）；
-/// fable 只有 auto 模式的（`00541`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00418`、`00246`、`00364`、`00329`）；
+/// fable 只有 auto 模式的（`00523`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。
 ///
 /// `effort` 与官方逐值相同（opus / sonnet / haiku-5-5 是 medium、fable 是 high、haiku-4.5 不带）。
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_296_captures() {
-    let dir = format!("{}/cap/auto-2.1.296-20261013-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_299_captures() {
+    let dir = format!("{}/cap/auto-2.1.299-20261014-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.296-20261013-full not present");
+        eprintln!("skipped: cap/auto-2.1.299-20261014-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
+    // 抓包那个号的分组：清单是默认值，正文是实验 v4 第 1 组那段（`assets/cc_agent_cerf_text_v4.txt` 就是
+    // 从这次抓包的 eval 里原样取出的）。用独立的号喂进去，不动别的用例共用的测试凭证。
+    let cred = crate::credentials::Credential { id: 9_299, ..test_cred() };
+    let eval = serde_json::json!({"features": {
+        "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
+            "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
+            "source": "defaultValue"},
+        "tengu_lucky_cerf_text": {"value": include_str!("../../assets/cc_agent_cerf_text_v4.txt"),
+            "source": "experiment", "experiment": {"key": "tengu_lucky_cerf_experiment_v4"},
+            "experimentResult": {"inExperiment": true, "variationId": 1}}}});
+    crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00418", false), ("00258", false), ("00382", false), ("00344", false), ("00541", true)]
+        [("00418", false), ("00246", false), ("00364", false), ("00329", false), ("00523", true)]
     {
         let path = files
             .iter()
@@ -1583,7 +1594,7 @@ fn simulated_main_threads_match_the_2_1_296_captures() {
         // 对照的是官方默认配置的抓包（14 个工具），关掉默认开着的精简。
         let full_tools = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
         let sim = detect_for(&body, full_tools).unwrap();
-        let out = rewrite_body(&body, &test_cred(), "fp", full_tools, Some(&sim), None);
+        let out = rewrite_body(&body, &cred, "fp", full_tools, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let h = crate::proxy::build_forward_headers_for(
             &crate::proxy::HeaderMap::new(),
@@ -1611,7 +1622,7 @@ fn simulated_main_threads_match_the_2_1_296_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：2.1.296 五个主线程首轮都是 `create`，模拟出站与之一致。
+        // `thread`：2.1.299 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1643,7 +1654,7 @@ fn simulated_main_threads_match_the_2_1_296_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.296."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.299."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1652,7 +1663,7 @@ fn simulated_main_threads_match_the_2_1_296_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/dc335a23-e8e7-46a6-ad55-461d0da2ae00/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/15124181-f540-4059-833d-4bfac1a40362/scratchpad/calc",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与末尾 WebSearch 那段。
         let mut official_rest = osys[3]["text"].as_str().unwrap().to_string();
@@ -1670,7 +1681,8 @@ fn simulated_main_threads_match_the_2_1_296_captures() {
         );
 
         // 工具：注入的 14 个内建工具与官方那 14 个逐字节相同（顺序是官方的名字序）；sonnet-5-5、
-        // haiku-5-5、fable-5-1 的 `Agent` 是 `tengu_lucky_cerf` 那版（[`crate::proxy::cc_tools_core_for`]）。
+        // haiku-5-5、fable-5-1 的 `Agent` 是 cerf 那版、正文是上面喂的那份 eval 里 v4 第 1 组那段
+        // （[`crate::proxy::cc_tools_core_for`]）。
         let tools = v["tools"].as_array().unwrap();
         let otools = official["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 14, "{model}");
@@ -1864,6 +1876,20 @@ fn every_auto_2_1_293_official_request_passes_through() {
 fn every_auto_2_1_296_official_request_passes_through() {
     let sub = "auto-2.1.296-20261013-full";
     let Some((seen, bad, _)) = official_passthrough_report_at(sub, (2, 1, 296)) else {
+        eprintln!("skipped: cap/{sub} not present");
+        return;
+    };
+    assert!(seen >= 100, "{sub}: {seen}");
+    assert!(bad.is_empty(), "{sub} {} 条：\n{}", bad.len(), bad.join("\n"));
+}
+
+/// **2.1.299 各种用法的官方请求**（`cap/auto-2.1.299-20261014-full`：场景同 2.1.296-full；全部 beta 去掉了
+/// `mid-conversation-system`，sonnet-5-5 / haiku-5-5 / fable-5-1 的 `Agent` 是服务端下发的 v4 正文）同样
+/// 一条不进模拟、不被当探针、merge_beta 一项不多（尤其不会把转正不发的那一项补回去）。
+#[test]
+fn every_auto_2_1_299_official_request_passes_through() {
+    let sub = "auto-2.1.299-20261014-full";
+    let Some((seen, bad, _)) = official_passthrough_report_at(sub, (2, 1, 299)) else {
         eprintln!("skipped: cap/{sub} not present");
         return;
     };

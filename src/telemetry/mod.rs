@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 
+mod bash_ast;
 mod call;
 mod events;
 mod identity;
@@ -406,8 +407,22 @@ impl Telemetry {
                 uptime_secs: uptime(dt),
             };
             let feature = |name: &str| json!({ "feature_name": name });
-            let mut events: Vec<(DateTime<Utc>, Value)> = Vec::with_capacity(5);
+            let mut events: Vec<(DateTime<Utc>, Value)> = Vec::with_capacity(6);
             let mut dd: Vec<Value> = Vec::with_capacity(3);
+            // 2.1.299 起退出时先打印「Resume this session with: claude --resume <id>」并报一条，与
+            // `config_cache_stats` 同一毫秒、排在它前面（`cap/auto-2.1.299-20261014-full` 每个交互式
+            // 会话退出时一条：`arg: id`，没起名、不在 worktree、没有额外提示）。
+            if version_at_least(&identity.version, "2.1.299") {
+                events.push((
+                    t0,
+                    identity.event(
+                        "tengu_resume_hint_printed",
+                        t0,
+                        &ctx(t0),
+                        json!({ "arg": "id", "title": "absent", "worktree": "absent", "advice": false }),
+                    ),
+                ));
+            }
             // 配置缓存命中数随会话长短走：抓包里 7 秒的会话 3779、一小时的 11054。
             let cache_hits = 3_000 + u64::from(s.prompt_index) * 2_500;
             events.push((

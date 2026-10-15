@@ -1,9 +1,9 @@
-//! 2.1.296 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.296 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.296 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.296 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.296 的 profile 表：2.1.296 ~ 2.1.298 来访的 beta 参照（[`cc_profile_at`]）。2.1.299 的表
+/// （[`CC_PROFILES`]）只去掉了 `mid-conversation-system`。
 ///
 /// **各行除版本号外与 2.1.293（[`CC_PROFILES_2_1_293`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.296-20261013-full`（场景同 2.1.293-full）：
@@ -20,7 +20,7 @@ use super::*;
 ///   `tengu_lucky_cerf` 列出的模型换成另一段说明，见 [`crate::proxy::cc_tools_core_for`]。
 ///
 /// 2.1.294 / 2.1.295 没有抓包；可执行文件里的 beta 字面量与 2.1.296 相同，按这张表处理。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_296: &[CcProfile] = &[
     at_296(CC_PROFILES_2_1_293[0]),
     at_296(CC_PROFILES_2_1_293[1]),
     at_296(CC_PROFILES_2_1_293[2]),

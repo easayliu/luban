@@ -3,7 +3,7 @@
 use super::*;
 
 /// 2.1.293 的 profile 表：2.1.293 ~ 2.1.295 来访的 beta 参照（[`cc_profile_at`]）。2.1.296 的表
-/// （[`CC_PROFILES`]）各行与它相同、只换了版本号。beta 串逐字取自 `cap/auto-2.1.293-20261008-full`，去掉 `oauth`。
+/// （[`CC_PROFILES_2_1_296`]）各行与它相同、只换了版本号。beta 串逐字取自 `cap/auto-2.1.293-20261008-full`，去掉 `oauth`。
 ///
 /// 与 2.1.291 一样按**默认权限模式**的抓包定（不带 `safeguards` / `afk-mode` / `dangerous-tool-use`）：
 ///

@@ -151,11 +151,32 @@ pub(super) static TEMPLATE_2_1_296_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_296_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.296 起用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 2.1.299 的两份模板：以 2.1.296 那两份为底，按 `cap/auto-2.1.299-20261014-full` 生成
+/// （`_driver/build_tpl_299.py`）。相对 2.1.296：`signed_cache_shadow` 多 `stored_copy`，
+/// `remote_settings_fetch` 多 `cache_age_ms`、`stored_copy`、`stored_copy_gate`，`policy_limits_fetch`
+/// 多后两个；首轮那条曝光换成正文开关的 `tengu_lucky_cerf_experiment_v4`（实际发哪几条照号的 eval）。
+/// 退出那一串多出的 `tengu_resume_hint_printed` 不在模板里，见 `Telemetry::gc`。
+pub(super) static TEMPLATE_2_1_299: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_299.json"))
+            .expect("assets/cc_telemetry_template_2_1_299.json must parse")
+    });
+
+/// 2.1.299 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_299`]。
+pub(super) static TEMPLATE_2_1_299_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_299_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_299_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.299 起用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
     let at = |v: &str| version_at_least(version, v);
+    if at("2.1.299") {
+        return if sdk { &TEMPLATE_2_1_299_SDK } else { &TEMPLATE_2_1_299 };
+    }
     if at("2.1.296") {
         return if sdk { &TEMPLATE_2_1_296_SDK } else { &TEMPLATE_2_1_296 };
     }
@@ -278,10 +299,10 @@ pub(super) struct Subst<'a> {
     /// 正文里关着的那几个用户可关的工具（[`RequestShape::tools_off`]）。`-p` 不看它：打印模式本来就
     /// 不带 Artifact / SendFeedback（不是用户关的），也没有关掉之后的样本。
     pub(super) tools_off: ToolsOff,
-    /// 这一轮那条 `tengu_lucky_cerf` 实验曝光的（实验名, 分组），`None` 即不发——按会话钉住的
-    /// 分组与「模型走不走精简提示词」见 [`crate::proxy::lucky_cerf_exposure`]，一个会话一次见
+    /// 这一轮那几条 `tengu_lucky_cerf` 一系实验曝光，空即不发——按会话钉住的分组与「模型走不走
+    /// 精简提示词」见 [`crate::proxy::lucky_cerf_exposures`]，一个进程每个一次见
     /// [`super::session::TurnFacts::lucky_cerf`]。
-    pub(super) lucky_cerf: Option<(String, i64)>,
+    pub(super) lucky_cerf: Vec<crate::proxy::LuckyCerfExposure>,
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -480,22 +501,18 @@ where
         let t = anchor + chrono::Duration::milliseconds(e.off);
         for _ in 0..e.repeat.unwrap_or(1).max(1) {
             if e.kind == "growth" {
-                // `tengu_lucky_cerf`（`Agent` 按模型换说明）的曝光：客户端只在精简提示词的模型上读这个
-                // 开关（haiku-4.5、sonnet-4.x / 5、opus-4-7 及更老都不读，`cap/auto-2.1.296-20261013-full`
-                // B3c 两个会话里 haiku-5-5 那个有、haiku-4.5 那个没有），读了且这个号在实验里才有这条，
-                // 实验名与分组照这个号的 eval（[`Subst::lucky_cerf`]）。
-                if e.feature.as_deref() == Some(crate::proxy::LUCKY_CERF_FEATURE) {
-                    if let Some((key, var)) = &subst.lucky_cerf {
-                        events.push((
-                            t,
-                            id.growth_event(
-                                t,
-                                key,
-                                *var,
-                                crate::proxy::LUCKY_CERF_FEATURE,
-                                subst.version,
-                            ),
-                        ));
+                // `tengu_lucky_cerf` 一系（`Agent` 按模型换说明）的曝光：客户端只在精简提示词的模型上读
+                // 这两个开关（haiku-4.5、sonnet-4.x / 5、opus-4-7 及更老都不读，`cap/auto-2.1.296-20261013-full`
+                // B3c 两个会话里 haiku-5-5 那个有、haiku-4.5 那个没有），读了且这个号在实验里才有，实验名、
+                // 分组与发哪几条照这个号的 eval（[`Subst::lucky_cerf`]）。模板那条（2.1.296 是清单的 v3，
+                // 2.1.299 是正文的 v4）只给位置：2.1.299 抓包里两者都紧挨在 `tool_search_mode_decision` 前。
+                if e.feature
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with(crate::proxy::LUCKY_CERF_FEATURE))
+                {
+                    for x in &subst.lucky_cerf {
+                        events
+                            .push((t, id.growth_event(t, &x.key, x.var, x.feature, subst.version)));
                     }
                     continue;
                 }

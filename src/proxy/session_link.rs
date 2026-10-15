@@ -135,7 +135,7 @@ struct ThreadState {
 /// 提醒处就断，闲置前那段 1h 缓存再也读不到。
 ///
 /// 不记当时的落法：重现时按**这一轮**模型的落法写，与环境说明、换模型说明同一规矩——跨模型族
-/// 换到不带 `mid-conversation-system` 的模型，照当时补成 `role: system` 消息上游会 400；换了模型
+/// 换到不支持中途 system 消息的模型，照当时补成 `role: system` 消息上游会 400；换了模型
 /// 缓存本来也不共用，没有逐字对齐的必要。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TurnReminder {

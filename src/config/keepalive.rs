@@ -16,18 +16,19 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.296";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.299";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。原取自 `cap/2.1.258/00032`
 /// （opus-5 **1M** 会话那串，多一项 `context-1m`）；2.1.285 起模拟路径不再带 `context-1m`，
 /// 保活默认的又是 sonnet-5，换成 `cap/2.1.285` 里非 1M 会话那串（opus-5-5 / sonnet-5 等
-/// 七个 Claude 5 代模型的会话级 betas 都是它）。
+/// 七个 Claude 5 代模型的会话级 betas 都是它）。2.1.299 起 `mid-conversation-system` 转正不发头，
+/// 会话级那份随之少了它（`cap/auto-2.1.299-20261014-full` 4841 条主线程会话事件都止于
+/// `prompt-caching-scope`），与 [`KEEPALIVE_USER_AGENT`] 同版。
 pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
     interleaved-thinking-2025-05-14,\
     redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-    context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-    mid-conversation-system-2026-04-07";
+    context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 
 /// 保活端点路径。
 pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";

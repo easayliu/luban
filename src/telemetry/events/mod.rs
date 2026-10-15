@@ -8,6 +8,8 @@ mod forks;
 mod prompt;
 mod request;
 mod tools;
+#[cfg(test)]
+pub(super) use tools::bash_timing;
 
 /// 拼这条调用的事件链：只读 [`TurnFacts`]，不碰会话状态。
 pub(super) fn build_events(
@@ -248,6 +250,7 @@ impl<'a> EventEnv<'a> {
             kind,
             v285,
             v291,
+            v299,
             anchor_tool_call,
             anchor_end,
             ref tether,
@@ -311,6 +314,14 @@ impl<'a> EventEnv<'a> {
                 ],
             );
         }
+        // 2.1.299：紧跟 `serverToolHistory` 多一项（`cap/auto-2.1.299-20261014-full` 108 条全是 false）。
+        if v299 {
+            insert_after(
+                &mut live,
+                "serverToolHistory",
+                vec![("searchResultHistory", json!(false))],
+            );
+        }
         // 2.1.291：队尾多四项线程计时（`cap/auto-2.1.291-20261006-full` 每条都有）。时间锚点是同一条线
         // 上一条请求的收尾（[`TurnFacts::anchor_end`]：主线程含被 Esc 取消的那条，子代理看它自己那条
         // 支线）：`threadIdleMs` 是它收尾到这条发出隔了多久，与这条续用还是另起线程无关——
@@ -364,6 +375,12 @@ pub(super) struct ToolStep {
     pub(super) prev_depth: u32,
     /// 这条请求带回的工具结果数。
     pub(super) n: i64,
+    /// 这一批里要用户点头（弹框）的工具数——弹框那段等待不是任何工具的执行，见
+    /// [`EventBuilder::emit_tool_result`] 对问题 3 的处理。
+    pub(super) prompted: i64,
+    /// 这一批盯弹框的总等待（死时间）的估值：间隔减去各工具一份合理执行后剩下的。只在
+    /// `prompted > 0` 时非零；它只进点头那些工具的 `permissionDurationMs`，不摊到别的工具的时长上。
+    pub(super) batch_approval: i64,
 }
 
 /// 攒这条调用的几路事件。各段 `emit_*` 照官方的先后依次往里写，[`Self::finish`] 再按原来的
