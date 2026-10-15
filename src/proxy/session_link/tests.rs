@@ -860,3 +860,61 @@ fn ordinary_conversations_are_not_side_queries() {
     });
     assert!(K::of(&v, &structured).is_side_query(&v));
 }
+
+/// 谱系表的整表清过期隔一阵才做一次（[`super::SESSION_SWEEP_EVERY`]），但被查的那一条过没过期
+/// 每次当场判：两次整表清理之间过期的上一轮照样当它不存在；清理时腾出的字节从总量里扣掉。
+#[test]
+fn prefix_table_treats_an_expired_entry_as_gone_between_sweeps() {
+    use super::{CC_SESSION_IDLE, CachePrefix, PrefixKey, PrefixLimits, PrefixTable};
+    let t0 = std::time::Instant::now();
+    let secs = std::time::Duration::from_secs;
+    let mut t = PrefixTable::default();
+    let k = |i: i64| PrefixKey {
+        cred_id: i,
+        session_id: format!("s{i}"),
+        kind: crate::proxy::CcRequestKind::Main,
+        tools_fp: 1,
+        blocks: 1,
+    };
+    let rec = |t: &mut PrefixTable, i: i64, when| {
+        let pf = CachePrefix { tools_fp: 1, system: vec!["x".repeat(10)] };
+        let (fp, bytes) = (pf.system_fp(), pf.stored_bytes());
+        t.record(k(i), fp, Some(pf.system), bytes, when, PrefixLimits::DEFAULT)
+    };
+    let one = CachePrefix { tools_fp: 1, system: vec!["x".repeat(10)] }.stored_bytes();
+
+    rec(&mut t, 1, t0);
+    // 快到期时另一条谱系触发一次整表清理：k(1) 还没过期，留着。
+    rec(&mut t, 2, t0 + CC_SESSION_IDLE - secs(5));
+    assert!(t.map.contains_key(&k(1)));
+    // 10 秒后（没到下一次整表清理）k(1) 已过期：上一轮当不存在。
+    assert!(rec(&mut t, 1, t0 + CC_SESSION_IDLE + secs(5)).is_none(), "过期的上一轮不算");
+    assert_eq!(t.text_bytes, 2 * one);
+    // 再过很久，下一次整表清理把过期的 k(2) 清掉、字节扣回来；新来的 k(3) 照常入表。
+    rec(&mut t, 3, t0 + 2 * CC_SESSION_IDLE + secs(10));
+    assert!(!t.map.contains_key(&k(2)));
+    assert!(!t.map.contains_key(&k(1)), "k(1) 也在这一次过期了");
+    assert_eq!(t.text_bytes, one);
+}
+
+/// 会话表的整表清过期隔一阵才做一次（[`super::SESSION_SWEEP_EVERY`]），但
+/// [`CcSessionLink::load_turn`] 查的那一条过期了当场就当新会话重来：`first_seen`、prompt 计数从 1
+/// 起，不接上一次对话的链。
+#[test]
+fn an_expired_session_starts_over_between_sweeps() {
+    use super::{CC_SESSION_IDLE, CC_SESSIONS, CC_SESSIONS_SWEPT, CcSessionLink};
+    let now = std::time::Instant::now();
+    // 单调时钟从开机算起；开机不到 3 小时造不出一个过期时刻，跳过。
+    let Some(old) = now.checked_sub(CC_SESSION_IDLE + std::time::Duration::from_secs(1)) else {
+        return;
+    };
+    let sid = "expired-between-sweeps";
+    assert!(CcSessionLink::load(key(sid), true, true).first_seen);
+    assert_eq!(CcSessionLink::load(key(sid), true, true).prompt_index, 2);
+    // 这一条过期了，而整表清理刚做过、这次不会再做。
+    CC_SESSIONS.lock().get_mut(&(1, sid.to_string())).unwrap().last_seen = old;
+    *CC_SESSIONS_SWEPT.lock() = Some(std::time::Instant::now());
+    let again = CcSessionLink::load(key(sid), true, true);
+    assert!(again.first_seen, "过期的会话当新会话");
+    assert_eq!(again.prompt_index, 1, "计数从头来");
+}

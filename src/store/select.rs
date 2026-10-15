@@ -298,6 +298,28 @@ async fn free_session_slot(
     Ok(slot)
 }
 
+/// 选号没提交成时把「到点暂停号」的检查门拨回去，见 [`CredentialStore::select_with_slot`]。
+struct ResumeGateGuard<'a> {
+    store: &'a CredentialStore,
+    armed: bool,
+}
+
+impl ResumeGateGuard<'_> {
+    fn disarm_if(mut self, ok: bool) {
+        if ok {
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for ResumeGateGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store.note_resume_at(0);
+        }
+    }
+}
+
 impl CredentialStore {
     /// 这把接入 Key 能用的号里，此刻还有没有**可调度**的：启用（或限流暂停已到点）、号主有效、
     /// 在 `groups` 里、没被判过「套餐不含 `model`」、不在冷却。只读——不放回到点的暂停号、
@@ -371,9 +393,19 @@ impl CredentialStore {
             model: model.as_deref(),
             ..sel
         };
-        let mut tx = self.begin_write().await?;
+        // 放回到点暂停号的那条 UPDATE 也在这笔事务里（[`Self::resume_due_gated`]），门已经推远了。
+        // 这笔没提交成——数据库出错、或者来访断开把这个 future 取消了（后面的代码一行都不会
+        // 跑）——那几个号其实没放回去：守卫在析构时把门拨回来，下一次选号再查。只有提交成功
+        // 且没撞上数据库错误才撤掉它；名额满、限流这类正常拒绝照样提交，不拨。
+        let gate = ResumeGateGuard { store: self, armed: true };
+        // 提交不等 WAL 落盘：见 [`CredentialStore::begin_write_async_commit`]。
+        let mut tx = self.begin_write_async_commit().await?;
         let out = self.select_in(&mut tx, sel).await;
         let committed = tx.commit().await;
+        gate.disarm_if(
+            committed.is_ok()
+                && !out.as_ref().err().is_some_and(|e| e.downcast_ref::<sqlx::Error>().is_some()),
+        );
         match (out, committed) {
             // 候选号读出来时 token 没解密（见 [`row_to_sealed_cred`]），只解选中这一个，
             // 而且放在提交之后、不占全局写锁。
@@ -448,8 +480,9 @@ impl CredentialStore {
         let session_retention =
             effective_retention(session_ttl_secs, session_retention_secs).unwrap_or(0);
 
-        // 限流暂停到点的号先放回来，再读启用的号（分两条语句，见 [`candidates_sql`]）。
-        Self::resume_due(&mut *conn).await?;
+        // 限流暂停到点的号先放回来，再读启用的号（分两条语句，见 [`candidates_sql`]）。没有号
+        // 可能到点时整条跳过，见 [`Self::resume_due_gated`]。
+        self.resume_due_gated(&mut *conn).await?;
         let model_key = model.map(model_denial_key);
         let rows = sqlx::query(sqlx::AssertSqlSafe(candidates_sql()))
             .bind(groups)
@@ -2092,5 +2125,79 @@ pub(super) mod tests {
         assert!(!pick.is_finished(), "选号应在等另一条连接的行锁");
         other.commit().await.unwrap();
         assert_eq!(pick.await.unwrap().unwrap(), a.id);
+    }
+    /// 选号的写事务提交不等 WAL 落盘（[`CredentialStore::begin_write_async_commit`]），只管这一笔；
+    /// 别的串行写事务（[`CredentialStore::begin_write`]）照旧同步提交。
+    #[sqlx::test]
+    async fn only_the_selection_tx_commits_asynchronously(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let setting = "SELECT current_setting('synchronous_commit')";
+        let mut tx = store.begin_write_async_commit().await.unwrap();
+        let v: String = sqlx::query_scalar(setting).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(v, "off");
+        tx.commit().await.unwrap();
+        let mut tx = store.begin_write().await.unwrap();
+        let v: String = sqlx::query_scalar(setting).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(v, "on", "SET LOCAL 不该漏到同一条连接的下一笔事务");
+    }
+
+    /// 到点暂停号的放回有门控（[`CredentialStore::resume_due_gated`]）：没有号可能到点时选号
+    /// 不发那条 UPDATE；`pause_for_rate_limit` 写进来的恢复时刻会把门拨回来，到点照常放回。
+    #[sqlx::test]
+    async fn selection_resumes_paused_credentials_only_when_due(pool: PgPool) {
+        use std::sync::atomic::Ordering;
+        let (store, ids) = store_with(pool, &["a", "b"]).await;
+        let sel = Select { ttl_secs: 0, ..Default::default() };
+        let now = crate::credentials::now_secs() as i64;
+
+        // 没有暂停号：查过一次后门推到兜底间隔之后，下一次选号不再查。
+        store.select_for_device(sel).await.unwrap();
+        let gate = store.next_resume_check.load(Ordering::SeqCst);
+        assert!(gate > now && gate <= now + 61, "{gate} vs {now}");
+
+        // 暂停到将来：门拨到那个时刻（早于兜底间隔就取它）。
+        store.pause_for_rate_limit(ids[0], "rl", (now + 30) as u64).await.unwrap();
+        assert_eq!(store.next_resume_check.load(Ordering::SeqCst), now + 30);
+        assert_eq!(store.select_for_device(sel).await.unwrap().id, ids[1], "a 还没到点");
+
+        // 暂停到过去（到点）：门拨到过去，下一次选号放回，a 回到候选里排第一。
+        store.pause_for_rate_limit(ids[0], "rl", (now - 1) as u64).await.unwrap();
+        assert_eq!(store.select_for_device(sel).await.unwrap().id, ids[0]);
+        assert!(!store.get(ids[0]).await.unwrap().unwrap().disabled);
+        assert!(store.next_resume_check.load(Ordering::SeqCst) > now, "放回后门重新推远");
+    }
+    /// 选号卡在放回到点暂停号那一步（等别的连接的行锁）时被取消（来访断开）：事务回滚、号没
+    /// 放回去，检查门要拨回来，下一次选号照样放回它——不能停在推远了的位置上。
+    #[sqlx::test]
+    async fn a_cancelled_selection_leaves_the_resume_gate_open(pool: PgPool) {
+        use std::sync::atomic::Ordering;
+        let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
+        let a = store.insert("a", None, "ta", "ra", 0, None, None, 1).await.unwrap();
+        let now = crate::credentials::now_secs() as i64;
+        store.pause_for_rate_limit(a.id, "到点", (now - 1) as u64).await.unwrap();
+
+        // 另一条连接攥着这一行的锁，选号的放回语句会卡在那里。
+        let mut other = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM credentials WHERE id = $1 FOR UPDATE")
+            .bind(a.id)
+            .execute(&mut *other)
+            .await
+            .unwrap();
+        let s = store.clone();
+        let pick = tokio::spawn(async move {
+            s.select_for_device(Select { ttl_secs: 0, ..Default::default() }).await.map(|c| c.id)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!pick.is_finished(), "选号应卡在行锁上");
+        pick.abort();
+        assert!(pick.await.unwrap_err().is_cancelled());
+        assert!(store.next_resume_check.load(Ordering::SeqCst) <= now, "取消后门要拨回");
+        other.rollback().await.unwrap();
+
+        // 下一次选号放回它。
+        assert_eq!(
+            store.select_for_device(Select { ttl_secs: 0, ..Default::default() }).await.unwrap().id,
+            a.id
+        );
     }
 }

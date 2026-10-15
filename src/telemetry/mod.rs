@@ -77,6 +77,9 @@ pub struct Telemetry(Arc<Shared>);
 struct Shared {
     state: parking_lot::Mutex<State>,
     ingest: IngestQueue,
+    /// 已经有组织 id 的凭证（[`State::org_uuid`] 里有它）。那张表只增不删，[`Telemetry::seed_org_uuid`]
+    /// 每条转发请求都调，先在这里用读锁看一眼，有了就不去抢状态锁。
+    org_known: parking_lot::RwLock<std::collections::HashSet<i64>>,
 }
 
 /// 待处理的调用队列：**入队是同步的，出队只有一个消费者**，故处理顺序恒等于
@@ -163,8 +166,10 @@ impl Telemetry {
                 }
                 continue;
             };
+            // 解析在锁外，见 [`Self::process_parsed`]。
+            let shape = parse_shape(&call.body);
             let mut st = self.0.state.lock();
-            Self::process(&mut st, call, true, None);
+            Self::process_parsed(&mut st, call, shape, true, None);
         }
     }
 
@@ -180,7 +185,11 @@ impl Telemetry {
     /// `organization_uuid`——官方 345/345 条都带。
     pub fn seed_org_uuid(&self, cred_id: i64, org_uuid: Option<&str>) {
         let Some(org) = org_uuid.map(str::trim).filter(|o| !o.is_empty()) else { return };
+        if self.0.org_known.read().contains(&cred_id) {
+            return;
+        }
         self.0.state.lock().org_uuid.entry(cred_id).or_insert_with(|| org.to_string());
+        self.0.org_known.write().insert(cred_id);
     }
 
     /// 某凭证最近活跃的真实会话（`max_idle` 内有过请求的那些里最新的一个）；没有则 `None`。

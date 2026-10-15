@@ -144,6 +144,9 @@ pub struct CredentialStore {
     key_cache: std::sync::Arc<Mutex<KeyAccessCache>>,
     /// 已经落进 `tool_sets` 的工具集 sha，写流水时省掉重复的 upsert，见 `usage::split_tool_names`。
     known_tool_sets: Mutex<std::collections::HashSet<String>>,
+    /// 选号最早该在什么时刻（unix 秒）去放回到点的限流暂停号，见
+    /// [`CredentialStore::resume_due_gated`]。没到点就不发那条 UPDATE。
+    next_resume_check: std::sync::atomic::AtomicI64,
 }
 
 /// 后台写入（流水、学到的规则）同时占用的连接数上限。
@@ -227,6 +230,7 @@ impl CredentialStore {
             quota_cache: Mutex::new(None),
             key_cache: Default::default(),
             known_tool_sets: Mutex::default(),
+            next_resume_check: Default::default(),
         })
     }
 
@@ -239,7 +243,19 @@ impl CredentialStore {
     /// 开一个**串行化的**写事务，见模块文档。
     pub(crate) async fn begin_write(&self) -> Result<WriteTx> {
         let guard = self.write_lock.clone().lock_owned().await;
-        let tx = begin_locked(&self.pool).await?;
+        let tx = begin_locked(&self.pool, false).await?;
+        Ok(WriteTx { tx, _guard: guard })
+    }
+
+    /// 同 [`Self::begin_write`]，但这笔事务**提交不等 WAL 落盘**（`synchronous_commit = off`）。
+    ///
+    /// 只给选号用：它每条请求都要提交一次，而且在全局锁里提交，等 fsync 的那一下直接摊在
+    /// 所有请求的排队上。它写的是绑定续期、计数与绑定事件——PG 本身崩溃时丢最后几百毫秒，
+    /// 代价是个别会话下一条请求重新选号，数据不会损坏，可以接受。流水、账单、后台的配置改动
+    /// 照旧走 [`Self::begin_write`]。设置随在拿锁那条语句里，不多一次往返。
+    pub(crate) async fn begin_write_async_commit(&self) -> Result<WriteTx> {
+        let guard = self.write_lock.clone().lock_owned().await;
+        let tx = begin_locked(&self.pool, true).await?;
         Ok(WriteTx { tx, _guard: guard })
     }
 
@@ -343,15 +359,22 @@ pub(super) fn strip_nul(s: &mut String) {
 }
 
 /// 开事务并拿全局 advisory 锁（只防多进程；进程内的排队在 [`CredentialStore::begin_write`]）。
-async fn begin_locked(pool: &PgPool) -> Result<Transaction<'static, Postgres>> {
+/// `async_commit` 见 [`CredentialStore::begin_write_async_commit`]：`set_config(.., true)` 即
+/// `SET LOCAL`，只管这一笔事务。
+async fn begin_locked(pool: &PgPool, async_commit: bool) -> Result<Transaction<'static, Postgres>> {
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(WRITE_LOCK_KEY).execute(&mut *tx).await?;
+    let sql = if async_commit {
+        "SELECT set_config('synchronous_commit', 'off', true), pg_advisory_xact_lock($1)"
+    } else {
+        "SELECT pg_advisory_xact_lock($1)"
+    };
+    sqlx::query(sql).bind(WRITE_LOCK_KEY).execute(&mut *tx).await?;
     Ok(tx)
 }
 
 /// 补齐恒存在的行。在串行化事务里做：几个进程同时启动时不会各插一份。
 async fn seed(pool: &PgPool) -> Result<()> {
-    let mut tx = begin_locked(pool).await?;
+    let mut tx = begin_locked(pool, false).await?;
     // admin 行恒存在（还没设密码时 password_hash 为空），号与出口代理的 owner 才总能落到
     // 一个确定的人身上。
     sqlx::query(

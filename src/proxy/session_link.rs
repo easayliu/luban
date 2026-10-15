@@ -521,6 +521,31 @@ pub(crate) static CC_SESSIONS: std::sync::LazyLock<
 /// session id 隔了几个小时再来就是另一次对话，把上次那条 request-id 接过去是假的。
 const CC_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
 
+/// [`CC_SESSIONS`] 与 [`CC_PREFIX_FPS`] 整表清过期条目的最小间隔。
+///
+/// 原先每条请求都在全局锁里 `retain` 一遍整张表——表里是 3 小时内的全部会话，几千条时每条
+/// 请求都要扫几千项，期间别的请求全在等这把锁。清理只是为了不让表无限长，隔一分钟做一次足够；
+/// 被查的那**一条**过没过期则每次当场判（[`expired`]），查询结果与每次都清时一样。
+const SESSION_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 某条会话 / 谱系记录在 `now` 是否已经过期（隔了 [`CC_SESSION_IDLE`] 没来）。
+fn expired(seen: std::time::Instant, now: std::time::Instant) -> bool {
+    now.duration_since(seen) >= CC_SESSION_IDLE
+}
+
+/// 距上次整表清理到没到 [`SESSION_SWEEP_EVERY`]；到了就记下这次。
+fn sweep_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    if last.is_some_and(|t| now.duration_since(t) < SESSION_SWEEP_EVERY) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// [`CC_SESSIONS`] 上次整表清理的时刻。只在持着 [`CC_SESSIONS`] 的锁时动它。
+static CC_SESSIONS_SWEPT: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
+
 /// 每个**前缀谱系**上一条请求的 system 正文指纹与正文（[`PrefixEntry`]），给
 /// [`cache_prefix_stable`] 判「这一轮的 system 与上一轮是不是同一份」，变了的话还要拿
 /// 上一轮的正文对出差异。
@@ -617,6 +642,8 @@ impl PrefixLimits {
 struct PrefixTable {
     map: std::collections::HashMap<PrefixKey, PrefixEntry>,
     text_bytes: usize,
+    /// 上次整表清过期的时刻，见 [`SESSION_SWEEP_EVERY`]。
+    swept: Option<std::time::Instant>,
 }
 
 impl PrefixTable {
@@ -632,9 +659,19 @@ impl PrefixTable {
         now: std::time::Instant,
         limits: PrefixLimits,
     ) -> Option<PrefixEntry> {
-        // 过期清理与条目数上限都要在插入前做，不然刚插的这条可能就被自己淘汰掉。
-        self.map.retain(|_, e| now.duration_since(e.seen) < CC_SESSION_IDLE);
-        self.text_bytes = self.map.values().map(|e| e.bytes).sum();
+        // 过期清理与条目数上限都要在插入前做，不然刚插的这条可能就被自己淘汰掉。整表清过期
+        // 隔一阵才做一次（[`SESSION_SWEEP_EVERY`]），字节数随删随减，不再每次整表求和。
+        if sweep_due(&mut self.swept, now) {
+            let mut freed = 0;
+            self.map.retain(|_, e| {
+                let keep = !expired(e.seen, now);
+                if !keep {
+                    freed += e.bytes;
+                }
+                keep
+            });
+            self.text_bytes -= freed;
+        }
         while self.map.len() >= limits.entries && !self.map.contains_key(&key) {
             let Some(oldest) = self.map.iter().min_by_key(|(_, e)| e.seen).map(|(k, _)| k.clone())
             else {
@@ -648,6 +685,8 @@ impl PrefixTable {
         if let Some(e) = &prev {
             self.text_bytes -= e.bytes;
         }
+        // 没赶上整表清理、其实已经过期的上一轮：当它不存在，与每次都清时一样。
+        let prev = prev.filter(|e| !expired(e.seen, now));
         let keep_text = text.is_some() && self.text_bytes + bytes <= limits.total_bytes;
         let entry = PrefixEntry {
             system_fp,
@@ -816,8 +855,14 @@ impl CcSessionLink {
     ) -> Self {
         let now = std::time::Instant::now();
         let mut map = CC_SESSIONS.lock();
-        map.retain(|_, e| now.duration_since(e.last_seen) < CC_SESSION_IDLE);
+        if sweep_due(&mut CC_SESSIONS_SWEPT.lock(), now) {
+            map.retain(|_, e| !expired(e.last_seen, now));
+        }
         let key = key.owned();
+        // 没赶上整表清理、其实已经过期的这一条：当新会话重来，与每次都清时一样。
+        if map.get(&key).is_some_and(|e| expired(e.last_seen, now)) {
+            map.remove(&key);
+        }
         let known = map.contains_key(&key);
         let entry = map.entry(key).or_insert_with(|| CcSessionEntry {
             prompt_id: uuid_v4(),

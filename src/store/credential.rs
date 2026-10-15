@@ -14,6 +14,9 @@
 /// （`credential-shared.tsx`）。改文案须三处一起改。
 pub const ORG_OAUTH_SUSPEND_MARKER: &str = "organization does not allow OAuth authentication";
 
+/// 选号检查到点暂停号的最长间隔（秒），见 [`CredentialStore::resume_due_gated`]。
+const RESUME_RECHECK_SECS: i64 = 60;
+
 /// 订阅未生效暂停原因的开头标签：`[` + 它 + ` <三位状态码>] `，见 [`ORG_OAUTH_SUSPEND_MARKER`]。
 pub const SUBSCRIPTION_PAUSE_TAG: &str = "subscription-inactive";
 
@@ -268,6 +271,11 @@ impl CredentialStore {
             release_bindings(&mut tx, &[id], "account_paused").await?;
         }
         tx.commit().await?;
+        // 提交之后再记：选号那边先置成最远再读最早时刻（见 [`Self::resume_due_gated`]），提交
+        // 前记的话可能被它读之前那次置远抹掉。
+        if updated && let Some(at) = resume_at {
+            self.note_resume_at(at);
+        }
         Ok(updated)
     }
 
@@ -300,7 +308,7 @@ impl CredentialStore {
 
     /// 把所有「限流暂停且已到恢复时刻」的号重新启用，返回实际恢复的条数。
     ///
-    /// 惰性执行（选号与列表各调一次，见 [`crate::store::CredentialStore::select_with_slot`]/[`Self::list`]），
+    /// 惰性执行（选号经 [`Self::resume_due_gated`]、列表直接调，见 [`crate::store::CredentialStore::select_with_slot`]/[`Self::list`]），
     /// 和设备绑定的 TTL 过期同一套路子：不挂后台定时器。条件里的 `resume_at IS NOT NULL` 是
     /// 关键，它保证只碰限流暂停的号，封号与人工停用的不会被顺手打开。
     pub(super) async fn resume_due(conn: &mut PgConnection) -> Result<usize> {
@@ -312,6 +320,49 @@ impl CredentialStore {
         .execute(conn)
         .await?
         .rows_affected() as usize)
+    }
+
+    /// 选号用的 [`Self::resume_due`]：只在可能有号到点时才发那条 UPDATE。
+    ///
+    /// 原先每次选号都无条件跑一遍——一条写语句，又在全局写锁里。现在记一个「最早该查的时刻」
+    /// （`CredentialStore::next_resume_check`）：没到就跳过；到了才放回，放完从库里取下一个
+    /// 最早的 `resume_at` 记上。新的暂停由 [`Self::note_resume_at`] 往前拨。兜底最多隔
+    /// [`RESUME_RECHECK_SECS`] 查一次，手工改库写进来的 `resume_at` 也误不了多久。
+    ///
+    /// 顺序是「先推到兜底时刻 → 放回 → 读最早时刻 → 取较小者写回」：读之前提交的暂停读得到，读
+    /// 之后提交的会在提交后自己往前拨（取较小者，不会被这里覆盖掉）。先推的是**有限**的兜底时刻
+    /// 而不是无穷远：这一步之后都在等库，选号任务被取消（来访断开）时后面一行都不会跑，推到
+    /// 无穷远就再也拨不回来。选号那边另有守卫，在事务没提交成时把门拨回（见
+    /// [`crate::store::CredentialStore::select_with_slot`]）。
+    pub(super) async fn resume_due_gated(&self, conn: &mut PgConnection) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let now = crate::credentials::now_secs() as i64;
+        if self.next_resume_check.load(Ordering::SeqCst) > now {
+            return Ok(());
+        }
+        self.next_resume_check.store(now + RESUME_RECHECK_SECS, Ordering::SeqCst);
+        let next: Result<Option<i64>> = async {
+            Self::resume_due(&mut *conn).await?;
+            Ok(sqlx::query_scalar(
+                "SELECT MIN(resume_at) FROM credentials \
+                  WHERE disabled = 1 AND resume_at IS NOT NULL",
+            )
+            .fetch_one(&mut *conn)
+            .await?)
+        }
+        .await;
+        // 出错就退回「下次一定查」，不能停在最远处。
+        let at = match &next {
+            Ok(n) => n.unwrap_or(i64::MAX).min(now + RESUME_RECHECK_SECS),
+            Err(_) => 0,
+        };
+        self.next_resume_check.fetch_min(at, Ordering::SeqCst);
+        next.map(|_| ())
+    }
+
+    /// 有号要在 `at`（unix 秒）恢复：把选号的下次检查拨到不晚于它。
+    pub(super) fn note_resume_at(&self, at: i64) {
+        self.next_resume_check.fetch_min(at, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 连通性测试通过时调用：若该号是被限流自动停用的（`resume_at` 非空），当场恢复调度。

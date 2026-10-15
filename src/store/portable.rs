@@ -390,6 +390,10 @@ impl CredentialStore {
             }
         };
         tx.commit().await?;
+        // 导进来的号可能带着限流暂停的恢复时刻，选号得知道该去查了。
+        if let Some(at) = c.resume_at {
+            self.note_resume_at(at as i64);
+        }
         Ok(outcome)
     }
 

@@ -4862,3 +4862,21 @@ fn agent_summary_stopped_keeps_the_model_from_spawn_time() {
     assert_eq!(stopped["session_model_family"], "opus", "{stopped}");
     assert_eq!(stopped["config_flag"], "tengu_groovy_ember");
 }
+
+/// [`Telemetry::seed_org_uuid`] 只垫底：已有的不覆盖（不论是先垫的还是响应头学到的），空白的
+/// 不算数、也不让后来的那次被快路径挡掉。
+#[test]
+fn seed_org_uuid_only_fills_a_missing_one() {
+    let t = Telemetry::default();
+    t.seed_org_uuid(1, Some("org-a"));
+    t.seed_org_uuid(1, Some("org-b"));
+    assert_eq!(t.org_uuid(1).as_deref(), Some("org-a"));
+    t.seed_org_uuid(2, Some("  "));
+    assert_eq!(t.org_uuid(2), None);
+    t.seed_org_uuid(2, Some("org-c"));
+    assert_eq!(t.org_uuid(2).as_deref(), Some("org-c"));
+    // 响应头学到的（状态里已有、快路径集合里还没有）：垫底照样不覆盖。
+    t.0.state.lock().org_uuid.insert(3, "from-header".into());
+    t.seed_org_uuid(3, Some("from-profile"));
+    assert_eq!(t.org_uuid(3).as_deref(), Some("from-header"));
+}

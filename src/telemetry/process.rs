@@ -12,7 +12,21 @@ impl Telemetry {
         allow_defer: bool,
         prev_end_override: Option<SystemTime>,
     ) {
-        let Some(mut shape) = parse_shape(&call.body) else { return };
+        let shape = parse_shape(&call.body);
+        Self::process_parsed(st, call, shape, allow_defer, prev_end_override);
+    }
+
+    /// [`Self::process`] 的本体，请求体已经解析好（[`parse_shape`]）。转发来的调用在拿状态锁
+    /// **之前**解析（[`Telemetry::drain`]）：100KB 以上的 JSON 要几毫秒，放在锁里就是让转发
+    /// 路径上同样要这把锁的那几处（`seed_org_uuid` 之类）跟着等。
+    pub(super) fn process_parsed(
+        st: &mut State,
+        call: ApiCall,
+        shape: Option<RequestShape>,
+        allow_defer: bool,
+        prev_end_override: Option<SystemTime>,
+    ) {
+        let Some(mut shape) = shape else { return };
         if shape.quota_probe {
             // 官方不为它报任何事件，但它标着一次进程启动，见 [`State::process_starts`]。
             if let (Some(dev), Some(sid)) = (

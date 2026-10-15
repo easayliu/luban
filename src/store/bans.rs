@@ -41,10 +41,13 @@ impl CredentialStore {
         // 原因与报错可能回显客户端塞进来的串，见 [`nul_free`]。
         let reason = nul_free(&ctx.reason);
         let mut tx = self.begin_write().await?;
+        // `FOR NO KEY UPDATE` 而不是 `FOR UPDATE`：这里只改非键列，用不着排他到底。写流水时对
+        // 同一行拿的是 `FOR KEY SHARE`（`usage.rs`），它与 `FOR UPDATE` 互斥——封号就得等这个号
+        // 所有在写的流水提交，而这时手里攥着全局写锁，全站选号跟着停。
         let account: Option<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE(disabled = 1 AND resume_at IS NULL AND ban_reason IS NOT NULL
                              AND NOT ({SUBSCRIPTION_PAUSE_SQL}), FALSE)
-               FROM credentials WHERE id = $1 FOR UPDATE"
+               FROM credentials WHERE id = $1 FOR NO KEY UPDATE"
         )))
         .bind(id)
         .fetch_optional(&mut *tx)
