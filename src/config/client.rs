@@ -222,8 +222,8 @@ pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("../assets/cc_system_base_ha
 /// 没有的工具，提示词与工具集不成套。其余每个字节照抓包。
 ///
 /// **为什么要这一块**：官方主线程的 `system` 是 `[billing, 身份, 基座, 其余]`，「其余」这块
-/// 几千到一万字节、带末尾断点，上游对末块有内容级检测（见 `proxy::MAX_CLIENT_SYSTEM_CHARS`）。
-/// 此前模拟路径末块放的是客户端自己那段提示词，与官方形态差得最远的正是这一块。
+/// 几千到一万字节、带末尾断点。此前模拟路径末块放的是客户端自己那段提示词，与官方形态差得
+/// 最远的正是这一块（2026-10-15 实测末块长度本身不触发第三方判定，补这块只为形态对齐）。
 pub const CC_SYSTEM_REST: &str = include_str!("../assets/cc_system_rest.txt");
 
 /// 2.1.291 fable 主线程的第四块模板（10794 字节）：`cap/auto-2.1.291-20261006-full/00464`

@@ -6372,9 +6372,9 @@ fn model_notice_survives_a_trailing_client_system_message() {
     }
 }
 
-/// 模拟路径上开头夹着一条指令：客户端那段长 system 要挪进首条**用户**消息、环境说明跟在它后面，
-/// 指令本身一个字节都不动。不跳过它的话，正文会塞进指令里，指令就成了一条开头的普通 system。
-/// 严格检查开（默认，不提升）与关（提升）两种都要成立。
+/// 模拟路径上开头夹着一条指令：客户端那段长 system 整段留在 system 末块、环境说明跟在首条
+/// **用户**消息后面，指令本身一个字节都不动。不跳过它的话，说明会塞进指令里，指令就成了一条
+/// 开头的普通 system。严格检查开（默认，不提升）与关（提升）两种都要成立。
 #[test]
 fn simulation_skips_a_leading_system_directive() {
     use crate::proxy::test_support::{detect_for, rewrite_body};
@@ -6398,7 +6398,9 @@ fn simulation_skips_a_leading_system_directive() {
         assert_eq!(msgs[0], directive, "指令原样: {ctx}");
         assert_eq!(msgs[1]["role"], "user", "{ctx}");
         let first = msgs[1]["content"][0]["text"].as_str().unwrap();
-        assert!(first.contains("客户端规则。"), "长 system 进了首条用户消息: {ctx}");
+        assert_eq!(first, format!("开头指令·{strict}"), "首条用户消息原样: {ctx}");
+        let tail = v["system"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap();
+        assert_eq!(tail, "客户端规则。".repeat(400), "长 system 整段留在末块: {ctx}");
         assert!(
             msgs[2]["content"][0]["text"].as_str().unwrap().starts_with("# Environment"),
             "环境说明跟在首条用户消息后面: {ctx}"

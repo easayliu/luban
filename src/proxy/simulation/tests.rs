@@ -75,9 +75,7 @@ fn simulates_official_system_for_plain_request() {
     let first = v["messages"][0]["content"].as_array().unwrap();
     assert_eq!(first.len(), 1, "首条消息不再被塞东西: {s}");
     assert_eq!(first[0]["text"], "hi", "首条消息正文原样: {s}");
-    assert!(!s.contains(crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD), "短 system 不该挪进消息: {s}");
     assert!(!s.contains("system_instructions"), "自创标签一个都不能有: {s}");
-    assert!(!s.contains("(see conversation)"), "没有占位块: {s}");
 
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     assert_eq!(
@@ -179,92 +177,6 @@ fn session_id_must_look_like_a_uuid() {
     assert!(!ok("d0c1fb05_9b19_4576_9465_e2b8a206dabf"), "分隔符不对");
     assert!(!ok("g0c1fb05-9b19-4576-9465-e2b8a206dabf"), "非 hex");
     assert!(!ok(""));
-}
-
-/// 超长客户端 system 搬不动时，**一个字节都不许改**。
-///
-/// 原来的实现先把末块换成 `(see conversation)` 占位、再去写 `messages[0]`，落点不可写
-/// 时就直接 `return false`——客户端明确下的那段指令凭空消失，而调用方只看到一个
-/// `false`，以为什么都没发生。
-///
-/// 有没有第四块都一样有活干：客户端 system 恒为独立的末块（0.3.154），超长就搬。
-#[test]
-fn long_client_system_is_relocated_atomically() {
-    let long = "指令".repeat(1200); // 远超 MAX_CLIENT_SYSTEM_BYTES
-    let no_rest = store::ForwardFlags { simulate_full_system: false, ..all_on() };
-    // messages[0].content 是数字：既不是数组也不是字符串，搬不过去。
-    let body = serde_json::json!({
-            "model": "claude-opus-5",
-            "max_tokens": 64000,
-            "messages": [{"role": "user", "content": 42}],
-            "system": long});
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let sim = detect_for(&raw, no_rest).expect("该请求应走模拟路径");
-    assert!(sim.rest.is_none());
-    let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(crate::proxy::simulate_system(
-        &mut v,
-        &sim,
-        crate::proxy::CacheShape { global: true, ttl_1h: true }
-    ));
-    let before = v.clone();
-    assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim), "搬不动就该返回 false");
-    assert_eq!(v, before, "搬不动时 body 必须原样不动，不能只剩一个占位块");
-    let tail = v["system"].as_array().unwrap().last().unwrap();
-    assert!(tail["text"].as_str().unwrap().contains("指令"), "客户端那段 system 还在: {tail}");
-
-    // messages[0] 可写时照常搬走，末块换占位。
-    let ok = serde_json::json!({
-            "model": "claude-opus-5",
-            "max_tokens": 64000,
-            "messages": [{"role": "user", "content": "hi"}],
-            "system": long});
-    let raw = Bytes::from(serde_json::to_vec(&ok).unwrap());
-    let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(crate::proxy::simulate_system(
-        &mut v,
-        &sim,
-        crate::proxy::CacheShape { global: true, ttl_1h: true }
-    ));
-    assert!(crate::proxy::relocate_long_client_system(&mut v, &sim));
-    let tail = v["system"].as_array().unwrap().last().unwrap();
-    assert_eq!(tail["text"], "(see conversation)", "末块换成占位");
-    let first = v["messages"][0]["content"].as_str().unwrap();
-    assert!(first.starts_with("<system-reminder>\n"), "内容搬到了首条消息: {first}");
-    assert!(first.contains("指令"), "内容没丢");
-
-    // 有第四块时一样：客户端 system 是第 5 块，超长照搬，第四块的官方正文一个字不掺。
-    let sim = detect_for(&raw, all_on()).unwrap();
-    assert!(sim.rest.is_some());
-    let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(crate::proxy::simulate_system(
-        &mut v,
-        &sim,
-        crate::proxy::CacheShape { global: true, ttl_1h: true }
-    ));
-    assert_eq!(v["system"].as_array().unwrap().len(), 5, "{v}");
-    assert!(v["system"][4]["text"].as_str().unwrap().contains("指令"), "客户端 system 占末块");
-    assert!(
-        v["system"][3]["text"].as_str().unwrap().ends_with("</total_tokens>"),
-        "第四块是官方正文，一个字都没掺"
-    );
-    assert!(crate::proxy::relocate_long_client_system(&mut v, &sim), "超长该搬走");
-    assert_eq!(v["system"][4]["text"], "(see conversation)", "末块换成占位");
-    assert!(v["messages"][0]["content"].as_str().unwrap().contains("指令"), "内容没丢");
-
-    // 落点不可写（content 是数字）：搬不动，末块留着客户端原文，body 一个字节不动。
-    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
-    let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-    assert!(crate::proxy::simulate_system(
-        &mut v,
-        &sim,
-        crate::proxy::CacheShape { global: true, ttl_1h: true }
-    ));
-    let before = v.clone();
-    assert_eq!(v["system"].as_array().unwrap().len(), 5, "{v}");
-    assert!(!crate::proxy::relocate_long_client_system(&mut v, &sim), "搬不动就该返回 false");
-    assert_eq!(v, before, "搬不动时 body 必须原样不动");
-    assert!(v["system"][4]["text"].as_str().unwrap().contains("指令"), "客户端那段还在");
 }
 
 /// 没有 system 的请求同样成立：opus 族四块（billing / 身份句 / 基座 / 其余），与
@@ -896,7 +808,7 @@ fn merges_client_system_blocks_into_one_trailing_block() {
     assert_eq!(sys[4]["cache_control"]["ttl"], "1h", "末块照官方在 system 末尾标一个断点");
     assert_eq!(crate::proxy::count_cache_control(&v), 3, "基座 + 第四块 + 末块: {v}");
 
-    // 首条消息可写也不挪：这段不到 MAX_CLIENT_SYSTEM_BYTES，留在自己那一块里。
+    // 客户端 system 留在自己那一块里，首条消息不动。
     let body = Bytes::from(format!(
         r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"system":{sys_json}}}"#
     ));
@@ -911,9 +823,8 @@ fn merges_client_system_blocks_into_one_trailing_block() {
     assert_eq!(first.len(), 1, "首条消息不再被塞东西: {v}");
     assert_eq!(first[0]["text"], "hi");
 
-    // 超过 MAX_CLIENT_SYSTEM_BYTES 的由 relocate_long_client_system 挪进首条消息，
-    // 末块原地留一行占位，整段裹成官方那种 system-reminder 插在首条消息最前。
-    let long = "x".repeat(crate::proxy::MAX_CLIENT_SYSTEM_BYTES + 1);
+    // 超长的也不挪（2026-10-15 实测末块 12KB 照走订阅额度）：整段原样留在末块，首条消息不动。
+    let long = "x".repeat(12_000);
     let body = Bytes::from(format!(
         r#"{{"model":"claude-opus-5","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],"system":"{long}"}}"#
     ));
@@ -923,18 +834,10 @@ fn merges_client_system_blocks_into_one_trailing_block() {
     let sys = v["system"].as_array().unwrap();
     assert_eq!(sys.len(), 5, "{v}");
     assert!(sys[3]["text"].as_str().unwrap().ends_with("</total_tokens>"), "第四块原样");
-    assert_eq!(sys[4]["text"], "(see conversation)", "末块换成占位: {v}");
+    assert_eq!(sys[4]["text"], long, "超长客户端 system 原样占末块: {v}");
     let first = v["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(first.len(), 2, "长 system 作为一个 text 块插在首条消息最前: {v}");
-    assert_eq!(
-        first[0]["text"],
-        format!(
-            "<system-reminder>\n{}\n\n{long}\n</system-reminder>",
-            crate::proxy::CLIENT_SYSTEM_REMINDER_LEAD
-        ),
-        "与官方首条用户消息第一块同形（cap/2.1.277/00023）"
-    );
-    assert_eq!(first[1]["text"], "hi");
+    assert_eq!(first.len(), 1, "首条消息不被塞东西: {v}");
+    assert_eq!(first[0]["text"], "hi");
 
     // 空块并不进来（发一个空文本块上游不收），也就不多出末块那一块。
     let empty = Bytes::from(

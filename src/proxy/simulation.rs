@@ -1448,8 +1448,9 @@ pub(super) fn simulate_system(
     // 那 11KB 的断点会跟着客户端 system 一起失效，客户端每换一次 system 就按写入价重付一次。
     //
     // **代价**：`system` 比官方多一块（`cap/` 37 份抓包的末块恒为官方「其余」段），且末块是
-    // 纯非 CC 内容。上游对末块有内容级检测，超过 [`MAX_CLIENT_SYSTEM_BYTES`] 的由
-    // [`relocate_long_client_system`] 在 [`rewrite_body`] 里挪进首条用户消息、原地留一行占位。
+    // 纯非 CC 内容。曾以为上游对末块有内容级检测（超过 ~2000 字节判第三方），超长的就挪进首条
+    // 用户消息；2026-10-15 实测末块 1000~12000 字节、拼进第四块到 14KB，haiku/sonnet/opus 两代
+    // 全部照走订阅额度，故不再挪，整段原样留在末块。
     let rest = sim.rest.clone().map(|mut rest| {
         // 2.1.300 起工具里同时有 Artifact 与 Edit 时，第四块末尾接 `edits` 说明（见
         // [`config::CC_SYSTEM_ARTIFACT_EDITS`]）。system 拼在注工具之前（cch 随后按整份体算），
@@ -1503,122 +1504,6 @@ pub(super) fn simulate_system(
     }
 
     insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
-    true
-}
-
-/// 官方把 CLAUDE.md 与用户指令塞进首条用户消息时，`<system-reminder>` 块开头那一句
-/// （`cap/2.1.277/00023`、`00031`、`00357` 逐字相同；四族首条用户消息的第一个 text 块都是它）。
-/// 客户端自己的 system 在官方形态里最接近的落点就是这一块：都是「用户这边给的指令」。
-pub(super) const CLIENT_SYSTEM_REMINDER_LEAD: &str = "Codebase and user instructions are shown below. \
-Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior \
-and you MUST follow them exactly as written.";
-
-/// 把客户端自己那段 system 正文裹成官方那种 `<system-reminder>` 块（开头是
-/// [`CLIENT_SYSTEM_REMINDER_LEAD`] 那句、空一行、正文、换行、闭合标签）塞到首条用户消息的
-/// 第一个内容块前面——`cap/2.1.277` 里 44 份带首条用户消息的请求都是这个写法，luban 原先
-/// 自创的 `<system_instructions>` 标签一次都没出现过。
-///
-/// 首条用户消息通常就是 `messages[0]`，但开头可以夹着指令式 system（`content: []` 带
-/// `output_config`，[`crate::proxy::body::is_system_directive`]，提升不动它）：往那条里塞字，
-/// 它就成了一条开头的普通 system，上游必拒，客户端调的 effort 也跟着变了味。所以跳过它们；
-/// 跳过之后第一条不是 user 就当落点不可写。
-///
-/// **要么整个写成，要么一个字节都不动**：先确认落点的 `content` 是数组或字符串再写，
-/// 落点不可写（`content` 缺失、是数字、messages 为空）返回 `false`，调用方自己决定正文往哪放。
-pub(super) fn stash_client_system(v: &mut serde_json::Value, text: &str) -> bool {
-    let at = v.get("messages").and_then(|m| m.as_array()).and_then(|m| {
-        m.iter().position(|x| !crate::proxy::body::is_system_directive(x)).filter(|&i| {
-            m[i].get("role").and_then(|r| r.as_str()) == Some("user")
-                && m[i].get("content").is_some_and(|c| c.is_array() || c.is_string())
-        })
-    });
-    let Some(at) = at else {
-        tracing::warn!(
-            chars = text.chars().count(),
-            "the first user message is not writable, leaving the client system in `system`"
-        );
-        return false;
-    };
-    let wrapped =
-        format!("<system-reminder>\n{CLIENT_SYSTEM_REMINDER_LEAD}\n\n{text}\n</system-reminder>");
-    // 走到这里两步都必定成功：上面刚验过 `content` 是数组或字符串。
-    let Some(first) =
-        v.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.get_mut(at))
-    else {
-        return false;
-    };
-    match first.get_mut("content") {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.insert(0, serde_json::json!({"type": "text", "text": wrapped}));
-            true
-        }
-        Some(content @ serde_json::Value::String(_)) => {
-            let s = content.as_str().unwrap_or_default();
-            *content = serde_json::Value::String(format!("{wrapped}\n\n{s}"));
-            true
-        }
-        _ => false,
-    }
-}
-
-/// 模拟后 system 末块（客户端自有内容）超过此**字节**数时，移到 messages 首条用户消息里。
-///
-/// 上游对末块有内容级检测：非 CC 特征内容超过 ~2000 触发第三方判定，实测 1900 安全、2021
-/// 触发。那次实测的正文是 ASCII，字符数与字节数相等，上游按哪个单位算**没有证据**，这里取
-/// 两者中更保守的字节数——猜错方向的代价是封号，多搬一次只是少一层 system 优先级。
-///
-/// 取值就是实测那条安全线 1900，不再往下留余量（0.3.154 之前是 1500）：留余量保护的是
-/// 「上游按字符算」那种猜错，而那种情形下按字节算本身已经在保守一侧；1500 换来的只是中文
-/// 提示词从约 633 字提前到约 500 字就被搬走，白丢一层 system 优先级。
-pub(super) const MAX_CLIENT_SYSTEM_BYTES: usize = 1900;
-
-/// 把模拟后 system 末块（客户端自有内容）的超长内容搬到 messages 首条用户消息里。
-///
-/// 搬走后末块换成一行短占位（保持块数形态），内容作为官方那种 `<system-reminder>` 块
-/// （[`stash_client_system`]）注入到 messages[0] 的第一个 content 块前面。messages[0] 必须是 user role（API 约束），
-/// 官方 CC 也恒为 user 开头，正常情况下不会踩空。
-///
-/// **要么整个搬成，要么一个字节都不动。** 先确认 `messages[0].content` 是可写的形态，
-/// 再去动 `system`——反过来的话，落点不可写时（`content` 缺失、是数字、messages 为空）
-/// 就会得到「末块已经换成 `(see conversation)` 占位、内容却没搬到任何地方」的请求：
-/// 客户端明确下的那段指令**凭空消失**，而调用方只看到一个 `false`，以为什么都没发生。
-pub(super) fn relocate_long_client_system(v: &mut serde_json::Value, sim: &Simulation) -> bool {
-    // 模拟产出的固定块数：billing + 身份句 (+ reporting) (+ 基座) (+ 第四块)。多出来的那一块
-    // 才是客户端自己的 system；块数不多于它（来访本来就没发 system）就没有可搬的东西。
-    // 有没有第四块都一样：0.3.154 起客户端 system 恒为独立末块，两种情形都走这里。
-    let reporting = sim.profile.system == config::CcSystemShape::IdentityReporting;
-    let fixed = 2
-        + usize::from(reporting)
-        + usize::from(sim.base.is_some())
-        + usize::from(sim.rest.is_some());
-    let sys = match v.get("system").and_then(|s| s.as_array()) {
-        Some(a) if a.len() > fixed => a,
-        _ => return false,
-    };
-    let last = sys.len() - 1;
-    let tail_text = match sys[last].get("text").and_then(|t| t.as_str()) {
-        Some(t) if t.len() > MAX_CLIENT_SYSTEM_BYTES => t.to_string(),
-        _ => return false,
-    };
-    // 先写落点：写不进去就原地返回，`system` 还没被动过。
-    if !stash_client_system(v, &tail_text) {
-        return false;
-    }
-    if let Some(blocks) = v.get_mut("system").and_then(|s| s.as_array_mut()) {
-        let cc = blocks[last].get("cache_control").cloned();
-        let mut placeholder = text_block_bare("(see conversation)");
-        if let Some(cc) = cc
-            && let Some(o) = placeholder.as_object_mut()
-        {
-            o.insert("cache_control".into(), cc);
-        }
-        blocks[last] = placeholder;
-    }
-    tracing::info!(
-        bytes = tail_text.len(),
-        last,
-        "relocated long client system from last block to messages[0]"
-    );
     true
 }
 
@@ -1772,9 +1657,8 @@ pub(super) fn billing_header_text(
 /// `cc_turn_index`（2.1.285 起）。`cch` 在这里就一次写好，不再等
 /// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
 ///
-/// 第四段按 [`cc_version_suffix`] 从 `v`（此刻还是来访自己的 `messages`，客户端 system 还没
-/// 被 [`relocate_long_client_system`] 挪进首条消息）派生：同一个对话每轮首条消息不变，后缀也
-/// 就整段会话不变，与官方一致。此前写的是抓包那一个会话的值（2.1.277 的 `d56`），经 luban
+/// 第四段按 [`cc_version_suffix`] 从 `v`（此刻还是来访自己的 `messages`）派生：同一个对话
+/// 每轮首条消息不变，后缀也就整段会话不变，与官方一致。此前写的是抓包那一个会话的值（2.1.277 的 `d56`），经 luban
 /// 的每一个模拟会话后缀都相同，而官方的后缀随会话首句变。
 fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> String {
     let p = sim.profile;

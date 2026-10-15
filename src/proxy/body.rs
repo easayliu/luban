@@ -14,8 +14,7 @@ use super::session_link::{
 };
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, SimEnv, Simulation, billing_header_text, cap_system_blocks,
-    cc_profile_for, cc_profile_kind_for, has_cc_identity, is_cc_shaped,
-    relocate_long_client_system, simulate_system,
+    cc_profile_for, cc_profile_kind_for, has_cc_identity, is_cc_shaped, simulate_system,
 };
 use super::thinking::preserve_thinking_encoding;
 use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
@@ -184,11 +183,6 @@ pub(super) fn rewrite_body_out(
     // 只喂给 `strip_extra_fields` 判 `thinking.display` 该不该剥。
     let cc_inbound = is_cc_shaped(&v);
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
-    // 模拟后末块是客户端的自有 system。上游对该块有内容级检测——非 CC 特征内容超过
-    // ~2000 字符就触发第三方判定。把超长内容移到 messages 首条用户消息里，末块只留
-    // 一个短占位，绕过内容检测且不丢失指令语义。
-    let sys_relocated =
-        simulated && !billing_only && sim.is_some_and(|s| relocate_long_client_system(&mut v, s));
     // 消息线程指纹按**环境说明插入之前**的 `messages` 算：换了模型族时环境说明从 `role: system`
     // 消息变成用户正文里的提醒块（或反之），插入后的 `fps` 自然就对不上上一轮的记录，但两种
     // 形态对应的是同一段对话——用来访真正发出的那份算指纹，前缀匹配就不被这种形态变化打断。
@@ -476,7 +470,6 @@ pub(super) fn rewrite_body_out(
     tracing::debug!(
         billing_only,
         simulated,
-        sys_relocated,
         env_noted,
         sim_meta,
         meta_stripped,
@@ -513,7 +506,6 @@ pub(super) fn rewrite_body_out(
         && !cch_added
         && !link_added
         && !simulated
-        && !sys_relocated
         && !env_noted
         && !sim_meta
         && !meta_stripped

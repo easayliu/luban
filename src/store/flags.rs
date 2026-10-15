@@ -132,8 +132,7 @@ pub struct ForwardFlags {
     ///   算法与官方 `ymo` / `ug` 一致（2.1.296 非续轮 122 条后缀全中）。差别只在官方辅助调用不带
     ///   工具，第三方客户端带自己的工具。
     ///   2026-10-10 实测：客户端 system 12KB、出站 system 9 块均照常走订阅额度、未判第三方，
-    ///   故这条路不跑完整模拟那两道防线（`cap_system_blocks` 块数封顶、`relocate_long_client_system`
-    ///   长 system 挪进首条消息）。
+    ///   故这条路不跑完整模拟的 `cap_system_blocks` 块数封顶。
     /// - **关**（默认）：按完整官方形态模拟。
     pub sim_billing_only: bool,
     /// billing-only 下**模拟请求**带不带 `metadata.user_id`（[`Self::sim_billing_only`] 的子项）。

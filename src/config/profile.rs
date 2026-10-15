@@ -252,7 +252,7 @@ pub enum CcModelTier {
     /// opus-4-7、opus-4-6、sonnet-4-6 及更老：`mid-conversation-system` 一系（连同
     /// `-clear-at`）、`per-turn-control`、`mid-conversation-tool-changes` 全不发。这几个模型的
     /// 官方请求里也确实没有 `role: "system"` 的消息，环境说明整段落在首条 user 消息的
-    /// `<system-reminder>` 里——模拟路径本来就是这么放的（[`crate::proxy::stash_client_system`]）。
+    /// `<system-reminder>` 里。
     Legacy,
 }
 
