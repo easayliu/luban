@@ -56,7 +56,8 @@ pub(crate) use version::*;
 /// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
 ///    见 [`align_system_shape`]。含拆块与基座标 `scope:"global"`（后者另受
 ///    `cache_scope_global` 管）。模拟路径已经直接产出 5 块，故两者互斥，不叠加。同一开关还管**块数封顶**
-///    （[`cap_system_blocks`]）：超过 [`MAX_SYSTEM_BLOCKS`] 块的 `system` 会被上游判成第三方应用、改扣超额池。
+///    （[`cap_system_blocks`]）：把超过 [`MAX_SYSTEM_BLOCKS`] 块的 `system` 并回官方块数，只为形态对齐
+///    （2026-10-15 实测块数本身不触发第三方判定，见 `MAX_SYSTEM_BLOCKS` 的注）。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
 ///    「真账号 + 陌生设备」的矛盾。它也管着模拟路径的 `metadata` 注入——凭空造一份身份，
@@ -366,8 +367,9 @@ pub(super) fn rewrite_body_out(
     });
     // 封顶排在**所有会增加 system 块数的步骤之后**：两条整形产出的都是 ≤5 块，而补前缀会在
     // 最前面加一到两块。原先它排在补前缀之前，一条客户端 5 块、没 billing header 的来访
-    // （现网 2.1.238，req_ujomarOOPtXL38jx）过了封顶再被补成 6 或 7 块，出站正好超过
-    // `MAX_SYSTEM_BLOCKS`，上游按第三方应用计——封顶本来要防的正是这个。
+    // （现网 2.1.238，req_ujomarOOPtXL38jx）过了封顶再被补成 6 或 7 块，出站超过
+    // `MAX_SYSTEM_BLOCKS`。当时把那条 400 归因于块数；2026-10-15 实测块数本身不触发第三方判定
+    // （见 `MAX_SYSTEM_BLOCKS` 的注），封顶如今只是形态对齐，顺序照旧。
     let capped = shape && !billing_only && cap_system_blocks(&mut v);
     // 收尾：把客户端自己那些断点的 `ttl` 也补齐，否则就是「system 有、消息没有」这种官方
     // 不产生的半对齐（见 [`fill_cache_ttl`]）。放在所有整形之后，才能覆盖到全部断点。

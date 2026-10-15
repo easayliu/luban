@@ -1344,10 +1344,13 @@ pub(super) const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// `[billing, 身份句, reporting, 基座, 其余]`，opus-5 / sonnet-5 / haiku 是去掉 reporting 的
 /// 4 块（2.1.251 时四族都是 5 块）；API-key 模式那三份是 3 块合并态（见 [`align_system_shape`]）。
 ///
-/// 块数超了就不再是 CC 形态，上游按第三方应用计费，客户端会看到
-/// `Third-party apps now draw from your extra usage, not your plan limits.`
-/// ——请求照样有回复，只是从订阅额度转到了超额池。故对齐它是**计费正确性**问题，
-/// 不只是形态好看：见 [`cap_system_blocks`] 与 [`merge_system_blocks`]。
+/// 曾以为块数超了就不再是 CC 形态、上游按第三方应用计费（客户端看到
+/// `Third-party apps now draw from your extra usage, not your plan limits.`），把封顶当成
+/// **计费正确性**问题。2026-10-15 实测推翻：仅 billing 下非官方客户端出站 7 到 4097 块
+/// （每块 12~1500 字节）、伪装真实 CC 出站 6/8/12 块，haiku 全部 200、走订阅额度、无任何
+/// 提示文案；上游对块数没有可观测的上限。当年那条 400 的判据另有其物（10-11 复盘指向具体
+/// 第三方产品的提示词原文）。故封顶与合并（[`cap_system_blocks`]、[`merge_system_blocks`]）
+/// 如今只为与官方形态对齐，不再承担计费防线。
 pub(super) const MAX_SYSTEM_BLOCKS: usize = 5;
 
 /// 把非 CC 请求的 `system` 换成官方形态（2.1.260，fable 族五块、其余四块）：
@@ -1366,9 +1369,9 @@ pub(super) const MAX_SYSTEM_BLOCKS: usize = 5;
 /// 客户端的 `system` 是字符串就裹成一个文本块，是数组就并成一块（见
 /// [`merge_system_blocks`]），没有就没有末块。
 ///
-/// **客户端那堆块必须并成一块**：官方末块就是「基座之后的全部内容」拼成的一大段，
-/// 客户端自己拆成 N 块发过来，照搬就会得到 4+N 块——超过 [`MAX_SYSTEM_BLOCKS`]
-/// 即被上游判为第三方应用、改扣超额池。
+/// **客户端那堆块并成一块**：官方末块就是「基座之后的全部内容」拼成的一大段，
+/// 客户端自己拆成 N 块发过来，照搬就会得到 4+N 块、与官方形态不同。只是形态对齐：
+/// 2026-10-15 实测块数本身不触发第三方判定（见 [`MAX_SYSTEM_BLOCKS`] 的注）。
 ///
 /// **断点是数着加的**：客户端可能自己就用满了 4 个（比如给每条工具定义都标了缓存），这时
 /// 再加就会让整条请求被上游拒——那是把「形态更像」换成「根本发不出去」。预算不够时基座与
@@ -1598,7 +1601,8 @@ fn strip_cc_preamble_lines(text: &str) -> String {
 /// 把 `system` 压回 [`MAX_SYSTEM_BLOCKS`] 块：超出部分并进末块
 /// （见 [`merge_system_blocks`]）。
 ///
-/// 兜住任何在我们之前就把 `system` 拆碎了的中间层：块数超限照样按第三方额度扣。
+/// 兜住任何在我们之前就把 `system` 拆碎了的中间层，让出站块数与官方一致。只是形态对齐：
+/// 2026-10-15 实测块数超限不会被判第三方（见 [`MAX_SYSTEM_BLOCKS`] 的注）。
 ///
 /// 已经不超过限制（含官方的 5 块与 API-key 的 3 块）时不动结构、返回 `false`。
 pub(super) fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
