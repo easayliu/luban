@@ -249,7 +249,9 @@ async fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop(p
             cc_session: None,
             cc_thread: None,
             empty_reply_key: key.map(|(m, n)| (m.to_string(), n)),
-            prompt_key: prompt.map(|(m, d)| (m.to_string(), d.to_string())),
+            prompt_key: prompt.map(|(m, d)| {
+                (m.to_string(), crate::proxy::LazyPromptDigest::Ready(d.to_string()))
+            }),
             // 与提示词哈希同源的 system 哈希：按应用学的那条与按提示词学的那条一起验。
             app_key: prompt.map(|(m, d)| (m.to_string(), format!("app-{d}"))),
             empty_replies: mem.clone(),

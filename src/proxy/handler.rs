@@ -22,7 +22,7 @@ use super::ban::{
     log_third_party_rejection, park_org_oauth_disallowed, parse_upstream_error,
 };
 use super::body::{
-    below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
+    below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
     cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
     extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
     known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
@@ -33,10 +33,10 @@ use super::connectivity::{prewarm_body, prewarm_upstream, session_start, spawn_s
 use super::digest::redact_headers;
 use super::headers::{BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta};
 use super::learned_rules::{
-    MODEL_DENIAL_MAX_SWAPS, RejectionLog, SSE_CONTENT_TYPE, TRANSIENT_MAX_ATTEMPTS,
-    app_system_digest, empty_reply_class, has_outbound_shape_rules, is_max_plan, known_app_refusal,
-    known_empty_reply, known_refused_prompt, known_shape_rejection, next_transient_backoff,
-    prompt_digest, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
+    LazyPromptDigest, MODEL_DENIAL_MAX_SWAPS, RejectionLog, SSE_CONTENT_TYPE,
+    TRANSIENT_MAX_ATTEMPTS, app_system_digest, empty_reply_class, has_outbound_shape_rules,
+    is_max_plan, known_app_refusal, known_empty_reply, known_refused_prompt, known_shape_rejection,
+    next_transient_backoff, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 use super::logging::{
     ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,

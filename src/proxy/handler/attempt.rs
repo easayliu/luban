@@ -320,13 +320,11 @@ pub(super) async fn prepare<'a>(
     }
     // `extended-cache-ttl` 跟着**出站体**走（[`ensure_cache_ttl_beta`]）：头建在改写之前，
     // 那时只看得到来访体；整形补出来的 1h 断点要在这里补上它的 beta。模拟路径的串由
-    // profile 整条给出，不在此列。
+    // profile 整条给出，不在此列。出站体有没有 1h 断点由改写顺手判好（`cache_ttl_1h`，体没
+    // 被改写时恒为假），这里不再解析一遍。
     if upstream.sim.is_none()
         && flags.merge_beta
-        && sent.as_ptr() != body.as_ptr()
-        && body_has_pair(&sent, b"\"ttl\"", b"\"1h\"")
-        && serde_json::from_slice::<serde_json::Value>(&sent)
-            .is_ok_and(|v| crate::proxy::has_cache_ttl_1h(&v))
+        && sent_bits.cache_ttl_1h
         && let Some(beta) = upstream.headers.get("anthropic-beta").and_then(|b| b.to_str().ok())
         && let Ok(fixed) = HeaderValue::from_str(&ensure_cache_ttl_beta(beta))
     {

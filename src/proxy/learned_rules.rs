@@ -597,6 +597,33 @@ pub(crate) fn prompt_digest(body: &serde_json::Value) -> Option<String> {
     Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
 }
 
+/// 推迟到用时才算的 [`prompt_digest`]。
+///
+/// 只有上游真拒答了才用得到这个哈希，而它要把 system/tools/messages 整个序列化一遍再
+/// sha256——几 MB 的长对话每条请求白算一次。所以流水上先只留来访原始字节（`Bytes` 是引用
+/// 计数，不拷贝），拒答时再解析、再算；来访体与 `body_json` 同源（探针改写成预热时两者一起
+/// 换），算出来与当场算的逐字相同。
+pub(crate) enum LazyPromptDigest {
+    /// 已经算好的（测试用）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    Ready(String),
+    /// 来访原始字节，用时解析。
+    FromBody(axum::body::Bytes),
+}
+
+impl LazyPromptDigest {
+    /// 算出哈希；体解析不了或没有 `messages` 时为 `None`。
+    pub(crate) fn resolve(self) -> Option<String> {
+        match self {
+            Self::Ready(d) => Some(d),
+            Self::FromBody(body) => serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .as_ref()
+                .and_then(prompt_digest),
+        }
+    }
+}
+
 /// 来访 `system` 的哈希：紧凑序列化后 sha256 前 16 位 hex。没有 `system`、或是空串 / 空数组
 /// 的返回 `None`——没有 system 的请求识别不出「哪个应用」，不学也不判。
 ///

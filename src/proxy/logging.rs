@@ -102,7 +102,8 @@ pub(crate) struct ReqLog {
     pub(super) empty_reply_key: Option<(String, i64)>,
     /// 这条请求的「模型 + 提示词哈希」（[`prompt_digest`](crate::proxy::prompt_digest)），上游拒答（`stop_reason:
     /// "refusal"`）时按它学，见 [`known_refused_prompt`](crate::proxy::known_refused_prompt)；非计费路径为 `None`。
-    pub(super) prompt_key: Option<(String, String)>,
+    /// 哈希推迟到拒答时才算，见 [`LazyPromptDigest`](crate::proxy::LazyPromptDigest)。
+    pub(super) prompt_key: Option<(String, crate::proxy::LazyPromptDigest)>,
     /// 这条请求的「模型 + system 哈希」（[`app_system_digest`](crate::proxy::app_system_digest)），只有**识别不了会话**的来访（没有
     /// 会话 id 也没有 device_id）且带 system 时才有；上游拒答时按它学，见 [`known_app_refusal`](crate::proxy::known_app_refusal)。
     pub(super) app_key: Option<(String, String)>,
@@ -623,7 +624,9 @@ impl ReqLog {
                     None => format!("[{category}] {excerpt}"),
                 };
                 // 按提示词学（所有来访）：只拦逐字相同的重发。
-                if let Some((model, digest)) = self.prompt_key.take() {
+                if let Some((model, digest)) =
+                    self.prompt_key.take().and_then(|(m, d)| Some((m, d.resolve()?)))
+                {
                     learned.extend(remember_refused_prompt(
                         &self.empty_replies,
                         &model,
@@ -916,6 +919,11 @@ pub(crate) struct ShapeBits {
     pub(super) injected_tools: Vec<&'static str>,
     /// 来访一个工具都没声明、出站却带上了注入的官方工具（开关 `fill_absent_tools`）。
     pub(super) tools_filled: bool,
+    /// 改写**动过**体、且出站体里有 `ttl:"1h"` 的缓存断点（[`crate::proxy::has_cache_ttl_1h`]）。
+    /// 给发送前补 `extended-cache-ttl` beta 用：改写手里本来就有出站 `Value`，顺手判掉，
+    /// 不必为一个布尔值把几 MB 的出站体再解析一遍。只有 [`crate::proxy::Upstream::shape_outbound`]
+    /// 填它；体没被改写时恒为假。
+    pub(crate) cache_ttl_1h: bool,
 }
 
 /// [`shape_summary`] 的本体：吃一份**已经解析好**的出站体。

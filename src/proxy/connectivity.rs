@@ -784,7 +784,9 @@ pub(crate) async fn send_quota_probe(
     let url = ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL));
     let req = client.post(&url).headers(headers);
     let req = if flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
-    let sent = req.body(body).send().await;
+    // 跑在后台握手任务里、没人限时等它（见 [`spawn_session_handshake`]），自己限时：
+    // 卡住的话这一串剩下的握手连同任务本身都挂着不走。
+    let sent = req.body(body).timeout(crate::oauth::SIDE_REQUEST_TIMEOUT).send().await;
     match sent {
         Ok(r) => tracing::debug!(
             cred_id = cred.id,

@@ -313,10 +313,10 @@ async fn fetch_profile_from(
             .header("Accept", config::AXIOS_ACCEPT)
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("User-Agent", config::AXIOS_DEFAULT_USER_AGENT)
-            .timeout(PROFILE_TIMEOUT),
+            .header("User-Agent", config::AXIOS_DEFAULT_USER_AGENT),
         "oauth_profile",
     )
+    .timeout(PROFILE_TIMEOUT)
     .send()
     .await
     .context("request to the profile endpoint failed")?;
@@ -661,10 +661,10 @@ async fn post_token_to(
             .post(url)
             .header("Accept", config::AXIOS_ACCEPT)
             .header("User-Agent", config::AXIOS_DEFAULT_USER_AGENT)
-            .json(&body)
-            .timeout(TOKEN_TIMEOUT),
+            .json(&body),
         "oauth_token",
     )
+    .timeout(TOKEN_TIMEOUT)
     .send()
     .await
     .context("request to the token endpoint failed")?;
@@ -1096,11 +1096,20 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
 ///
 /// 头**值**由各调用点自己 `.header(...)`，本函数只管形态；漏加一个头不会凭空发出，
 /// 多加的排在队尾（见 [`crate::proxy::orig_header_case`] 记的同一套 `OrigHeaderMap` 语义）。
+///
+/// 顺带挂上 [`SIDE_REQUEST_TIMEOUT`]：走这里的都是保活、握手、遥测这类旁路请求，出站客户端
+/// 本身不限总时长（它也承载 `/v1/*` 的长 SSE），不限的话一个只建连不回包的代理能把串行的
+/// 保活 / 遥测循环永久挂住。要别的时长的，在**这一步之后**再 `.timeout(..)` 覆盖（后设的生效）。
 pub(crate) fn axios(req: wreq::RequestBuilder, shape: &str) -> wreq::RequestBuilder {
     req.header("Accept-Encoding", config::AXIOS_ACCEPT_ENCODING)
         .header("Connection", config::AXIOS_CONNECTION)
         .orig_headers(orig_headers(config::axios_shape(shape)))
+        .timeout(SIDE_REQUEST_TIMEOUT)
 }
+
+/// 旁路请求（保活、启动握手、遥测上报、额度探测）的总时长上限：从开始连接到读完响应体。
+/// 与官方 token 请求同档（axios `timeout: 15000`）。
+pub(crate) const SIDE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 按给定的头名表构造 `OrigHeaderMap`（决定线上的拼写与顺序）。
 pub(crate) fn orig_headers(order: &[&'static str]) -> wreq::header::OrigHeaderMap {
@@ -1341,6 +1350,7 @@ pub async fn keepalive_eval(
         .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
         .orig_headers(orig_headers(config::AXIOS_SHAPE_EVAL.order))
         .json(&ctx.eval_body())
+        .timeout(SIDE_REQUEST_TIMEOUT)
         .send()
         .await;
     match resp {
@@ -1490,10 +1500,10 @@ fn download_request(client: &wreq::Client, path: &str) -> wreq::RequestBuilder {
         client
             .get(format!("https://downloads.claude.ai{path}"))
             .header("Accept", config::AXIOS_ACCEPT)
-            .header("User-Agent", config::DATADOG_USER_AGENT)
-            .timeout(DOWNLOAD_TIMEOUT),
+            .header("User-Agent", config::DATADOG_USER_AGENT),
         "download",
     )
+    .timeout(DOWNLOAD_TIMEOUT)
 }
 
 // ---------- 官方最新发布版 ----------

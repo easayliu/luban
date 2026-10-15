@@ -9,6 +9,11 @@ use anyhow::{Context, Result};
 
 use crate::config;
 
+/// 出站建连的时限。wreq 默认不限：代理或上游只接 TCP 不回握手时，请求会一直挂着——转发
+/// 路径上拖住一个来访，串行的保活 / 遥测循环里则拖住后面所有的号。只影响连不上的情形，
+/// 发出去的字节一个不变。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 构造发往上游的 HTTP 客户端，刻意贴近官方客户端的传输形态：
 /// - `http1_only`：官方客户端（Bun 自带的 HTTP 客户端）走 HTTP/1.1（抓包里有
 ///   `Connection`/`Host`，h2 不会有这两个头）。默认会经 ALPN 协商 h2，留下 h2 的
@@ -19,6 +24,9 @@ use crate::config;
 ///   tower-http 的解压中间件会给「没带这个头」的请求补一个它自己的取值
 ///   `zstd,gzip,deflate,br`（顺序与写法都不是官方客户端会产生的）。
 ///
+/// - `connect_timeout`：只管建连这一段（含代理握手与 TLS），见 [`CONNECT_TIMEOUT`]。**不设
+///   总时长**：同一个客户端承载 `/v1/*` 的长 SSE，总时长由各旁路请求自己设（`oauth::axios`）。
+///
 /// `proxy` 为 `Some` 时挂上代理，其余形态与直连那份**逐字节相同**——代理只改走法，不改
 /// 请求本身，否则「配了代理的号」就多出一处与别的号不同的指纹。
 pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
@@ -28,6 +36,7 @@ pub fn upstream_client(proxy: Option<&str>) -> Result<wreq::Client> {
     defaults.insert(ACCEPT_ENCODING, HeaderValue::from_static(config::CC_ACCEPT_ENCODING));
 
     let builder = wreq::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
         .http1_only()
         .user_agent(config::CC_USER_AGENT)
         .default_headers(defaults);

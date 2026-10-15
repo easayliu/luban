@@ -250,26 +250,41 @@ pub async fn run_flusher(
         if !store.forward_flags().api_telemetry {
             continue;
         }
-        for f in due {
-            let Ok(Some(cred)) = store.get(f.cred_id).await else { continue };
-            // 订阅未生效暂停中的号同样不发：上游对它每一发都是 403。
-            if cred.is_banned() || cred.is_subscription_paused() {
-                continue;
-            }
-            let Ok(client) = clients.for_credential(&cred) else { continue };
-            let token = match crate::store::ensure_fresh_token(&store, &clients, &cred).await {
-                Ok(crate::store::TokenAttempt::Ready(t)) => t,
-                _ => {
-                    tracing::debug!(
-                        cred_id = cred.id,
-                        "telemetry: no fresh token, dropping this batch"
-                    );
-                    continue;
-                }
-            };
-            send_flush(&client, &token, &cred, f).await;
-        }
+        // 各批之间并发发（有上限），一批之内照旧按序：一个号的代理慢，不该让别的号的那批
+        // 跟着排队，也不该拖住下一 tick 的 `gc`。单条请求有时限（`oauth::axios`），这一轮
+        // 总会在有限时间内结束。
+        futures_util::StreamExt::for_each_concurrent(
+            futures_util::stream::iter(due),
+            FLUSH_CONCURRENCY,
+            |f| flush_one(&store, &clients, f),
+        )
+        .await;
     }
+}
+
+/// [`run_flusher`] 一轮里同时在发的批数上限。
+const FLUSH_CONCURRENCY: usize = 8;
+
+/// 取该批所属凭证的客户端与新鲜 token，发出去；号不可用或拿不到 token 就丢掉这一批。
+async fn flush_one(
+    store: &crate::store::CredentialStore,
+    clients: &Arc<crate::clients::ClientPool>,
+    f: Flush,
+) {
+    let Ok(Some(cred)) = store.get(f.cred_id).await else { return };
+    // 订阅未生效暂停中的号同样不发：上游对它每一发都是 403。
+    if cred.is_banned() || cred.is_subscription_paused() {
+        return;
+    }
+    let Ok(client) = clients.for_credential(&cred) else { return };
+    let token = match crate::store::ensure_fresh_token(store, clients, &cred).await {
+        Ok(crate::store::TokenAttempt::Ready(t)) => t,
+        _ => {
+            tracing::debug!(cred_id = cred.id, "telemetry: no fresh token, dropping this batch");
+            return;
+        }
+    };
+    send_flush(&client, &token, &cred, f).await;
 }
 
 /// 发一张凭证的这一批。

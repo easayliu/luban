@@ -134,12 +134,13 @@ pub(crate) use connectivity::{ProbeReport, probe};
 mod learned_rules;
 #[allow(unused_imports)]
 pub(crate) use learned_rules::{
-    APP_COUNTER_MAX_KEYS, AppCounter, REFUSAL_REPLY_BYTES, REJECTION_LOG_WINDOW, SHAPE_MEMORY_CAP,
-    SHAPE_PROBES, SSE_CONTENT_TYPE, TRANSIENT_BACKOFF_BASE_SECS, TRANSIENT_BACKOFF_RESET,
-    TRANSIENT_MAX_ATTEMPTS, app_system_digest, empty_reply_class, known_app_refusal,
-    known_empty_reply, known_refused_prompt, known_shape_rejection, next_transient_backoff_at,
-    prompt_digest, record_app_request, remember_app_refusal, remember_empty_reply,
-    remember_refused_prompt, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
+    APP_COUNTER_MAX_KEYS, AppCounter, LazyPromptDigest, REFUSAL_REPLY_BYTES, REJECTION_LOG_WINDOW,
+    SHAPE_MEMORY_CAP, SHAPE_PROBES, SSE_CONTENT_TYPE, TRANSIENT_BACKOFF_BASE_SECS,
+    TRANSIENT_BACKOFF_RESET, TRANSIENT_MAX_ATTEMPTS, app_system_digest, empty_reply_class,
+    known_app_refusal, known_empty_reply, known_refused_prompt, known_shape_rejection,
+    next_transient_backoff_at, prompt_digest, record_app_request, remember_app_refusal,
+    remember_empty_reply, remember_refused_prompt, remember_shape_rejection, replay_refusal,
+    take_rejection_log_slot,
 };
 pub(crate) use learned_rules::{
     DeprecatedFieldMemory, EmptyReplyMemory, LEARNED_KINDS, RejectionLog, SeededMemories,

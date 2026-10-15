@@ -1501,3 +1501,24 @@ fn the_backoff_a_client_actually_sees_is_almost_flat() {
         "线上那 63 毫秒内的 6 条并发，如今一律是第 1 档的 30 秒"
     );
 }
+
+/// [`crate::proxy::LazyPromptDigest`]：推迟到拒答时从来访原始字节算出的哈希，与入口处拿解析好的
+/// 体当场算的（[`crate::proxy::known_refused_prompt`] 查表用的那份）逐字相同——学与查对得上。
+/// 两边解析的是同一份字节，key 顺序（`preserve_order`）与非 ASCII 内容都一样。
+#[test]
+fn lazy_prompt_digest_matches_the_eager_one() {
+    let raw: &[u8] = r#"{"model":"claude-opus-5","system":[{"type":"text","text":"你好 世"}],
+        "tools":[{"name":"Bash","input_schema":{"type":"object","required":["b","a"]}}],
+        "messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"auto"}}"#
+        .as_bytes();
+    let eager = crate::proxy::prompt_digest(&serde_json::from_slice(raw).unwrap()).unwrap();
+    let lazy = crate::proxy::LazyPromptDigest::FromBody(axum::body::Bytes::from_static(raw));
+    assert_eq!(lazy.resolve(), Some(eager));
+    // 没有 `messages`、或体解析不了：不学（与当场算时的 `None` 一致）。
+    let no_msgs = crate::proxy::LazyPromptDigest::FromBody(axum::body::Bytes::from_static(
+        br#"{"model":"claude-opus-5"}"#,
+    ));
+    assert_eq!(no_msgs.resolve(), None);
+    let broken = crate::proxy::LazyPromptDigest::FromBody(axum::body::Bytes::from_static(b"{"));
+    assert_eq!(broken.resolve(), None);
+}

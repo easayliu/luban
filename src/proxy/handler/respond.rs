@@ -240,11 +240,13 @@ async fn relay_ok(
         } else {
             None
         },
-        prompt_key: if learns && flags.reject_refusals {
-            req_model
-                .as_deref()
-                .zip(body_json.as_ref().and_then(prompt_digest))
-                .map(|(m, d)| (m.to_string(), d))
+        // 哈希推迟到真拒答时才算（[`LazyPromptDigest`]）；有没有 `messages` 现在就判，
+        // 没有的与原先一样不留键。
+        prompt_key: if learns
+            && flags.reject_refusals
+            && body_json.as_ref().is_some_and(|v| v.get("messages").is_some())
+        {
+            req_model.as_deref().map(|m| (m.to_string(), LazyPromptDigest::FromBody(body.clone())))
         } else {
             None
         },

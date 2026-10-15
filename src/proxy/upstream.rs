@@ -117,6 +117,7 @@ impl Upstream<'_> {
             bits.injected_tools = injected_tools_of(inb, out, sim.profile);
             bits.tools_filled = !bits.injected_tools.is_empty() && declares_no_tools(inb);
         }
+        bits.cache_ttl_1h = outbound.as_ref().is_some_and(crate::proxy::has_cache_ttl_1h);
         (sent, bits)
     }
 
