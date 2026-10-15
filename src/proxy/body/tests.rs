@@ -2298,9 +2298,10 @@ fn core_tool_stubs_are_profile_specific() {
         "Bash 描述取自 cap/auto-2.1.293-20261008-full/00419: {}",
         bash["description"]
     );
-    assert_eq!(d(opus, "Bash").chars().count(), 3018);
-    // 2.1.293 的 Artifact 改了一段措辞（2.1.291 是 34399）。
-    assert_eq!(d(opus, "Artifact").chars().count(), 34605);
+    // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）。
+    assert_eq!(d(opus, "Bash").chars().count(), 3098);
+    // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 36637);
     assert_eq!(d(haiku, "Bash").chars().count(), 11913);
 }
 
@@ -4258,7 +4259,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 299)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 300)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

@@ -332,6 +332,9 @@ impl EventBuilder<'_> {
                 if env.f.v291 {
                     auto_mode_decision_v291(&mut decision);
                 }
+                if env.f.v300 {
+                    auto_mode_decision_v300(&mut decision);
+                }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
             let tg = ms(t_end, -3);
@@ -407,6 +410,50 @@ impl EventBuilder<'_> {
             // 06:57:29.511 → .574）；2.1.280 的 `lively_waffle` 带 `flagged: false`。以 SubagentHandback
             // 收尾的紧接着报，照旧有 `lively_waffle`，另多一条交还提示（07:51:29.455）。
             let t2 = ms(t1, if v285 && handback.is_none() { 63 } else { 3 });
+            // 2.1.300：子代理一结束，它的进度摘要器跟着停，报一条 `tengu_agent_summary_stopped`，与收尾
+            // 同一刻、排在 `lively_waffle` 前（`cap/auto-2.1.300-20261015-full` 六条：Explore / 通用 / Plan
+            // 都有）。摘要器从子代理起跑就计时，时长比 `turn_end` 多 6~14ms、比 `agent_tool_completed` 少
+            // 22~35ms。`calls` / `calls_failed` / `lines_accepted` 按这条支线上实际经过的摘要请求统计（每
+            // 30 秒才可能分叉一次；抓包里的子代理都不到 30 秒，三项恒 0，大于 0 的情形没有样本）。
+            // `config_flag` 按子代理拉起时会话主模型的族挑（可执行文件 `nd`：fable / opus 各一个，其余一个；
+            // 摘要器启动时读当前主模型，中途 `/model` 换过的以那时为准）。
+            // `config_source` 抓包六条都是 `fallback`——那三个开关这个号的 eval 里都没有；号若下发了，官方
+            // 报什么没有样本，luban 也不读这三个开关，照报 `fallback`。
+            let summary_ms = elapsed + 10;
+            if env.f.v300 {
+                let family = |m: &str| {
+                    let m = m.to_ascii_lowercase();
+                    ["fable", "opus", "sonnet", "haiku"]
+                        .into_iter()
+                        .find(|f| m.contains(f))
+                        .unwrap_or("other")
+                };
+                let session_family = family(&done.session_model);
+                let calls = done.summaries;
+                self.push(
+                    t2,
+                    "tengu_agent_summary_stopped",
+                    json!({
+                        "config_flag": match session_family {
+                            "fable" => "tengu_starry_wall",
+                            "opus" => "tengu_groovy_ember",
+                            _ => "tengu_composed_plum",
+                        },
+                        "config_source": "fallback",
+                        "session_model_family": session_family,
+                        "agent_model_family": family(display_model),
+                        "agent_model": &display_model,
+                        "is_sdk_host": false,
+                        "is_resume": false,
+                        "duration_ms": summary_ms,
+                        "calls": calls,
+                        "calls_failed": done.summaries_failed,
+                        "lines_accepted": done.summaries_accepted,
+                        "first_wait_ms": 30_000,
+                        "next_wait_ms": 30_000
+                    }),
+                );
+            }
             if handback.is_some() {
                 self.push_dd(t2, "tengu_feature_ok", feature("agent_handback_pointer_notice"));
             }
@@ -426,7 +473,8 @@ impl EventBuilder<'_> {
                     "response_char_count": call.text_chars,
                     "assistant_message_count": done.steps,
                     "total_tool_uses": done.tool_uses,
-                    "duration_ms": elapsed + 16,
+                    // 2.1.300 起中间多停一个摘要器，收尾比 `turn_end` 晚得多一些（同上，22~35ms 落在它之后）。
+                    "duration_ms": if env.f.v300 { summary_ms + 28 } else { elapsed + 16 },
                     "total_tokens": done.prev_total,
                     "is_built_in_agent": builtin_agent.is_some(),
                     "is_async": true,

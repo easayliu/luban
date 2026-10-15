@@ -169,11 +169,31 @@ pub(super) static TEMPLATE_2_1_299_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_299_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.299 起用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 2.1.300 的两份模板：以 2.1.299 那两份为底，按 `cap/auto-2.1.300-20261015-full` 生成
+/// （`_driver/build_tpl_300.py`）。相对 2.1.299 只有 `remote_settings_fetch`、`policy_limits_fetch`、
+/// `policy_limits_cache_state_at_first_prompt` 三条多了 `credential_road`（`"none"`，排在 `token_source`
+/// 之后）。
+pub(super) static TEMPLATE_2_1_300: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_300.json"))
+            .expect("assets/cc_telemetry_template_2_1_300.json must parse")
+    });
+
+/// 2.1.300 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_300`]。
+pub(super) static TEMPLATE_2_1_300_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_300_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_300_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.300 起用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
     let at = |v: &str| version_at_least(version, v);
+    if at("2.1.300") {
+        return if sdk { &TEMPLATE_2_1_300_SDK } else { &TEMPLATE_2_1_300 };
+    }
     if at("2.1.299") {
         return if sdk { &TEMPLATE_2_1_299_SDK } else { &TEMPLATE_2_1_299 };
     }

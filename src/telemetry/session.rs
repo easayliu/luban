@@ -117,6 +117,9 @@ pub(super) struct Session {
     /// [`Self::last_message_id`] 那条请求的完成时刻：补发的、更早完成的请求不往回拨它。
     pub(super) last_message_end: Option<SystemTime>,
     pub(super) last_model: Option<String>,
+    /// 主线程请求按**发出时刻**记的模型（最近 [`MAIN_MODEL_HISTORY`] 条，处理先后可能乱序）：子代理拉起
+    /// 那一刻的主模型按它查（[`Session::main_model_at`]），不看处理到子代理时主线程已经换成了什么。
+    pub(super) main_models: std::collections::VecDeque<(SystemTime, String)>,
     /// 上次报过的工具长度表 hash，主线程一组、侧查询一组各记各的：官方整个会话只有两条
     /// `tengu_tool_schema_sizes`（主线程 16 个工具一条、标题生成空表一条），第二轮主线程
     /// 不重发——两类查询的工具集互不覆盖。
@@ -213,6 +216,15 @@ pub(super) struct AgentState {
     /// 子代理类型（请求头 `x-claude-code-agent-type`）。它的摘要请求头上只有 `agent-id`，
     /// 按类型定的取值（claude-code-guide 的 `dontAsk`）要从这里取。
     pub(super) agent_type: Option<String>,
+    /// 这条支线上经过的进度摘要请求（`agent_summary`，同一个 `agent-id`）：发了几条、几条失败、几条的
+    /// 回复会被收下，即 2.1.300 收尾那条 `tengu_agent_summary_stopped` 的 `calls` / `calls_failed` /
+    /// `lines_accepted`。
+    pub(super) summaries: u32,
+    pub(super) summaries_failed: u32,
+    pub(super) summaries_accepted: u32,
+    /// 子代理拉起时会话的主模型（展示名）：摘要器启动那一刻读的当前主模型，收尾那条摘要器统计按它的族
+    /// 挑开关。按子代理首条请求的发出时刻查（[`Session::main_model_at`]），之后主线程换模型不影响它。
+    pub(super) session_model: String,
 }
 
 /// 一条线程（主线程，或某个子代理）上一条**完整**请求的形态。
@@ -539,6 +551,7 @@ pub(super) struct TurnFacts {
     pub(super) v293: bool,
     pub(super) v296: bool,
     pub(super) v299: bool,
+    pub(super) v300: bool,
     /// 这一轮要发的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text` 实验曝光。客户端头一次给精简提示词
     /// 的模型拼 `Agent` 说明时读这两个开关、各记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词
     /// 模型开头、中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮；从 opus-5-5（不在
@@ -636,7 +649,30 @@ pub(super) struct State {
     pub(super) process_starts: HashMap<(i64, String), (String, SystemTime)>,
 }
 
+/// [`Session::main_models`] 记多少条。
+pub(super) const MAIN_MODEL_HISTORY: usize = 32;
+
 impl Session {
+    /// 记一条主线程请求的发出时刻与模型。
+    pub(super) fn note_main_model(&mut self, at: SystemTime, model: &str) {
+        if self.main_models.len() >= MAIN_MODEL_HISTORY {
+            self.main_models.pop_front();
+        }
+        self.main_models.push_back((at, model.to_string()));
+    }
+
+    /// `at` 那一刻的主模型：发出时刻不晚于它的主线程请求里最晚的那条；一条都没有就退回最近一条主线程
+    /// 的模型，再没有就是默认模型。
+    pub(super) fn main_model_at(&self, at: SystemTime) -> String {
+        self.main_models
+            .iter()
+            .filter(|(t, _)| *t <= at)
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, m)| m.clone())
+            .or_else(|| self.last_model.clone())
+            .unwrap_or_else(|| self.default_model.clone())
+    }
+
     /// 会话的头一条请求到了：按它建一份初始状态。`id.parent_session_id` 就是 `/clear` 换掉的
     /// 那个会话（[`State::resolve_lineage`] 的 `cleared_from`），`cleared_prev` 是那个会话留下的。
     pub(super) fn fresh(
@@ -699,6 +735,7 @@ impl Session {
             last_message_id: None,
             last_message_end: None,
             last_model: None,
+            main_models: Default::default(),
             tools_hash_main: None,
             tools_hash_side: None,
             counted: false,

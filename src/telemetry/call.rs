@@ -78,6 +78,9 @@ pub struct ApiCall {
     /// 流式回复还没收尾，客户端就把连接掐了（按 Esc 打断、猜下一句被新输入顶掉）：官方那头
     /// 既不报 success 也不报 error，报的是取消那一串（`aborted_streaming`）。
     pub aborted: bool,
+    /// 这条主线程回复接替了一条续命成功过的缓存保活记录：收尾时补
+    /// `tengu_feature_ok{api_cache_keepalive}`（见 [`crate::proxy`] 的 `cache_keepalive`）。
+    pub cache_keepalive_ok: bool,
 }
 
 /// 回复里的一个工具调用。下一条请求把它的结果带回来时，那串工具事件（入参字节数、Bash 的
@@ -123,6 +126,8 @@ pub struct Capture {
     pub agent: AgentHeaders,
     pub organization_id: Option<String>,
     pub started_at: SystemTime,
+    /// 这条主线程回复接替了一条续命成功过的缓存保活记录，见 [`ApiCall::cache_keepalive_ok`]。
+    pub cache_keepalive_ok: bool,
 }
 
 impl Capture {
@@ -176,6 +181,7 @@ impl Capture {
             speed: None,
             failure: Some(failure),
             aborted: false,
+            cache_keepalive_ok: false,
         });
     }
 }

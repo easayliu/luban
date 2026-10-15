@@ -127,11 +127,19 @@ pub(super) struct ReqLog {
     pub(super) _session_concurrency: SessionConcurrencyGuard,
     /// 「账号 + 模型」在飞格的句柄，见 [`UpstreamRouteGuard`]：同样只为让那一格活到流结束。
     pub(super) _route_load: UpstreamRouteGuard,
+    /// 缓存保活：最终那一发响应要按它登记（重试换过一发时），见
+    /// [`super::cache_keepalive::note_final`]。非计费、改写成预热的探针为 `None`。
+    pub(super) keepalive: Option<super::cache_keepalive::KeepaliveNote>,
 }
 
 impl Drop for ReqLog {
     fn drop(&mut self) {
         self.sniffer.finish();
+        // 缓存保活：这条回复的流结束了，它那条记录（开了保活才有）从此刻起计时，见
+        // [`super::cache_keepalive::end_stream`]。
+        if let Some(rid) = &self.upstream_request_id {
+            super::cache_keepalive::end_stream(rid);
+        }
         // 「额度宽限」头要的按账号事实之一（[`config::CC_USAGE_LIMIT_HEADER`]）：限流器跑过的
         // 响应里额外用量停没停。
         super::note_overage(self.cred_id, &self.ratelimit);
@@ -487,6 +495,7 @@ impl Drop for ReqLog {
                 speed,
                 failure,
                 aborted,
+                cache_keepalive_ok: cap.cache_keepalive_ok,
             });
         }
     }
@@ -776,6 +785,7 @@ pub(super) fn telemetry_capture(
         started_at: std::time::SystemTime::now()
             .checked_sub(started.elapsed())
             .unwrap_or_else(std::time::SystemTime::now),
+        cache_keepalive_ok: false,
     })
 }
 

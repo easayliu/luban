@@ -156,6 +156,7 @@ async fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing(pool: sqlx
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
             _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+            keepalive: None,
         })
     };
     // 1) 输出前被拒：花费 0，标签 refusal。
@@ -258,6 +259,7 @@ async fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop(p
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
             _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+            keepalive: None,
         })
     };
     let empty = br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":425,"output_tokens":0}}"#;
@@ -529,6 +531,7 @@ async fn client_ua_lands_in_the_usage_log(pool: sqlx::PgPool) {
             _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
             _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
             _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+            keepalive: None,
         })
     };
     // 非模拟路径：来访那份原样转发，两列相同。
@@ -598,6 +601,7 @@ async fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log(pool: sqlx::PgPool
         _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
         _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
         _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+        keepalive: None,
     };
     let reply = |name: &str| -> Vec<u8> {
         const SSE: &str = "event: message_start
@@ -709,6 +713,7 @@ async fn mid_stream_error_is_billed_as_the_mapped_status(pool: sqlx::PgPool) {
         _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
         _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
         _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+        keepalive: None,
     };
     rl.sniffer.feed(
             b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":47030}}}\n\n",
@@ -788,6 +793,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
             agent: Default::default(),
             organization_id: None,
             started_at: std::time::SystemTime::now(),
+            cache_keepalive_ok: false,
         }),
         cc_session: None,
         cc_thread: None,
@@ -801,6 +807,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
         _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
         _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
         _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+        keepalive: None,
     };
     // 上游回包（非流式）：有 usage，收尾按成功走。
     rl.sniffer.feed(
@@ -1263,5 +1270,6 @@ async fn req_log(pool: sqlx::PgPool) -> crate::proxy::ReqLog {
         _in_flight: crate::proxy::InFlightGuard::new(Default::default()),
         _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
         _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
+        keepalive: None,
     }
 }

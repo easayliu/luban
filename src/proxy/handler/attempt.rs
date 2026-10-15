@@ -386,7 +386,7 @@ pub(super) async fn prepare<'a>(
 /// 这一轮用的号的出站客户端：配了专用代理的号必须走它自己的代理，否则真实出口 IP 会直接打到
 /// 上游。取不出来（代理配错/建不出客户端）时直接标记禁用踢出调度池——不退回直连，也不留在池里
 /// 每次白吃一发 503。
-async fn client_for(
+pub(super) async fn client_for(
     state: &AppState,
     cred: &crate::credentials::Credential,
     request_id: &str,

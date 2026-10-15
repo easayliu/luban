@@ -132,14 +132,46 @@ pub(super) fn sim_uses_threads(sim: &Simulation, model: &str) -> bool {
 /// 里 message thread 那一步）四族主线程都带，2.1.285 的 fable-5-1 不写 `thread` 也照带
 /// （`cap/auto-2.1.285-20260930/00383`）。
 pub(super) fn sim_is_main_thread(sim: &Simulation) -> bool {
+    profile_is_main_thread(sim.profile.kind)
+}
+
+fn profile_is_main_thread(kind: config::CcProfileKind) -> bool {
     matches!(
-        sim.profile.kind,
+        kind,
         config::CcProfileKind::MainOpus
             | config::CcProfileKind::MainSonnet
             | config::CcProfileKind::MainHaiku
             | config::CcProfileKind::MainHaiku55
             | config::CcProfileKind::MainFable
     )
+}
+
+/// 模拟路径带不带缓存保活的 beta，**暂时关着**。上游一旦对这条回 `active`，缓存写入就按 5 分钟档记
+/// （`cap/auto-2.1.300-20261015-full` 89 条 `active` 的主线程回复全是 `ephemeral_5m`，体里写的仍是
+/// `ttl:"1h"`；没开的 6 条是 1h），寿命全靠客户端每 30 秒一发 touch 续。luban 不替模拟会话发 touch，
+/// 带了它就是把模拟会话的缓存从 1 小时缩成 5 分钟。等决定由 luban 自己续命时再打开。
+const SIM_CACHE_KEEPALIVE: bool = false;
+
+/// 号的缓存保活开着（[`crate::proxy::cache_keepalive::account_enabled`]，服务端开关
+/// `tengu_sequential_cloud`）时，主线程 profile 的串里补上 [`config::CC_BETA_CACHE_KEEPALIVE`]：
+/// 官方交互式会话的主线程这时每条都带它，落在 `message-threads` 之前（没有那项就接在
+/// `cache-diagnosis` 之后，都没有排队尾），且只在走 1h 缓存时带（客户端 `ttl === "1h"` 才上膛）。
+/// 模拟路径的 UA 是交互式 `cli`，不是 `-p`（那边不带）。
+fn with_cache_keepalive(
+    beta: std::borrow::Cow<'static, str>,
+    wanted: bool,
+) -> std::borrow::Cow<'static, str> {
+    let mut parts: Vec<&str> = beta.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if !wanted || parts.contains(&config::CC_BETA_CACHE_KEEPALIVE) {
+        return beta;
+    }
+    let at = parts
+        .iter()
+        .position(|p| *p == config::CC_BETA_MESSAGE_THREADS)
+        .or_else(|| parts.iter().position(|p| *p == config::CC_BETA_CACHE_DIAGNOSIS).map(|i| i + 1))
+        .unwrap_or(parts.len());
+    parts.insert(at, config::CC_BETA_CACHE_KEEPALIVE);
+    std::borrow::Cow::Owned(parts.join(","))
 }
 
 /// 出站 beta 里有没有这一项；`<total_tokens>` 提醒按它选落法，见 [`crate::proxy::rewrite_body_out`]。
@@ -274,7 +306,13 @@ impl Simulation {
         Some(Self {
             base: cc_system_base(model),
             profile,
-            beta: config::cc_model_beta(profile, model),
+            beta: with_cache_keepalive(
+                config::cc_model_beta(profile, model),
+                SIM_CACHE_KEEPALIVE
+                    && profile_is_main_thread(profile.kind)
+                    && flags.cache_ttl_1h
+                    && super::cache_keepalive::account_enabled(cred.id),
+            ),
             session_id,
             link,
             reason,
@@ -1412,7 +1450,18 @@ pub(super) fn simulate_system(
     // **代价**：`system` 比官方多一块（`cap/` 37 份抓包的末块恒为官方「其余」段），且末块是
     // 纯非 CC 内容。上游对末块有内容级检测，超过 [`MAX_CLIENT_SYSTEM_BYTES`] 的由
     // [`relocate_long_client_system`] 在 [`rewrite_body`] 里挪进首条用户消息、原地留一行占位。
-    let rest = sim.rest.clone();
+    let rest = sim.rest.clone().map(|mut rest| {
+        // 2.1.300 起工具里同时有 Artifact 与 Edit 时，第四块末尾接 `edits` 说明（见
+        // [`config::CC_SYSTEM_ARTIFACT_EDITS`]）。system 拼在注工具之前（cch 随后按整份体算），
+        // 只能照注工具那一步的判据预判：会注官方工具（[`super::body::injects_cc_tools`]），且没精简
+        // 掉 Artifact——注了就是 14 条全在、Edit 恒在其中。不注工具（开关关着、来访强制调某个工具）
+        // 或精简了，出站就没有 Artifact，这段也不接。
+        if super::body::injects_cc_tools(v, sim.fill_absent_tools) && !sim.trim_tools {
+            rest.push_str("\n\n");
+            rest.push_str(config::CC_SYSTEM_ARTIFACT_EDITS);
+        }
+        rest
+    });
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
     let outside = cache_slots(v).iter().filter(|s| !matches!(s, CacheSlot::System(_))).count();
     let used = outside + client.iter().filter(|b| b.get("cache_control").is_some()).count();

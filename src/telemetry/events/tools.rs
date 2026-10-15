@@ -183,6 +183,9 @@ impl EventBuilder<'_> {
             if env.f.v291 {
                 auto_mode_decision_v291(&mut decision);
             }
+            if env.f.v300 {
+                auto_mode_decision_v300(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`

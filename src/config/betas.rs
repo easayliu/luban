@@ -122,6 +122,20 @@ pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05"
 /// `merge_beta` **不补**这一项：没有 API-key 端的抓包，不知道那一侧发不发。
 pub const CC_BETA_MESSAGE_THREADS: &str = "message-threads-2026-08-12";
 
+/// `cache-keepalive-2026-09-03`：缓存保活。注册项 2.1.299 前就有，发不发由服务端开关
+/// `tengu_sequential_cloud` 定（10-14 还是默认关，10-15 起对号强制开，2.1.299 / 2.1.300 同时生效）。
+/// 开着时交互式会话的主线程、与它同前缀的辅助请求（猜下一句、`/btw`）、压缩带它，位置恒在
+/// [`CC_BETA_CACHE_DIAGNOSIS`] 与 [`CC_BETA_MESSAGE_THREADS`] 之间（`cap/auto-2.1.300-20261015-full`
+/// 主线程 89 条、辅助 42 条无一例外）；子代理、无工具 helper、标题、额度探测、`-p`、`count_tokens` 不带。
+/// 上游回 `anthropic-cache-keepalive: active` 后，客户端闲着时每 30 秒打一发
+/// [`CC_CACHE_TOUCH_PATH`]，见 [`crate::proxy::cache_keepalive`]。
+pub const CC_BETA_CACHE_KEEPALIVE: &str = "cache-keepalive-2026-09-03";
+
+/// 缓存保活的续命端点：`POST`，体 `{"request_id":"req_…"}`（上一条主线程回复的 `request-id`），
+/// 上游回 `204`。头只有 `oauth` 与 [`CC_BETA_CACHE_KEEPALIVE`] 两项 beta、请求类别 `auxiliary`，
+/// 没有 `?beta=true`（`cap/auto-2.1.300-20261015-full/00139`、`00143`）。
+pub const CC_CACHE_TOUCH_PATH: &str = "/v1/messages/cache_touch";
+
 /// 会话中途工具集变了（ToolSearch 载入延迟工具、MCP 工具上线）时，message-threads 续轮照带
 /// 完整 `tools`（`cap/auto-2.1.285-20260930/00054`、`00795`），见
 /// [`crate::proxy::is_official_thread_continuation`]。

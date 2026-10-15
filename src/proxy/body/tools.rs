@@ -449,7 +449,7 @@ pub(super) fn same_schema_surface(
 /// [`inject_cc_tools`] 会不会给这条补官方工具：声明了工具就补；一个都没声明（[`declares_no_tools`]）
 /// 时看开关 `fill_absent_tools`，且来访没有强制调某个工具。首轮环境说明（[`insert_env_note`]）按同一个判据
 /// 决定补不补——它列的 Agent 类型与技能离不开那两个工具。
-pub(super) fn injects_cc_tools(v: &serde_json::Value, fill_absent: bool) -> bool {
+pub(in crate::proxy) fn injects_cc_tools(v: &serde_json::Value, fill_absent: bool) -> bool {
     !(declares_no_tools(v) && (!fill_absent || forces_tool_use(v)))
 }
 

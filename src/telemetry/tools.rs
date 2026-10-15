@@ -873,6 +873,16 @@ pub(super) fn auto_mode_decision_v291(v: &mut Value) {
     insert_after(v, "agentMsgId", vec![("fromTurnHandoff", json!(false))]);
 }
 
+/// 2.1.300 的 `tengu_auto_mode_decision` 多一项 `coworkWebAllowOverride`，紧跟
+/// `mcpRemoteSessionAllowOverride`（`cap/auto-2.1.300-20261015-full` 31 条都是 `false`）。
+pub(super) fn auto_mode_decision_v300(v: &mut Value) {
+    insert_after(
+        v,
+        "mcpRemoteSessionAllowOverride",
+        vec![("coworkWebAllowOverride", json!(false))],
+    );
+}
+
 /// 路径的扩展名（不带点）；没有的为空。
 pub(super) fn file_ext(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);

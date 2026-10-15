@@ -229,6 +229,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             speed: None,
             failure: None,
             aborted: false,
+            cache_keepalive_ok: false,
         }
 }
 
@@ -1599,6 +1600,7 @@ fn a_capture_can_report_a_failure_without_a_response() {
         agent: AgentHeaders::default(),
         organization_id: None,
         started_at: frozen_now() - Duration::from_secs(3),
+        cache_keepalive_ok: false,
     };
     // 连接层就失败：没有状态码、没有上游 request-id。
     cap(t.clone()).record_failure(
@@ -1663,6 +1665,7 @@ fn a_401_early_return_still_reports_an_auth_error() {
         agent: AgentHeaders::default(),
         organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
         started_at: frozen_now() - Duration::from_secs(2),
+        cache_keepalive_ok: false,
     }
     .record_failure(
         7,
@@ -4689,4 +4692,173 @@ fn a_mixed_batch_keeps_the_dialog_wait_off_the_auto_approved_tool() {
         "等待进 Bash 的 permissionDurationMs: {bash}"
     );
     assert!(bash["durationMs"].as_i64().unwrap() < 1_500, "Bash 时长不含等待: {bash}");
+}
+
+/// 2.1.300 的遥测（`cap/auto-2.1.300-20261015-full`）：启动段两条配置拉取多 `credential_road: "none"`，
+/// 紧跟 `token_source`；2.1.299 没有。auto 模式判决多 `coworkWebAllowOverride`，紧跟
+/// `mcpRemoteSessionAllowOverride`。
+#[test]
+fn version_2_1_300_telemetry_shape() {
+    let fetch = |ua: &str| {
+        let t = Telemetry::default();
+        let mut c = call(body_for("claude-opus-5-5", Some("medium"), true), "req_300", "end_turn");
+        c.ua_out = ua.into();
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_remote_settings_fetch")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let new = fetch("claude-cli/2.1.300 (external, cli)");
+    let keys: Vec<&String> = new.as_object().unwrap().keys().collect();
+    let at = keys.iter().position(|k| *k == "token_source").unwrap();
+    assert_eq!(keys[at + 1], "credential_road", "{new}");
+    assert_eq!(new["credential_road"], "none");
+    assert!(fetch("claude-cli/2.1.299 (external, cli)").get("credential_road").is_none());
+
+    let mut d = json!({"mcpAlwaysAllowOverride": false, "mcpServerAskOverride": false});
+    super::tools::auto_mode_decision_v291(&mut d);
+    super::tools::auto_mode_decision_v300(&mut d);
+    let keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "mcpAlwaysAllowOverride",
+            "mcpRemoteSessionAllowOverride",
+            "coworkWebAllowOverride",
+            "mcpServerAskOverride",
+            "fromTurnHandoff"
+        ]
+    );
+}
+
+/// 缓存保活：这条主线程回复接替了一条续命成功过的记录（[`ApiCall::cache_keepalive_ok`]）时，收尾补一条
+/// `tengu_feature_ok{api_cache_keepalive}`，夹在 `tether_live_outcome` 与 `api_success` 之间、同一刻，
+/// Datadog 也有（`cap/auto-2.1.300-20261015-full` A0）；没接替的不报。
+#[test]
+fn cache_keepalive_feature_follows_the_successor_reply() {
+    for ok in [true, false] {
+        let t = Telemetry::default();
+        let mut c = call(body_for("claude-opus-5-5", Some("medium"), true), "req_ka", "end_turn");
+        c.ua_out = "claude-cli/2.1.300 (external, cli)".into();
+        c.cache_keepalive_ok = ok;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let mut evs: Vec<&(DateTime<Utc>, Value)> = p.events.iter().collect();
+        evs.sort_by_key(|(t, _)| *t);
+        let names: Vec<String> = evs
+            .iter()
+            .map(|(_, e)| match ev_name(e) {
+                "tengu_feature_ok" => {
+                    format!("ok:{}", meta_of(e)["feature_name"].as_str().unwrap())
+                }
+                n => n.to_string(),
+            })
+            .collect();
+        let ka = names.iter().position(|n| n == "ok:api_cache_keepalive");
+        assert_eq!(ka.is_some(), ok, "{names:?}");
+        if let Some(at) = ka {
+            assert_eq!(names[at + 1], "tengu_api_success", "{names:?}");
+            assert!(names[..at].iter().any(|n| n == "tengu_tether_live_outcome"));
+            assert!(p.dd.iter().any(|d| d.to_string().contains("api_cache_keepalive")));
+        }
+    }
+}
+
+/// 2.1.300 `tengu_agent_summary_stopped` 的开关按子代理拉起时会话的**当前**主模型挑：同一会话 opus 起头、
+/// `/model` 换到 fable 之后拉起的 Explore（子代理自己跑 opus），报 fable 族、`tengu_starry_wall`，不是
+/// 会话首轮那个 opus。
+#[test]
+fn agent_summary_stopped_uses_the_main_model_at_spawn() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let ua = "claude-cli/2.1.300 (external, cli)";
+    let main = |model: &str, rid: &str, at: u64, tools: bool| {
+        let mut c = call(body_for(model, Some("high"), true), rid, "tool_use");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(at);
+        if tools {
+            c.tool_calls = vec![ToolCall {
+                id: "t1".into(),
+                name: "Agent".into(),
+                input: json!({}),
+                verdict: None,
+            }];
+        } else {
+            c.stop_reason = Some("end_turn".into());
+        }
+        c
+    };
+    t.ingest(main("claude-opus-5-5", "req_m1", 0, false));
+    t.ingest(main("claude-fable-5-1", "req_m2", 20, true));
+    let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
+    sub.ua_out = ua.into();
+    sub.started_at = base + Duration::from_secs(30);
+    sub.agent = AgentHeaders {
+        agent_id: Some("a1".into()),
+        agent_type: Some("Explore".into()),
+        request_class: Some("subagent".into()),
+    };
+    t.ingest(sub);
+    let st = t.0.state.lock();
+    let stopped = st.pending[&key()]
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
+        .map(|(_, e)| meta_of(e))
+        .expect("子代理收尾报一条");
+    assert_eq!(stopped["session_model_family"], "fable", "{stopped}");
+    assert_eq!(stopped["config_flag"], "tengu_starry_wall");
+    assert_eq!(stopped["agent_model_family"], "opus");
+    assert_eq!((&stopped["calls"], &stopped["config_source"]), (&json!(0), &json!("fallback")));
+}
+
+/// 后台子代理在 opus 下拉起，它的首条回复处理之前主线程已经换到 fable：摘要器照拉起那一刻的 opus 报
+/// （`tengu_groovy_ember`），不看处理到它时的主模型。
+#[test]
+fn agent_summary_stopped_keeps_the_model_from_spawn_time() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let ua = "claude-cli/2.1.300 (external, cli)";
+    let main = |model: &str, rid: &str, at: u64, tools: bool| {
+        let mut c = call(body_for(model, Some("high"), true), rid, "tool_use");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(at);
+        if tools {
+            c.tool_calls = vec![ToolCall {
+                id: "t1".into(),
+                name: "Agent".into(),
+                input: json!({}),
+                verdict: None,
+            }];
+        } else {
+            c.stop_reason = Some("end_turn".into());
+        }
+        c
+    };
+    t.ingest(main("claude-opus-5-5", "req_m1", 0, true));
+    // 子代理第 10 秒发出，但主线程第 20 秒发出的 fable 那条先处理完。
+    t.ingest(main("claude-fable-5-1", "req_m2", 20, false));
+    let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
+    sub.ua_out = ua.into();
+    sub.started_at = base + Duration::from_secs(10);
+    sub.agent = AgentHeaders {
+        agent_id: Some("a2".into()),
+        agent_type: Some("Explore".into()),
+        request_class: Some("subagent".into()),
+    };
+    t.ingest(sub);
+    let st = t.0.state.lock();
+    let stopped = st.pending[&key()]
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
+        .map(|(_, e)| meta_of(e))
+        .expect("子代理收尾报一条");
+    assert_eq!(stopped["session_model_family"], "opus", "{stopped}");
+    assert_eq!(stopped["config_flag"], "tengu_groovy_ember");
 }

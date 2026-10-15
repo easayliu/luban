@@ -337,7 +337,7 @@ async fn read_body(
 }
 
 /// 1～1.5：来访 API key 与最低客户端版本，只看头。回这把 Key 能用哪些号。
-async fn client_gates(
+pub(super) async fn client_gates(
     state: &AppState,
     method: &Method,
     path_and_query: &str,

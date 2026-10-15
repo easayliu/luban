@@ -179,6 +179,25 @@ pub(super) fn detect_with(
     )
 }
 
+/// 同 [`detect_for`]，但按指定的凭证派生（按号的开关——cerf 分组、缓存保活——跟着这个号走）。
+pub(super) fn detect_as(
+    body: &Bytes,
+    flags: store::ForwardFlags,
+    cred: &crate::credentials::Credential,
+) -> Option<super::Simulation> {
+    let v = parsed(body);
+    let key = v.as_ref().map(super::sim_session_key).unwrap_or_default();
+    super::Simulation::detect(
+        v.as_ref(),
+        &super::HeaderMap::new(),
+        false,
+        flags,
+        cred,
+        "fp",
+        super::SimSessionSeed::Prefix(&key),
+    )
+}
+
 pub(super) fn detect_for(body: &Bytes, flags: store::ForwardFlags) -> Option<super::Simulation> {
     detect_with(body, &super::HeaderMap::new(), flags)
 }

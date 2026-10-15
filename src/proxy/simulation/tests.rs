@@ -1,5 +1,5 @@
 use crate::proxy::test_support::{
-    API_SHAPE_BODY, PLAIN_BODY, all_on, base_block, detect_for, detect_with, parsed,
+    API_SHAPE_BODY, PLAIN_BODY, all_on, base_block, detect_as, detect_for, detect_with, parsed,
     platform_headers, rewrite_body, sim_for, test_cred,
 };
 use crate::proxy::{Bytes, HeaderValue, build_forward_headers, config, header, store};
@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.300.ca9; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -403,7 +403,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.300.ca9; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1516,8 +1516,9 @@ fn cc_client_needs_both_ua_and_cc_shape() {
 fn system_base_assets_are_verbatim() {
     assert_eq!(
         config::CC_SYSTEM_BASE.len(),
-        1607,
-        "2.1.293 四族同一份基座的字节数（cap/auto-2.1.293-20261008-full/00419，2.1.277 ~ 2.1.291 是 1588）"
+        2029,
+        "2.1.300 四族同一份基座的字节数（cap/auto-2.1.300-20261015-full/00436，`<pasted_content>` 那条多一句；\
+         2.1.293 ~ 2.1.299 是 1607，2.1.277 ~ 2.1.291 是 1588）"
     );
     assert_eq!(config::CC_SYSTEM_IDENTITY.len(), 57, "身份句字节数");
     assert_eq!(config::CC_SYSTEM_REPORTING.len(), 911, "reporting 块字节数");
@@ -1539,37 +1540,40 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.299-20261014-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.300-20261015-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
 /// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00418`、`00246`、`00364`、`00329`）；
-/// fable 只有 auto 模式的（`00523`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
-/// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00436`、`00260`、`00380`、`00343`）；
+/// fable 只有 auto 模式的（`00541`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
+/// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`）；第四块末尾那段 Artifact `edits` 说明随注入的工具一起出现。
 ///
 /// `effort` 与官方逐值相同（opus / sonnet / haiku-5-5 是 medium、fable 是 high、haiku-4.5 不带）。
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_299_captures() {
-    let dir = format!("{}/cap/auto-2.1.299-20261014-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_300_captures() {
+    let dir = format!("{}/cap/auto-2.1.300-20261015-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.299-20261014-full not present");
+        eprintln!("skipped: cap/auto-2.1.300-20261015-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
     // 抓包那个号的分组：清单是默认值，正文是实验 v4 第 1 组那段（`assets/cc_agent_cerf_text_v4.txt` 就是
     // 从这次抓包的 eval 里原样取出的）。用独立的号喂进去，不动别的用例共用的测试凭证。
-    let cred = crate::credentials::Credential { id: 9_299, ..test_cred() };
+    let cred = crate::credentials::Credential { id: 9_300, ..test_cred() };
     let eval = serde_json::json!({"features": {
         "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
             "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
             "source": "defaultValue"},
         "tengu_lucky_cerf_text": {"value": include_str!("../../assets/cc_agent_cerf_text_v4.txt"),
             "source": "experiment", "experiment": {"key": "tengu_lucky_cerf_experiment_v4"},
-            "experimentResult": {"inExperiment": true, "variationId": 1}}}});
+            "experimentResult": {"inExperiment": true, "variationId": 1}},
+        "tengu_sequential_cloud": {"value": {"enabled": true, "touchIntervalSeconds": 30,
+            "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
     crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00418", false), ("00246", false), ("00364", false), ("00329", false), ("00523", true)]
+        [("00436", false), ("00260", false), ("00380", false), ("00343", false), ("00541", true)]
     {
         let path = files
             .iter()
@@ -1593,7 +1597,7 @@ fn simulated_main_threads_match_the_2_1_299_captures() {
         ));
         // 对照的是官方默认配置的抓包（14 个工具），关掉默认开着的精简。
         let full_tools = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
-        let sim = detect_for(&body, full_tools).unwrap();
+        let sim = detect_as(&body, full_tools, &cred).unwrap();
         let out = rewrite_body(&body, &cred, "fp", full_tools, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let h = crate::proxy::build_forward_headers_for(
@@ -1607,11 +1611,13 @@ fn simulated_main_threads_match_the_2_1_299_captures() {
             crate::proxy::BetaCtx::MAIN,
         );
 
-        // beta：auto 模式那条去掉 auto 模式才有的两项。
+        // beta：auto 模式那条去掉 auto 模式才有的两项；`cache-keepalive` 模拟路径暂不带
+        // （[`super::SIM_CACHE_KEEPALIVE`]）。
         let want: Vec<&str> = header("anthropic-beta")
             .split(',')
             .filter(|b| {
                 !(auto_mode && (b.starts_with("afk-mode-") || b.starts_with("dangerous-tool-use-")))
+                    && *b != config::CC_BETA_CACHE_KEEPALIVE
             })
             .collect();
         assert_eq!(h["anthropic-beta"], want.join(","), "{model}（{n}）beta");
@@ -1622,7 +1628,7 @@ fn simulated_main_threads_match_the_2_1_299_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：2.1.299 五个主线程首轮都是 `create`，模拟出站与之一致。
+        // `thread`：2.1.300 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1654,7 +1660,7 @@ fn simulated_main_threads_match_the_2_1_299_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.299."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.300."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1663,19 +1669,26 @@ fn simulated_main_threads_match_the_2_1_299_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/15124181-f540-4059-833d-4bfac1a40362/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/8234399e-cd24-4171-afd2-ac4cbec19de7/scratchpad/calc",
         );
-        // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与末尾 WebSearch 那段。
+        // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段；
+        // 末尾那段 Artifact `edits` 说明留着。
         let mut official_rest = osys[3]["text"].as_str().unwrap().to_string();
         if let Some(end) = official_rest.find("EndConversation (deferred tool)") {
             let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
             official_rest.replace_range(end..end_to, "");
         }
         let ws = official_rest.find("\n\nWebSearch takes a `mode`").unwrap();
-        official_rest.truncate(ws);
+        let ws_end = ws + 2 + official_rest[ws + 2..].find("\n\n").unwrap();
+        official_rest.replace_range(ws..ws_end, "");
+        assert!(official_rest.ends_with(config::CC_SYSTEM_ARTIFACT_EDITS), "{model}");
         let template = super::cc_system_rest(model).unwrap();
         assert_eq!(
-            crate::proxy::render_system_rest(template, &cap_env),
+            format!(
+                "{}\n\n{}",
+                crate::proxy::render_system_rest(template, &cap_env),
+                config::CC_SYSTEM_ARTIFACT_EDITS
+            ),
             official_rest,
             "{model}: 第四块按抓包机的环境回填后逐字节相同"
         );
@@ -2285,8 +2298,8 @@ fn system_rest_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_REST_HAIKU.contains("# auto memory"));
     assert_eq!(
         config::CC_SYSTEM_BASE_HAIKU.chars().count(),
-        11069,
-        "cap/auto-2.1.293-20261008-full/00383（2.1.291 的 00303 是 11050）"
+        11491,
+        "cap/auto-2.1.300-20261015-full/00380（同一句加长；2.1.293 ~ 2.1.299 是 11069，2.1.291 的 00303 是 11050）"
     );
     assert!(!config::CC_SYSTEM_BASE_HAIKU.contains("easayliu"));
     // haiku-5-5 那份：opus 那份把 EndConversation 那段的位置换成五段说明，其余逐字相同。
@@ -2702,4 +2715,52 @@ fn cc_version_suffix_matches_official_algorithm() {
     // 没有 messages 时退化为全 0
     let empty: serde_json::Value = serde_json::json!({"model": "x"});
     assert_eq!(suffix(&empty), "1e2", "无消息退化为 '000' → 同 'hi'");
+}
+
+/// 缓存保活的 beta 落位：有 `message-threads` 插在它前面，没有就接在 `cache-diagnosis` 后面，都没有排队尾；
+/// 号没开、或串里已有，原样不动。
+#[test]
+fn cache_keepalive_beta_lands_before_message_threads() {
+    use std::borrow::Cow;
+    let ka =
+        |b: &'static str, on: bool| super::with_cache_keepalive(Cow::Borrowed(b), on).into_owned();
+    assert_eq!(
+        ka("a,cache-diagnosis-2026-04-07,message-threads-2026-08-12", true),
+        "a,cache-diagnosis-2026-04-07,cache-keepalive-2026-09-03,message-threads-2026-08-12"
+    );
+    assert_eq!(
+        ka("a,cache-diagnosis-2026-04-07,b", true),
+        "a,cache-diagnosis-2026-04-07,cache-keepalive-2026-09-03,b"
+    );
+    assert_eq!(ka("a,b", true), "a,b,cache-keepalive-2026-09-03");
+    assert_eq!(ka("a,message-threads-2026-08-12", false), "a,message-threads-2026-08-12");
+    assert_eq!(
+        ka("cache-keepalive-2026-09-03,message-threads-2026-08-12", true),
+        "cache-keepalive-2026-09-03,message-threads-2026-08-12"
+    );
+}
+
+/// 第四块末尾的 Artifact `edits` 说明只跟着真注进去的 Artifact 走：精简工具（默认）、不注工具（来访
+/// 没带工具且 `fill_absent_tools` 关着）都不接；注了完整 14 条才接，且是最后一段。
+#[test]
+fn artifact_edits_paragraph_follows_the_injected_artifact_tool() {
+    let rest_of = |flags: store::ForwardFlags, body: &str| {
+        let body = Bytes::from(body.to_string());
+        let sim = detect_for(&body, flags).unwrap();
+        let out = rewrite_body(&body, &test_cred(), "fp", flags, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let has_artifact =
+            v["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "Artifact"));
+        (v["system"][3]["text"].as_str().unwrap().to_string(), has_artifact)
+    };
+    let plain = r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}],"system":"你是助手","max_tokens":1024}"#;
+    let full = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
+    let (rest, artifact) = rest_of(full, plain);
+    assert!(artifact);
+    assert!(rest.ends_with(&format!("</total_tokens>\n\n{}", config::CC_SYSTEM_ARTIFACT_EDITS)));
+    let (rest, artifact) = rest_of(all_on(), plain);
+    assert!(!artifact && rest.ends_with("</total_tokens>"), "精简了 Artifact 就不接");
+    let no_fill = store::ForwardFlags { fill_absent_tools: false, ..full };
+    let (rest, artifact) = rest_of(no_fill, plain);
+    assert!(!artifact && rest.ends_with("</total_tokens>"), "不注工具就不接");
 }

@@ -295,6 +295,9 @@ impl Telemetry {
         // 2.1.299：工具成功多两个计时键、Bash 命令多几项判定、tether 多 `searchResultHistory`
         // （`cap/auto-2.1.299-20261014-full`）。
         let v299 = version_at_least(&version, "2.1.299");
+        // 2.1.300：auto 模式判决多 `coworkWebAllowOverride`、`-p` 收尾多两个 debug 丢弃计数
+        // （`cap/auto-2.1.300-20261015-full`）。
+        let v300 = version_at_least(&version, "2.1.300");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -476,6 +479,7 @@ impl Telemetry {
             v293,
             v296,
             v299,
+            v300,
             lucky_cerf,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
@@ -913,6 +917,8 @@ impl Session {
     /// 摘要请求只读不推进。
     fn agent_view(&mut self, call: &ApiCall, shape: &RequestShape, agent_key: &str) -> AgentView {
         let spawn = self.last_spawn_request_id.clone();
+        // 摘要器在子代理起跑时读当前主模型：按它首条请求的发出时刻查，处理到这条时主线程可能已经换了。
+        let session_model = self.main_model_at(call.started_at);
         let a = self.agents.entry(agent_key.to_string()).or_default();
         if a.agent_type.is_none() {
             a.agent_type = call.agent.agent_type.clone().filter(|t| !t.is_empty());
@@ -920,6 +926,7 @@ impl Session {
         if a.chain_id.is_empty() {
             a.chain_id = uuid_v4();
             a.started = Some(call.started_at);
+            a.session_model = session_model;
             a.prompt_chars = shape.prompt_len;
             a.invoking_request_id = spawn;
         }
@@ -1142,6 +1149,7 @@ impl Session {
                     + call.output_tokens;
             }
             self.last_model = Some(display_model.to_string());
+            self.note_main_model(call.started_at, display_model);
             self.turn_tool_calls += shape.tool_uses.len() as u32;
             self.turn_api_calls += 1;
             self.turn_api_ms += call.total_ms as i64;
@@ -1164,6 +1172,20 @@ impl Session {
         let handback = (kind == Kind::Subagent && !turn_over && !failed && !aborted)
             .then(|| call.tool_calls.iter().find(|c| c.name == "SubagentHandback").cloned())
             .flatten();
+        // 摘要请求不推进支线，只记数（收尾那条摘要器统计要它）。收没收下照客户端的过滤（`ad`）：
+        // 一行、去掉首尾空白后不超过 100 个字、不是标题或代码块才收。代理看不到正文的行数与开头，
+        // 只按字数判——多行或以 `#`、``` 开头的短回复会被多算成收下。
+        if kind == Kind::AgentSummary
+            && !aborted
+            && let Some(a) = self.agents.get_mut(agent_key)
+        {
+            a.summaries += 1;
+            if failed {
+                a.summaries_failed += 1;
+            } else if (1..=100).contains(&call.text_chars) {
+                a.summaries_accepted += 1;
+            }
+        }
         // 子代理支线推进一步（摘要请求不算）。
         let mut agent_done: Option<AgentState> = None;
         if kind == Kind::Subagent

@@ -287,6 +287,11 @@ impl EventBuilder<'_> {
             if let Some(live) = env.live_outcome("ok") {
                 self.push_dd_snake(t_end, "tengu_tether_live_outcome", live);
             }
+            // 缓存保活：这条主线程回复接替了一条续命成功过的记录，客户端停掉那条的续命时报一次，夹在
+            // tether 收尾与 api_success 之间、同一毫秒（`cap/auto-2.1.300-20261015-full` A0）。
+            if call.cache_keepalive_ok {
+                self.push_dd(t_end, "tengu_feature_ok", feature("api_cache_keepalive"));
+            }
             self.push(t_end, "tengu_api_success", success.clone());
             // Datadog 那份比 event_logging 少两项：工具长度表的 hash 与各工具入参长度
             // （`cap/2.1.260-2`、`2.1.277`、`2.1.280` 三份的 Datadog 批次里一条都没有）。
@@ -460,6 +465,7 @@ impl EventBuilder<'_> {
             v285,
             v291,
             v299,
+            v300,
             ref dd_model,
             sess_turn_tools,
             sess_turn_api_calls,
@@ -564,6 +570,11 @@ impl EventBuilder<'_> {
                 // 2.1.299：末尾多报进程里加载了几个 mod（`cap/auto-2.1.299-20261014-full` 的 `-p` 全是 0）。
                 if v299 {
                     result["installed_mods"] = json!(0);
+                }
+                // 2.1.300：再多 debug 输出被丢掉的条数，stderr 一项、调试文件一项（`-p` 的 6 条全是 0）。
+                if v300 {
+                    result["debug_stderr_dropped_total"] = json!(0);
+                    result["debug_file_dropped_total"] = json!(0);
                 }
                 self.push(t4, "tengu_sdk_result", result);
                 self.push(

@@ -1199,3 +1199,119 @@ async fn a_probe_sent_as_a_prewarm_never_learns_an_empty_reply(pool: sqlx::PgPoo
     }
     assert_eq!(mock.seen().len(), 2, "第二条照常到上游");
 }
+
+/// 缓存保活：主线程回复带 `anthropic-cache-keepalive: active` 时原样交回客户端，之后的 `cache_touch`
+/// 打回发出那条回复的号、带那条请求出站的会话 id 与 UA，头与体照官方 touch；没记过的 request_id 本地
+/// 回 404、不打上游，也不按计费请求占名额。
+#[sqlx::test]
+async fn cache_touch_goes_back_to_the_account_that_served_the_reply(pool: sqlx::PgPool) {
+    let touched = Reply {
+        status: 204,
+        headers: vec![("request-id".into(), "req_touch".into())],
+        body: vec![],
+    };
+    let mock = MockUpstream::start(vec![
+        sse_ok("hi").with_headers(&[
+            ("request-id", "req_011CmockKeepA1".into()),
+            ("anthropic-cache-keepalive", "active".into()),
+        ]),
+        touched,
+    ])
+    .await;
+    let (_store, state, _ids) = setup(pool.clone(), 2, &mock.base).await;
+
+    let (status, headers, _) = send(&state, cc_request(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get("anthropic-cache-keepalive").unwrap(), "active", "回复头原样交回");
+
+    let touch = |id: &str| {
+        let (mut h, _) = cc_request(serde_json::json!({}));
+        h.insert("x-claude-code-request-class", HeaderValue::from_static("auxiliary"));
+        (h, Bytes::from(format!(r#"{{"request_id":"{id}"}}"#)))
+    };
+    let (status, _, body) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockKeepA1")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{}", String::from_utf8_lossy(&body));
+
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    let (main, t) = (&seen[0], &seen[1]);
+    assert_eq!(t.path, crate::config::CC_CACHE_TOUCH_PATH, "不带 ?beta=true");
+    assert_eq!(t.token, main.token, "同一个号");
+    let h = |s: &Seen, k: &str| s.headers.get(k).map(|v| v.to_str().unwrap().to_string());
+    for k in ["x-claude-code-session-id", "user-agent", "x-app", "x-stainless-package-version"] {
+        assert_eq!(h(t, k), h(main, k), "{k}");
+    }
+    assert_eq!(
+        h(t, "anthropic-beta").as_deref(),
+        Some("oauth-2025-04-20,cache-keepalive-2026-09-03")
+    );
+    assert_eq!(h(t, "x-claude-code-request-class").as_deref(), Some("auxiliary"));
+    assert_eq!(h(t, "x-stainless-retry-count").as_deref(), Some("0"));
+    assert_eq!(h(t, "accept").as_deref(), Some("application/json"));
+    assert!(h(t, "x-api-key").is_none(), "接入 Key 不出站");
+    assert_eq!(&t.body[..], br#"{"request_id":"req_011CmockKeepA1"}"#);
+
+    // 同一条 10 秒内再来：就地 204，不再打上游。
+    let (status, _, _) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockKeepA1")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(mock.seen().len(), 2, "太密的 touch 不转");
+
+    // 没记过的：本地 404，不打上游。
+    let (status, _, _) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockUnknown")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // 体不对：400。
+    let (h0, _) = touch("x");
+    let (status, _, _) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, (h0, Bytes::from_static(b"{}"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(mock.seen().len(), 2);
+}
+
+/// 降级重试成功的那一发开了保活：登记的是最终那条回复，客户端 touch 它的 request-id 照样转到原号；
+/// 被拒的首发不留记录。
+#[sqlx::test]
+async fn cache_touch_follows_the_reply_from_a_demote_retry(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        )
+        .with_headers(&[("request-id", "req_011CmockFirst400".into())]),
+        sse_ok("hi").with_headers(&[
+            ("request-id", "req_011CmockRetryOk".into()),
+            ("anthropic-cache-keepalive", "active".into()),
+        ]),
+        Reply { status: 204, headers: vec![], body: vec![] },
+    ])
+    .await;
+    let (_store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": "c2lnbmF0dXJl"},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, headers, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 2, "降级重试了一次");
+    assert_eq!(headers.get("anthropic-cache-keepalive").unwrap(), "active");
+
+    let touch = |id: &str| {
+        let (h, _) = cc_request(serde_json::json!({}));
+        (h, Bytes::from(format!(r#"{{"request_id":"{id}"}}"#)))
+    };
+    let (status, _, _) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockRetryOk")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[2].path, crate::config::CC_CACHE_TOUCH_PATH);
+    assert_eq!(seen[2].token, seen[1].token);
+    let (status, _, _) =
+        send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockFirst400")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "被拒的首发没记");
+}

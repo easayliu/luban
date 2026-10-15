@@ -79,6 +79,7 @@ use rate_limit::{
     rate_limit_scope, rate_limit_scope_for,
 };
 pub(crate) use usage_grace::note_eval_features;
+mod cache_keepalive;
 mod lucky_cerf;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,

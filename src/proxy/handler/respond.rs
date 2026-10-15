@@ -115,6 +115,27 @@ async fn relay_ok(
     let ratelimit = upstream_limit.unwrap_or_else(|| RateLimitInfo::from_headers(up.headers()));
     // 本地应答探针时 `cf-ray` 照这把 Key 能分到的号的机房造，见 [`note_upstream_cf_ray`]。
     note_upstream_cf_ray(cred.id, up.headers());
+    // 缓存保活：开了的回复按 request-id 记下号与出站身份头，之后的 `cache_touch` 照着发；主线程
+    // 回复顺带接替这个会话上一条，接替的那条续命成功过就要补一条遥测，见 [`cache_keepalive`]。
+    // 重试换来的最终那一发由 `relay_upstream` 照 `ReqLog::keepalive` 再登记。
+    let keepalive = (billable && inb.probe_prewarm.is_none()).then(|| {
+        crate::proxy::cache_keepalive::KeepaliveNote {
+            cred_id: cred.id,
+            key_id: *log_state.key_id.lock(),
+            outbound: upstream.headers.clone(),
+            main: is_main_request(&upstream.headers, inb.cc_kind),
+            noted: header_opt(up.headers(), "request-id"),
+        }
+    });
+    let keepalive_prev_ok = keepalive.as_ref().is_some_and(|n| {
+        crate::proxy::cache_keepalive::note_response(
+            n.cred_id,
+            n.key_id,
+            &n.outbound,
+            up.headers(),
+            n.main,
+        )
+    });
     // 顺手看一眼额度：快用尽（默认 90%）就提前把这个号挪出调度池，别等下一条请求去撞
     // 429，见 [`park_if_quota_nearly_exhausted`]。本次响应照常回给客户端——它已经成了，
     // 停的是**之后**的调度。429 那条路不在这儿：上面已按账号/模型分档停过了，
@@ -143,6 +164,10 @@ async fn relay_ok(
             billable,
             header_opt(up.headers(), "anthropic-organization-id"),
         )
+        .map(|mut c| {
+            c.cache_keepalive_ok = keepalive_prev_ok;
+            c
+        })
     };
     let mut forensics = store::Forensics {
         // 这条请求落在哪条模拟会话绑定上（没有就是 None），名额对话框里点
@@ -238,6 +263,7 @@ async fn relay_ok(
         _in_flight: guards.in_flight,
         _session_concurrency: guards.session_concurrency,
         _route_load: route_load,
+        keepalive,
     };
 
     // 模拟路径的 `thread: continue` 被拒（上游线程过期、接不上）：当场改发 `create` 重试一次，
@@ -755,4 +781,13 @@ fn unreachable(
         "api_error",
         format!("upstream request failed [{kind}]: {detail}"),
     )
+}
+
+/// 出站这条是不是主线程请求：缓存保活只有主线程会上膛、接替（官方只给 `repl_main_thread` 上膛）。
+/// 请求类别头（2.1.277 起每条都带）得是 `main`，且体判出来不是「猜下一句」——那一条在老版本里也报
+/// `main`（2.1.300 起报 `auxiliary`，`cap/auto-2.1.300-20261015-full` 39 条），却不是主线程。没带头的
+/// 老客户端只看体判出来的类别。
+fn is_main_request(outbound: &HeaderMap, kind: CcRequestKind) -> bool {
+    let class = outbound.get("x-claude-code-request-class").and_then(|v| v.to_str().ok());
+    class.is_none_or(|c| c == "main") && kind == CcRequestKind::Main
 }

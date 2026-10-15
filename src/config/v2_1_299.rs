@@ -1,9 +1,9 @@
-//! 2.1.299 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.299 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.299 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.299 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.299 的 profile 表：2.1.299 来访的 beta 参照（[`cc_profile_at`]）。2.1.300 的表（[`CC_PROFILES`]）
+/// 逐行同这张，只换版本号。
 ///
 /// 相对 2.1.296（[`CC_PROFILES_2_1_296`]）**只改了 beta**：`mid-conversation-system-2026-04-07`
 /// 转为正式能力，客户端不再发这个头（可执行文件里的注册项改成 `header: null`，`ANTHROPIC_BETAS` 里
@@ -15,7 +15,7 @@ use super::*;
 /// 逐字一致。工具只有 `Agent` 的 cerf 那段说明改了措辞，见 [`crate::proxy::cc_tools_core_for`]。
 ///
 /// 2.1.297 / 2.1.298 官方没发布（发布清单里没有这两个版本）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_299: &[CcProfile] = &[
     CcProfile {
         kind: CcProfileKind::MainOpus,
         version: "2.1.299",

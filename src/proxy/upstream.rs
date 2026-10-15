@@ -276,6 +276,10 @@ pub(super) async fn relay_upstream(
     if let Some(rid) = header_opt(up.headers(), "request-id") {
         rl.upstream_request_id = Some(rid);
     }
+    // 缓存保活同理：重试换来的那一发开了保活，客户端随后 touch 的是它的 request-id。
+    if let Some(note) = &rl.keepalive {
+        super::cache_keepalive::note_final(note, up.headers());
+    }
     let (is_stream, _) = resp_shape(&up);
     if upgrade_stream && is_stream {
         aggregate_sse(up, rl, tool_names.as_deref()).await
