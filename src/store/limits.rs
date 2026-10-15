@@ -130,7 +130,7 @@ impl<K: std::hash::Hash + Eq + Clone> RateWindow<K> {
     /// 与 [`Self::take`] 拆开，是因为**一次选号要过两道窗口**（裸请求上限 + 账号 RPM）：
     /// 若边问边记，一个过了第一道却卡在第二道的号会白扣一个名额，而它压根没被用上。
     /// 拆开后「问过了但没发」的窗口并不存在——选号全程持着 `conn` 锁（见
-    /// [`CredentialStore::select_for_device`]），选号彼此串行，中间插不进第二次选号。
+    /// [`crate::store::CredentialStore::select_with_slot`]），选号彼此串行，中间插不进第二次选号。
     ///
     /// 单闸场景（设备 RPM）没有这个顾虑，用 [`Self::try_take`] 一次问完记完。
     pub(super) fn has_room(&self, key: K, limit: i64, window: Duration) -> bool {
@@ -222,7 +222,7 @@ fn prune(q: &mut VecDeque<Instant>, window: Duration) {
 /// 要么是模型级容量限制，要么是 fable 专用的超额池（`7d_oi`）吃满了，两种都不是账号
 /// 额度耗尽：同一时刻 sonnet/opus 在这个号上照常可用。把整个账号打进冷却等于因为一个
 /// 模型不可用就把这个号的其余流量一起赶走。故冷却分两档，由
-/// [`crate::proxy::rate_limit_scope`] 依限流头判定：
+/// [`crate::proxy::rate_limit_scope_for`] 依限流头判定：
 ///
 /// - **账号级**（`model = None`）：**基础窗口**被拒或打满（额度确实耗尽），该号所有
 ///   模型一起让位；
@@ -238,7 +238,7 @@ fn prune(q: &mut VecDeque<Instant>, window: Duration) {
 /// 陈旧状态。硬门禁下这一条同时也是最后一道保险：真被一个离谱的 reset 锁住时，重启即解。
 ///
 /// **冷却是硬门禁**：冷却中的号一律不参与调度，全部凭证都在冷却时
-/// [`CredentialStore::select_for_device`] 直接返回 [`AllRateLimited`]（代理映射为 429 +
+/// [`crate::store::CredentialStore::select_with_slot`] 直接返回 [`AllRateLimited`]（代理映射为 429 +
 /// `retry-after`），不会「忽略冷却照常选」。额度真耗尽时继续发只是把 429 换个地方产生。
 ///
 /// 硬门禁的代价是上游 reset 报得过长（或我们算错）时会把代理白白锁住，故留了两个逃生口：
@@ -410,7 +410,7 @@ impl CredentialStore {
     ///
     /// 与账号 RPM 刻意不同的两点：
     /// - **不参与选号**。账号打满可以换个号发，设备打满换哪个号都是同一台机器在刷，故这道闸
-    ///   在代理入口独立判定、直接 429，不进 [`Self::select_for_device`]（那里换号是为了绕开
+    ///   在代理入口独立判定、直接 429，不进 [`crate::store::CredentialStore::select_with_slot`]（那里换号是为了绕开
     ///   一个满了的号，对设备维度没有意义，只会白白改绑设备）。
     /// - **问与记在同一把锁里**（[`RateWindow::try_take`]）。选号那两道窗口靠选号的串行化写
     ///   事务（[`CredentialStore::begin_write`]）串行，这里没有那把锁，同一台设备的并发请求必须自己

@@ -160,7 +160,7 @@ pub const CC_HEADER_ORDER: &[&str] = &[
 ///    换到 `wreq` 的 `OrigHeaderMap`（见 [`CC_HEADER_ORDER`] 与
 ///    [`crate::proxy::orig_header_case`]）。留在这里是为了记住此路不通的那些尝试：
 ///    `HeaderName` 构造即归一化成小写，来访侧的原始拼写在进到
-///    [`crate::proxy::build_forward_headers`] 之前就没了（也不需要——要装的是官方客户端，
+///    [`crate::proxy::build_forward_headers_for`] 之前就没了（也不需要——要装的是官方客户端，
 ///    照固定表在出站侧重建即可）；reqwest 的 `http1_title_case_headers()` 是**全部**首字母
 ///    大写，会把 `anthropic-beta` 写成 `Anthropic-Beta`、`X-Stainless-OS` 写成
 ///    `X-Stainless-Os`，22 个头里错 6 个，只是换了个错法；hyper 1.x 的 `ext::HeaderCaseMap`

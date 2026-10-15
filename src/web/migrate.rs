@@ -53,7 +53,7 @@ const EXPORT_VERSION: u32 = 3;
 /// 导出全部账号与设置，供迁移到另一台机器。
 ///
 /// **未设管理密码时拒绝**：这个口子返回的是明文 access/refresh token，等于把全部账号交出去。
-/// 未设密码时 [`auth::require_admin`] 已经拦下所有管理接口，这里是兜底：其余管理接口顶多
+/// 未设密码时 `auth::require_admin` 已经拦下所有管理接口，这里是兜底：其余管理接口顶多
 /// 是改配置，这条不一样，所以它自己再确认一次门锁着。
 pub(super) async fn export(State(state): State<AppState>) -> Result<Response, ApiError> {
     if !auth::admin_configured(&state).await {

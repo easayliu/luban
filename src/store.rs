@@ -47,11 +47,10 @@ mod select;
 mod session_events;
 mod settings;
 mod stats;
-mod usage;
-mod users;
-
 #[cfg(test)]
 mod tests;
+mod usage;
+mod users;
 
 pub use bans::*;
 pub use billing::{BillingDim, BillingFilter, BillingRow};

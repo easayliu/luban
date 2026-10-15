@@ -48,12 +48,12 @@ use super::uuid_from_bytes;
 ///   它前面）。2.1.270 起队尾是 [`config::CC_BETA_MESSAGE_THREADS`]，有它就插它前面。
 /// - [`config::CC_BETA_MESSAGE_THREADS`]：**不补**。2.1.270 没有 API-key 端样本，不知道那一侧
 ///   发不发；且它与 body 顶层的 `thread` 成对。来访带了就原位保留。
-/// - fable 族（由 [`cc_profile_for`] 判：该族官方串里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
+/// - fable 族（由 [`cc_profile_for`](crate::proxy::cc_profile_for) 判：该族官方串里有 [`config::CC_BETA_THINKING_DISPLAY_UPDATES`]）：
 ///   补 `thinking-display-updates`（`fallback-credit` 之后；没有它——2.1.270 的 sonnet——就沿
 ///   `server-side-fallback` → `effort` → `advanced-tool-use` 这条链找上一格），并**剥掉**
 ///   [`config::CC_BETA_REDACT_THINKING`]——订阅端 fable 不发它，API-key 端发；这是本函数
 ///   唯一会删客户端项的地方，fable 上原始思维链本来就不返回，删了没有语义损失。与之配套的
-///   body 侧 `thinking.display:"updates"` 由 [`fill_thinking_display`] 补。
+///   body 侧 `thinking.display:"updates"` 由 [`fill_thinking_display`](crate::proxy::fill_thinking_display) 补。
 ///
 /// `model` 为 `None` 时族相关的几条一条都不做（`server-side-fallback` / `fallback-credit` /
 /// `thinking-display-updates` 与剥 `redact-thinking`）——不知道是哪族就不猜。
@@ -61,7 +61,7 @@ use super::uuid_from_bytes;
 /// **参照串按来访自报的版本取**（[`config::cc_profile_at`]）：2.1.258 / 2.1.260 / 2.1.270
 /// 三张表，2.1.270 只有 sonnet 一行。对一条**完整的**订阅端串本函数必须幂等——参照串选错
 /// 一版，就会把上一版才有的项塞回一条官方请求里（2.1.270 sonnet 曾被补回
-/// `server-side-fallback` 与 `fallback-credit`，见 [`tests::merged_beta_is_idempotent_on_2_1_270_sonnet`]）。
+/// `server-side-fallback` 与 `fallback-credit`，见 `tests::merged_beta_is_idempotent_on_2_1_270_sonnet`）。
 ///
 /// **非主线程 profile 整条豁免**（[`is_official_non_main_beta`]）：2.1.260 的 SDK 子代理、
 /// 标题生成、安全分类、无工具 helper 与额度探测各有一套**更短**的官方 beta 集合，把主线程那几项补进去只会
@@ -72,8 +72,8 @@ use super::uuid_from_bytes;
 /// `-2026-07-01`，拼出两条同名 beta。
 ///
 /// 2.1.220 三对抓包（opus-5 / sonnet-5 / haiku-4.5）用这套规则都能**逐字节**还原官方串；
-/// 2.1.258 四族以 API-key 端原始请求头为输入，同样逐字节还原订阅端官方串。回归测试见 [`tests::merged_beta_matches_official_order`] 与
-/// [`tests::merged_beta_matches_2_1_258_official_order`]。
+/// 2.1.258 四族以 API-key 端原始请求头为输入，同样逐字节还原订阅端官方串。回归测试见 `tests::merged_beta_matches_official_order` 与
+/// `tests::merged_beta_matches_2_1_258_official_order`。
 ///
 /// **SDK 子代理由调用方告知**（[`BetaCtx::only_oauth`]）：子代理光看 beta 串认不出来：2.1.277 起它带 `advisor-tool`，[`is_official_non_main_beta`]
 /// 那条「有 display-updates 却没有主线程标记」的判据放它过去，于是被当主线程补上
@@ -89,7 +89,7 @@ use super::uuid_from_bytes;
 ///
 /// **`thinking.display:"omitted"` 的不补 `thinking-display-updates`**（[`BetaCtx::display_omitted`]）：
 /// `-p` 打印模式四族都写 `omitted`（`00441`、`00554` 等），官方串里就没有这一项。
-pub(super) fn merge_beta_for(
+pub(crate) fn merge_beta_for(
     incoming: Option<&str>,
     model: Option<&str>,
     version: Option<(u64, u64, u64)>,
@@ -230,10 +230,10 @@ fn insert_extended_cache_ttl(parts: &mut Vec<String>) {
 
 /// 出站体改写之后再对一次 `extended-cache-ttl`：头是在改写**之前**建的（改写要看头上有哪些
 /// beta），[`merge_beta_for`] 那时只能按来访体判 [`BetaCtx::ttl_1h`]。API-key 端的三块形态被
-/// 整形时断点会被补成 `ttl:"1h"`（[`super::rewrite_body`] 里的 `fill_cache_ttl`），来访体没有、
+/// 整形时断点会被补成 `ttl:"1h"`（[`crate::proxy::rewrite_body_out`] 里的 `fill_cache_ttl`），来访体没有、
 /// 出站体有——这时头上得跟着补，否则上游按 5 分钟算、还是「体里写了字段头上没声明」。
 /// 反过来不删：luban 从不去掉体里已有的 1h，来访有、出站就有。
-pub(super) fn ensure_cache_ttl_beta(beta: &str) -> String {
+pub(crate) fn ensure_cache_ttl_beta(beta: &str) -> String {
     let mut parts: Vec<String> =
         beta.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
     insert_extended_cache_ttl(&mut parts);
@@ -243,7 +243,7 @@ pub(super) fn ensure_cache_ttl_beta(beta: &str) -> String {
 /// [`merge_beta_for`] 要的那几项**请求事实**：它自己只看得到 beta 串，这几样得从请求体与请求
 /// 分类里来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BetaCtx {
+pub(crate) struct BetaCtx {
     /// 只补 `oauth`、别的一项不动（[`super::session_link::CcRequestKind::beta_only_oauth`]）。
     pub(super) only_oauth: bool,
     /// 出站体里有 `ttl:"1h"` 的断点：只有这时才补 `extended-cache-ttl`。
@@ -273,7 +273,7 @@ impl BetaCtx {
     /// haiku-5-5 那条（`00096`）却原样只补 `oauth`。只认这两种认得出的形态，不按 `Auxiliary` 整类豁免：
     /// 那一类还装着别的无工具对话，它们照主线程补（体里补了 `scope: global` 断点，头上就得有
     /// `prompt-caching-scope`）。
-    pub(super) fn of(
+    pub(crate) fn of(
         kind: super::session_link::CcRequestKind,
         raw: &[u8],
         body: Option<&serde_json::Value>,
@@ -312,7 +312,7 @@ pub(super) fn merge_beta(
 /// 日期）就补 2.1.260 那个日期（[`config::CC_BETA_SERVER_SIDE_FALLBACK_JUN`]，数组形态的
 /// `fallbacks` 只认它），位置照 [`merge_beta_for`]：`effort` 之后，没有则 `advanced-tool-use`
 /// 之后，都没有追加在末尾。已经带了（fable 的官方串、2.1.258 的客户端）一个字不动。
-pub(super) fn ensure_fallback_beta(beta: String) -> String {
+pub(crate) fn ensure_fallback_beta(beta: String) -> String {
     let mut parts: Vec<String> =
         beta.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
     if has_beta(&parts, config::CC_BETA_SERVER_SIDE_FALLBACK_JUN) {
@@ -330,7 +330,7 @@ pub(super) fn ensure_fallback_beta(beta: String) -> String {
 /// `beta` 传的是含日期的全名（常量都是那个形态），比较时只取到最后一个 `-` 之前的名字段：
 /// `server-side-fallback-2026-07-01` 与 `server-side-fallback-2026-06-01` 是同一项换了
 /// 日期，不是两项。逐字相等地判会让 [`merge_beta_for`] 给一个已经带新日期的来访再插一条旧的。
-pub(super) fn has_beta(parts: &[String], beta: &str) -> bool {
+pub(crate) fn has_beta(parts: &[String], beta: &str) -> bool {
     find_beta(parts, beta).is_some()
 }
 
@@ -372,11 +372,11 @@ fn beta_name(beta: &str) -> &str {
 ///
 ///    这一条不会误伤谁：主线程四族要么有 `effort`（opus/fable/sonnet），要么有
 ///    `advisor-tool`（2.1.258/2.1.260 的 haiku 主线程）；2.1.220 那代的 haiku
-///    （[`tests::BETA_PAIRS`]）压根没有 `thinking-display-updates`。
+///    （`tests::BETA_PAIRS`）压根没有 `thinking-display-updates`。
 ///
 /// 走到 [`merge_beta_for`] 的只有 CC 形态的来访（非 CC 形态的走模拟路径），所以「没有
 /// claude-code beta」在这里是个可用的信号，而不是「随便哪个第三方客户端」。
-pub(super) fn is_official_non_main_beta(parts: &[String]) -> bool {
+pub(crate) fn is_official_non_main_beta(parts: &[String]) -> bool {
     // 一项都没带不算：官方每个 profile 至少五项。压根没有 `anthropic-beta` 头的来访要走
     // 正常的补齐规则，不然它只会拿到一个孤零零的 `oauth`。
     if parts.is_empty() {
@@ -427,11 +427,11 @@ pub(super) fn build_forward_headers(
     build_forward_headers_for(headers, token, flags, sim, session_id, None, false, BetaCtx::MAIN)
 }
 
-/// [`build_forward_headers`] 带模型名的版本：`model` 只喂给 [`merge_beta_for`] 做族相关的两条
+/// [`build_forward_headers_for`] 带模型名的版本：`model` 只喂给 [`merge_beta_for`] 做族相关的两条
 /// 规则（fable 的 `thinking-display-updates` / `redact-thinking`）。转发路径与探测都知道模型，
 /// 走这个；不带模型的那个留给测试与无 body 的场景。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_forward_headers_for(
+pub(crate) fn build_forward_headers_for(
     headers: &HeaderMap,
     token: &str,
     flags: store::ForwardFlags,
@@ -546,7 +546,7 @@ pub(super) fn build_forward_headers_for(
 }
 
 /// 模拟模式下整套重建的转发头：[`config::CC_SIM_HEADERS`] 那张固定表 + 两个随请求变的值
-/// （会话 id、请求 id）。`Authorization` 与 `anthropic-beta` 由 [`build_forward_headers`]
+/// （会话 id、请求 id）。`Authorization` 与 `anthropic-beta` 由 [`build_forward_headers_for`]
 /// 随后覆盖上去。
 ///
 /// **来访客户端自己的头一个都不带过去**：一个 UA 是 `python-httpx/0.27`、没有 `x-app`、
@@ -557,7 +557,7 @@ pub(super) fn build_forward_headers_for(
 /// 插入序即 [`config::CC_SIM_HEADERS`] 的表序（官方线序），末尾两个动态头除外——线上的
 /// 拼写与顺序另由 `orig_header_case` 按 [`config::CC_HEADER_ORDER`] 归位，那张表里
 /// `X-Claude-Code-Session-Id` 与 `x-client-request-id` 都在各自的官方位置上。
-fn official_headers(sim: &Simulation) -> HeaderMap {
+pub(crate) fn official_headers(sim: &Simulation) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in config::CC_SIM_HEADERS {
         match (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
@@ -622,7 +622,7 @@ fn official_headers(sim: &Simulation) -> HeaderMap {
 /// `oauth` 的落位：官方串以 `claude-code-20250219` 开头时紧随其后（opus / fable / sonnet），
 /// 否则排在最前（haiku 三个 profile 的 `claude-code` 在串中间，`oauth` 在队首）。这两种
 /// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta_for`] 用的同一条规则。
-pub(super) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
+pub(crate) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
     let mut parts: Vec<&str> = seed.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     let at = usize::from(parts.first() == Some(&config::CC_BETA_CLAUDE_CODE));
     parts.insert(at, config::OAUTH_BETA_HEADER);
@@ -749,7 +749,7 @@ pub(crate) fn orig_header_case() -> wreq::header::OrigHeaderMap {
 }
 
 /// 生成一个随机 uuid v4（小写带连字符），用于补齐 `x-client-request-id`。
-pub(super) fn uuid_v4() -> String {
+pub(crate) fn uuid_v4() -> String {
     uuid_from_bytes(rand::rng().random())
 }
 
@@ -761,7 +761,7 @@ pub(super) fn uuid_v4() -> String {
 /// 回给客户端的是未压缩内容（见 [`is_resp_forwardable`]）。
 ///
 /// `authorization`/`anthropic-beta`/`anthropic-version` 也**保留转发**——它们的值随后会被
-/// [`build_forward_headers`] 原位覆盖。在这里剥离会让它们被追加到头列表末尾，破坏来访头序。
+/// [`build_forward_headers_for`] 原位覆盖。在这里剥离会让它们被追加到头列表末尾，破坏来访头序。
 ///
 /// `connection` 只在值为 `keep-alive` 时转发：官方客户端显式发这个头（抓包 040 可见），
 /// 而 hyper 认为 HTTP/1.1 隐含 keep-alive、默认不发，剥掉就是个稳定差异。其余取值

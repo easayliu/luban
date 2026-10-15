@@ -170,7 +170,7 @@ pub(super) fn version_at_least(v: &str, min: &str) -> bool {
 ///
 /// 估算按类型取抓包里的数：`total_tokens_reminder` 二十条恒为 23；其余随内容变，取首轮那条
 /// （`00040`）的值——代理看不到客户端注入的附件正文，模板里的附件类型本来也是照抓包写死的。
-/// `model` 那条随模型名变（`cap/auto-2.1.285-20260930`：opus 62、opus[1m] 71、sonnet 64、fable 63、
+/// `model` 那条随模型名变（`cap/auto-2.1.285-20260930`：opus 62、opus\[1m] 71、sonnet 64、fable 63、
 /// haiku 70，交互式与 `-p` 相同）。`-p`（`sdk`）的附件正文是 SDK 那套：环境 75、MCP 说明 1080，
 /// 延迟工具 / 子代理清单 / 技能清单 haiku 是 1001 / 489 / 2168（`00448` 等四个会话），其余模型
 /// 977 / 435 / 3406（`00562`、`00622` 等五个会话）。
@@ -250,7 +250,7 @@ pub(super) fn fill_attachment_estimates(
 
 /// 模型的默认 effort（`tengu_api_success.default_effort_level`）：opus-5-5、sonnet-5-5 与 haiku-5-5
 /// 是 `medium`，opus-4-7 是 `xhigh`，其余带 effort 的都是 `high`（`cap/2.1.285` 11 个模型、
-/// `cap/2.1.280` 的 opus-5-5[1m]；haiku-5-5 见 `cap/auto-2.1.293-20261008-full` 18 条 `medium` /
+/// `cap/2.1.280` 的 opus-5-5\[1m]；haiku-5-5 见 `cap/auto-2.1.293-20261008-full` 18 条 `medium` /
 /// `is_default_effort: true`）。表在 [`crate::config::cc_default_effort`]，模拟出站也按它发。
 pub(super) fn default_effort_of(model: &str) -> &'static str {
     crate::config::cc_default_effort(model)
@@ -301,8 +301,8 @@ pub(super) fn snapshot_hash_of(shape: &RequestShape) -> String {
 /// tether 引擎把模型固定成无状态发送的几个模型（`sentThreadType: "none"`）：
 ///
 /// - `cap/2.1.277`：fable-5-1 为 true、opus-5 为 false；
-/// - `cap/2.1.280`：fable-5-1 与 opus-5-5**[1m]** 为 true，sonnet / haiku 为 false；
-/// - `cap/2.1.285`（11 个模型）：只有 fable-5-1 为 true——fable-5 为 false，**不带 [1m] 的**
+/// - `cap/2.1.280`：fable-5-1 与 opus-5-5**\[1m]** 为 true，sonnet / haiku 为 false；
+/// - `cap/2.1.285`（11 个模型）：只有 fable-5-1 为 true——fable-5 为 false，**不带 \[1m] 的**
 ///   opus-5-5 也是 false（那条实际建了线程，`00030` 体里 `thread: create`）。
 ///
 /// 故按具体模型判：fable-5-1，与 1M 上下文的 opus-5-5。`model` 是带 `[1m]` 后缀的展示名。

@@ -37,7 +37,7 @@ use super::*;
 /// - 会话续轮走 **message threads**：`thread: {type: continue, previous_message_id}`，只发新增
 ///   消息，`system` 只剩 billing header 一块、不带 `tools`（`00035`、`00051` 等 30 余条）。
 ///   模拟路径每轮仍发完整上下文、不写 `thread`；透传路径对这种续轮整条放行，见
-///   [`crate::proxy::is_thread_continuation`]。
+///   `crate::proxy::is_thread_continuation`。
 ///
 /// 无工具 helper 与安全分类在 2.1.277 里没有样本，不编行：[`cc_profile`] 对这两个 kind 落回
 /// [`CC_PROFILES_2_1_260`]。

@@ -73,7 +73,7 @@ pub(super) fn eager_tools_wanted(
 ///
 /// 键追加在对象末尾：官方声明序是 `name, description, input_schema, eager_input_streaming`
 /// （`cap/2.1.258/00012` 每一条）。
-pub(in crate::proxy) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
+pub(crate) fn fill_eager_tools(v: &mut serde_json::Value) -> bool {
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else { return false };
     let mut changed = false;
     for tool in tools.iter_mut() {
@@ -217,7 +217,7 @@ static CC_TOOLS_CORE_CERF_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
 
 /// [`cc_tools_core_for`] 交出的那份声明：资产里那几份是静态的，号下发了正文的那几版在共享缓存里。
 #[derive(Clone)]
-pub(in crate::proxy) enum CcTools {
+pub(crate) enum CcTools {
     Static(&'static [serde_json::Value]),
     Shared(Arc<[serde_json::Value]>),
 }
@@ -274,7 +274,7 @@ fn trimmed(all: &[serde_json::Value]) -> Vec<serde_json::Value> {
 /// 的 `Read` 多了 `allow_large` 参数（两份都有），其余逐字未变；`Agent` 另有按模型换说明的一版，见
 /// [`cc_tools_core_for`]。`trim` 是开关
 /// `sim_trim_tools`，开着去掉 [`CC_TRIMMED_TOOLS`] 那三条、剩 11 条，先后不变。
-pub(in crate::proxy) fn cc_tools_core(
+pub(crate) fn cc_tools_core(
     profile: &config::CcProfile,
     trim: bool,
 ) -> &'static [serde_json::Value] {
@@ -290,7 +290,7 @@ pub(in crate::proxy) fn cc_tools_core(
 /// 这个模型用哪一版（[`crate::proxy::lucky_cerf::agent_desc`]）：清单命中就用 cerf 那版
 /// （[`CC_TOOLS_CORE_CERF`]），号下发了正文就换上那段（[`cerf_with_text`]）。haiku-4.5 不走精简提示词、
 /// 客户端根本不读这两个开关，不受影响。工具名与先后几份相同，只看名字的地方仍用 [`cc_tools_core`]。
-pub(in crate::proxy) fn cc_tools_core_for(
+pub(crate) fn cc_tools_core_for(
     profile: &config::CcProfile,
     desc: &crate::proxy::lucky_cerf::AgentDesc,
     trim: bool,
@@ -334,7 +334,7 @@ pub(in crate::proxy) fn cc_tools_core_for(
 /// 工具集是上一版的拼法、还缺四个恒带的」这个组合官方同样不产生。只加不删：老版本多出来
 /// 的那几个是客户端的能力，删了是改它的行为。
 ///
-/// **不能借 [`has_cc_tool_profile`] 判**：那个函数回答的是「这看起来像不像真的 CC 客户端」，
+/// **不能借 [`has_cc_tool_profile`](crate::proxy::has_cc_tool_profile) 判**：那个函数回答的是「这看起来像不像真的 CC 客户端」，
 /// 对「没带 tools」和「`tools: []`」都答**是**（判不出来就不冤枉人）。而这里问的是「这条
 /// 请求缺哪些官方工具」——空数组的答案显然是**全缺**。借用之后，一条 `tools: []` 的
 /// 主线程请求就永远注不进工具，正是「零个 CC 工具等于自证不是 CC」那个要消灭的形态。
@@ -366,7 +366,7 @@ pub(in crate::proxy) fn cc_tools_to_inject(
 ///
 /// 流水按它记 `injected_tool_called` / `tools_filled`，不再拿来访体预判
 /// （[`cc_tools_to_inject`]）：注入那一步按 `tool_choice` 与开关决定补不补，读来访原文会误记。官方工具名不参与假名混淆，出站里认得出。
-pub(in crate::proxy) fn injected_tools_of(
+pub(crate) fn injected_tools_of(
     inbound: &serde_json::Value,
     outbound: &serde_json::Value,
     profile: &config::CcProfile,
@@ -475,7 +475,7 @@ pub(in crate::proxy) fn injects_cc_tools(v: &serde_json::Value, fill_absent: boo
 ///
 /// **换不换不看 JSON 值相等**：`Value` 的相等忽略对象键序，客户端一条内容全同、键序不同的
 /// 声明会被当成「已经是官方的」跳过，出站就不是逐字节的官方声明了。故 14 条一律以资产对象
-/// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body`] 那条
+/// 落位，「有没有变」按紧凑序列化的字节比——这只影响日志计数与 [`rewrite_body_out`] 那条
 /// 「什么都没改就原样透传」的快路。
 pub(super) fn inject_cc_tools(
     v: &mut serde_json::Value,

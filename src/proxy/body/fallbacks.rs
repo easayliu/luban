@@ -13,10 +13,10 @@ use super::*;
 ///   与 Opus 4.7/4.8 同样带实时网络安全分类器、同样以 200 + `stop_reason: "refusal"` 拒答——
 ///   而是官方客户端在这些模型上不发 `fallbacks` 字段，luban 不凭空造官方从不产生的请求形态
 ///   （opus-5 那条自定链就是为此才默认关的）。它们的拒答照样被嗅探器记流水、按提示词学
-///   （[`UsageSniffer::classifier_refusal`] 不看模型族），只是不替它们换模型重跑。
+///   （[`UsageSniffer::classifier_refusal`](crate::proxy::UsageSniffer::classifier_refusal) 不看模型族），只是不替它们换模型重跑。
 ///
 /// 上游曾以 400 拒过这个模型的 fallback 目标（[`remember_fallback_rejection`]）的，也不补。
-pub(in crate::proxy) fn refusal_fallbacks_for(
+pub(crate) fn refusal_fallbacks_for(
     model: Option<&str>,
     flags: store::ForwardFlags,
     billable: bool,
@@ -51,14 +51,14 @@ pub(in crate::proxy) fn refusal_fallbacks_for(
 /// luban 不算补过：`refusal_fallbacks` 留 `None`，上游 400 拒它时不学、不剥掉重试。字符串
 /// `"default"` 不算——luban 有计划时它会被换成计划（[`ensure_fallbacks`]），模拟路径上没计划时
 /// 归一成官方数组（[`normalize_fallbacks`]），出站的都是 luban 的字面量。
-pub(in crate::proxy) fn client_supplied_fallbacks(body: Option<&serde_json::Value>) -> bool {
+pub(crate) fn client_supplied_fallbacks(body: Option<&serde_json::Value>) -> bool {
     body.and_then(|v| v.get("fallbacks")).is_some_and(|f| !f.is_string())
 }
 
 /// 这条请求出站时会不会带一份**上游会照着换模型重跑**的 `fallbacks`——客户端自己写了合法的
-/// 数组（[`valid_fallback_array`]，[`rewrite_body`] 一字不动送出），或 luban 按族开关要补
+/// 数组（[`valid_fallback_array`]，[`rewrite_body_out`] 一字不动送出），或 luban 按族开关要补
 /// （[`refusal_fallbacks_for`]）。带的请求上游拒答后会自己换模型重跑，本地的「已拒答提示词」
-/// 规则（[`known_refused_prompt`]）不该拦它。
+/// 规则（[`known_refused_prompt`](crate::proxy::known_refused_prompt)）不该拦它。
 ///
 /// **字符串形态只在有计划时算**，与 [`client_supplied_fallbacks`] 同口径。2.1.258 那种
 /// `"default"`（`cap/2.1.258/00013`）在 luban 有计划时会被 [`ensure_fallbacks`] 换成计划（上面
@@ -68,7 +68,7 @@ pub(in crate::proxy) fn client_supplied_fallbacks(body: Option<&serde_json::Valu
 /// 已学到的拒答时本地回放，而不是放上去让上游换模型重跑。空串或别的字面量上游一定 400，同样不算。
 /// `cc_kind` 在这里按体与 beta 头现算：调用点在 `handle_inner` 早于主流程算 `cc_kind` 的
 /// 位置，而 [`CcRequestKind::of`] 是纯函数。
-pub(in crate::proxy) fn outbound_carries_fallbacks(
+pub(crate) fn outbound_carries_fallbacks(
     body: Option<&serde_json::Value>,
     model: Option<&str>,
     flags: store::ForwardFlags,
@@ -114,20 +114,20 @@ pub(in crate::proxy) fn valid_fallback_array(f: &serde_json::Value) -> bool {
 
 /// 记忆表里「这个模型不收 `fallbacks`」那条的字段名（[`DeprecatedFieldMemory`]，落库
 /// `kind = "deprecated"`）。
-pub(in crate::proxy) const FALLBACKS_FIELD: &str = "fallbacks";
+pub(crate) const FALLBACKS_FIELD: &str = "fallbacks";
 
 /// 上游那条 400 是不是冲着 `fallbacks` 来的（目标模型不在 `allowed_fallback_models`、
 /// 与请求模型重复、条数超限……）。只按 message 判：这类错误归在 `invalid_request_error`
 /// 名下，靠类型分不出来；而 `fallback` 这个词只在这一件事上出现。
-pub(in crate::proxy) fn is_fallback_rejection(err: &[u8]) -> bool {
+pub(crate) fn is_fallback_rejection(err: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(err);
     message.to_lowercase().contains("fallback")
 }
 
 /// 上游以 400 拒了 luban 补的 `fallbacks` → 记进 [`DeprecatedFieldMemory`]（模型 +
 /// `fallbacks`），之后 [`refusal_fallbacks_for`] 对该模型不再补。返回**这次新学到**的那条，
-/// 调用方拿去落库（同 [`remember_shape_rejection`]）。
-pub(in crate::proxy) fn remember_fallback_rejection(
+/// 调用方拿去落库（同 [`remember_shape_rejection`](crate::proxy::remember_shape_rejection)）。
+pub(crate) fn remember_fallback_rejection(
     mem: &DeprecatedFieldMemory,
     model: &str,
     err: &[u8],
@@ -160,7 +160,7 @@ pub(in crate::proxy) fn remember_fallback_rejection(
 /// 位置按 [`config::CC_BODY_ORDER_MAIN`]：`context_management` 之后、`output_config` 之前；
 /// 找不到锚点时追加，随后 [`align_cc_top_level_order`] 归位。要补什么、补给谁由
 /// [`refusal_fallbacks_for`] 决定，这里只管写。
-pub(in crate::proxy) fn ensure_fallbacks(v: &mut serde_json::Value, plan: &str) -> bool {
+pub(crate) fn ensure_fallbacks(v: &mut serde_json::Value, plan: &str) -> bool {
     if v.get("fallbacks").is_some_and(|f| !f.is_string()) {
         return false;
     }

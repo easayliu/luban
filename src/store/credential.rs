@@ -179,7 +179,7 @@ impl CredentialStore {
     }
 
     /// 清空所有凭证，返回删除条数。连带清空设备绑定与全部用量日志（口径同
-    /// [`Self::delete`]：账号没了，历史用量不再保留）。
+    /// `Self::delete`：账号没了，历史用量不再保留）。
     pub async fn clear(&self) -> Result<usize> {
         // 串行化：不能和选号交错——选号刚读到的号在这里被删掉后，它照样会把绑定写回来。
         let mut tx = self.begin_write().await?;
@@ -300,7 +300,7 @@ impl CredentialStore {
 
     /// 把所有「限流暂停且已到恢复时刻」的号重新启用，返回实际恢复的条数。
     ///
-    /// 惰性执行（选号与列表各调一次，见 [`Self::select_for_device`]/[`Self::list`]），
+    /// 惰性执行（选号与列表各调一次，见 [`crate::store::CredentialStore::select_with_slot`]/[`Self::list`]），
     /// 和设备绑定的 TTL 过期同一套路子：不挂后台定时器。条件里的 `resume_at IS NOT NULL` 是
     /// 关键，它保证只碰限流暂停的号，封号与人工停用的不会被顺手打开。
     pub(super) async fn resume_due(conn: &mut PgConnection) -> Result<usize> {
@@ -528,7 +528,7 @@ impl CredentialStore {
         self.update_column("session_limit", id, limit).await
     }
 
-    /// 批量设置账号自己的提前停调度阈值（两档整份覆盖）；三态同 [`Self::set_quota_pause_pcts`]。
+    /// 批量设置账号自己的提前停调度阈值（两档整份覆盖）；三态同 `Self::set_quota_pause_pcts`。
     pub async fn set_quota_pause_pcts_many(
         &self,
         ids: &[i64],
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(pick().await.unwrap(), b, "人工停用的号不参与调度");
         assert_eq!(store.get(a).await.unwrap().unwrap().resume_at, None, "人工停用不该有恢复时刻");
         assert_eq!(
-            CredentialStore::resume_due(&mut *store.pool.acquire().await.unwrap()).await.unwrap(),
+            CredentialStore::resume_due(&mut store.pool.acquire().await.unwrap()).await.unwrap(),
             0,
             "没有该恢复的号"
         );
@@ -1151,7 +1151,7 @@ mod tests {
         assert!(got.is_subscription_paused() && !got.is_banned());
         assert_ne!(pick().await.unwrap(), a, "暂停的号不该再被选中");
         assert_eq!(
-            CredentialStore::resume_due(&mut *store.pool.acquire().await.unwrap()).await.unwrap(),
+            CredentialStore::resume_due(&mut store.pool.acquire().await.unwrap()).await.unwrap(),
             0,
             "不会到点自己回来"
         );

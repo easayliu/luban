@@ -8,7 +8,7 @@ use super::*;
 /// **为什么是占位符而不是在这里算**：`cch` 是官方 Bun HTTP 出口层对**最终出站 body**
 /// （含 `cch=00000` 占位符本身）算的 xxHash64 取低 20 位（见 [`compute_cch`]）。它依赖
 /// 工具注入、工具名混淆、message thread 等所有后续改写的结果，而这个函数在改写链的中段
-/// （[`ensure_billing_cch`] / [`simulated_billing_header_text`]）就被调用，那时 body 还没定型，
+/// （[`ensure_billing_cch`] / [`simulated_billing_header_text`](crate::proxy::simulated_billing_header_text)）就被调用，那时 body 还没定型，
 /// 算不出正确值。于是这里只落占位符，把真正的计算推到全部改写之后。
 ///
 /// **不会打爆 prompt cache**：`cap/2.1.260-2` 的 00057 → 00059 是同一会话连续两条，

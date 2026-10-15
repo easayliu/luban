@@ -34,7 +34,7 @@ static GRACE: std::sync::LazyLock<parking_lot::RwLock<HashMap<i64, Grace>>> =
 
 /// 记下一条上游响应的额外用量状态。没带 `anthropic-ratelimit-unified-status` 的响应限流器
 /// 没跑过，不算数（官方同样只认那种响应）。
-pub(super) fn note_overage(cred_id: i64, info: &RateLimitInfo) {
+pub(crate) fn note_overage(cred_id: i64, info: &RateLimitInfo) {
     if info.unified_status.is_none() {
         return;
     }
@@ -78,7 +78,7 @@ fn account_eligible(cred_id: i64) -> bool {
 /// 的续轮（官方 `queryTracking.depth > 0`），或者后台任务通知那一轮（官方 `Far` 的第三个参数
 /// `v7n`：末条用户消息是会话任务的通知——`cap/auto-2.1.291-20261006-full/00174`、`00564` 末条只有
 /// 通知那段 text、没有工具结果，也带这个头）；且这个号按账号的事实成立。
-pub(super) fn usage_limit_wanted(
+pub(crate) fn usage_limit_wanted(
     v: &serde_json::Value,
     profile: &config::CcProfile,
     cred_id: i64,

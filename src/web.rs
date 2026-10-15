@@ -86,7 +86,7 @@ pub struct AppState {
     pub client_key: Option<Arc<String>>,
     /// 管理密码（环境接管，明文；None 表示未由环境设置）。
     pub admin_env: Option<Arc<String>>,
-    /// 只读访客密码（环境接管，明文；None 表示未由环境设置）。见 [`auth::Role::Viewer`]。
+    /// 只读访客密码（环境接管，明文；None 表示未由环境设置）。见 `auth::Role::Viewer`。
     pub viewer_env: Option<Arc<String>>,
     /// 首次设置管理密码的初始化口令：每次启动随机生成、重启前不变，未设密码时打进日志。
     /// 设密码必须带上它，本机也一样，见 [`auth::setup`]。
@@ -345,6 +345,11 @@ fn open_in_browser(url: &str) {
         let _ = std::process::Command::new(cmd.0).arg(cmd.1).spawn();
     }
 }
+
+// rustdoc 链接用的再导出：拆分前这些项都在本模块下，文档里按 `crate::web::X` 链到它们；
+// 代码不经这里引用，故逐条 allow(unused_imports)。
+#[allow(unused_imports)]
+pub(crate) use login::exchange;
 
 #[cfg(test)]
 mod tests;

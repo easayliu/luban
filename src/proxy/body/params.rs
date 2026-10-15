@@ -29,10 +29,7 @@ pub(in crate::proxy) const THINKING_MIN_MAX_TOKENS: u64 = 1024;
 /// 补上之后客户端带的 `temperature` / `top_p` 若与 thinking 冲突，一并剥掉
 /// （[`drop_sampling_conflicting_with_thinking`]）：冲突是注入造成的，收拾也归注入这一步，
 /// 不依赖 `strip_extra_fields` 开着。
-pub(in crate::proxy) fn ensure_thinking(
-    v: &mut serde_json::Value,
-    profile: &config::CcProfile,
-) -> bool {
+pub(crate) fn ensure_thinking(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     if obj.contains_key("thinking") {
         return false;
@@ -95,16 +92,16 @@ pub(in crate::proxy) fn ensure_thinking(
 /// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由
 /// [`cc_profile_for`] 判（该族的官方串里有 `thinking-display-updates` 的才算）。
 ///
-/// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body`] 的 `display_beta`）：`updates`
+/// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body_out`] 的 `display_beta`）：`updates`
 /// 是 beta 才认的取值，头上没声明时上游回 400 `Input should be 'summarized', 'omitted'`。
 /// 2026-09-02 一条 `claude-vscode, agent-sdk/0.3.258` 的 fable-5-1 请求就是这样被拒的——它的
-/// beta 串没有 `advisor-tool`，[`merge_beta_for`] 按老世代处理不补，体里却写了。
+/// beta 串没有 `advisor-tool`，[`merge_beta_for`](crate::proxy::merge_beta_for) 按老世代处理不补，体里却写了。
 ///
 /// 那个前提也是**唯一**的门槛：本函数不再自己按模型族判一遍。哪一族在哪一版发这项 beta
-/// 是 [`merge_beta_for`] 的事（它按来访自报的版本查 [`config::cc_profile_at`]），在这里再判
+/// 是 [`merge_beta_for`](crate::proxy::merge_beta_for) 的事（它按来访自报的版本查 [`config::cc_profile_at`]），在这里再判
 /// 一次只会两处口径分头漂移——2.1.260 起 opus 主线程也发 `display:"updates"`，
 /// 原来那句「只有 fable」的判断当场就成了错的。
-pub(in crate::proxy) fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
+pub(crate) fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
     let Some(th) = v.get_mut("thinking").and_then(|t| t.as_object_mut()) else { return false };
     if th.get("type").and_then(|t| t.as_str()) != Some("adaptive") || th.contains_key("display") {
         return false;
@@ -152,7 +149,7 @@ pub(in crate::proxy) fn fill_thinking_display(v: &mut serde_json::Value) -> bool
 ///
 /// **注意**：模拟路径下 [`ensure_thinking`] 会先补上 `thinking`，然后本函数就能自然补上
 /// `context_management`，两者配合才完整。
-pub(in crate::proxy) fn ensure_context_management(v: &mut serde_json::Value) -> bool {
+pub(crate) fn ensure_context_management(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     // 客户端自己带了就不动——那是它自己的编辑策略，替它改属于越权（同 [`ensure_beta_query`]
     // 对客户端自带 `beta=` 的口径）。
@@ -195,10 +192,7 @@ pub(in crate::proxy) fn ensure_context_management(v: &mut serde_json::Value) -> 
 ///
 /// **`effort` 要配 `effort-2025-11-24` beta**：三个带它的 profile 的 beta 串里都有这一项，
 /// haiku 的没有——这也是 haiku 那行 `effort: None` 的另一层理由，别只看抓包里有没有字段。
-pub(in crate::proxy) fn ensure_output_config(
-    v: &mut serde_json::Value,
-    profile: &config::CcProfile,
-) -> bool {
+pub(crate) fn ensure_output_config(v: &mut serde_json::Value, profile: &config::CcProfile) -> bool {
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
     let Some(effort) = config::cc_outbound_effort(profile, model) else { return false };
     let Some(obj) = v.as_object() else { return false };

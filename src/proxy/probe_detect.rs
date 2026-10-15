@@ -14,9 +14,9 @@ use super::{error_response, is_quota_probe_shaped, request_max_tokens};
 /// [`probe_signature`] 命中的哪一条判据。日志与错误消息按类写清楚，运维一眼能看出拦的是什么。
 ///
 /// 身份格式不对（device 不是 64 位 hex、session 不是 uuid）**不在**这里：那是「抄错了」而不是
-/// 探针，交给模拟路径重建身份（[`cc_identity_well_formed`] 决定它进不了透传），不拒。
+/// 探针，交给模拟路径重建身份（[`cc_identity_well_formed`](crate::proxy::cc_identity_well_formed) 决定它进不了透传），不拒。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProbeKind {
+pub(crate) enum ProbeKind {
     /// 单句 ping：无 tools、恰好 1 条消息、`max_tokens` 在 `2..=16`（带不带 system 都算）。
     Ping,
     /// 1 token 的探活：无 system、无 tools、恰好 1 条用户消息、`max_tokens=1`，且不可能是官方
@@ -29,7 +29,7 @@ pub(super) enum ProbeKind {
     ThrowawayConversation,
     /// system 里 CC 身份句出现在**不止一块**里。官方只写一次。
     DuplicateIdentity,
-    /// 短开场（严格模式，[`store::ForwardFlags::reject_probes_strict`]）：无 system、无 tools、
+    /// 短开场（严格模式，[`store::ForwardFlags::reject_probes_strict`](crate::store::ForwardFlags::reject_probes_strict)）：无 system、无 tools、
     /// 恰好 1 条用户消息、正文不超过 [`PROBE_SHORT_OPENER_BYTES`] 字节、`max_tokens != 1`。
     /// 测活脚本发的正是「hi」「ping」「test」。
     ShortOpener,
@@ -42,7 +42,7 @@ const PROBE_SHORT_OPENER_BYTES: usize = 32;
 
 impl ProbeKind {
     /// 进日志的短名。
-    pub(super) fn tag(self) -> &'static str {
+    pub(crate) fn tag(self) -> &'static str {
         match self {
             Self::Ping => "ping",
             Self::OneTokenPing => "one-token-ping",
@@ -86,7 +86,7 @@ impl ProbeKind {
 /// | 封前 8 分钟的 21 条 | 同样 3 块 system、无 `tools`/`thinking`、1 条消息、`temperature=1`、每条一个新 device_id + 新 session_id | 官方一台新机器的第一条是预热（无 system）或主请求（带 tools），从不是「没有 tools 的一句话对话」 |
 /// | `sdk-cli` 每 20 分钟一条 | `device_id`=`channel-test`、`session_id`=`channel-test-claude-code` | 官方 device_id 恒为 64 位 hex、session_id 恒为 uuid（`cap/` 37 份样本无一例外） |
 ///
-/// 第三类**不在这里拒**：身份写错是「抄错了」，不是探针形态。它由 [`cc_identity_well_formed`]
+/// 第三类**不在这里拒**：身份写错是「抄错了」，不是探针形态。它由 [`cc_identity_well_formed`](crate::proxy::cc_identity_well_formed)
 /// 挡在透传门外、走模拟——模拟路径本来就会剥掉来访的 `metadata.user_id`，用凭证 + 平台指纹
 /// 重建一份合法身份，那个 `channel-test` 到不了上游。代价是这类探活换了身合法的皮照常放行；
 /// 它 `max_tokens=256`、设备恒定，也不命中下面三条。这是有意的取舍：只拒探针，不拒抄错的。
@@ -98,7 +98,7 @@ impl ProbeKind {
 ///   不要求带 system。下界排除官方 cache 预热（`max_tokens=1`；2.1.187 Claude Desktop 的预热带
 ///   `[billing, identity]` 两块 system，见 `ban.log`），上界远低于官方带 system 的最小值 64
 ///   （补全建议）；官方也没有任何一种「无 system、`max_tokens` 在 2 到 16」的请求。
-///   严格模式（`strict`，[`store::ForwardFlags::reject_probes_strict`]）下 ping 不再要求无
+///   严格模式（`strict`，[`store::ForwardFlags::reject_probes_strict`](crate::store::ForwardFlags::reject_probes_strict)）下 ping 不再要求无
 ///   tools，并多一条**短开场**（[`ProbeKind::ShortOpener`]），见函数体内的说明；
 /// - **1 token 探活**（[`ProbeKind::OneTokenPing`]）：无 system、无 tools、恰好 1 条消息、
 ///   `max_tokens=1`，且**不可能是官方的**：`from_cc_client` 为假（UA 不是可信的 Claude Code），
@@ -110,7 +110,7 @@ impl ProbeKind {
 ///   device_id 的 1 token 请求这里不碰，它是桌面端预热，由模拟路径按形态放行；
 /// - **凭空冒出的一次性对话**（[`ProbeKind::ThrowawayConversation`]）：有 system、没有
 ///   tools、恰好 1 条消息、`max_tokens != 1`、不是官方那三种无 tools 请求、且设备从没见过
-///   （[`store::CredentialStore::device_is_known`]）。官方无 tools 的请求只有四种：预热
+///   （[`store::CredentialStore::device_is_known`](crate::store::CredentialStore::device_is_known)）。官方无 tools 的请求只有四种：预热
 ///   （`max_tokens=1`）、Helper（[`is_official_helper_request`]）、标题生成
 ///   （[`is_official_title_request`]）、安全分类（[`is_official_classifier_request`]）；后三种
 ///   按 system 结构 + beta 头 + body 取值**逐项**对，不是「带了某个字段就放」。标题生成必须在
@@ -129,7 +129,7 @@ impl ProbeKind {
 /// 请求，这里分不出来——那时剩下的信号只有行为（身份轮换、节奏），不在本函数范围内。
 ///
 /// 只看形态与身份、一条就判，不做任何计数——所以不存在「合法流量大了会误伤」的问题。
-pub(super) async fn probe_signature(
+pub(crate) async fn probe_signature(
     body: Option<&serde_json::Value>,
     device_id: Option<&str>,
     beta: &[String],
@@ -248,7 +248,7 @@ fn single_user_text_bytes(v: &serde_json::Value) -> Option<usize> {
 
 /// 探针命中时本地回给客户端的正文（[`probe_reply`]）。探活脚本只看状态码与「有没有回话」，
 /// 一个字就够；严格模式下被短开场判据拦住的真人看到的也是它，下一句正常长度的话照常放行。
-pub(super) const PROBE_REPLY_TEXT: &str = "OK";
+pub(crate) const PROBE_REPLY_TEXT: &str = "OK";
 
 /// 上游 Message id 与 `request-id` 用的字母表（base58：没有 `0`、`O`、`I`、`l`）。
 const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -490,7 +490,7 @@ fn upstream_like_headers(
 ///
 /// 回给下游的东西里**没有任何 luban 的标记**：命中的是哪条判据、是 luban 就地答的，都只记在自己的
 /// 流水里（`probe_reply:<判据>` 标签，花费记 0）。
-pub(super) fn probe_reply(
+pub(crate) fn probe_reply(
     model: Option<&str>,
     req_max_tokens: Option<i64>,
     wants_stream: bool,
@@ -544,7 +544,7 @@ pub(super) fn probe_reply(
         })
 }
 
-/// 把一条整段 Message 展成 `/v1/messages` 的 SSE 事件流（[`SseAggregator`] 的逆操作）：
+/// 把一条整段 Message 展成 `/v1/messages` 的 SSE 事件流（[`SseAggregator`](crate::proxy::SseAggregator) 的逆操作）：
 /// `message_start`（骨架，`content` 清空、停止字段置空）→ 每个内容块的
 /// `content_block_start` / 一条整块的 `content_block_delta` / `content_block_stop` →
 /// `message_delta`（`stop_reason` / `stop_sequence` / `stop_details` + `usage`）→ `message_stop`。
@@ -553,7 +553,7 @@ pub(super) fn probe_reply(
 /// 不到；仍按官方 delta 种类写全（text / thinking / tool_use 入参），不认识的块类型整块放在
 /// `content_block_start` 里——与聚合器「未知块原样收下」对称。不是对象、没有 `content` 数组的
 /// 返回 `None`。
-pub(super) fn message_to_sse(msg: &serde_json::Value) -> Option<String> {
+pub(crate) fn message_to_sse(msg: &serde_json::Value) -> Option<String> {
     use serde_json::{Value, json};
     let obj = msg.as_object()?;
     let content = obj.get("content")?.as_array()?;

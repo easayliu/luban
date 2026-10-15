@@ -2,7 +2,7 @@
 //!
 //! 各阶段一个子模块，彼此只经下面几个结构交接：
 //! - [`admit`]：闸门放行后给出 [`Inbound`]（整条请求不变的事实）与 [`Guards`]；
-//! - [`select`]：首发的号（[`Pick`]）；
+//! - [`select`](fn@select)：首发的号（[`Pick`]）；
 //! - [`attempt`]：循环外的出站材料（[`Prepared`]）与当前号的一轮请求（[`Attempt`]）；
 //! - [`retry`]：上游这一发之后换号重发、就地回复还是收尾（[`Flow`]）；
 //! - [`respond`]：把最后那一发交回客户端。
@@ -105,7 +105,7 @@ pub(super) struct Pick {
     pub(super) session_slot: Option<i64>,
 }
 
-pub(super) async fn handle_inner(
+pub(crate) async fn handle_inner(
     state: AppState,
     method: Method,
     uri: Uri,

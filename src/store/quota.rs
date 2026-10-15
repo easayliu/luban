@@ -164,7 +164,7 @@ impl CredentialStore {
         Ok(fresh)
     }
 
-    /// 单个凭证的额度快照；口径与 [`Self::latest_quotas`] 完全一致（同一条 SQL）。
+    /// 单个凭证的额度快照；口径与 `Self::latest_quotas` 完全一致（同一条 SQL）。
     pub async fn latest_quota(&self, cred_id: i64) -> Result<Option<QuotaSnapshot>> {
         Ok(self.quota_snapshots(Some(cred_id)).await?.remove(&cred_id))
     }

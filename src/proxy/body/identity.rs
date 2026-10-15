@@ -6,7 +6,7 @@ use super::*;
 /// 加 `sim:` 前缀。没伪装过就返回 `None`（日志照旧是 `-`）。
 ///
 /// **只在真伪装过时才记**，且按**出站体**判，不按开关推：`out_device` 是实际发出去的
-/// `metadata.user_id` 里的 device_id（[`ShapeBits::device_id_out`]），等于本号按这台设备派生的
+/// `metadata.user_id` 里的 device_id（[`ShapeBits::device_id_out`](crate::proxy::ShapeBits::device_id_out)），等于本号按这台设备派生的
 /// 那个才算——即 [`ensure_cc_metadata`] 真把它写进了出站体（模拟路径、CC 形态补身份、
 /// billing-only 下补的那份）。从开关推会漏掉几种没写的情形：billing-only 保留了客户端自带的
 /// 非 CC 格式 `user_id`（`client-uid-123` 这类，补那步不覆盖已有的）、非计费路径
@@ -17,7 +17,7 @@ use super::*;
 /// 成 `"|<arch>|<os>"`，同账号同平台的所有裸客户端共用一个），看着就像「一台设备打了全部
 /// 请求」。前缀让它在日志与 `usage_logs` 里一眼可辨，不至于被当成真实设备读。它也**不写设备绑定**，故不占 `device_limit` 名额、不会出现在设备列表里
 /// （[`store::CredentialStore::list_devices`] 从 `device_bindings` 出发）。
-pub(in crate::proxy) fn sim_device_id(
+pub(crate) fn sim_device_id(
     out_device: Option<&str>,
     cred: &crate::credentials::Credential,
     device_fp: &str,
@@ -45,7 +45,7 @@ pub(in crate::proxy) fn sim_device_id(
 ///
 /// 除 UA 外仍只取**稳定的硬件/系统身份**：runtime 版本、SDK 包版本这些同一版本客户端也会
 /// 各不相同的字段不进指纹，免得同一台机器碎成一堆设备。
-pub(in crate::proxy) fn device_fingerprint(
+pub(crate) fn device_fingerprint(
     client_device_id: Option<&str>,
     headers: &HeaderMap,
     out_ua: &str,
@@ -73,7 +73,7 @@ pub(in crate::proxy) fn device_fingerprint(
 ///
 /// `client_device_id` 仍然参与（归一化关着时）：来访自带设备 id 却被判成非官方客户端的那种，
 /// 各自还是各自的设备。
-pub(in crate::proxy) fn sim_device_fingerprint(client_device_id: Option<&str>) -> String {
+pub(crate) fn sim_device_fingerprint(client_device_id: Option<&str>) -> String {
     let sim = |k: &str| config::CC_SIM_HEADERS.iter().find(|(n, _)| *n == k).map_or("", |(_, v)| v);
     format!(
         "{}|{}|{}|{}",
@@ -107,7 +107,7 @@ pub(in crate::proxy) fn sim_device_fingerprint(client_device_id: Option<&str>) -
 /// 一条会话，与原来一样。**这是近似**：两条请求连首条 content 都逐字相同时，协议里没有任何
 /// 信息能分出它们是不是两个对话，后台的会话数与上限都按这个口径算。返回 32 个 hex 字符；
 /// 入库前还要经 [`session_binding_key`] 套上命名空间与口径版本。
-pub(in crate::proxy) fn sim_session_key(v: &serde_json::Value) -> String {
+pub(crate) fn sim_session_key(v: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"luban-prefix\0");
@@ -202,10 +202,7 @@ pub(crate) const SESSION_KEY_VERSION: &str = "lb:v2:";
 /// 任何父子线索，只能按前缀各算各的——这是 `pfx` 分支已知的近似（见 [`sim_session_key`]）。
 ///
 /// 模型与线程类型要看就记在绑定行上（`session_bindings.last_model`）给后台列，不进键。
-pub(in crate::proxy) fn session_binding_key(
-    incoming_session_id: Option<&str>,
-    prefix_key: &str,
-) -> String {
+pub(crate) fn session_binding_key(incoming_session_id: Option<&str>, prefix_key: &str) -> String {
     match incoming_session_id {
         Some(sid) => format!("{SESSION_KEY_VERSION}sid:{sid}"),
         None => format!("{SESSION_KEY_VERSION}pfx:{prefix_key}"),
@@ -217,7 +214,7 @@ pub(in crate::proxy) fn session_binding_key(
 ///
 /// **只进流水，从不落 `session_bindings`**：这类请求没有设备身份，主线程落在哪个号上只能凭
 /// 会话键碰运气，碰到了就跟过去、碰不到就分散到别的号，都不写绑定、不占会话名额（见
-/// [`super::session_id::session_plan`]）。类别段让后台把标题、分类、探测这些用量与真正的对话
+/// [`super::session_id::session_plan`](crate::proxy::session_plan)）。类别段让后台把标题、分类、探测这些用量与真正的对话
 /// 分开看；保留来源与值，按会话 id 查流水仍查得到它。
 pub(in crate::proxy) fn anon_session_key(binding_key: &str, class: &str) -> String {
     let rest = binding_key.strip_prefix(SESSION_KEY_VERSION).unwrap_or(binding_key);
@@ -260,10 +257,10 @@ fn canonical_json(v: &serde_json::Value) -> String {
 /// **保持原格式**（内嵌 JSON 定点替换 / 扁平串重拼），已经同值时不动。
 ///
 /// [`spoof_identity`] 刻意不碰 session 段——那一步只管 account / device 两段，会话段由这里
-/// 统一对齐到 [`outbound_session_id`] 选定的那个：身份伪装开着时是按账号钉住的派生值
-/// （[`account_session_id`]，同一条来访会话换号后不再带着同一个 uuid 出现在另一个组织下），
+/// 统一对齐到 [`outbound_session_id`](crate::proxy::outbound_session_id) 选定的那个：身份伪装开着时是按账号钉住的派生值
+/// （[`account_session_id`](crate::proxy::account_session_id)，同一条来访会话换号后不再带着同一个 uuid 出现在另一个组织下），
 /// 关着时就是客户端自己那个合法值。头是 `sess-42`、体里是合法 uuid，或两处给了两个不同的合法
-/// uuid 时，[`incoming_session_id`] 已经替这条请求选定了一个，出站两处就都得是它——否则发出
+/// uuid 时，[`incoming_session_id`](crate::proxy::incoming_session_id) 已经替这条请求选定了一个，出站两处就都得是它——否则发出
 /// 去的是一份官方绝不产生的请求（那两处逐字相同）。
 ///
 /// 那份 user_id **没有会话段**时补上：内嵌 JSON 在收尾 `}` 前追加 `"session_id"`（官方键序
@@ -274,7 +271,7 @@ fn canonical_json(v: &serde_json::Value) -> String {
 ///
 /// 两种格式都认不出来（既不是 JSON 对象也不是 `user_<dev>_account_<acct>` 形态）时不动。
 /// 返回是否改动过。
-pub(in crate::proxy) fn sync_metadata_session(v: &mut serde_json::Value, session_id: &str) -> bool {
+pub(crate) fn sync_metadata_session(v: &mut serde_json::Value, session_id: &str) -> bool {
     let Some(user_id) = v.get_mut("metadata").and_then(|m| m.get_mut("user_id")) else {
         return false;
     };
@@ -340,7 +337,7 @@ fn append_json_str_field(s: &str, key: &str, val: &str) -> Option<String> {
     Some(format!("{body}{sep}\"{key}\":\"{val}\"}}"))
 }
 
-pub(in crate::proxy) fn spoof_identity(
+pub(crate) fn spoof_identity(
     v: &mut serde_json::Value,
     cred: &crate::credentials::Credential,
     device_fp: &str,
@@ -409,11 +406,7 @@ pub(in crate::proxy) fn spoof_identity(
 /// 内容逐字节不变。仅处理**字符串型且值内无转义引号**的字段——`device_id`(hex)、
 /// `account_uuid`(UUID，可能为空串)均满足，`new_val` 同为 hex/UUID，无需 JSON 转义。
 /// 找不到该字段（或其不是 `"key":"` 形态）时返回 `None`，**不新增字段**，以免改变结构。
-pub(in crate::proxy) fn replace_json_str_field(
-    s: &str,
-    key: &str,
-    new_val: &str,
-) -> Option<String> {
+pub(crate) fn replace_json_str_field(s: &str, key: &str, new_val: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let val_start = s.find(&needle)? + needle.len();
     // 值到下一个引号为止（值内无转义引号，故直接找 '"'）。
@@ -427,7 +420,7 @@ pub(in crate::proxy) fn replace_json_str_field(
 
 /// 测试用的最小请求体：一条 `ping`、`max_tokens=1`。
 ///
-/// 其余部分（官方 `system` 四块、`metadata` 身份）由 [`rewrite_body`] 在模拟路径上补齐，
+/// 其余部分（官方 `system` 四块、`metadata` 身份）由 [`rewrite_body_out`] 在模拟路径上补齐，
 /// 与真实转发用的是同一份代码——这里手抄一份官方形态，只会得到「测试通过但转发失败」。
 ///
 /// key 序按官方的 `model → messages → … → max_tokens` 写；补出来的 `system`/`metadata`
@@ -437,7 +430,7 @@ pub(in crate::proxy) fn replace_json_str_field(
 /// 属于任何 API 客户端都会产生的常规形态，不是「真实客户端不产生」的那类破绽。
 /// 这条请求**实际发出去的** `metadata.user_id` 里那份身份。
 #[derive(Debug, Clone, Default)]
-pub(in crate::proxy) struct OutboundIdentity {
+pub(crate) struct OutboundIdentity {
     pub(in crate::proxy) device_id: String,
     pub(in crate::proxy) account_uuid: String,
     /// 出站体里那串 `user_id` 的**原文**（连编码形态一起）。
@@ -472,7 +465,7 @@ pub(in crate::proxy) struct OutboundIdentity {
 /// 这里会把整个出站体解析一遍。**只在会话第一条请求上调用一次**，那点开销可以接受；
 /// 换成按 `(cred, device_fp, flags)` 重算一份逻辑，就得把 `spoof_identity` /
 /// `ensure_cc_metadata` 的分支在这里抄第二份，迟早对不上。
-pub(in crate::proxy) fn outbound_identity(
+pub(crate) fn outbound_identity(
     sent: &Bytes,
     cred: &crate::credentials::Credential,
 ) -> OutboundIdentity {
@@ -522,7 +515,7 @@ pub(in crate::proxy) fn outbound_identity(
 /// 主请求没发身份（`raw_user_id` 为 `None`）时原样交回：身份伪装开着时探测体里
 /// [`ensure_cc_metadata`] 造的那份就是它唯一能有的身份，换掉反而更不一致；关着时探测体里
 /// 本来就没有（探测用后台的真实开关改写），与主请求一样不带。
-pub(in crate::proxy) fn with_outbound_identity(body: Bytes, ident: &OutboundIdentity) -> Bytes {
+pub(crate) fn with_outbound_identity(body: Bytes, ident: &OutboundIdentity) -> Bytes {
     let Some(raw) = ident.raw_user_id.as_deref() else { return body };
     let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return body };
     match v.get_mut("metadata").and_then(|m| m.as_object_mut()) {

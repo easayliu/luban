@@ -44,7 +44,7 @@ pub(super) fn redact_headers(headers: &HeaderMap) -> String {
 
 /// 出站请求体的结构摘要，见 [`super::ban::log_third_party_rejection`] 的取舍说明。
 /// 非对象（理论上到不了这儿）原样返回。
-pub(super) fn request_digest(v: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn request_digest(v: &serde_json::Value) -> serde_json::Value {
     let Some(obj) = v.as_object() else { return v.clone() };
     let mut out = serde_json::Map::new();
     for (k, val) in obj {
@@ -108,7 +108,7 @@ pub(super) fn block_label(b: &serde_json::Value) -> String {
 }
 
 /// `system` 的摘要：每块记长度、前 [`DUMP_TEXT_HEAD`] 字符与 `cache_control` 原样。
-/// 块数与断点位置是形态对齐的核心判据（见 [`super::align_system_shape`]），必须能一眼数出来。
+/// 块数与断点位置是形态对齐的核心判据（见 [`super::align_system_shape`](crate::proxy::align_system_shape)），必须能一眼数出来。
 pub(super) fn system_digest(v: &serde_json::Value) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = match v {
         serde_json::Value::String(s) => {

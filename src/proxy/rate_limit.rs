@@ -5,9 +5,9 @@ use axum::http::HeaderMap;
 
 use crate::store;
 
-/// 一次 429 该冷却到什么范围，见 [`rate_limit_scope`]。
+/// 一次 429 该冷却到什么范围，见 [`rate_limit_scope_for`]。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum LimitScope {
+pub(crate) enum LimitScope {
     /// 基础额度窗口真的耗尽：该账号所有模型一起让位。
     Account,
     /// 这个号的某个额度池满了（它专用的超额/回补池）：只让这个模型让位，其余模型照常。
@@ -31,7 +31,7 @@ pub(super) enum LimitScope {
     /// 开 extra usage。故它既不打冷却也不停号，而是落一条准入记录
     /// （[`store::CredentialStore::deny_model`]）并**换号重发**，之后的选号直接绕开这一格。
     ///
-    /// **只给「fable/mythos 且账号等级不是 Max」**（[`store::premium_model`] + [`is_max_plan`]）：
+    /// **只给「fable/mythos 且账号等级不是 Max」**（[`store::premium_model`] + [`is_max_plan`](crate::proxy::is_max_plan)）：
     /// 这是唯一能把这形态解读成「套餐不含」的组合。其余组合见 [`Self::OverageDisabled`]。
     Unsupported(String),
     /// 形态与 [`Self::Unsupported`] 相同（无窗口、只说 credits 被组织关了），但**不能**解读成
@@ -117,10 +117,10 @@ pub(super) fn rate_limit_scope(info: &RateLimitInfo, model: Option<&str>) -> Lim
     rate_limit_scope_for(info, model, false)
 }
 
-/// 同 [`rate_limit_scope`]，多一个「这个号是 Max 档吗」（见 [`is_max_plan`]）：只影响「无窗口 +
+/// 同 [`rate_limit_scope_for`]，多一个「这个号是 Max 档吗」（见 [`is_max_plan`](crate::proxy::is_max_plan)）：只影响「无窗口 +
 /// overage 被关」那一档的解读——Max 号的 fable 不可能是「套餐不含」，见
 /// [`LimitScope::OverageDisabled`]。
-pub(super) fn rate_limit_scope_for(
+pub(crate) fn rate_limit_scope_for(
     info: &RateLimitInfo,
     model: Option<&str>,
     max_plan: bool,
@@ -175,7 +175,7 @@ pub(super) fn rate_limit_scope_for(
 ///   [`store::CredentialStore::mark_rate_limited`]，但 cooldown 用 ladder 退避值（2s 起步），
 ///   远短于额度那一档。短 gate 阻止同一个号被立刻再选中、反复打出 429，同时因为持续时间短，
 ///   不会像长 gate 那样级联封死整池。
-pub(super) async fn park_rate_limited(
+pub(crate) async fn park_rate_limited(
     store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     scope: &LimitScope,
@@ -241,7 +241,7 @@ pub(super) async fn park_rate_limited(
 /// [`store::CredentialStore::quota_pause_pct`] 配（默认 90%，配 `0` 即关掉本机制、退回
 /// 「收到 429 才停」的老行为）。
 ///
-/// 只看**基础**窗口，与 [`rate_limit_scope`] 共用 [`is_overage_window`] 口径：超额池
+/// 只看**基础**窗口，与 [`rate_limit_scope_for`] 共用 [`is_overage_window`] 口径：超额池
 /// （`7d_oi`/`overage`）快满了不代表账号额度耗尽——实测那期间同一账号的 sonnet/opus 照常
 /// 200，按它停整个号是误伤。同理这里也不做模型级那一档：使用率讲的是账号额度，不是某个
 /// 模型此刻有没有容量。
@@ -259,7 +259,7 @@ pub(super) async fn park_rate_limited(
 ///
 /// 返回是否已经把号停在池外，调用方据此决定要不要再走「测试通过就恢复」那条路——否则一次
 /// 手动探活会把刚按阈值停掉的号放回去，下一条请求再停一次，来回拉锯。
-pub(super) async fn park_if_quota_nearly_exhausted(
+pub(crate) async fn park_if_quota_nearly_exhausted(
     store: &std::sync::Arc<store::CredentialStore>,
     cred: &crate::credentials::Credential,
     info: &RateLimitInfo,
@@ -340,7 +340,7 @@ fn human_secs(d: std::time::Duration) -> String {
 /// 该窗口是否属于**超额/回补池**而非账号基础额度（实测形态：`7d_oi`、`overage`）。
 ///
 /// 它满了只说明「这条超额通道走不通」，不代表账号额度耗尽——同一时刻别的模型照常 200，
-/// 故既不判账号级（[`rate_limit_scope`]），也不拿它的 reset 当账号冷却
+/// 故既不判账号级（[`rate_limit_scope_for`]），也不拿它的 reset 当账号冷却
 /// （[`RateLimitInfo::exhausted_base_reset`]）。两处必须同一口径，故抽成一个函数。
 fn is_overage_window(w: &str) -> bool {
     w.ends_with("_oi") || w.contains("overage")
@@ -435,13 +435,13 @@ pub(crate) struct RateLimitInfo {
     pub(super) overage_in_use: Option<bool>,
     /// `anthropic-ratelimit-unified-overage-disabled-reason`（实测值 `org_level_disabled`）：
     /// 这次请求本该走 usage credits，但组织没开。它单独出现、**不带任何额度窗口头**时，说明
-    /// 这个模型压根不在该套餐的额度窗口里——Pro 号打 fable 就是这个形态，见 [`rate_limit_scope`]。
+    /// 这个模型压根不在该套餐的额度窗口里——Pro 号打 fable 就是这个形态，见 [`rate_limit_scope_for`]。
     pub(super) overage_disabled_reason: Option<String>,
     /// **所有** `anthropic-ratelimit-unified-<窗口>-status` 的取值（窗口名原样保留）。
     ///
     /// 刻意不写死窗口名：实测除了 `5h`/`7d`，还有 `7d_oi`（7 天含超额），而**真正被拒的
     /// 正是它**——只解析 5h/7d 会看到「两个窗口都没满」，从而把一次账号级限流误判成模型
-    /// 容量限制。窗口种类是上游说了算的，只能全收，见 [`rate_limit_scope`]。
+    /// 容量限制。窗口种类是上游说了算的，只能全收，见 [`rate_limit_scope_for`]。
     pub(super) window_status: Vec<(String, String)>,
     /// 所有 `…-<窗口>-utilization` 的取值。同上，全收。
     pub(super) window_utilization: Vec<(String, f64)>,
@@ -563,7 +563,7 @@ impl RateLimitInfo {
     /// 到点自动回到调度池里参与正常选号，不做定时探活、也不提前放出去撞。上限经历过
     /// 6h → 24h → 7d：夹得比真实窗口短，等于每到上限就把这个号放出去白撞一次 429
     /// （上游实测给过 63 小时的 `retry-after`，7d 窗口耗尽时还会更长）。
-    /// 冷却现在是硬门禁（见 [`store::CredentialStore::select_for_device`]），
+    /// 冷却现在是硬门禁（见 [`crate::store::CredentialStore::select_with_slot`]），
     /// 睡过头的代价由「连通性测试成功自动解除」和控制台的手动解除兜底。
     pub(super) fn cooldown(&self, account_level: bool) -> std::time::Duration {
         let now = crate::credentials::now_secs() as i64;
@@ -675,7 +675,7 @@ impl RateLimitInfo {
     ///
     /// 供 [`park_if_quota_nearly_exhausted`] 判定与写原因文案。取使用率最高的那个纯粹是为了
     /// 让文案指向最有说服力的那一个——停多久另算，见 [`Self::quota_pause_cooldown`]。
-    /// 超额族窗口不算（[`is_overage_window`]），口径与 [`rate_limit_scope`] 一致。
+    /// 超额族窗口不算（[`is_overage_window`]），口径与 [`rate_limit_scope_for`] 一致。
     ///
     /// 阈值按窗口分档取（[`QuotaPauseThresholds`]）：5h 用 5h 那档、7d 用 7d 那档，某档关着
     /// 时那个窗口再满也不参与判定。
@@ -719,12 +719,12 @@ impl RateLimitInfo {
     }
 
     /// 已被拒/已打满的**基础窗口**（排除超额族）中最晚的那个 `*-reset`——账号级冷却该睡到的
-    /// 时刻，也是 [`rate_limit_scope`] 判账号级的依据本身。
+    /// 时刻，也是 [`rate_limit_scope_for`] 判账号级的依据本身。
     ///
     /// 取**最晚**而不是最早：5h 和 7d 同时耗尽时，5h 到点了 7d 照样拦着，早醒只是白撞一发
     /// 429 再重新睡回去。而只有一个窗口满时 max 退化成它自己，正是要的答案。
     ///
-    /// 只看基础窗口，与 [`rate_limit_scope`] 用同一个 [`is_overage_window`] 口径：超额池
+    /// 只看基础窗口，与 [`rate_limit_scope_for`] 用同一个 [`is_overage_window`] 口径：超额池
     /// （`7d_oi`/`overage`）满不是账号额度耗尽，它压根走不到账号级这一档。
     pub(super) fn exhausted_base_reset(&self) -> Option<i64> {
         let rejected = |w: &str| {
@@ -744,7 +744,7 @@ impl RateLimitInfo {
 ///
 /// 取 30 秒：容量限制是「这一阵挤」，不是「这个号没额度了」，躲一小会儿就该让它回来试；
 /// 押太久等于把一个健康账号的这个模型白白闲置。
-pub(super) const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
+pub(crate) const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
 
 /// 冷却时长的上限：7 天窗口 + 1 小时余量。
 ///
@@ -752,7 +752,7 @@ pub(super) const DEFAULT_MODEL_COOLDOWN_SECS: i64 = 30;
 /// 请求算的，而 reset 时刻本身还可能被上游微调。上限存在的意义只剩「挡住明显异常的头」
 /// （比如 reset 落在几年后），不再是「每隔 N 小时放出去试一次」——那种试探每次都要白撞
 /// 一发 429，而额度没到点是不会自己长回来的。
-pub(super) const MAX_RATE_LIMIT_COOLDOWN_SECS: i64 = 7 * 24 * 3600 + 3600;
+pub(crate) const MAX_RATE_LIMIT_COOLDOWN_SECS: i64 = 7 * 24 * 3600 + 3600;
 
 /// 瞬时限流（容量/请求速率）那一档的冷却上限：60 秒。见
 /// [`RateLimitInfo::transient_cooldown`]。
@@ -761,7 +761,7 @@ pub(super) const MAX_RATE_LIMIT_COOLDOWN_SECS: i64 = 7 * 24 * 3600 + 3600;
 /// 未必按同一口径算（实测见过直接给额度窗口重置时刻的），照单全收会把一个额度充足的号
 /// 按几十小时锁住。夹到一分钟：真需要等更久时，客户端下一条请求会再撞一发、再冷却一分钟，
 /// 代价是一次往返；夹错方向（该等 1 小时却只等 1 分钟）远比反过来便宜。
-pub(super) const MAX_TRANSIENT_COOLDOWN_SECS: i64 = 60;
+pub(crate) const MAX_TRANSIENT_COOLDOWN_SECS: i64 = 60;
 
 /// 上游 429 但没给任何可用的等待时间时，凭证的默认冷却时长。
 ///

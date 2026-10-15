@@ -296,7 +296,7 @@ fn reminder_block(s: &str) -> serde_json::Value {
 }
 
 /// 这段历史里已经有一份环境说明（同一条请求改写了两遍之类）：某条 `role: system` 环境说明
-/// （首条之后第一个合法落点，不一定是 msgs[1]），或首条用户消息开头那个提醒块。
+/// （首条之后第一个合法落点，不一定是 msgs\[1]），或首条用户消息开头那个提醒块。
 fn has_env_note(msgs: &[serde_json::Value]) -> bool {
     let reminder = msgs
         .iter()
@@ -538,7 +538,7 @@ fn locate_switch(
 /// 把历史里那条模型说明补回它当时所在的位置。调用点：
 ///
 /// - [`apply_sim_thread`] 的 `create` 分支（续轮上游线程里仍有，不用补）；
-/// - 关着 message thread 时 [`crate::proxy::rewrite_body`] 走的那条路（完整历史每轮重发，必补）。
+/// - 关着 message thread 时 [`crate::proxy::rewrite_body_out`] 走的那条路（完整历史每轮重发，必补）。
 ///
 /// `switch.0` 是触发换模型那条用户消息在出站 `messages` 里的下标（[`locate_switch`] 核对过）。
 /// 落位同 [`place_model_notice`]：`mid_conv_sys` 为 `true`（opus/sonnet/fable/haiku-5-5）时作为独立

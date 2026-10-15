@@ -32,7 +32,7 @@ use super::upstream::{Aggregated, SseAggregator};
 /// 不带引号，且后半句还列着一串**合法**类型，裸子串判会把它们一并学成「不支持」，故另有
 /// [`cited_in_tool_type_list`] 只认冒号后那一段；采样参数点名的形态是 `` `取值` ``
 /// （[`cited_in_backticks`]）；prefill 那句不点取值，整句认（[`cited_prefill`]）。
-pub(super) struct ShapeProbe {
+pub(crate) struct ShapeProbe {
     /// 记忆表里的字段标签，同时用于日志。
     pub(super) field: &'static str,
     /// 报错文案里必须出现的字段名（小写比对）。
@@ -83,7 +83,7 @@ fn is_qualified_rejection(message: &str) -> bool {
 
 /// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取、怎么算被点名」，学习与
 /// 拦截两侧都不必改——它们只跟这张表打交道。
-pub(super) const SHAPE_PROBES: &[ShapeProbe] = &[
+pub(crate) const SHAPE_PROBES: &[ShapeProbe] = &[
     ShapeProbe {
         field: "effort",
         keyword: "effort",
@@ -517,7 +517,7 @@ const APP_REFUSAL_FIELD: &str = "system_sha";
 
 /// 两格记忆：上游回过零输出的「模型 + `max_tokens`」，与上游拒答过的「模型 + 提示词哈希」。
 /// 零输出格的值是本地拒时回给客户端的那段文案：当时截下的上游回复开头（信息就在开头——
-/// 一段没有 `content` 的 Message）。拒答格的值是 [`RefusedPrompt`]：判决文案「[类别]
+/// 一段没有 `content` 的 Message）。拒答格的值是 [`RefusedPrompt`]：判决文案「\[类别]
 /// stop_details=<原样 JSON>」（判决在流末尾，开头截不到）给日志与控制台看，外加上游那次的
 /// **完整响应体**——命中时不是 luban 自己造一条 403，而是把上游那次的 200 + 体原样回放给
 /// 客户端，见 [`replay_refusal`]。
@@ -546,7 +546,7 @@ pub struct EmptyReplyRejections {
 
 /// 一个识别不了会话的应用（模型 + system）在上游的战绩：到过上游几条、被分类器拒了几条。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AppCounter {
+pub(crate) struct AppCounter {
     pub(super) total: u32,
     pub(super) refused: u32,
 }
@@ -558,15 +558,15 @@ const APP_REFUSAL_MIN_REFUSALS: u32 = 3;
 /// 单看一条拒答分不开两者，比例分得很开。
 const APP_REFUSAL_MIN_RATIO_PCT: u32 = 30;
 /// 计数器最多记多少个应用；满了整体清掉重计（只是进程内的统计，丢了代价是多送几条）。
-pub(super) const APP_COUNTER_MAX_KEYS: usize = 4096;
+pub(crate) const APP_COUNTER_MAX_KEYS: usize = 4096;
 
 /// 拒答格里的一条：上游对这条提示词的判决文案，与当时那次响应的原样体。
 ///
 /// 没有 `reply` 的拒答**不进表**（0.3.98 之前学的行回填时按过期删掉、重学）：这一格的用途
 /// 就是原样回放，回放不出来就不该拦。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct RefusedPrompt {
-    /// 「[类别] stop_details=<原样 JSON>」，见 [`ReqLog::note_unanswered_reply`]。
+pub(crate) struct RefusedPrompt {
+    /// 「\[类别] stop_details=<原样 JSON>」，见 [`ReqLog::note_unanswered_reply`](crate::proxy::ReqLog::note_unanswered_reply)。
     pub(super) verdict: String,
     /// 上游那次的响应体与形态，见 [`store::LearnedReply`]。
     pub(super) reply: store::LearnedReply,
@@ -583,7 +583,7 @@ pub type EmptyReplyMemory = std::sync::Arc<parking_lot::RwLock<EmptyReplyRejecti
 /// 能不能读写文件）风险不一样，判决未必一样——键取窄一点，宁可多送一条，不用一条判决拦
 /// 另一种上下文。缺失的字段按「没有」哈希，与显式 `null` / `[]` 不同，这是有意的：形态
 /// 不同就是不同的请求。
-pub(super) fn prompt_digest(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn prompt_digest(body: &serde_json::Value) -> Option<String> {
     use sha2::{Digest, Sha256};
     let messages = body.get("messages")?;
     let mut h = Sha256::new();
@@ -604,7 +604,7 @@ pub(super) fn prompt_digest(body: &serde_json::Value) -> Option<String> {
 /// 派生的会话 id 按「账号 + 指纹」恒定、还把同账号上的 Go、python、node 全折成一个，拿它当键
 /// 既太粗又和账号绑死；而对这类来访，system 就是「哪个应用在说话」——封号复盘（`ban/`）里那场
 /// reasoning_extraction 风暴 568 条请求只有 4 种 system，正文每条不同、提示词哈希永远对不上。
-pub(super) fn app_system_digest(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn app_system_digest(body: &serde_json::Value) -> Option<String> {
     use sha2::{Digest, Sha256};
     let system = body.get("system")?;
     let empty = match system {
@@ -624,7 +624,7 @@ pub(super) fn app_system_digest(body: &serde_json::Value) -> Option<String> {
 /// 这条请求是不是来自**已知被上游拒答过的应用**（同一模型、`system` 逐字相同，见
 /// [`app_system_digest`]）；是则给出当时记下的判决与上游那次的原样响应体。只对识别不了会话的
 /// 来访调用，见 [`EmptyReplyRejections::apps`]。
-pub(super) fn known_app_refusal(
+pub(crate) fn known_app_refusal(
     mem: &EmptyReplyMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
@@ -646,7 +646,7 @@ pub(super) fn known_app_refusal(
 /// 为什么按比例而不是一条就学：同一批中转站上既有拒答率过半的风暴应用，也有固定 system、
 /// 偶尔撞一次分类器的真人会话（复盘里 1% 到 2%）；一条就学会把后者整个应用连坐 7 天。
 /// 已学过的应用不再计。
-pub(super) fn record_app_request(
+pub(crate) fn record_app_request(
     mem: &EmptyReplyMemory,
     model: &str,
     digest: &str,
@@ -686,7 +686,7 @@ pub(super) fn record_app_request(
 /// 把一个识别不了会话的应用（模型 + system 哈希）记成「上游一律拒答」，之后同应用的每条请求
 /// 回放 `reply`。门槛在 [`record_app_request`] 里判，这里只管写。返回**这次新学到**的那条
 /// （已有的不重复），调用方拿去落库。
-pub(super) fn remember_app_refusal(
+pub(crate) fn remember_app_refusal(
     mem: &EmptyReplyMemory,
     model: &str,
     digest: &str,
@@ -718,7 +718,7 @@ pub(super) fn remember_app_refusal(
 /// 这条提示词是不是**已知**被上游拒答过的（同一模型、`system` + `messages` + `tools` +
 /// `tool_choice` 逐字相同）；是则给出当时记下的判决文案（`[类别] stop_details=…`）与上游那次
 /// 的原样响应体（[`RefusedPrompt`]）。
-pub(super) fn known_refused_prompt(
+pub(crate) fn known_refused_prompt(
     mem: &EmptyReplyMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
@@ -734,7 +734,7 @@ pub(super) fn known_refused_prompt(
 
 /// 上游拒答了这条提示词 → 连同上游那次的原样响应体记进 [`EmptyReplyMemory`]。返回**这次
 /// 新学到**的那条（已有的不重复），调用方拿去落库。不设上限，见 [`EmptyReplyRejections`]。
-pub(super) fn remember_refused_prompt(
+pub(crate) fn remember_refused_prompt(
     mem: &EmptyReplyMemory,
     model: &str,
     digest: &str,
@@ -764,14 +764,14 @@ pub(super) fn remember_refused_prompt(
     })
 }
 
-/// [`UsageSniffer::reply`] 最多留多少字节，超过就不学这条拒答。输出前被拒的体只有几百字节到
+/// [`UsageSniffer::reply`](crate::proxy::UsageSniffer::reply) 最多留多少字节，超过就不学这条拒答。输出前被拒的体只有几百字节到
 /// 几 KB（流式是 `message_start` + 若干 `ping` + `message_delta` + `message_stop`）；64 KiB
 /// 是给 `stop_details.explanation` 与偶发的长 usage 留的余量，正常回复早在几 KB 内就见到
 /// 第一个内容块、停止攒了。
-pub(super) const REFUSAL_REPLY_BYTES: usize = 64 * 1024;
+pub(crate) const REFUSAL_REPLY_BYTES: usize = 64 * 1024;
 
 /// SSE 响应的 `content-type`，与上游一致。
-pub(super) const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
+pub(crate) const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
 
 /// 把上游那次的拒答按**这次来访要的形态**回放：200 + 上游的体。
 ///
@@ -779,7 +779,7 @@ pub(super) const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
 /// 整段 JSON 走 [`SseAggregator`]（与来访非流式、上游 SSE 时的聚合路径同一套），整段 JSON →
 /// SSE 走 [`message_to_sse`]。转不出来（学到的体残缺、解析失败）返回 `None`，调用方照常转发
 /// 上游——宁可多送一条，不回一段拼不齐的响应。
-pub(super) fn replay_refusal(reply: &store::LearnedReply, wants_stream: bool) -> Option<Response> {
+pub(crate) fn replay_refusal(reply: &store::LearnedReply, wants_stream: bool) -> Option<Response> {
     let (content_type, body): (&str, Vec<u8>) = match (reply.sse, wants_stream) {
         (true, true) => (SSE_CONTENT_TYPE, reply.body.clone().into_bytes()),
         (false, false) => ("application/json", reply.body.clone().into_bytes()),
@@ -812,7 +812,7 @@ fn empty_reply_row_key(field: &str, value: &str) -> Option<i64> {
 /// 用户消息、带 `max_tokens`** 的请求才归类；其余（带 tools、多轮、没写 `max_tokens`）返回
 /// `None`——它们既不学也不拒。模型取来访声明的那个（与 [`known_empty_reply`] 同一侧，学与
 /// 判必须看同一个值）。
-pub(super) fn empty_reply_class(
+pub(crate) fn empty_reply_class(
     model: Option<&str>,
     body: Option<&serde_json::Value>,
 ) -> Option<(String, i64)> {
@@ -831,7 +831,7 @@ pub(super) fn empty_reply_class(
 ///
 /// 只有「同一个模型、同一种无 tools 单条消息、同一个 `max_tokens`」确实回过一次零输出才
 /// `Some`。没学过的一律照常往上游发。
-pub(super) fn known_empty_reply(
+pub(crate) fn known_empty_reply(
     mem: &EmptyReplyMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,
@@ -846,7 +846,7 @@ pub(super) fn known_empty_reply(
 
 /// 上游对这一类回了零输出 → 记进 [`EmptyReplyMemory`]。返回**这次新学到**的那条（已有的
 /// 不重复、表满了不记），调用方拿去落库。
-pub(super) fn remember_empty_reply(
+pub(crate) fn remember_empty_reply(
     mem: &EmptyReplyMemory,
     model: &str,
     max_tokens: i64,
@@ -899,7 +899,7 @@ pub type RejectionLog = std::sync::Arc<parking_lot::Mutex<RejectionCounters>>;
 /// 取 10 秒：撞上限的客户端往往每几十毫秒重试一次（实测有 67ms 一发的），一条不落地记就是
 /// 每秒十几行 WARN，几分钟能把日志刷得没法看，真正要查的东西全被挤走了。10 秒足够把一次
 /// 突发收成一行，又短到「这台机器还在撞」这件事不会从日志里消失——限流本身最长也就 60 秒。
-pub(super) const REJECTION_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const REJECTION_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 抑制表最多留多少个键。键是客户端自报的 id，乱编 id 的脚本能把表撑大，故与限流窗口同样
 /// 需要清扫（[`take_rejection_log_slot`]）。
@@ -914,7 +914,7 @@ const REJECTION_LOG_MAX_KEYS: usize = 4096;
 /// **代价说清楚**：客户端不再发了之后，最后那截憋着的条数没有下一行可挂，就丢了；表被撑爆
 /// 触发清扫时，被清掉的老键同理。两者都只影响计数的尾巴，不影响「撞没撞、撞了多久」——
 /// 为它加一个定时冲刷的后台任务，不值当。
-pub(super) fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u64> {
+pub(crate) fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u64> {
     let now = std::time::Instant::now();
     let mut map = log.lock();
     if map.len() > REJECTION_LOG_MAX_KEYS {
@@ -943,7 +943,8 @@ pub(super) fn take_rejection_log_slot(log: &RejectionLog, key: &str) -> Option<u
 ///
 /// 第二项是档位的锚点而不是「上次命中时刻」：升档只看这个锚点走了多久，同一档窗口内再撞
 /// 多少发都不刷新它，见 [`next_transient_backoff_at`]。
-type TransientStreaks = std::collections::HashMap<(i64, String), (u32, std::time::Instant)>;
+pub(crate) type TransientStreaks =
+    std::collections::HashMap<(i64, String), (u32, std::time::Instant)>;
 
 /// [`TransientStreaks`] 的共享句柄，挂在 [`crate::web::AppState`] 上。
 ///
@@ -954,7 +955,7 @@ pub type TransientBackoff = std::sync::Arc<parking_lot::Mutex<TransientStreaks>>
 ///
 /// 起点取 2 秒而不是 1 秒：1 秒的退避对一个正在拥堵的上游几乎等于不退，第一发就该给客户端
 /// 一个真的能让出口喘口气的间隔；而 2 秒对偶发的单次限流也不算长。
-pub(super) const TRANSIENT_BACKOFF_BASE_SECS: u64 = 2;
+pub(crate) const TRANSIENT_BACKOFF_BASE_SECS: u64 = 2;
 
 /// 一个档位挂了多久没能往上走，就把连撞计数清零。
 ///
@@ -962,7 +963,7 @@ pub(super) const TRANSIENT_BACKOFF_BASE_SECS: u64 = 2;
 /// 拥堵，不该清零；而两倍于此都没能升档（最长的一档也才 60 秒，故这中间至少有 60 秒没人撞
 /// 过），说明上一阵已经过去，下次该从 2 秒重新数起——不然计数只增不减，几小时后偶发一次
 /// 限流也会被判成「连撞第 9 次」，直接甩给客户端 60 秒。
-pub(super) const TRANSIENT_BACKOFF_RESET: std::time::Duration =
+pub(crate) const TRANSIENT_BACKOFF_RESET: std::time::Duration =
     std::time::Duration::from_secs(2 * MAX_TRANSIENT_COOLDOWN_SECS as u64);
 
 /// 退避表最多留多少格。键是 `(账号, 模型)`，模型名来自来访请求体，故与拒绝日志同样需要清扫。
@@ -972,16 +973,16 @@ const TRANSIENT_BACKOFF_MAX_KEYS: usize = 4096;
 ///
 /// 取 6：正好是退避涨到封顶的那一档（2→4→8→16→32→60）。**退避都涨到头了还在撞**，说明这
 /// 不是一阵拥堵，而是这条路线此刻真的走不通——再无限吞下去，客户端就只是一直吃 429，而我们
-/// 手里明明还有别的号没试过。到点即把这一格挪出调度池（见 [`park_rate_limited`]），
+/// 手里明明还有别的号没试过。到点即把这一格挪出调度池（见 [`park_rate_limited`](crate::proxy::park_rate_limited)），
 /// 让**后续**请求改走别的号；连撞计数同时清零，冷却过后重新从 2 秒数起。
 ///
 /// 数的是**档位**不是发数，两者的区别就是这一档的成败：档位只随墙钟往上走（见
 /// [`next_transient_backoff_at`]），故走到第 6 档意味着这条路线已经连续坏了
 /// 2+4+8+16+32≈62 秒。曾经它数的是发数，于是一批并发一次性就把 6 格吃光——线上那份日志里
 /// 6 条在飞的请求在 63 毫秒内撞完（`ttft_ms` 都在 230 上下），把这个号的这个模型直接硬冷却
-/// 挪出了调度池，1.5 秒内一路点掉 5 个号，正是 [`park_rate_limited`] 那段注释里说要防的
+/// 挪出了调度池，1.5 秒内一路点掉 5 个号，正是 [`park_rate_limited`](crate::proxy::park_rate_limited) 那段注释里说要防的
 /// 「转够一圈全池都在冷却」。
-pub(super) const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
+pub(crate) const TRANSIENT_MAX_ATTEMPTS: u32 = 6;
 
 /// 一条请求因「套餐不含这个模型」最多换几个号。一次失败就学到一条记录、之后的选号自动绕开，
 /// 所以这个数只在**冷启动**（记录还没学到）时被碰到；设成池子里 Pro 号的常见数量级即可。
@@ -990,8 +991,8 @@ pub(super) const MODEL_DENIAL_MAX_SWAPS: usize = 4;
 /// 这个号是不是 Max 档（个人 Max，或团队/企业号拿的 Max 额度档——两者 `tier` 都以 `Max` 开头，
 /// 见 `crate::oauth::tier_from`）。等级未知按「不是」算：那时唯一的信息来源是上游的判决。
 /// 只有 Max 含 fable/mythos，其余等级撞到那形态的 429 都记「套餐不含」，见
-/// [`LimitScope::Unsupported`]。
-pub(super) fn is_max_plan(cred: &crate::credentials::Credential) -> bool {
+/// [`LimitScope::Unsupported`](crate::proxy::LimitScope::Unsupported)。
+pub(crate) fn is_max_plan(cred: &crate::credentials::Credential) -> bool {
     cred.tier.as_deref().is_some_and(|t| t.starts_with("Max"))
 }
 
@@ -1010,7 +1011,7 @@ pub(super) fn transient_backoff_for(attempts: u32) -> std::time::Duration {
 /// [`MAX_TRANSIENT_COOLDOWN_SECS`]，静默 [`TRANSIENT_BACKOFF_RESET`] 后清零。
 ///
 /// **为什么必须是指数而不是一个固定值**：瞬时限流那档我们已经不换号、也不再把号挪出调度池
-/// （见 [`park_rate_limited`]），交回客户端的就是一发 429。若每次都告诉它「30 秒后再来」，
+/// （见 [`park_rate_limited`](crate::proxy::park_rate_limited)），交回客户端的就是一发 429。若每次都告诉它「30 秒后再来」，
 /// 一个正在拥堵的出口面对的就是一群按固定节拍同时回来的客户端——退避的意义正在于**让重试
 /// 的密度随失败次数下降**，固定值做不到这一点，秒级重试更是直接把拥堵喂大。指数退避让第一次
 /// 偶发限流几乎无感（2 秒），而真的撞上一堵墙时迅速拉到分钟级。
@@ -1033,7 +1034,7 @@ pub(super) fn next_transient_backoff(
 
 /// 同 [`next_transient_backoff`]，但由调用方给出「现在」——清零那条路要等两分钟才走得到，
 /// 拿真实时钟测等于不测。
-pub(super) fn next_transient_backoff_at(
+pub(crate) fn next_transient_backoff_at(
     state: &TransientBackoff,
     cred_id: i64,
     model: &str,
@@ -1068,7 +1069,7 @@ pub(super) fn next_transient_backoff_at(
 
 /// 记忆表的容量上限。每个「模型 + 字段 + 没见过的取值」占一格，而取值来自来访请求，
 /// 也就是说这张表的增长是外部可控的——封顶后不再插入（既有条目照常生效）。
-pub(super) const SHAPE_MEMORY_CAP: usize = 512;
+pub(crate) const SHAPE_MEMORY_CAP: usize = 512;
 
 /// 上游用一条 400 点名了请求里的某个取值 → 记进 [`ShapeMemory`]，之后同款组合由
 /// [`known_shape_rejection`] 在本地拦下，不再往上游送。
@@ -1077,7 +1078,7 @@ pub(super) const SHAPE_MEMORY_CAP: usize = 512;
 /// 拿它当键既够用，又不会把某个模型学到的结论套到别的模型头上。
 ///
 /// 返回**这次新学到**的条目（已知的不算），调用方拿去落库；空 Vec 即什么也没学到。
-pub(super) fn remember_shape_rejection(
+pub(crate) fn remember_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
     inbound: Option<&serde_json::Value>,
@@ -1137,7 +1138,7 @@ pub(super) fn remember_shape_rejection(
 ///
 /// `on_outbound` 选查哪一组探针（[`ShapeProbe::on_outbound`]）：入口传 `false` 与来访原件，
 /// 改写之后、发送之前传 `true` 与出站体。
-pub(super) fn known_shape_rejection(
+pub(crate) fn known_shape_rejection(
     mem: &ShapeMemory,
     model: Option<&str>,
     body: Option<&serde_json::Value>,

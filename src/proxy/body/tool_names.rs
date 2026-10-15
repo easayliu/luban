@@ -52,7 +52,7 @@ const BLOCKED_TOOL_NAMES: &[&str] = &["skill_manage", "skill_view", "skills_list
 ///
 /// **为什么要混淆**：`tools[*].name` 是上游判定「这是不是第三方应用」的一个已验证判据，
 /// 命中 [`BLOCKED_TOOL_NAMES`] 就把额度改扣超额池并回 400。加 `mcp__` 前缀后实测豁免。
-pub(in crate::proxy) struct ToolNameMap {
+pub(crate) struct ToolNameMap {
     /// 真名 → 假名，请求侧用。
     pub(in crate::proxy) forward: std::collections::HashMap<String, String>,
     /// (假名, 真名)，按假名长度**倒序**——短假名可能是长假名的子串，先替长的才不会被吃掉。
@@ -65,7 +65,7 @@ pub(in crate::proxy) struct ToolNameMap {
 /// - server tool（`web_search_20250305` 等）——改了上游直接拒；
 /// - `mcp__` 前缀——实测豁免，且改了会破坏 MCP 命名空间语义；
 /// - [`config::CC_TOOL_NAMES`] 里的官方 CC 工具名。
-fn should_mimic_tool(t: &serde_json::Value) -> bool {
+pub(crate) fn should_mimic_tool(t: &serde_json::Value) -> bool {
     let kind = t.get("type").and_then(|k| k.as_str()).unwrap_or_default();
     if !matches!(kind, "" | "custom" | "function") {
         return false;
@@ -83,9 +83,7 @@ fn should_mimic_tool(t: &serde_json::Value) -> bool {
 /// **假名对同一组工具名恒定**：seed 取 `sha256(名字集合)`，同一会话内每轮请求得到同一套假名，
 /// 上游的 prompt cache 才命中得了。客户端中途增删工具会让整套假名全变——历史里的
 /// `tool_use.name` 由 [`apply_tool_names`] 用**新**映射一起重写，故仍然自洽，代价只是缓存失效。
-pub(in crate::proxy) fn build_tool_name_map(
-    body: Option<&serde_json::Value>,
-) -> Option<ToolNameMap> {
+pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> {
     let tools = body?.get("tools")?.as_array()?;
     let declared: std::collections::HashSet<&str> =
         tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
@@ -145,7 +143,7 @@ pub(in crate::proxy) fn build_tool_name_map(
 /// - 工具增删与 ToolSearch 结果里按名字的引用，见 [`rename_tool_references`]
 ///
 /// 漏掉第三处的话，上游会因为 `tool_use` 引用了一个 `tools` 里没声明的名字而拒掉整条请求。
-pub(in crate::proxy) fn apply_tool_names(v: &mut serde_json::Value, map: &ToolNameMap) -> bool {
+pub(crate) fn apply_tool_names(v: &mut serde_json::Value, map: &ToolNameMap) -> bool {
     let mut changed = false;
     let mut rename = |obj: &mut serde_json::Value| {
         let Some(name) = obj.get("name").and_then(|n| n.as_str()) else { return };
@@ -471,7 +469,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// 是就逐行还原，不是（整段 JSON）就攒齐了一次还原。留存的状态跟着流走，流结束时 flush。
 ///
 /// 用 `unfold` 而不是 `map`：`map` 收不到「上游流结束」这个事件，没法把留存的尾字节吐出去。
-pub(in crate::proxy) fn restore_tool_names_stream<S>(
+pub(crate) fn restore_tool_names_stream<S>(
     inner: S,
     map: std::sync::Arc<ToolNameMap>,
     sse: bool,

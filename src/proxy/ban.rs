@@ -53,7 +53,7 @@ const ORG_OAUTH_FALLBACK_COOLDOWN: std::time::Duration = std::time::Duration::fr
 
 /// 从上游错误响应体解析 `(error.type, error.message)`；解析失败时 message 退化为整段原文。
 /// 取一个响应头的文本值；缺失或非 UTF-8 时返回 `"-"`，与日志里其余缺值字段同形。
-pub(super) fn header_text(headers: &HeaderMap, name: &str) -> String {
+pub(crate) fn header_text(headers: &HeaderMap, name: &str) -> String {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string()
 }
 
@@ -241,7 +241,7 @@ const THIRD_PARTY_PHRASES: &[&str] = &["third-party app", "extra usage"];
 /// **注意它不会被 [`classify_account_rejection`] 误判成封号**：这段文案里既没有 `oauth`/
 /// `invalid_grant`，也凑不出「主语 + 状态词」的共现，故不会停用凭证——账号是好的，
 /// 被拒的是请求形态。
-pub(super) fn is_third_party_rejection(body: &[u8]) -> bool {
+pub(crate) fn is_third_party_rejection(body: &[u8]) -> bool {
     let (etype, message) = parse_upstream_error(body);
     let hay = format!("{} {}", etype.as_deref().unwrap_or(""), message).to_lowercase();
     THIRD_PARTY_PHRASES.iter().any(|p| hay.contains(p))

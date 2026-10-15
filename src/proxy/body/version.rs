@@ -4,7 +4,7 @@ use super::*;
 
 /// 从一组头里取 `User-Agent` 供日志与落库用：没有该头或不是可打印 ASCII 时为 `-`。
 ///
-/// 来访头与出站头两侧都用它——[`ReqLog`] 两份 UA 各存各的，取值规则必须是同一套，
+/// 来访头与出站头两侧都用它——[`ReqLog`](crate::proxy::ReqLog) 两份 UA 各存各的，取值规则必须是同一套，
 /// 否则「入站 == 出站」这个判断会因为两边截断/回退方式不同而失真。
 ///
 /// 截断到 120 字符：官方 CC 那串（`claude-cli/2.1.220 (external, cli)`）只有 35 字符，
@@ -13,7 +13,7 @@ use super::*;
 ///
 /// 取值恒为可见 ASCII：`to_str()` 对非 ASCII 头值直接失败，那类一律落 `-`。按 `char` 截而不是
 /// `&s[..120]` 只是不给未来留坑——真按字节切，哪天换个不做此保证的取值方式就会切出 panic。
-pub(in crate::proxy) fn ua_of(headers: &HeaderMap) -> String {
+pub(crate) fn ua_of(headers: &HeaderMap) -> String {
     const MAX: usize = 120;
     match headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()) {
         Some(ua) if !ua.trim().is_empty() => ua.chars().take(MAX).collect(),
@@ -41,7 +41,7 @@ pub(crate) fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
 
 /// 从 `User-Agent` 里抠出 Claude Code 自报的版本：`claude-cli/2.1.220 (external, cli)`
 /// → `(2, 1, 220)`。UA 里没有 `claude-cli/`、或后面那串不是版本号时返回 `None`。
-pub(in crate::proxy) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
     let rest = ua.split_once("claude-cli/")?.1;
     // 版本串到第一个非「数字/点」字符为止（官方那串后面跟的是空格 + `(external, cli)`）。
     let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(rest.len());
@@ -55,7 +55,7 @@ pub(in crate::proxy) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
 /// 官方 billing header 的 `cc_entrypoint` 与 UA 这一段同源，`cap/` 里 433 条带 billing 的
 /// 请求逐条成对（418 条 `cli` ↔ `cli`、15 条 `sdk-cli` ↔ `sdk-cli`）。段名只认小写字母、
 /// 数字与 `-`，最长 32 字节；读不出或不规矩时返回 `None`，调用方按 `cli` 处理。
-pub(in crate::proxy) fn cc_ua_entrypoint(ua: &str) -> Option<&str> {
+pub(crate) fn cc_ua_entrypoint(ua: &str) -> Option<&str> {
     let rest = ua.split_once("claude-cli/")?.1;
     let inner = rest.split_once('(')?.1.split_once(')')?.0;
     let ep = inner.split(',').nth(1)?.trim();
@@ -68,7 +68,7 @@ pub(in crate::proxy) fn cc_ua_entrypoint(ua: &str) -> Option<&str> {
 /// 真实 CC 来访**自报**的身份，供补 billing header 等处沿用：版本取自
 /// [`trusted_cc_version`]，entrypoint 取自 [`cc_ua_entrypoint`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy) struct CcClient<'a> {
+pub(crate) struct CcClient<'a> {
     /// `x.y.z`。
     pub version: &'a str,
     /// UA 括号里第二段；读不出时为 `cli`。
@@ -94,12 +94,12 @@ pub(crate) fn known_latest_release() -> (u64, u64, u64) {
 /// 高于官方最新版的自报版本按「读不出版本」处理（`None`）：这不是官方客户端，跳过模拟、
 /// 沿用它的版本去补 billing header / 跑握手 / 发额度探测，都是在替一个不存在的版本背书。
 /// 低于最新版的一律认——用户不升级是常态，下限另有 [`below_min_client_version`] 管。
-pub(in crate::proxy) fn trusted_cc_version(ua: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn trusted_cc_version(ua: &str) -> Option<(u64, u64, u64)> {
     trusted_cc_version_against(ua, known_latest_release())
 }
 
 /// [`trusted_cc_version`] 的纯函数形态：`latest` 由调用方给，供测试不碰全局缓存。
-pub(in crate::proxy) fn trusted_cc_version_against(
+pub(crate) fn trusted_cc_version_against(
     ua: &str,
     latest: (u64, u64, u64),
 ) -> Option<(u64, u64, u64)> {
@@ -116,10 +116,7 @@ pub(in crate::proxy) fn trusted_cc_version_against(
 /// - `claude-cli/` 后面读不出版本号 —— 宁可放过，也不为一个解析不了的串把人挡在门外。
 ///
 /// 注意这只是一道**引导升级**的闸，不是安全边界：UA 是客户端自报的，随手改一个头就能绕过。
-pub(in crate::proxy) fn below_min_client_version(
-    ua: &str,
-    min: Option<&str>,
-) -> Option<(String, String)> {
+pub(crate) fn below_min_client_version(ua: &str, min: Option<&str>) -> Option<(String, String)> {
     let min = min?;
     let want = parse_version(min)?;
     let got = cc_cli_version(ua)?;

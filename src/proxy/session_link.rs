@@ -67,7 +67,7 @@ impl CcSessionLink {
 }
 
 /// 按会话 id 索引的模拟会话链条状态。
-struct CcSessionEntry {
+pub(crate) struct CcSessionEntry {
     prompt_id: String,
     /// 见 [`CcSessionLink::prompt_index`]：换一轮 prompt id 就加一。
     prompt_index: u32,
@@ -103,7 +103,7 @@ const MAX_THREADS_PER_SESSION: usize = 8;
 /// 出站历史若恰好是「`msgs` + 那条回复 + 新增的 user 消息」，就只发新增部分；对不上一律
 /// `create`（[`thread_decision`]）。
 #[derive(Debug, Clone)]
-struct ThreadState {
+pub(crate) struct ThreadState {
     /// 首条消息的指纹：同一个会话 id 下区分不同对话的第一道筛。
     root: u64,
     /// 线程形态指纹（[`ThreadPending::shape`]）：变了即官方会重新 `create` 的那类变化。
@@ -513,7 +513,7 @@ pub(super) fn thread_decision(
 ///
 /// 进程内存里就够：这些值只在一个会话活着的时候有意义，重启后客户端那边多半也换了会话；
 /// 落库反而会把「上次进程里那条 request-id」接到一个新会话上。
-static CC_SESSIONS: std::sync::LazyLock<
+pub(crate) static CC_SESSIONS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<(i64, String), CcSessionEntry>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
@@ -548,7 +548,7 @@ static CC_PREFIX_FPS: std::sync::LazyLock<parking_lot::Mutex<PrefixTable>> =
 /// 一条请求缓存前缀里**会进缓存键**的部分：`tools` 的指纹，加 `system` 各块正文
 /// （不含 billing header 那一块）。由 [`crate::proxy::cache_prefix_of`] 算。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CachePrefix {
+pub(crate) struct CachePrefix {
     pub(super) tools_fp: u64,
     pub(super) system: Vec<String>,
 }
@@ -777,7 +777,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// [`CC_SESSIONS`] 的键：**凭证 + 会话**，缺一不可，理由见那张表的注释。
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CcSessionKey<'a> {
+pub(crate) struct CcSessionKey<'a> {
     pub(super) cred_id: i64,
     pub(super) session_id: &'a str,
 }
@@ -1001,7 +1001,7 @@ pub(crate) enum CcRequestKind {
 impl CcRequestKind {
     /// 判据与 [`crate::telemetry`] 那边的 `Kind` 同源，只是这里还多认一个额度探测
     /// （遥测那边不需要区分它）。`beta` 是**来访自己**那串。
-    pub(super) fn of(v: &serde_json::Value, beta: &[String]) -> Self {
+    pub(crate) fn of(v: &serde_json::Value, beta: &[String]) -> Self {
         // 额度探测最先判：它**连 `system` 都没有**，后面每一条判据都以 `system` 或
         // `tools` 为前提，落到那里只会被当成 helper。
         if is_quota_probe_shaped(v) {
@@ -1076,7 +1076,7 @@ impl CcRequestKind {
     /// | 桌面端会话状态摘要 | 无工具，system 里有「A user kicked off a Claude Code agent to do a coding task and walked away」（`cap/auto-desktop-2.1.295-20261010-sub/00145`、`00056`，由桌面端发、不带身份句） |
     ///
     /// `count_tokens` 按路径认、不在这里判（调用方对不计费路径直接给类别）：它本来就不占会话。
-    pub(super) fn is_side_query(self, v: &serde_json::Value) -> bool {
+    pub(crate) fn is_side_query(self, v: &serde_json::Value) -> bool {
         let single = v.get("messages").and_then(|m| m.as_array()).is_some_and(|m| {
             m.len() == 1 && m[0].get("role").and_then(|r| r.as_str()) == Some("user")
         });
@@ -1161,10 +1161,10 @@ impl CcRequestKind {
         matches!(self, Self::Classifier | Self::QuotaProbe | Self::Prewarm)
     }
 
-    /// `anthropic-beta` 只补 `oauth`、别的一项不动（[`super::merge_beta_for`]）：SDK 子代理、
+    /// `anthropic-beta` 只补 `oauth`、别的一项不动（[`super::merge_beta_for`](crate::proxy::merge_beta_for)）：SDK 子代理、
     /// `/model` 预热（`00230` 官方那串没有 `advanced-tool-use` 与 `extended-cache-ttl`）与
     /// `count_tokens`（`00104` 等只有五项）。其余非主线程 profile 靠 beta 串自己认得出来，见
-    /// [`super::is_official_non_main_beta`]；主线程的一次性辅助调用要看体，见 [`super::BetaCtx::of`]。
+    /// [`super::is_official_non_main_beta`](crate::proxy::is_official_non_main_beta)；主线程的一次性辅助调用要看体，见 [`super::BetaCtx::of`](crate::proxy::BetaCtx::of)。
     pub(super) fn beta_only_oauth(self) -> bool {
         matches!(self, Self::Subagent | Self::Prewarm | Self::CountTokens)
     }
@@ -1195,7 +1195,7 @@ impl CcRequestKind {
     }
 }
 
-/// **判据不能借用 [`is_official_non_main_beta`]**——那是「要不要补主线程那几项 beta」，
+/// **判据不能借用 [`is_official_non_main_beta`](crate::proxy::is_official_non_main_beta)**——那是「要不要补主线程那几项 beta」，
 /// 和「带不带会话关联字段」是两码事，六个 profile 上的分界线根本不在同一处：
 ///
 /// | profile | 补主线程 beta | 带 `cc_prompt_id` / `diagnostics` |
@@ -1215,7 +1215,7 @@ impl CcRequestKind {
 /// 其余 CC 形态的请求都补。无工具 helper 官方带 `cc_prompt_id` 但不带 `diagnostics`，
 /// 而 luban 认不出它（它没有任何独有标记），归到「补」这一侧——多一个 `diagnostics`
 /// 的代价小于整类子代理都缺关联链。
-pub(super) fn client_session_link(
+pub(crate) fn client_session_link(
     body: Option<&serde_json::Value>,
     headers: &HeaderMap,
     sim: Option<&Simulation>,

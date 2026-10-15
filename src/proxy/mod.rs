@@ -2,7 +2,6 @@
 //!
 //! 透传请求体，仅替换鉴权：校验来访 API Key 后，注入选中凭证的 OAuth access_token
 //! 与 `anthropic-beta: oauth-2025-04-20`，响应流式原样回传。
-
 #[cfg(test)]
 use axum::http::HeaderName;
 use axum::{
@@ -19,77 +18,84 @@ use crate::store;
 use crate::web::AppState;
 
 mod openai_marker;
-#[cfg(test)]
-use openai_marker::find_openai_marker;
+#[allow(unused_imports)]
+pub(crate) use openai_marker::find_openai_marker;
 
 mod digest;
-#[cfg(test)]
-use digest::request_digest;
+#[allow(unused_imports)]
+pub(crate) use digest::request_digest;
 
 mod ban;
 #[cfg(test)]
-pub(crate) use ban::detect_account_ban;
+use ban::detect_account_ban;
 pub(crate) use ban::{
     AccountRejection, classify_account_rejection, park_org_oauth_disallowed, parse_upstream_error,
 };
-#[cfg(test)]
-use ban::{header_text, is_third_party_rejection};
+#[allow(unused_imports)]
+pub(crate) use ban::{header_text, is_third_party_rejection};
 
 mod headers;
 #[cfg(test)]
-use headers::{
-    BetaCtx, build_forward_headers, build_forward_headers_for, ensure_cache_ttl_beta,
-    ensure_fallback_beta, is_official_non_main_beta, merge_beta, merge_beta_for, orig_header_case,
-    simulated_beta,
+use headers::build_forward_headers;
+#[cfg(test)]
+use headers::merge_beta;
+#[allow(unused_imports)]
+pub(crate) use headers::{
+    BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta, ensure_fallback_beta,
+    is_official_non_main_beta, merge_beta_for, orig_header_case, simulated_beta,
 };
-use headers::{has_beta, uuid_v4};
+pub(crate) use headers::{has_beta, uuid_v4};
 
 mod session_link;
-#[cfg(test)]
-use session_link::{CcRequestKind, CcSessionKey, CcSessionLink, client_session_link};
+#[allow(unused_imports)]
+pub(crate) use session_link::{CcRequestKind, CcSessionKey, CcSessionLink, client_session_link};
 
 mod session_id;
-use session_id::incoming_session_id;
-#[cfg(test)]
-use session_id::{
+pub(crate) use session_id::incoming_session_id;
+#[allow(unused_imports)]
+pub(crate) use session_id::{
     account_session_id, bare_session_id, outbound_session_id, pin_session_id, session_id_conflict,
     session_id_for,
 };
 
 mod probe_detect;
-#[cfg(test)]
-use probe_detect::{PROBE_REPLY_TEXT, ProbeKind, message_to_sse, probe_reply, probe_signature};
+#[allow(unused_imports)]
+pub(crate) use probe_detect::{
+    PROBE_REPLY_TEXT, ProbeKind, message_to_sse, probe_reply, probe_signature,
+};
 
 mod thinking;
-#[cfg(test)]
-use thinking::{
+#[allow(unused_imports)]
+pub(crate) use thinking::{
     block_site, demote_thinking_blocks, error_block_path, is_redacted_thinking_data_error,
     is_thinking_modified_error, is_thinking_signature_error, latest_assistant_diff,
     preserve_thinking_encoding, thinking_block_error_kind, trace_thinking_block,
 };
 
 mod rate_limit;
-use rate_limit::RateLimitInfo;
+pub(crate) use rate_limit::RateLimitInfo;
 
 mod usage_grace;
 #[cfg(test)]
-use rate_limit::{
+use rate_limit::rate_limit_scope;
+#[allow(unused_imports)]
+pub(crate) use rate_limit::{
     DEFAULT_MODEL_COOLDOWN_SECS, LimitScope, MAX_RATE_LIMIT_COOLDOWN_SECS,
     MAX_TRANSIENT_COOLDOWN_SECS, park_if_quota_nearly_exhausted, park_rate_limited,
-    rate_limit_scope, rate_limit_scope_for,
+    rate_limit_scope_for,
 };
 pub(crate) use usage_grace::note_eval_features;
-mod cache_keepalive;
+pub(crate) mod cache_keepalive;
 mod lucky_cerf;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,
 };
-use usage_grace::{note_overage, usage_limit_wanted};
+pub(crate) use usage_grace::{note_overage, usage_limit_wanted};
 
 mod body;
-use body::ua_of;
-#[cfg(test)]
-use body::{
+pub(crate) use body::ua_of;
+#[allow(unused_imports)]
+pub(crate) use body::{
     CacheShape, CcClient, FALLBACKS_FIELD, ToolNameMap, align_system_shape, apply_tool_names,
     below_min_client_version, body_has_pair, body_has_user_id, build_tool_name_map, cc_cli_version,
     cc_tools_core, cc_tools_core_for, cc_ua_entrypoint, client_supplied_fallbacks,
@@ -103,29 +109,31 @@ use body::{
 pub(crate) use body::{has_cache_ttl_1h, parse_version};
 
 mod upstream;
-use upstream::Upstream;
-#[cfg(test)]
-use upstream::{
+pub(crate) use upstream::Upstream;
+#[allow(unused_imports)]
+pub(crate) use upstream::{
     Aggregated, InFlightGuard, SessionConcurrencyGuard, SseAggregator, UPSTREAM_SEND_WINDOW,
     aggregate_sse, error_status, note_upstream_send, upstream_load_snapshot,
 };
 pub(crate) use upstream::{SessionConcurrency, UpstreamLoad, in_flight_of};
 
 mod logging;
-#[cfg(test)]
-use logging::{RESPONSE_EXCERPT_BYTES, ReqLog, ShapeBits, shape_summary, shape_summary_of};
-use logging::{UsageSniffer, capture_forensics, spawn_usage_log};
+#[allow(unused_imports)]
+pub(crate) use logging::{
+    RESPONSE_EXCERPT_BYTES, ReqLog, ShapeBits, shape_summary, shape_summary_of,
+};
+pub(crate) use logging::{UsageSniffer, capture_forensics, spawn_usage_log};
 
 mod connectivity;
-#[cfg(test)]
-use connectivity::{
+#[allow(unused_imports)]
+pub(crate) use connectivity::{
     ProbeLog, ProbeQuota, aggregate_probe_sse, handshake_sequence, probe_body, probe_simulation,
 };
 pub(crate) use connectivity::{ProbeReport, probe};
 
 mod learned_rules;
-#[cfg(test)]
-use learned_rules::{
+#[allow(unused_imports)]
+pub(crate) use learned_rules::{
     APP_COUNTER_MAX_KEYS, AppCounter, REFUSAL_REPLY_BYTES, REJECTION_LOG_WINDOW, SHAPE_MEMORY_CAP,
     SHAPE_PROBES, SSE_CONTENT_TYPE, TRANSIENT_BACKOFF_BASE_SECS, TRANSIENT_BACKOFF_RESET,
     TRANSIENT_MAX_ATTEMPTS, app_system_digest, empty_reply_class, known_app_refusal,
@@ -139,20 +147,18 @@ pub(crate) use learned_rules::{
     learned_memory_len, resync_learned_memories, seed_learned_memories,
 };
 
-mod simulation;
+pub(crate) mod simulation;
 #[cfg(test)]
 use simulation::SimSessionSeed;
 #[cfg(test)]
 use simulation::{
-    CC_BASE_PROMPT_MIN_LEN, MAX_CACHE_BREAKPOINTS, SimEnv, SimulationReason, billing_header_text,
-    cap_system_blocks, cc_identity_well_formed, cc_profile_for, cc_system_rest, cc_version_suffix,
-    client_env, inbound_facts, is_official_thread_continuation, looks_like_uuid,
-    render_system_rest, sim_env_for, simulates_cc, simulation_reason,
+    CC_BASE_PROMPT_MIN_LEN, MAX_CACHE_BREAKPOINTS, SimEnv, SimulationReason, cap_system_blocks,
+    inbound_facts, looks_like_uuid, sim_env_for, simulates_cc, simulation_reason,
 };
-use simulation::{Simulation, is_cc_shaped};
+pub(crate) use simulation::{Simulation, is_cc_shaped};
 
 mod handler;
-use handler::handle_inner;
+pub(crate) use handler::handle_inner;
 
 /// 转发 `/v1/*` 到官方 API。
 /// 转发入口：给这条入站请求定一个 id，跑完 [`handle_inner`] 后把 id 写进响应头与错误体。
@@ -238,7 +244,7 @@ pub async fn handle(
 /// 转发请求体的上限。上游官方 /v1/messages 收 32MB，长对话、带附件的合法请求很容易超过
 /// axum 默认的 2MB，这里放到 64MB 留出余量，真正的大小判决交给上游。
 ///
-/// 体在 Key、最低版本、头上的会话闸都过了之后才读（[`handler::admit`]）：先读后验的话，
+/// 体在 Key、最低版本、头上的会话闸都过了之后才读（`handler::admit`）：先读后验的话，
 /// 不带 Key 的人并发灌 64MB 的体就能把内存吃满。
 pub(super) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
@@ -289,7 +295,7 @@ struct LocalRejectCtx {
 
 /// [`handle`] 与 [`handle_inner`] 之间关于「这条的流水谁来写」的约定。
 #[derive(Default)]
-struct RequestLogState {
+pub(crate) struct RequestLogState {
     /// 流水已经有人写了：建了 [`ReqLog`]（到过上游、正常收尾），或早退路径就地写了
     /// （[`log_early_upstream_failure`]）。仍为 false 的 4xx/5xx 才是真正的本地拒绝，由
     /// [`handle`] 按 [`local_reject_record`] 补一条。
@@ -573,7 +579,7 @@ fn annotate_error_json(bytes: &[u8], request_id: &str) -> Option<Vec<u8>> {
 
 /// 来访请求头里带的请求 id（若有）：New API 用 `{client_header:…}` 透传的终端用户 id、
 /// 官方 SDK 的 `x-client-request-id` 等。只记日志，不作主键——它不是 luban 发的，可能重复或缺失。
-fn client_request_id(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_request_id(headers: &HeaderMap) -> Option<String> {
     ["x-oneapi-request-id", "x-request-id", "x-client-request-id"]
         .iter()
         .find_map(|k| headers.get(*k).and_then(|v| v.to_str().ok()))
@@ -732,7 +738,7 @@ pub(super) fn last_user_text_contains(v: &serde_json::Value, needle: &str) -> bo
 ///
 /// 官方线序是 `model → messages → system → tools → metadata → max_tokens → … → stream`，
 /// 直接 append 会让补出来的 `system`/`metadata` 落到 `stream` 后面。key 顺序是这条链路上
-/// 唯一还留得住的形态信息（body 全程 `preserve_order`，见 [`rewrite_body`]），既然要装，
+/// 唯一还留得住的形态信息（body 全程 `preserve_order`，见 [`rewrite_body_out`]），既然要装，
 /// 就装到底。注意来访客户端自己那部分 key 序照旧不动——那是它的形态，不是我们要改的。
 pub(super) fn insert_top_level(
     v: &mut serde_json::Value,
@@ -845,7 +851,7 @@ pub(super) fn cache_slots(v: &serde_json::Value) -> Vec<CacheSlot> {
 /// 客户端自己带了 `user_id` 就不动——那条交给 [`spoof_identity`] 按原格式定点改写，
 /// 两条路只能有一条动它。凭证没有 `account_uuid`（旧库未回填）时返回 `false` 不造：
 /// 一个 `account_uuid` 为空、`device_id` 却是 64 位 hex 的组合，真实客户端不产生。
-pub(super) fn ensure_cc_metadata(
+pub(crate) fn ensure_cc_metadata(
     v: &mut serde_json::Value,
     cred: &crate::credentials::Credential,
     device_fp: &str,
@@ -885,7 +891,7 @@ pub(super) fn ensure_cc_metadata(
 }
 
 /// 读取请求体声明的模型名（顶层 `model`）。用于按模型分格的限流冷却，见
-/// [`rate_limit_scope`]。解析失败或没有该字段时返回 `None`（退化为账号级冷却）。
+/// [`rate_limit_scope_for`]。解析失败或没有该字段时返回 `None`（退化为账号级冷却）。
 fn request_model(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("model")?.as_str()?.to_string())
 }
@@ -952,6 +958,39 @@ pub(super) fn rate_limit_response(retry_after_secs: i64, message: impl AsRef<str
     )
         .into_response()
 }
+
+// rustdoc 链接用的再导出：拆分前这些项都在本模块下，文档里按 `crate::proxy::X` 链到它们；
+// 代码不经这里引用，故逐条 allow(unused_imports)。
+#[allow(unused_imports)]
+pub(crate) use body::{
+    cache_prefix_of, ensure_cc_message_breakpoint, ensure_cc_system_prefix,
+    ensure_context_management, ensure_output_config, ensure_thinking, fill_eager_tools,
+    fill_thinking_display, injected_tools_of, restore_tool_names_stream, session_binding_key,
+    should_mimic_tool, spoof_identity,
+};
+#[allow(unused_imports)]
+pub(crate) use connectivity::{send_quota_probe, spawn_session_handshake};
+#[allow(unused_imports)]
+pub(crate) use headers::official_headers;
+#[allow(unused_imports)]
+pub(crate) use learned_rules::{TransientStreaks, is_max_plan};
+#[allow(unused_imports)]
+pub(crate) use logging::record_early_failure;
+#[allow(unused_imports)]
+pub(crate) use session_id::session_plan;
+#[allow(unused_imports)]
+pub(crate) use session_link::{CC_SESSIONS, ThreadState};
+#[allow(unused_imports)]
+pub(crate) use simulation::{
+    MAX_SYSTEM_BLOCKS, billing_header_text, cc_identity_well_formed, cc_profile_for,
+    cc_system_rest, cc_version_suffix, client_env, has_cc_tool_profile, is_official_helper_request,
+    is_official_thread_continuation, merge_system_blocks, render_system_rest, simulate_system,
+    simulated_billing_header_text,
+};
+#[allow(unused_imports)]
+pub(crate) use thinking::retry_demoted_thinking;
+#[allow(unused_imports)]
+pub(crate) use upstream::stream_upstream;
 
 #[cfg(test)]
 mod test_support;

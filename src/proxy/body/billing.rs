@@ -11,11 +11,11 @@ use super::*;
 /// 只在该块确实是 billing header、且尚无 `cch=` 时改写；其余情况返回 `false` 不动结构。
 ///
 /// **这条路只服务真实 CC 来访。** 模拟路径的 billing header 由
-/// [`simulated_billing_header_text`] 一次拼好（cch 也在里面），走不到这里。
+/// [`simulated_billing_header_text`](crate::proxy::simulated_billing_header_text) 一次拼好（cch 也在里面），走不到这里。
 ///
 /// `system[0]` 位于第一个缓存断点之前，直觉上「每请求变的 cch 会打爆 prompt cache」——
 /// **抓包证否了这一点**，上游不把 billing header 算进缓存键，见 [`cch_value`]。
-pub(in crate::proxy) fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
+pub(crate) fn ensure_billing_cch(v: &mut serde_json::Value) -> bool {
     let blk = match v.get_mut("system").and_then(|s| s.as_array_mut()).and_then(|a| a.first_mut()) {
         Some(b) => b,
         None => return false,
@@ -61,11 +61,11 @@ pub(in crate::proxy) fn has_billing_header(v: &serde_json::Value) -> bool {
 }
 
 /// 给**真实 CC 来访**那条 billing header 追加会话关联字段：`cc_prev_req` 与
-/// `cc_prompt_id`，落在 `cch` 之后（官方段序，见 [`simulated_billing_header_text`]）。
+/// `cc_prompt_id`，落在 `cch` 之后（官方段序，见 [`simulated_billing_header_text`](crate::proxy::simulated_billing_header_text)）。
 ///
 /// API-key 端的 CC 一个都不发，而订阅端官方每条主线程请求都有；luban 拿 OAuth token 转出去
 /// 之后缺着，就是「OAuth 请求没有会话关联」这个官方不产生的形态。要不要补由
-/// [`client_session_link`] 判，这里只管拼串。
+/// [`client_session_link`](crate::proxy::client_session_link) 判，这里只管拼串。
 ///
 /// 客户端**自己已经写了**哪一项就不动那一项——它比我们更清楚自己的链。
 ///

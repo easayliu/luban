@@ -12,7 +12,7 @@ mod tools;
 pub(super) use tools::bash_timing;
 
 /// 拼这条调用的事件链：只读 [`TurnFacts`]，不碰会话状态。
-pub(super) fn build_events(
+pub(crate) fn build_events(
     call: &ApiCall,
     shape: &RequestShape,
     f: &TurnFacts,
@@ -42,7 +42,7 @@ pub(super) fn build_events(
     b.finish()
 }
 
-/// [`Telemetry::build_events`] 的产出。
+/// [`Telemetry::build_events`](crate::telemetry::build_events) 的产出。
 pub(super) struct BuiltEvents {
     pub(super) events: Vec<(DateTime<Utc>, Value)>,
     pub(super) dd: Vec<Value>,
@@ -50,7 +50,7 @@ pub(super) struct BuiltEvents {
     pub(super) probe_side: Option<(Identity, TplOutput)>,
 }
 
-/// [`Telemetry::build_events`] 各段共用的只读输入：这条调用、前半段推出的 [`TurnFacts`]，以及
+/// [`Telemetry::build_events`](crate::telemetry::build_events) 各段共用的只读输入：这条调用、前半段推出的 [`TurnFacts`]，以及
 /// 由它们再算出来的几项。
 pub(super) struct EventEnv<'a> {
     pub(super) call: &'a ApiCall,

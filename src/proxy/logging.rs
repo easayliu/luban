@@ -19,7 +19,7 @@ use super::upstream::{
 use super::{AppState, header_opt};
 
 /// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT、总耗时与用量）并落库。
-pub(super) struct ReqLog {
+pub(crate) struct ReqLog {
     pub(super) started: std::time::Instant,
     pub(super) ttft_ms: Option<u128>,
     pub(super) method: String,
@@ -27,14 +27,14 @@ pub(super) struct ReqLog {
     /// **来访**客户端自报的 `User-Agent`（已截断，见 [`ua_of`]）。
     ///
     /// 存在的理由：`path` 记的是来访原样的路径查询串（`?beta=true` 是官方 CC 自己带的，
-    /// luban 只在出站 URL 上补，见 [`ensure_beta_query`]），于是「带 metadata.user_id 却
+    /// luban 只在出站 URL 上补，见 [`ensure_beta_query`](crate::proxy::ensure_beta_query)），于是「带 metadata.user_id 却
     /// 没有 `?beta=true`」这类第三方 CC 兼容客户端在日志里和官方客户端长得一样。UA 是
     /// 分辨它们最省事的一项。
     pub(super) ua: String,
-    /// **实际发给上游**的那份 `User-Agent`（见 [`build_forward_headers`]）。
+    /// **实际发给上游**的那份 `User-Agent`（见 [`build_forward_headers_for`](crate::proxy::build_forward_headers_for)）。
     ///
-    /// 与 `ua` 分开记而不是只留一份：模拟路径整套头换成官方的（[`official_headers`]），
-    /// 出站恒为 [`config::CC_USER_AGENT`]；非模拟路径原样转发来访那份。于是两列一比就知道
+    /// 与 `ua` 分开记而不是只留一份：模拟路径整套头换成官方的（[`official_headers`](crate::proxy::official_headers)），
+    /// 出站恒为 [`config::CC_USER_AGENT`](crate::config::CC_USER_AGENT)；非模拟路径原样转发来访那份。于是两列一比就知道
     /// 这条走没走模拟——只存一份的话，要么看不见真实客户端是谁，要么看不见上游收到的是什么。
     pub(super) ua_out: String,
     pub(super) cred_id: i64,
@@ -64,19 +64,19 @@ pub(super) struct ReqLog {
     ///
     /// 与 [`UsageSniffer::stream_error`] 分开记：那个是上游**说**自己出错了，这个是连接
     /// 本身断了，两者排查方向不同（前者看上游侧原因，后者看网络/超时）。此前
-    /// [`stream_upstream`] 里这个分支是 `if let Ok` 的隐式丢弃——错误原样交给 axum，
+    /// [`stream_upstream`](crate::proxy::stream_upstream) 里这个分支是 `if let Ok` 的隐式丢弃——错误原样交给 axum，
     /// 客户端拿到一条截断的流，服务端侧一行日志都没有。
     pub(super) stream_broke: Option<String>,
-    /// 上游的流读到了头（`bytes_stream` 返回了 `None`），见 [`stream_upstream`]。
+    /// 上游的流读到了头（`bytes_stream` 返回了 `None`），见 [`stream_upstream`](crate::proxy::stream_upstream)。
     ///
     /// 流式回复没等到 `message_stop`、上游没报错也没断连，这一条若还是 `false`，就是**客户端
     /// 先走了**——axum 在对端断开时丢掉响应体，转发那条流连同这个标记一起没读到头。Claude
     /// Code 里按 Esc 打断、猜下一句被新输入顶掉，都是这个样子（遥测报 `aborted_streaming`）；
     /// 为 `true` 则是上游半截 EOF，那一类照旧不报。
     pub(super) upstream_done: bool,
-    /// luban 给这条入站请求发的 id，见 [`handle`]。
+    /// luban 给这条入站请求发的 id，见 [`handle`](crate::proxy::handle)。
     pub(super) request_id: String,
-    /// 来访请求头里带的 id（若有），见 [`client_request_id`]。
+    /// 来访请求头里带的 id（若有），见 [`client_request_id`](crate::proxy::client_request_id)。
     pub(super) client_request_id: Option<String>,
     /// 上游**最后一次**响应头里的 `request-id`；换号/重试后以最终那一发为准。
     pub(super) upstream_request_id: Option<String>,
@@ -97,14 +97,14 @@ pub(super) struct ReqLog {
     /// 才记成线程状态，失败把它接的那条线程作废。取自 [`super::Simulation::take_thread`]；
     /// 非模拟路径与没写 `thread` 的为 `None`。
     pub(super) cc_thread: Option<ThreadPending>,
-    /// 这条请求所属的「零输出请求类」（模型 + `max_tokens`），见 [`empty_reply_class`]；
+    /// 这条请求所属的「零输出请求类」（模型 + `max_tokens`），见 [`empty_reply_class`](crate::proxy::empty_reply_class)；
     /// `None` 即不属于任何一类（带 tools、多轮、非计费路径……），收尾时不学。
     pub(super) empty_reply_key: Option<(String, i64)>,
-    /// 这条请求的「模型 + 提示词哈希」（[`prompt_digest`]），上游拒答（`stop_reason:
-    /// "refusal"`）时按它学，见 [`known_refused_prompt`]；非计费路径为 `None`。
+    /// 这条请求的「模型 + 提示词哈希」（[`prompt_digest`](crate::proxy::prompt_digest)），上游拒答（`stop_reason:
+    /// "refusal"`）时按它学，见 [`known_refused_prompt`](crate::proxy::known_refused_prompt)；非计费路径为 `None`。
     pub(super) prompt_key: Option<(String, String)>,
-    /// 这条请求的「模型 + system 哈希」（[`app_system_digest`]），只有**识别不了会话**的来访（没有
-    /// 会话 id 也没有 device_id）且带 system 时才有；上游拒答时按它学，见 [`known_app_refusal`]。
+    /// 这条请求的「模型 + system 哈希」（[`app_system_digest`](crate::proxy::app_system_digest)），只有**识别不了会话**的来访（没有
+    /// 会话 id 也没有 device_id）且带 system 时才有；上游拒答时按它学，见 [`known_app_refusal`](crate::proxy::known_app_refusal)。
     pub(super) app_key: Option<(String, String)>,
     /// 零输出请求类与被拒答提示词的记忆表，收尾时按上游回复的种类往里记，
     /// 见 [`ReqLog::note_unanswered_reply`]。
@@ -505,7 +505,7 @@ impl ReqLog {
     /// 记一次 luban 侧的改写重试：追加标签，把上游 request-id 换成重试那一发的，并把
     /// **请求侧**那些由 body 算出来的东西一并换成重试实际发出去的那份。
     ///
-    /// 重试成功后这条流水按重试那次记账（见 [`retry_demoted_thinking`]），标签是唯一能看出
+    /// 重试成功后这条流水按重试那次记账（见 [`retry_demoted_thinking`](crate::proxy::retry_demoted_thinking)），标签是唯一能看出
     /// 「中间还发过一发被拒的」的地方。
     ///
     /// `sent` 不能省。响应侧（状态码、用量、model、stop_reason、限流）调用方已经换成重试
@@ -558,7 +558,7 @@ impl ReqLog {
     ///   就答了，学了是把能救的请求锁死 7 天；
     /// - 其余零输出（标签 `empty_reply`）：上游对这类请求形态本身不回——按
     ///   [`Self::empty_reply_key`]（模型 + 无 tools 单条消息 + `max_tokens`）学。
-    fn note_unanswered_reply(&mut self) {
+    pub(crate) fn note_unanswered_reply(&mut self) {
         let excerpt = self.sniffer.excerpt().unwrap_or_default();
         let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
         let refused = self.sniffer.refused();
@@ -691,7 +691,7 @@ pub(super) fn ban_context(
 }
 
 /// 转发那一刻能确定的取证字段：出口代理、是否模拟、出站体形态摘要、会话 id。
-/// 错误文案、第三方判定、改写标签在响应到达后再补（见 [`handle`] 的 4xx 段与 [`ReqLog::note_retry`]）。
+/// 错误文案、第三方判定、改写标签在响应到达后再补（见 [`handle`](crate::proxy::handle) 的 4xx 段与 [`ReqLog::note_retry`]）。
 /// 在**没有 [`ReqLog`]** 的早退路径上，补上失败请求该有的两件事：把这一发记进模拟会话链，
 /// 与报一条 `tengu_api_error`。正常路径上这两件事都在 [`ReqLog::drop`] 里。
 ///
@@ -707,7 +707,7 @@ pub(super) fn ban_context(
 /// 这个头的响应就还补得上；但一个进程里**头一条就是早退 401** 的号没有那份缓存，所以
 /// 拿得到就得往下传。连接层失败那条压根没有响应，只能是 `None`。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn record_early_failure(
+pub(crate) fn record_early_failure(
     state: &AppState,
     cred: &crate::credentials::Credential,
     upstream: &Upstream<'_>,
@@ -789,7 +789,7 @@ pub(super) fn telemetry_capture(
     })
 }
 
-pub(super) fn capture_forensics(
+pub(crate) fn capture_forensics(
     upstream: &Upstream<'_>,
     sent: &Bytes,
     cred: &crate::credentials::Credential,
@@ -881,7 +881,7 @@ pub(super) fn fill_shape_forensics(f: &mut store::Forensics, bits: ShapeBits) {
 
 /// 出站请求体的**结构**摘要（不含任何用户正文），落进流水的 `shape` 列。
 ///
-/// 与 [`request_digest`] 的区别：那个是排障日志用的、逐轮列出消息块，几百轮的会话一条就几 KB；
+/// 与 [`request_digest`](crate::proxy::request_digest) 的区别：那个是排障日志用的、逐轮列出消息块，几百轮的会话一条就几 KB；
 /// 这个每条请求都落库，只留计数、哈希与顶层参数，大小与会话长度无关。返回值的第二、三项是从
 /// `metadata.user_id` 里取出的 session_id 与 device_id（两种格式都认，见 [`extract_session_id`]
 /// 与 [`extract_device_id`]），没有则 `None`。这里读的是**出站**体，故取到的 device_id 是上游
@@ -894,7 +894,7 @@ pub(super) fn fill_shape_forensics(f: &mut store::Forensics, bits: ShapeBits) {
 /// - `tools`：数量、名字列表（最多 64 个）与名字串的哈希；
 /// - `messages`：条数、末条角色、各类内容块计数（text/tool_use/tool_result/thinking/image…）；
 /// - 其余顶层参数（model/max_tokens/stream/thinking/temperature/tool_choice/…）原样。
-pub(super) fn shape_summary(sent: &[u8]) -> ShapeBits {
+pub(crate) fn shape_summary(sent: &[u8]) -> ShapeBits {
     match serde_json::from_slice::<serde_json::Value>(sent) {
         Ok(v) => shape_summary_of(&v),
         Err(_) => ShapeBits::default(),
@@ -905,10 +905,10 @@ pub(super) fn shape_summary(sent: &[u8]) -> ShapeBits {
 ///
 /// 三项同源（都从同一份出站 `Value` 上读），故一并算、一并传。
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct ShapeBits {
+pub(crate) struct ShapeBits {
     pub(super) shape: Option<String>,
     pub(super) session_id: Option<String>,
-    pub(super) device_id_out: Option<String>,
+    pub(crate) device_id_out: Option<String>,
     /// 出站比来访多出来的官方工具名（模拟路径注入的），见 [`crate::proxy::injected_tools_of`]。
     /// 按**实际改写结果**算，不按来访体预判：注入那一步会按 `tool_choice` 与开关决定补不补，
     /// 读来访原文会算错。
@@ -920,10 +920,10 @@ pub(super) struct ShapeBits {
 
 /// [`shape_summary`] 的本体：吃一份**已经解析好**的出站体。
 ///
-/// 转发主路径走这个，`Value` 由改写那一步顺手交出来（见 [`rewrite_body_out`]）——同一份几 MB
+/// 转发主路径走这个，`Value` 由改写那一步顺手交出来（见 [`rewrite_body_out`](crate::proxy::rewrite_body_out)）——同一份几 MB
 /// 的 JSON 一条请求里只解析一次。只拿得到字节的那几条路（重试改写、早退兜底、连通性测试）
 /// 走上面那个包装。
-pub(super) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
+pub(crate) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
     use sha2::{Digest, Sha256};
     let Some(obj) = v.as_object() else { return ShapeBits::default() };
     // 两种 `metadata.user_id` 格式（内嵌 JSON / 扁平串）都由这两个函数认，别在下面再手写一套。
@@ -1005,7 +1005,7 @@ pub(super) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
 }
 
 /// 把一条用量日志交给后台任务落库，见 [`store::CredentialStore::spawn_write`]。
-pub(super) fn spawn_usage_log(
+pub(crate) fn spawn_usage_log(
     store: std::sync::Arc<store::CredentialStore>,
     rec: store::UsageRecord,
 ) {
@@ -1019,10 +1019,10 @@ pub(super) fn spawn_usage_log(
 ///   `message_delta` 带最终 output_tokens。后见到的非空值覆盖旧值。
 /// - 非流式 JSON：累积整段响应体，在 [`Self::finish`] 时解析顶层 `usage`。
 #[derive(Default)]
-pub(super) struct UsageSniffer {
+pub(crate) struct UsageSniffer {
     is_stream: bool,
     /// 响应体带我们解不开的 `content-encoding`，只能一律不解析（`feed` 直接丢弃）。
-    /// 正常路径下恒为 false——wreq 已解码，见 [`handle`] 里 `compressed` 的说明。
+    /// 正常路径下恒为 false——wreq 已解码，见 [`handle`](crate::proxy::handle) 里 `compressed` 的说明。
     opaque: bool,
     /// SSE 模式下未处理完的行尾；非流式模式下累积的整段响应体。
     buf: Vec<u8>,
@@ -1043,14 +1043,14 @@ pub(super) struct UsageSniffer {
     /// [`Self::merge`] 只挑 usage/model，它从眼前流过去不留痕迹，于是一次失败在日志与
     /// `usage_logs` 里都是一条 `status=200`——客户端那头报错（如上游发的 `client_gone`），
     /// 服务端这头查无此事，且成功率统计里凭空少了一次失败。收尾时由 [`ReqLog::drop`]
-    /// 取走告警。[`aggregate_sse`] 那条路另有 [`SseAggregator`] 就地处理，不走这里。
+    /// 取走告警。[`aggregate_sse`](crate::proxy::aggregate_sse) 那条路另有 [`SseAggregator`](crate::proxy::SseAggregator) 就地处理，不走这里。
     pub(super) stream_error: Option<serde_json::Value>,
     /// 见过 `message_stop` —— 流式响应正常收尾的唯一标志。
     ///
     /// 上游的流可能既不报错、也不断连，就是**发到一半 EOF**：`bytes_stream` 平静地返回
     /// `None`，[`Self::stream_error`] 和 [`ReqLog::stream_broke`] 双双为空，这一层看什么
     /// 都正常，而客户端拿到的是半截回复（Claude Code 报 `Connection closed mid-response`）。
-    /// [`aggregate_sse`] 靠 [`Aggregated::Incomplete`] 拦住了这一类，透传路径此前没有对应
+    /// [`aggregate_sse`](crate::proxy::aggregate_sse) 靠 [`Aggregated::Incomplete`](crate::proxy::Aggregated::Incomplete) 拦住了这一类，透传路径此前没有对应
     /// 的检查——三种断流方式里最安静的那种，恰恰完全无声。
     pub(super) saw_message_stop: bool,
     /// 最后见到的 SSE 事件类型，以及已解析的事件总数（含 `ping`）。
@@ -1122,7 +1122,7 @@ pub(super) struct UsageSniffer {
     /// 响应体**原样**的开头，最多 [`RESPONSE_EXCERPT_BYTES`] 字节，流式非流式都留。
     ///
     /// 与 `buf` 分开：流式那条路的 `buf` 逐行吃掉不留痕，非流式那条路 `finish` 后才解析。
-    /// 这份只在收尾时上游回了「200 却零输出」才用得上（[`ReqLog::note_empty_reply`]）——
+    /// 这份只在收尾时上游回了「200 却零输出」才用得上（`ReqLog::note_empty_reply`）——
     /// 用量列写着 `input=425 output=0`，却没有任何一处能看到上游到底回了什么：是没有
     /// `content` 的空 Message、`stop_reason: "refusal"`、还是别的形状。留下开头这一小段
     /// 就够回答这个问题，代价是每条请求多拷几 KB。
@@ -1130,13 +1130,13 @@ pub(super) struct UsageSniffer {
     /// 响应体**原样全文**，供学到拒答时原样回放（[`Self::refusal_reply`]）。只在还没见到任何
     /// 输出内容块、且没超过 [`REFUSAL_REPLY_BYTES`] 时攒：正常回复几 KB 内就到第一个
     /// `content_block_start`，此后不再拷；超上限的清空并标 `reply_overflow`，这条不学。
-    pub(super) reply: Vec<u8>,
+    pub(crate) reply: Vec<u8>,
     pub(super) reply_overflow: bool,
 }
 
 /// [`UsageSniffer::head`] 最多留多少字节。零输出的回复本身只有几百字节；8 KiB 连流式的
 /// `message_start` + `message_delta` + `message_stop` 三段也装得下。
-pub(super) const RESPONSE_EXCERPT_BYTES: usize = 8 * 1024;
+pub(crate) const RESPONSE_EXCERPT_BYTES: usize = 8 * 1024;
 
 /// 回复里一个 `text` / `thinking` / `redacted_thinking` 块的指纹，见 [`UsageSniffer::reply_fp`]。
 #[derive(Debug, Clone)]
@@ -1173,7 +1173,7 @@ struct ToolUseBlock {
     /// 遥测用的归类名（[`tool_use_label`]：`mcp__*` 归 `mcp_tool`、`skill__*` 归 `skill_tool`）。
     name: String,
     /// 上游回的原名，一字不改——回答「模型到底调了哪个」用的是它，归类名答不了。
-    /// 回程还原假名在嗅探之后（[`stream_upstream`] 先喂嗅探器再过 [`restore_tool_names_stream`]），
+    /// 回程还原假名在嗅探之后（[`stream_upstream`](crate::proxy::stream_upstream) 先喂嗅探器再过 [`restore_tool_names_stream`](crate::proxy::restore_tool_names_stream)），
     /// 故客户端自有工具在这里是 `mcp__luban__*` 那个假名，注入的官方工具是官方名。
     raw_name: String,
     /// 是客户端要去执行的 `tool_use`（`server_tool_use` / `mcp_tool_use` 由上游自己跑完，
@@ -1694,7 +1694,7 @@ impl UsageSniffer {
         Some(text)
     }
 
-    /// 上游这次响应的原样全文，学拒答时连同判决一起记下、之后原样回放（[`replay_refusal`]）。
+    /// 上游这次响应的原样全文，学拒答时连同判决一起记下、之后原样回放（[`replay_refusal`](crate::proxy::replay_refusal)）。
     ///
     /// `None` 的几种情形都不学这条拒答：体超过 [`REFUSAL_REPLY_BYTES`]；回复里已经出现过输出
     /// 内容块（流到一半才被掐的——分类器看的是采样出来的正文，不是对提示词的确定性判决，
@@ -1722,7 +1722,7 @@ impl UsageSniffer {
     /// 模型自拒」只是对多数样本成立的近似，不是定义；但学与不学两边的代价不对称：不学最多
     /// 让那条提示词再白跑一次上游，学错则把可能能答的请求锁 7 天。判据宁可收紧。官方文档也
     /// 只说输出前的拒答不计费、不占限流，「重发在账号上添一笔」没有依据。
-    fn classifier_refusal(&self) -> Option<&str> {
+    pub(crate) fn classifier_refusal(&self) -> Option<&str> {
         if !self.refused() || self.refusal_recommended_model.is_some() {
             return None;
         }

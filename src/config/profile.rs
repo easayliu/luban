@@ -133,7 +133,7 @@ pub struct CcProfile {
 /// 2.1.260 的 sonnet / haiku 主线程与 2.1.270 的其余三族一律 [`Self::Unknown`]。
 ///
 /// **它与 `advanced-tool-use` beta 同现**：带 eager 的每一条头上都有那项 beta，API-key 端
-/// 两者都没有。体侧补写因此要求出站头里真有它（[`crate::proxy::rewrite_body`]）。
+/// 两者都没有。体侧补写因此要求出站头里真有它（[`crate::proxy::rewrite_body_out`]）。
 ///
 /// **真 CC 路径按版本精确查**（[`cc_eager_tools_at`]）：只有来访自报的版本恰好是某张表抓包的
 /// 那一版（2.1.258 / 2.1.260 / 2.1.270）且该 kind 有行，才拿得到 On/Off；其余版本一律

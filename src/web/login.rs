@@ -209,7 +209,7 @@ where
 }
 
 #[derive(Deserialize)]
-pub(super) struct ExchangeReq {
+pub(crate) struct ExchangeReq {
     /// 用户从授权回调页粘贴的 `code#state`。
     pub(super) code: String,
     /// 可选的显示名；留空则自动命名。
@@ -228,7 +228,7 @@ pub(super) struct ExchangeReq {
 }
 
 /// 用粘贴的 `code#state` 交换 token，并新增一条凭证。
-pub(super) async fn exchange(
+pub(crate) async fn exchange(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     via_key: Option<Extension<auth::ViaProvisionKey>>,

@@ -49,7 +49,7 @@ impl DefaultLimits {
 
 /// 对外暴露的凭证视图（不返回明文 token）。
 #[derive(Serialize)]
-pub(super) struct CredentialView {
+pub(crate) struct CredentialView {
     pub(super) id: i64,
     label: String,
     /// 号的主人（控制台账号 id）。

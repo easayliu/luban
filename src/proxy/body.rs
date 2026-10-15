@@ -33,18 +33,18 @@ mod tool_names;
 mod tools;
 mod version;
 
-pub(super) use billing::*;
+pub(crate) use billing::*;
 pub(crate) use cache::*;
 pub(super) use cch::*;
 pub(super) use env_note::*;
-pub(super) use fallbacks::*;
+pub(crate) use fallbacks::*;
 pub(crate) use identity::*;
 pub(crate) use inspect::*;
-pub(super) use params::*;
-pub(super) use shape::*;
+pub(crate) use params::*;
+pub(crate) use shape::*;
 pub(super) use thread::*;
-pub(super) use tool_names::*;
-pub(super) use tools::*;
+pub(crate) use tool_names::*;
+pub(crate) use tools::*;
 pub(crate) use version::*;
 
 /// 转发前改写请求体，各项分别受 [`store::ForwardFlags`] 里的开关控制（默认全开；全关即
@@ -56,7 +56,7 @@ pub(crate) use version::*;
 /// 1. **system 形态**（`system_shape`）：把 API-key 模式的 3 块改写成订阅模式的 4 块，
 ///    见 [`align_system_shape`]。含拆块与基座标 `scope:"global"`（后者另受
 ///    `cache_scope_global` 管）。模拟路径已经直接产出 5 块，故两者互斥，不叠加。同一开关还管**块数封顶**
-///    （[`cap_system_blocks`]）：把超过 [`MAX_SYSTEM_BLOCKS`] 块的 `system` 并回官方块数，只为形态对齐
+///    （[`cap_system_blocks`]）：把超过 [`MAX_SYSTEM_BLOCKS`](crate::proxy::MAX_SYSTEM_BLOCKS) 块的 `system` 并回官方块数，只为形态对齐
 ///    （2026-10-15 实测块数本身不触发第三方判定，见 `MAX_SYSTEM_BLOCKS` 的注）。
 /// 2. **身份伪装**（`spoof_identity`）：把 `metadata.user_id` 里的 `account_uuid`/`device_id`
 ///    换成该凭证自洽的身份（真实 account_uuid + 由其稳定派生的 device_id），避免
@@ -66,13 +66,13 @@ pub(crate) use version::*;
 ///    取值另有两项独立策略：真实 CC 来访按 `cch_real_recompute`、模拟请求按 `cch_sim_compute`，
 ///    见 [`finalize_cch`]。
 /// 4. **流式化**（`force_stream`，由 `nonstream_as_sse` 拨）：把 `stream` 置成 `true`。
-///    官方 CC 恒为 `true`，回程由 [`aggregate_sse`] 聚合回整段 JSON，客户端无感。
+///    官方 CC 恒为 `true`，回程由 [`aggregate_sse`](crate::proxy::aggregate_sse) 聚合回整段 JSON，客户端无感。
 ///
 /// **key 顺序**：改写要把 body 重新序列化，serde_json 默认的 `Map = BTreeMap` 会把**整个
 /// body**（含 tools/messages/content/cache_control 里每一个对象）的 key 按字母序重排，得到
 /// 官方客户端不会产生的排列——集合对了顺序错，一次精确比对即可判定中间有代理。故本 crate
 /// 开了 serde_json 的 `preserve_order`（见 Cargo.toml），解析出的顺序原样写回，
-/// 新增字段追加在末尾。回归测试见 [`tests::preserves_key_order`]。
+/// 新增字段追加在末尾。回归测试见 `tests::preserves_key_order`。
 ///
 /// 解析失败或结构异常时原样返回——绝不因改写失败而阻断转发。
 ///
@@ -83,11 +83,11 @@ pub(crate) use version::*;
 ///
 /// `None` 有三种来源，共同点是**出站字节与入参 `body` 逐字节相同**（没改写、不是 JSON、
 /// 或序列化失败原样退回）：调用方此时拿来访那份已解析好的 body 算摘要即可，同样不必重新
-/// 解析，见 [`Upstream::shape_outbound`]。
+/// 解析，见 [`Upstream::shape_outbound`](crate::proxy::Upstream::shape_outbound)。
 // 参数多是有意的：这些全是「一次改写要知道的上下文」，打包成结构体只会多一层间接，
 // 而调用点只有 `Upstream::shape` 一处。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn rewrite_body_out(
+pub(crate) fn rewrite_body_out(
     body: &Bytes,
     cred: &crate::credentials::Credential,
     device_fp: &str,

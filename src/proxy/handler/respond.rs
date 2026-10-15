@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 循环收尾后的那一发：成功或上游的错误响应走 [`relay_ok`]，连不上走 [`unreachable`]。
+/// 循环收尾后的那一发：成功或上游的错误响应走 [`relay_ok`]，连不上走 [`unreachable`](fn@unreachable)。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn respond(
     cx: &Ctx<'_>,

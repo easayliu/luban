@@ -12,7 +12,7 @@ pub struct DeviceBinding {
     /// 最近一次活跃时间（Unix 秒）；TTL 就是按它算的。模拟客户端不参与 TTL，故为 `None`。
     pub last_seen_at: Option<i64>,
     /// 是否是**模拟客户端**的伪设备（`sim:` 前缀，见 [`crate::proxy::sim_device_id`]）：
-    /// 不写绑定、不占 [`Self::device_count`] 名额、不能解绑，只有用量与费用是真的。
+    /// 不写绑定、不占 [`Self::device_count`](crate::store::CredentialStore::device_count) 名额、不能解绑，只有用量与费用是真的。
     pub simulated: bool,
     /// 该设备经**本凭证**花掉的等价 API 费用（USD 合计，来自 `usage_logs`）。
     ///
@@ -35,7 +35,7 @@ pub struct SessionBinding {
     /// 见 `crate::proxy::session_binding_key` 与 `Select::session_key`。
     pub session_key: String,
     /// 在该凭证上占的槽位（0 起）；会话 id 由它派生，释放后被下一个对话复用。
-    /// [`PASSTHROUGH_SLOT`]（`-1`）表示真实客户端的会话：沿用来访自己的会话 id，不占槽位。
+    /// [`PASSTHROUGH_SLOT`](crate::store::PASSTHROUGH_SLOT)（`-1`）表示真实客户端的会话：沿用来访自己的会话 id，不占槽位。
     pub slot: i64,
     /// 上游看到的会话 id（`X-Claude-Code-Session-Id`）。模拟会话按「账号 + 槽位」派生
     /// （`crate::credentials::sim_slot_session_id`），真实客户端的会话是来访 id 按账号钉住后的值
@@ -87,7 +87,7 @@ impl CredentialStore {
     /// TTL `<= 0`（永不过期）时按全量计。
     ///
     /// 数不到休眠中的软绑定是有意的：它们不占名额，只是还记着「这台设备上次用的是这个号」
-    /// （见 [`Self::select_for_device`]），列进来会让「设备 x/y」这个名额口径失真。
+    /// （见 [`crate::store::CredentialStore::select_with_slot`]），列进来会让「设备 x/y」这个名额口径失真。
     pub async fn device_count(&self, cred_id: i64) -> Result<i64> {
         self.active_count("device_bindings", cred_id, self.device_binding_ttl()).await
     }

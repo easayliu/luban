@@ -16,7 +16,7 @@ use super::*;
 /// ```
 ///
 /// 故改写是三件事，**同受一个开关控制**：
-/// 1. 在 [`config::CC_SYSTEM_BASE_ANCHOR`] 前的 `\n\n` 处把合并块切成基座 + 其余；
+/// 1. 在 `config::CC_SYSTEM_BASE_ANCHOR` 前的 `\n\n` 处把合并块切成基座 + 其余；
 /// 2. 基座标 `{type:ephemeral, scope:global}`，其余标 `{type:ephemeral}`；
 /// 3. 去掉身份句上那个断点——它的缓存前缀只有 127 字节（约 35 token），远低于最小可缓存长度，
 ///    本就是空转，官方也不发。
@@ -35,7 +35,7 @@ use super::*;
 /// **预算**：拆基座是净 +1（身份句原本带断点时抵回来，净 0），断点总数不能顶过
 /// [`MAX_CACHE_BREAKPOINTS`]，满了就整形不做——与 [`align_message_shape`] 同一口径，
 /// 理由见函数体里那道闸。
-pub(in crate::proxy) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
+pub(crate) fn align_system_shape(v: &mut serde_json::Value, cache: CacheShape) -> bool {
     // 拆开前先数一遍整个 body 的断点，见下面那道预算闸（`sys` 一借出去就数不了了）。
     let total = count_cache_control(v);
     let sys = match v.get_mut("system").and_then(|s| s.as_array_mut()) {
@@ -154,10 +154,10 @@ fn last_cacheable_message_mut(msgs: &mut [serde_json::Value]) -> Option<&mut ser
 ///   `req_Fxs76cgvc57N5GNr` 那条 77 条消息、35 对 tool_use/tool_result 的请求，出站 `messages`
 ///   一个断点都没有，10 万 token 全部裸算、cache_creation 为 0，且每轮都是这个形态。
 /// - 末块未必是这两种。会话以 assistant 轮结尾时（prefill）末块可能是 `thinking`——那种块
-///   连签名都要上游验（见 [`is_thinking_signature_error`] 那条重试路），往上面挂 `cache_control`
+///   连签名都要上游验（见 [`is_thinking_signature_error`](crate::proxy::is_thinking_signature_error) 那条重试路），往上面挂 `cache_control`
 ///   是拿一条能发出去的请求去赌一个没有样本的组合。`image` 同样没有样本，一并不碰。
 ///
-/// 空 `text` 块一并跳过：发一个空文本块本身就会被上游拒，见 [`merge_system_blocks`]。
+/// 空 `text` 块一并跳过：发一个空文本块本身就会被上游拒，见 [`merge_system_blocks`](crate::proxy::merge_system_blocks)。
 pub(in crate::proxy) fn align_message_shape(v: &mut serde_json::Value, shape: CacheShape) -> bool {
     let mut changed = false;
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return false };
@@ -217,7 +217,7 @@ pub(in crate::proxy) fn align_message_shape(v: &mut serde_json::Value, shape: Ca
 /// 前缀照样命中（`cap/2.1.260-2` 00057 → 00059，见 [`cch_value`]），上游显然不把那一块算
 /// 进缓存键。`cache_control` 本身也不算——它决定在哪里切、不决定内容。在 luban 自己动
 /// `system` 之前算：补前缀、cch 这些是逐轮确定的改写，客户端两轮发的一样，改完也一样。
-pub(in crate::proxy) fn cache_prefix_of(v: &serde_json::Value) -> CachePrefix {
+pub(crate) fn cache_prefix_of(v: &serde_json::Value) -> CachePrefix {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     if let Some(tools) = v.get("tools") {
@@ -265,7 +265,7 @@ pub(in crate::proxy) fn cache_prefix_of(v: &serde_json::Value) -> CachePrefix {
 ///   400。`system` 里没有断点就写裸的 `{type:ephemeral}`；
 /// - 只往非空 `text` 与 `tool_result` 块上标、预算封顶 [`MAX_CACHE_BREAKPOINTS`]，与模拟
 ///   路径同一口径。
-pub(in crate::proxy) fn ensure_cc_message_breakpoint(v: &mut serde_json::Value) -> bool {
+pub(crate) fn ensure_cc_message_breakpoint(v: &mut serde_json::Value) -> bool {
     let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
     if msgs.is_empty() || cache_slots(v).iter().any(|s| matches!(s, CacheSlot::Message(..))) {
         return false;
@@ -392,7 +392,7 @@ pub(in crate::proxy) fn text_block(
 ///
 /// `client` 是这个来访**自报**的身份（从它自己的 UA 里解出），补出来的 `cc_version` 与
 /// `cc_entrypoint` 就用它，见 [`billing_header_text`]。
-pub(super) fn ensure_cc_system_prefix(
+pub(crate) fn ensure_cc_system_prefix(
     v: &mut serde_json::Value,
     client: Option<CcClient<'_>>,
     // 缺身份句时要不要一并补上；billing-only 下只补 billing header。
@@ -494,7 +494,7 @@ impl CacheShape {
 ///
 /// `global` 同理由 [`store::ForwardFlags::cache_scope_global`] 拨。两项各要一个 beta 认
 /// （`prompt-caching-scope` / `extended-cache-ttl`），故都还连着 `merge_beta`，
-/// 见 [`rewrite_body`]。
+/// 见 [`rewrite_body_out`]。
 pub(in crate::proxy) fn cache_control(shape: CacheShape) -> serde_json::Value {
     cache_control_keeping(shape, None)
 }

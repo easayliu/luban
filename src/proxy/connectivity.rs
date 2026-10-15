@@ -139,7 +139,7 @@ impl ProbeReport {
 ///    是账号的问题还是配置的问题了。于是这里恒定发一条**官方形态**的请求，作为基准。
 ///
 /// 而**账号状态照真实流量的口径更新**：这条请求是真实的——真花额度、拿到的也是上游此刻
-/// 的真实判决，429 就该打冷却（同一套 [`rate_limit_scope`] 分格）、命中封号特征就该
+/// 的真实判决，429 就该打冷却（同一套 [`rate_limit_scope_for`] 分格）、命中封号特征就该
 /// [`store::CredentialStore::record_ban`]、刷新时发现 `refresh_token` 被作废亦然（见
 /// [`store::access_token_of`]）。否则测试报了「已封禁」而卡片上一切如常，两边各说各话，
 /// 用户还得自己动手把号停掉。唯一仍与转发不同的是**不换号重试**——测的就是这一个，
@@ -497,8 +497,8 @@ pub async fn probe(
 /// 一个会话在本进程里的起点，供 [`spawn_session_handshake`] 用。
 ///
 /// 模拟路径与真实 CC 路径都能给出这三样，只是来源不同：前者取 [`Simulation`]，
-/// 后者取 [`client_session_link`] 那条链 + 客户端自报的版本。
-pub(super) struct SessionStart<'a> {
+/// 后者取 [`client_session_link`](crate::proxy::client_session_link) 那条链 + 客户端自报的版本。
+pub(crate) struct SessionStart<'a> {
     pub(super) session_id: &'a str,
     /// 写进遥测身份的客户端版本。模拟路径取 profile 的，真实 CC 取它自报的那个。
     pub(super) version: String,
@@ -556,10 +556,10 @@ pub(super) fn session_start<'a>(
 /// 配置的 OAuth 账号」本身就是判据。
 ///
 /// **只在会话的第一条请求上发一次**（[`CcSessionLink::first_seen`]，键含 cred_id，
-/// 见 [`CC_SESSIONS`]）。同一会话后续请求、以及 30 分钟一跳的保活循环，都不会再走到
+/// 见 [`CC_SESSIONS`](crate::proxy::CC_SESSIONS)）。同一会话后续请求、以及 30 分钟一跳的保活循环，都不会再走到
 /// 这里——保活那边发的是它自己那份周期端点，两者的触发条件不重叠：保活是「按时间」，
 /// 这里是「按新会话」，撞在一起时由 `oauth::handshake_recent` 拦一道。
-pub(super) async fn spawn_session_handshake(
+pub(crate) async fn spawn_session_handshake(
     state: &crate::web::AppState,
     cred: &crate::credentials::Credential,
     token: &str,
@@ -669,13 +669,13 @@ pub(super) async fn spawn_session_handshake(
 
 /// 串行跑完握手三段，并在**额度探测发完之后**发出放行信号。
 ///
-/// 抽成一个函数是为了让「顺序」本身可测（[`tests::handshake_runs_in_capture_order`]）——
+/// 抽成一个函数是为了让「顺序」本身可测（`tests::handshake_runs_in_capture_order`）——
 /// 这段代码唯一的职责就是顺序，而顺序错了不会有任何编译期或运行期症状，只会在上游那边
 /// 看到一个真实客户端不产生的时序。
 ///
 /// 放行信号发在 `quota` 之后、`rest` 之前：抓包里 eval 与额度探测排在 penguin/mcp/
 /// bootstrap 那批之前，而那批与首条 messages 是重叠的。
-pub(super) async fn handshake_sequence(
+pub(crate) async fn handshake_sequence(
     lead: impl std::future::Future<Output = ()>,
     quota: impl std::future::Future<Output = ()>,
     rest: impl std::future::Future<Output = ()>,
@@ -703,7 +703,7 @@ pub(super) async fn handshake_sequence(
 ///
 /// `flags` 用后台的真实配置，与同会话的主请求一致：用户关掉的（身份伪装、原始头大小写……）
 /// 这条也不做，否则同一会话里只有它还带着 luban 派生的身份或官方的头大小写。
-async fn send_quota_probe(
+pub(crate) async fn send_quota_probe(
     client: &wreq::Client,
     token: &str,
     cred: &crate::credentials::Credential,
@@ -827,7 +827,7 @@ impl ProbeShape {
 ///   `Simulation` **只用来出头**（UA、`request-class: auxiliary`、那串 beta）；体由 [`probe_body`]
 ///   造成官方原样，按真实 CC 来访的预热走改写（见 [`probe`]），不进模拟那套主线程整形——那会给它
 ///   补上基座、断点 ttl 与 `diagnostics`，官方的预热一个都没有。
-pub(super) fn probe_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
+pub(crate) fn probe_simulation(cred: &crate::credentials::Credential, model: &str) -> Simulation {
     header_simulation(
         cred,
         model,
@@ -881,7 +881,7 @@ fn header_simulation(
 /// 不能只交一段字节了事：错误事件攒出来的是一份错误 JSON、半截流交回的是原始 SSE，两者在
 /// 2xx 状态码下都会被当成「通过」——测试报绿，还顺手把暂停中的号放回池子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProbeStreamEnd {
+pub(crate) enum ProbeStreamEnd {
     /// 非流式回复（两种探测形态、错误响应）：体就是整段 JSON，由 [`probe_report`] 看它是不是 Message。
     NotStreamed,
     /// 收到了 `message_stop`，攒出一条完整 Message。
@@ -900,7 +900,7 @@ pub(super) enum ProbeStreamEnd {
 /// 不然会出现「测试说通了、真实请求却是半截流」这种自相矛盾的结论。错误事件交回那份错误
 /// JSON（[`probe_report`] 从里面取 `error.type` / `error.message`）；半截流原样交回（流水里
 /// 留的是上游实际发了什么）。
-pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
+pub(crate) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
     let mut agg = SseAggregator::default();
     agg.feed(bytes);
     let to_bytes = |v: &serde_json::Value| {
@@ -918,14 +918,14 @@ pub(super) fn aggregate_probe_sse(bytes: &[u8]) -> (Bytes, ProbeStreamEnd) {
 /// 连通性测试的请求体，按 [`ProbeShape`] 分两种，都是官方逐字形态。
 ///
 /// **额度探测**（`cap/2.1.260-2/00004`）：键序 `model → max_tokens → messages → metadata`
-/// （`metadata` 由 [`ensure_cc_metadata`] 补），正文就是 `quota` 这一个词。
+/// （`metadata` 由 [`ensure_cc_metadata`](crate::proxy::ensure_cc_metadata) 补），正文就是 `quota` 这一个词。
 ///
 /// **`/model` 预热**（`cap/auto-2.1.293-20261010-model/00031`）：键序
 /// `model → max_tokens → system → messages → metadata`，`system` 是 billing header 与身份句两块
 /// （都不带断点），正文 `Hi` 带一个裸 `ephemeral` 断点。billing header 先不写 `cch`——真实 CC 来访
-/// 那条路由 [`ensure_billing_cch`] 补在 `cc_entrypoint` 之后、出站前按最终字节重算；`metadata` 同样
+/// 那条路由 [`ensure_billing_cch`](crate::proxy::ensure_billing_cch) 补在 `cc_entrypoint` 之后、出站前按最终字节重算；`metadata` 同样
 /// 交给那条路补（[`probe`] 给的 `bare_session`）。
-pub(super) fn probe_body(model: &str) -> Bytes {
+pub(crate) fn probe_body(model: &str) -> Bytes {
     match ProbeShape::of(model) {
         ProbeShape::Quota => {
             let v = serde_json::json!({
@@ -1018,11 +1018,11 @@ pub(super) fn prewarm_upstream<'a>(
 /// 用量日志里标记「这条是连通性测试」的 device_id。
 ///
 /// 借 `device_id` 这一列而不新开一列：它本来就是「这条流量是谁打的」，测试正是一个特殊的
-/// 来源，与裸客户端那个 `sim:` 前缀（见 [`sim_device_id`]）同一个路子。它也不会与设备列表
+/// 来源，与裸客户端那个 `sim:` 前缀（见 [`sim_device_id`](crate::proxy::sim_device_id)）同一个路子。它也不会与设备列表
 /// 串味——那张表从 `device_bindings` 出发，而测试从不写绑定。
 const PROBE_DEVICE_ID: &str = "probe";
 
-/// 把一次测试记进 `usage_logs`，口径与转发路径的 [`ReqLog`] 完全一致（同一个嗅探器、
+/// 把一次测试记进 `usage_logs`，口径与转发路径的 [`ReqLog`](crate::proxy::ReqLog) 完全一致（同一个嗅探器、
 /// 同一套计价），差别只在 `device_id` 标成 [`PROBE_DEVICE_ID`]。
 ///
 /// **为什么要记**：账号卡片上的额度快照与累计花费都出自这张表（`latest_quotas` 取的是
@@ -1034,17 +1034,17 @@ const PROBE_DEVICE_ID: &str = "probe";
 ///
 /// 打包而不是逐个传：三个落日志的分支（body 超时 / 读断 / 读完）只有 status、body、限流头
 /// 不同，其余五项完全一样。摊平成八个参数既触了 clippy 的上限，也让三处调用各抄一遍。
-pub(super) struct ProbeLog<'a> {
+pub(crate) struct ProbeLog<'a> {
     pub(super) store: &'a std::sync::Arc<store::CredentialStore>,
     pub(super) cred: &'a crate::credentials::Credential,
     pub(super) req_model: &'a str,
     pub(super) started: &'a std::time::Instant,
     /// 实际发出去那份 UA，由调用方从出站头取（没有该头时为 `None`）。
     pub(super) out_ua: Option<String>,
-    /// 这次测试的 luban 请求 id（同转发路径的口径，见 [`handle`]），流水里按它能查到。
+    /// 这次测试的 luban 请求 id（同转发路径的口径，见 [`handle`](crate::proxy::handle)），流水里按它能查到。
     pub(super) request_id: String,
     /// 实际发出去的出站体（[`Upstream::shape`] 之后）：取证列里的形态摘要、会话 id、出站
-    /// device_id 都从它读，与转发路径的 [`capture_forensics`] 同源。`Bytes` 引用计数，留一份不拷字节。
+    /// device_id 都从它读，与转发路径的 [`capture_forensics`](crate::proxy::capture_forensics) 同源。`Bytes` 引用计数，留一份不拷字节。
     pub(super) sent: Bytes,
 }
 

@@ -192,7 +192,7 @@ pub struct ForwardFlags {
     /// 子代理、分叉、预热不补），且客户端自己写的短 `ttl` 一并升 1h（`ttl` 须按处理序单调不增）。
     ///
     /// 与 [`Self::cache_scope_global`] 一样要 beta 认（`extended-cache-ttl-2025-04-11`，
-    /// 由 `merge_beta` 补），故还连着那个开关，见 [`crate::proxy::rewrite_body`]。
+    /// 由 `merge_beta` 补），故还连着那个开关，见 [`crate::proxy::rewrite_body_out`]。
     pub cache_ttl_1h: bool,
     /// 工具声明补 `eager_input_streaming: true`，只补**抓包证实**该 profile 全带的那些组合
     /// （[`crate::config::CcEagerTools`]）：真 CC 按来访版本 × 模型 × 用途查表，模拟路径按出站
@@ -200,7 +200,7 @@ pub struct ForwardFlags {
     ///
     /// 订阅端主线程的每个内建工具都带这个字段、API-key 端一个不带，是两种模式间一处逐工具
     /// 重复的固定差异。它与出站头上的 `advanced-tool-use` beta 同现，故还连着 `merge_beta`
-    /// （耦合点在 [`crate::proxy::rewrite_body`]）。收益是缩小声明差异，对封号率的影响幅度
+    /// （耦合点在 [`crate::proxy::rewrite_body_out`]）。收益是缩小声明差异，对封号率的影响幅度
     /// 没有量过，所以单独给开关。
     pub eager_tool_streaming: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。

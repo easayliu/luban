@@ -100,7 +100,7 @@ pub const CC_BETA_REDACT_THINKING: &str = "redact-thinking-2026-02-12";
 ///
 /// 它同时是 `cache_control.ttl` 的准入条件：断点上那个 `ttl:"1h"`（默认写，由
 /// [`crate::store::ForwardFlags::cache_ttl_1h`] 拨）没有这个 beta 就是无源之水，
-/// 故那一项还连着 `merge_beta` 一起开着（耦合点在 [`crate::proxy::rewrite_body`]）。
+/// 故那一项还连着 `merge_beta` 一起开着（耦合点在 [`crate::proxy::rewrite_body_out`]）。
 /// 拆块本身不依赖它——裸的 `{"type":"ephemeral"}` 是 GA 能力。
 pub const CC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 

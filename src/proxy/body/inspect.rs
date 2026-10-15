@@ -16,7 +16,7 @@
 /// 若这里用前缀匹配，`/v1/messages/count_tokens/../` 这类路径就会被判成豁免，而出站 URL
 /// 交给 wreq 时点段会按 RFC 3986 归一化掉，上游看到的其实是 `/v1/messages/`——等于给了
 /// 一条绕开 `device_limit` 的路。精确匹配后这类路径一律落回计费侧，先过校验再说。
-pub(in crate::proxy) fn is_billable_messages(path: &str) -> bool {
+pub(crate) fn is_billable_messages(path: &str) -> bool {
     path.starts_with("/v1/messages") && path != "/v1/messages/count_tokens"
 }
 
@@ -26,7 +26,7 @@ pub(in crate::proxy) fn is_billable_messages(path: &str) -> bool {
 /// - 扁平串 `user_<hash>_account_<acct>_session_<sess>`（如 Windows 客户端）：取 `<hash>`。
 ///
 /// 解析失败或标识为空时返回 `None`（退化为纯优先级选择、不做粘性绑定）。
-pub(in crate::proxy) fn extract_device_id(body: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn extract_device_id(body: Option<&serde_json::Value>) -> Option<String> {
     let user_id = body?.get("metadata")?.get("user_id")?.as_str()?;
     // CC 内嵌 JSON 优先。
     if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id)
@@ -45,10 +45,10 @@ pub(in crate::proxy) fn extract_device_id(body: Option<&serde_json::Value>) -> O
 ///
 /// **体里那个会话 id 只有这一个解析器。** 曾经还有一份只认内嵌 JSON 的副本，于是
 /// Windows 那种扁平串（`user_<hash>_account_<acct>_session_<uuid>`）在
-/// [`incoming_session_id`] 与 [`session_id_conflict`] 眼里等于「体里没有会话 id」——
+/// [`incoming_session_id`](crate::proxy::incoming_session_id) 与 [`session_id_conflict`](crate::proxy::session_id_conflict) 眼里等于「体里没有会话 id」——
 /// 头体不一致检测对整整一类客户端形同虚设，默认拒的开关也拦不住。两种格式的差异只该
 /// 在一个函数里，别再复制一份。
-pub(in crate::proxy) fn extract_session_id(body: Option<&serde_json::Value>) -> Option<String> {
+pub(crate) fn extract_session_id(body: Option<&serde_json::Value>) -> Option<String> {
     let user_id = body?.get("metadata")?.get("user_id")?.as_str()?;
     if let Ok(inner) = serde_json::from_str::<serde_json::Value>(user_id)
         && let Some(sid) = inner.get("session_id").and_then(|s| s.as_str()).map(str::trim)
@@ -66,7 +66,7 @@ pub(in crate::proxy) fn extract_session_id(body: Option<&serde_json::Value>) -> 
 /// 与 [`extract_device_id`] 的区别：那个要求能**解析出设备标识**，格式认不出就是 `None`；
 /// 这里只问「这个字段在不在」——决定的是要不要给它补一份官方身份（见 [`ensure_cc_metadata`](super::ensure_cc_metadata)），
 /// 而字段已经在的话，改写它是 [`spoof_identity`](super::spoof_identity) 的活，两条路只能有一条动它。
-pub(in crate::proxy) fn body_has_user_id(body: Option<&serde_json::Value>) -> bool {
+pub(crate) fn body_has_user_id(body: Option<&serde_json::Value>) -> bool {
     body.and_then(|v| Some(v.get("metadata")?.get("user_id")?.is_string())).unwrap_or(false)
 }
 
@@ -97,7 +97,7 @@ pub(in crate::proxy) fn parse_flat_user_id(s: &str) -> Option<FlatUserId> {
 ///
 /// **口径与上游一致**：只有布尔 `true` 算流式。字段缺失、`false`、以及 `"true"` 这种字符串
 /// 都不是——上游那边它们同样得到一份整段 JSON，判断口径跟着响应形态走才不会错配。
-pub(in crate::proxy) fn stream_requested(body: &serde_json::Value) -> bool {
+pub(crate) fn stream_requested(body: &serde_json::Value) -> bool {
     body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
@@ -125,7 +125,7 @@ pub(in crate::proxy) fn set_stream_true(v: &mut serde_json::Value) -> bool {
 /// 就是「头上声明了一整串官方 beta、URL 却没开 beta 模式」这种真实客户端不产生的组合。
 ///
 /// 客户端自己写了 `beta=`（含 `beta=false`）时不动：那是它自己的选择，替它改属于越权。
-pub(in crate::proxy) fn ensure_beta_query(url: &str) -> String {
+pub(crate) fn ensure_beta_query(url: &str) -> String {
     let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
     if query.split('&').any(|kv| kv.split_once('=').map(|(k, _)| k) == Some("beta")) {
         return url.to_string();
@@ -134,7 +134,7 @@ pub(in crate::proxy) fn ensure_beta_query(url: &str) -> String {
     format!("{url}{sep}beta=true")
 }
 
-/// `body` 里有没有出现过这串字节。给 [`rewrite_body`] 的入口快速路径用：拿字面量粗筛
+/// `body` 里有没有出现过这串字节。给 [`rewrite_body_out`](crate::proxy::rewrite_body_out) 的入口快速路径用：拿字面量粗筛
 /// 「要不要解析」比解析一遍便宜得多。
 ///
 /// 单独一个函数是为了**让窗口宽度不可能写错**：原先三处各自写着
@@ -149,13 +149,13 @@ pub(in crate::proxy) fn body_contains(body: &[u8], needle: &[u8]) -> bool {
 /// `body_has_pair(body, b"\"role\"", b"\"system\"")`。
 ///
 /// 粗筛为什么要容空白：缩进过的请求体（不少中转、SDK 的调试模式会 pretty-print）里写的是
-/// `"role": "system"`，按紧凑字面量找一定落空，[`rewrite_body`] 的快速路径就直接原样返回，
+/// `"role": "system"`，按紧凑字面量找一定落空，[`rewrite_body_out`](crate::proxy::rewrite_body_out) 的快速路径就直接原样返回，
 /// 空壳 system 的清理与空 text 块的剥除全被跳过——判据不该取决于客户端的缩进风格。
 ///
 /// 仍然只认**字面量形态的键与值**：把键写成 `"\u0072ole"` 这种转义的绕得过去。现实里没有
 /// 客户端这么发（serde / encoding/json / Python 的 json 都不转义 ASCII 字母），真出现了也只是
 /// 退回「不解析、原样转发」，上游照常给它一条 400，不会得出错误的结论。
-pub(in crate::proxy) fn body_has_pair(body: &[u8], key: &[u8], value: &[u8]) -> bool {
+pub(crate) fn body_has_pair(body: &[u8], key: &[u8], value: &[u8]) -> bool {
     let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
     body.windows(key.len()).enumerate().any(|(i, w)| {
         if w != key {

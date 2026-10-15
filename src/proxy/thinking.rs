@@ -13,7 +13,7 @@ use super::upstream::{Upstream, error_chain, resp_shape};
 ///
 /// `reason` 只进日志，写的是上游这次点名的是哪一样（三条调用路各自传自己的那句）。
 ///
-/// 成功则返回重试那次的上游响应，并把 `rl` 改按它记账（交给调用方 [`stream_upstream`]）；
+/// 成功则返回重试那次的上游响应，并把 `rl` 改按它记账（交给调用方 [`stream_upstream`](crate::proxy::stream_upstream)）；
 /// 任何一步不成都返回 `None`、`rl` 不动，由调用方继续透传最初那条 400——这条兜底路径在设计上
 /// 不会让结果变差，最坏就是白花一次往返。
 ///
@@ -21,7 +21,7 @@ use super::upstream::{Upstream, error_chain, resp_shape};
 /// 于是这条会话的后续每一轮都会先撞一次 400 再降级重发，直到会话结束。会话能继续跑，但上游
 /// 请求数翻倍。真正的解法是别让会话中途换号（见 `store::CredentialStore::select_for_device`
 /// 的软绑定：名额到点就还，但设备回来仍优先回原号），这里只是兜底。
-pub(super) async fn retry_demoted_thinking(
+pub(crate) async fn retry_demoted_thinking(
     upstream: &Upstream<'_>,
     cred: &crate::credentials::Credential,
     device_fp: &str,
@@ -89,7 +89,7 @@ pub(super) async fn retry_demoted_thinking(
 /// 只按 message 文本判、不卡 `error.type`：这条错误上游归在 `invalid_request_error` 名下，
 /// 跟一大堆真正的请求形态错误同类，靠类型分不出来；而 `signature` 与 `thinking` 同时出现在
 /// 一句错误里只有这一种情况。
-pub(super) fn is_thinking_signature_error(body: &[u8]) -> bool {
+pub(crate) fn is_thinking_signature_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("signature") && hay.contains("thinking")
@@ -101,7 +101,7 @@ pub(super) fn is_thinking_signature_error(body: &[u8]) -> bool {
 ///
 /// 成因：客户端或代理的 JSON 序列化/反序列化改变了 thinking 块的编码。
 /// 处理方式与签名错误一样——降级重试。
-pub(super) fn is_thinking_modified_error(body: &[u8]) -> bool {
+pub(crate) fn is_thinking_modified_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("cannot be modified") && hay.contains("thinking")
@@ -115,7 +115,7 @@ pub(super) fn is_thinking_modified_error(body: &[u8]) -> bool {
 /// ——降级重试，[`demote_thinking_blocks`] 对 `redacted_thinking` 正是整块删。
 ///
 /// 两条判据不重叠：这句里没有 `signature`，签名那句里没有 `redacted_thinking`。
-pub(super) fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
+pub(crate) fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
     let (_, message) = parse_upstream_error(body);
     let hay = message.to_lowercase();
     hay.contains("redacted_thinking") && hay.contains("data")
@@ -123,7 +123,7 @@ pub(super) fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
 
 /// 上游那条 400 是不是「历史思考块验不过」的任意一种，是的话给出是哪一种（只进日志）。
 ///
-/// 三条各有自己的兜底重试——开关不同、降级后能不能救回来也不同，见 [`handle`] 里并排的
+/// 三条各有自己的兜底重试——开关不同、降级后能不能救回来也不同，见 [`handle`](crate::proxy::handle) 里并排的
 /// 那三段。但**取证问的是同一个问题**：那个块是 luban 改坏的，还是客户端发来就是坏的。
 /// [`trace_thinking_block`] 本身也不分块型（`thinking` 按 `signature` 配对、
 /// `redacted_thinking` 按 `data` 配对，两者都是 base64、改写前后逐字相同），所以三条共用
@@ -133,7 +133,7 @@ pub(super) fn is_redacted_thinking_data_error(body: &[u8]) -> bool {
 /// 但「被改」那句里 `thinking` 与 `redacted_thinking` 同现，上游哪天改措辞添上 `signature`
 /// 或 `data` 就会有两条同时认领；排在前面的先认领，日志里的 `kind` 与实际走的那条兜底就不会
 /// 张冠李戴。
-pub(super) fn thinking_block_error_kind(body: &[u8]) -> Option<&'static str> {
+pub(crate) fn thinking_block_error_kind(body: &[u8]) -> Option<&'static str> {
     if is_thinking_signature_error(body) {
         Some("signature")
     } else if is_thinking_modified_error(body) {
@@ -158,7 +158,7 @@ pub(super) fn thinking_block_error_kind(body: &[u8]) -> Option<&'static str> {
 /// **救不了工具续跑轮**：请求末尾是 `tool_result` 时，上游另外要求「最后一条 assistant 消息
 /// 必须以 thinking 块开头」，降级完照样被拒。这种情况下重试白跑一次，随后原样透传最初那条
 /// 400——不会更差，但也确实救不回来。
-pub(super) fn demote_thinking_blocks(body: &Bytes) -> Option<Bytes> {
+pub(crate) fn demote_thinking_blocks(body: &Bytes) -> Option<Bytes> {
     let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let msgs = v.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
@@ -219,9 +219,9 @@ fn previous_thinking_block(thinking: &str) -> serde_json::Value {
 /// 不同，即使**逻辑值**完全一致。Anthropic 上游会按字节比对 thinking 块，只要字节变了
 /// 就 400。
 ///
-/// 此函数在 [`rewrite_body`] 的最终序列化之后调用：把 `rewritten` 里每个
+/// 此函数在 [`rewrite_body_out`](crate::proxy::rewrite_body_out) 的最终序列化之后调用：把 `rewritten` 里每个
 /// thinking / redacted_thinking 块替换回 `original` 里的原始字节。
-pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) -> Vec<u8> {
+pub(crate) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) -> Vec<u8> {
     let Ok(orig_str) = std::str::from_utf8(original) else { return rewritten };
     // 两个都要找：`"redacted_thinking"` 里没有 `"thinking"` 这个子串（前面那个引号被
     // `redacted_` 占着）。只找后者的话，一份只有 `redacted_thinking` 块、顶层又没有
@@ -274,7 +274,7 @@ pub(super) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
     if subs.is_empty() {
         return rewritten;
     }
-    subs.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    subs.sort_by_key(|a| std::cmp::Reverse(a.0.start));
     let mut out = rewritten;
     for (range, orig) in subs {
         let mut v = Vec::with_capacity(out.len() - range.len() + orig.len());
@@ -369,7 +369,7 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
 ///
 /// 官方这类错误恒以它开头（`messages.5.content.48: Invalid …`）；不是这个形态就返回 `None`，
 /// 调用方照常透传，只是少一份定位信息。
-pub(super) fn error_block_path(message: &str) -> Option<(usize, usize)> {
+pub(crate) fn error_block_path(message: &str) -> Option<(usize, usize)> {
     let (msg, rest) = message.strip_prefix("messages.")?.split_once(".content.")?;
     let blk: &str = rest.split(|c: char| !c.is_ascii_digit()).next()?;
     Some((msg.parse().ok()?, blk.parse().ok()?))
@@ -377,7 +377,7 @@ pub(super) fn error_block_path(message: &str) -> Option<(usize, usize)> {
 
 /// 被上游点名的那个思考块在**入站**（客户端原件）与**出站**（luban 实际发出去的那份）两侧的
 /// 对照，见 [`trace_thinking_block`]。
-pub(super) struct ThinkingBlockTrace {
+pub(crate) struct ThinkingBlockTrace {
     /// 出站体里的坐标，也就是上游报错里那个（原样回显，供核对解析对没对）。
     pub(super) outbound_at: String,
     /// 入站体里同一个块的坐标，或没配上的理由（三者结论完全不同，见 [`InboundMatch`]）：
@@ -400,7 +400,7 @@ pub(super) struct ThinkingBlockTrace {
 /// （上游那句「latest assistant message」指的是哪一条）；`blocks` 说那条消息在出站体里还剩几块，
 /// 与入站一比就知道 luban 有没有剥掉过块；`at` 说那个位置现在装的是什么——对「cannot be modified」
 /// 这条 400，上游记得那里是思考块而出站体里不是，本身就是答案。
-pub(super) fn block_site(body: &[u8], mi: usize, bi: usize) -> String {
+pub(crate) fn block_site(body: &[u8], mi: usize, bi: usize) -> String {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
         return "<unparsable>".into();
     };
@@ -420,7 +420,7 @@ pub(super) fn block_site(body: &[u8], mi: usize, bi: usize) -> String {
 }
 
 /// 最后一条 assistant 消息在入站与出站两份体里的对照，见 [`latest_assistant_diff`]。
-pub(super) struct LatestAssistant {
+pub(crate) struct LatestAssistant {
     /// 两侧各自那条消息的下标（`none` = 这份体里没有 assistant 消息）。
     pub(super) inbound_at: String,
     pub(super) outbound_at: String,
@@ -430,7 +430,7 @@ pub(super) struct LatestAssistant {
     /// **不能单凭它判无罪**：Value 往返会抹平空白与转义，客户端发 `"\u0061"`、luban 出站写
     /// `"a"`，逻辑值一样而字节已经变了——而上游对思考块校验的正是字节。故另有下面那项。
     pub(super) turn_same: Option<bool>,
-    /// 那一轮里**全部思考块的原始字节**是否逐字相同（见 [`thinking_bytes_of_turn`]）。
+    /// 那一轮里**全部思考块的原始字节**是否逐字相同（见 `thinking_bytes_of_turn`）。
     /// 这一项才对得上上游的判据。`None` 表示有一侧不是合法 UTF-8 或取不到那一轮。
     pub(super) thinking_bytes_same: Option<bool>,
     /// 两侧各自的块型序列（[`turn_label`]，过长截断）。
@@ -497,11 +497,11 @@ fn run_label(msgs: &[serde_json::Value], run: std::ops::Range<usize>) -> String 
 /// 只有两项**都**为真才能说 luban 原样转发了那一轮，这条 400 的成因在 luban 之外（最常见的
 /// 是那些块由另一个凭证签发，见 [`retry_demoted_thinking`] 的措辞）。
 ///
-/// 为什么不直接比整轮的原始字节：[`rewrite_body`] 出站恒是紧凑序列化，客户端只要发过缩进
+/// 为什么不直接比整轮的原始字节：[`rewrite_body_out`](crate::proxy::rewrite_body_out) 出站恒是紧凑序列化，客户端只要发过缩进
 /// JSON，整轮的字节就必然不同——那会让 `false` 成为常态，把一条「luban 什么实质都没改」
 /// 的请求指认成改过。而排版差异不在上游的判据里，思考块的字节在（`preserve_thinking_encoding`
 /// 专门把它们还原回原样），所以字节这一项只取思考块。
-pub(super) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAssistant {
+pub(crate) fn latest_assistant_diff(inbound: &[u8], outbound: &[u8]) -> LatestAssistant {
     let parse = |body: &[u8]| -> Option<(serde_json::Value, std::ops::Range<usize>)> {
         let v: serde_json::Value = serde_json::from_slice(body).ok()?;
         let run = latest_assistant_run(v.get("messages")?.as_array()?)?;
@@ -640,12 +640,12 @@ fn match_inbound_block<'a>(
 /// - `inbound_at=none`：入站体里没有这段载荷 = **luban 把它改坏了**，这是唯一一种 luban 的锅
 ///   （`ambiguous(xN)` 与 `unkeyed` 是「认不出来」，不是这一档，见 [`InboundMatch`]）；
 /// - `inbound_at` 与 `outbound_at` 不同：块还在，但下标前移过（有消息或块被删）；
-/// - `turn_identical=false`：那一轮除这个块之外还被改过——工具名混淆（[`apply_tool_names`]）
+/// - `turn_identical=false`：那一轮除这个块之外还被改过——工具名混淆（[`apply_tool_names`](crate::proxy::apply_tool_names)）
 ///   会改历史里的 `tool_use.name`，两份 `*_turn` 一比就能看出改的是哪一块；
 /// - 三项全对上：luban 原样转发，坏在客户端发来的那份或上游自己那边。
 ///
 /// 不打任何正文，也不打载荷本身（几 KB 密文，没有信息量）。
-pub(super) fn trace_thinking_block(
+pub(crate) fn trace_thinking_block(
     inbound: &[u8],
     outbound: &[u8],
     mi: usize,

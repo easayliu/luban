@@ -1,7 +1,7 @@
 //! 出站形态清理：多余字段、tool_choice、顶层字段顺序、空壳 system 消息。
 
 /// 剥掉官方客户端**从不发送**的顶层字段，返回是否改动过。只在
-/// [`store::ForwardFlags::strip_extra_fields`] 开着时调用。
+/// [`store::ForwardFlags::strip_extra_fields`](crate::store::ForwardFlags::strip_extra_fields) 开着时调用。
 ///
 /// 判据逐条取自 `cap/raw/00006`（opus-5）与 `00009`（sonnet-5）两份直连抓包——两份的顶层键
 /// 恒为 `model, messages, system, tools, metadata, max_tokens, thinking, context_management,
@@ -20,7 +20,7 @@
 ///    fable 族官方自己也发 `display:"updates"`**（`cap/2.1.258/00013`，配着
 ///    `thinking-display-updates-2026-08-18` beta）。故这一项由 `keep_display` 拨：来访本来
 ///    就是 CC 形态（真 CC 带什么 `display` 就发什么），或 `thinking` 整个是
-///    [`ensure_thinking`] 按官方形态补的，都不剥；只剥第三方客户端自己写的 `display`。
+///    [`ensure_thinking`](crate::proxy::ensure_thinking) 按官方形态补的，都不剥；只剥第三方客户端自己写的 `display`。
 ///
 ///    **这一项有代价，不是零影响**：`display:"summarized"` 是客户端主动要思考摘要，剥掉之后
 ///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
@@ -28,8 +28,8 @@
 ///
 /// **对真实 CC**：第一项本来就是空操作（官方不发 `tool_choice`），第二项由调用方传
 /// `keep_display = true` 跳过——2.1.258 起 `display` 是官方形态的一部分。
-/// 判定要在模拟**之前**做（[`rewrite_body`] 里的 `cc_inbound`）：模拟一跑 body 就都是 CC 形态了。
-pub(in crate::proxy) fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
+/// 判定要在模拟**之前**做（[`rewrite_body_out`](crate::proxy::rewrite_body_out) 里的 `cc_inbound`）：模拟一跑 body 就都是 CC 形态了。
+pub(crate) fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     let mut changed = false;
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
@@ -47,7 +47,7 @@ pub(in crate::proxy) fn strip_extra_fields(v: &mut serde_json::Value, keep_displ
 }
 
 /// thinking 开着时剥掉与它冲突的采样参数，返回是否改动过。只给 luban **自己注入**的 thinking
-/// 用（[`ensure_thinking`]）：那是 luban 造出来的冲突，得自己收拾。客户端自己写的 thinking 与
+/// 用（[`ensure_thinking`](crate::proxy::ensure_thinking)）：那是 luban 造出来的冲突，得自己收拾。客户端自己写的 thinking 与
 /// 采样参数冲突不归这里，原样发出、由上游回 400。
 ///
 /// - `temperature`：thinking 开着时上游强制为 1，别的值直接 400。删掉即可——默认值就是 1。
@@ -88,15 +88,15 @@ pub(in crate::proxy) fn is_default_tool_choice(v: &serde_json::Value) -> bool {
         .is_some_and(|o| o.len() == 1 && o.get("type").and_then(|t| t.as_str()) == Some("auto"))
 }
 
-/// 把请求对象改成 profile 的顶层键序（[`config::CcProfile::body_key_order`]），
+/// 把请求对象改成 profile 的顶层键序（[`config::CcProfile::body_key_order`](crate::config::CcProfile::body_key_order)），
 /// 并保证 `stream` 在最后。
 ///
-/// **键序按 profile 分**：主线程那串（[`config::CC_BODY_ORDER_MAIN`]）套不到安全分类
+/// **键序按 profile 分**：主线程那串（[`config::CC_BODY_ORDER_MAIN`](crate::config::CC_BODY_ORDER_MAIN)）套不到安全分类
 /// （`max_tokens` 在第二位、`system` 在 `messages` 前）与额度探测（只有四个键）上，
 /// 硬套出来的是官方从不产生的排列。
 ///
 /// 不认识的字段可能有语义，不能丢；保留它们彼此的原始顺序，放在已知字段与 `stream`
-/// 之间。本函数只在 [`Simulation`] 路径调用，真 CC 请求继续保留客户端的字节与顺序。
+/// 之间。本函数只在 [`Simulation`](crate::proxy::Simulation) 路径调用，真 CC 请求继续保留客户端的字节与顺序。
 pub(in crate::proxy) fn align_cc_top_level_order(
     v: &mut serde_json::Value,
     order: &[&str],
@@ -195,8 +195,8 @@ fn misplaced_system_message(index: usize) -> String {
 /// 让上游判。空壳（[`is_empty_system_shell`]）不算数：上游对它回的是另一句。
 ///
 /// 首条 user/assistant 之前的不归这里（[`first_turn_index`]）：上游回的是另一句，由
-/// [`find_openai_marker`] 处理（它停用时原样交给上游）。
-pub(in crate::proxy) fn misplaced_system_role(body: Option<&serde_json::Value>) -> Option<String> {
+/// [`find_openai_marker`](crate::proxy::find_openai_marker) 处理（它停用时原样交给上游）。
+pub(crate) fn misplaced_system_role(body: Option<&serde_json::Value>) -> Option<String> {
     let msgs = body?.get("messages")?.as_array()?;
     let role = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()).map(str::to_owned);
     let mut i = first_turn_index(msgs);
@@ -227,7 +227,7 @@ pub(in crate::proxy) fn misplaced_system_role(body: Option<&serde_json::Value>) 
 /// 在它之前的 `role:"system"` 是 OpenAI 那种开头系统提示词，上游恒 400（`messages.0: use the
 /// top-level 'system' parameter for the initial system prompt`）；在它之后的上游是认的
 /// （2026-09-30 实测：新模型 200，老模型回 `role 'system' is not supported on this model`）。
-/// 判定（[`find_openai_marker`]）与形态记忆（`learned_rules::role_values`）共用这一条，
+/// 判定（[`find_openai_marker`](crate::proxy::find_openai_marker)）与形态记忆（`learned_rules::role_values`）共用这一条，
 /// 口径不许分叉。
 pub(in crate::proxy) fn first_turn_index(msgs: &[serde_json::Value]) -> usize {
     msgs.iter()

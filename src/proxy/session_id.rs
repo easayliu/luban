@@ -21,11 +21,11 @@ use super::simulation::{Simulation, looks_like_uuid};
 ///
 /// - 一个 `sess-42` 之类的短串本身就是判据——上游那边这个字段从来只有 uuid；
 /// - 更硬的是带控制字符/超长的值：`HeaderValue::from_str` 会失败，于是头上没有、体里
-///   却有，拼出「两处不一致」这个官方绝不产生的组合（[`official_headers`] 里那个
+///   却有，拼出「两处不一致」这个官方绝不产生的组合（[`official_headers`](crate::proxy::official_headers) 里那个
 ///   `if let Ok(v)` 就是这么漏的）。
 ///
 /// 校验不过就当没带，退回派生值——那至少是个自洽的 uuid。
-pub(super) fn incoming_session_id(
+pub(crate) fn incoming_session_id(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
 ) -> Option<String> {
@@ -68,7 +68,7 @@ pub(super) fn incoming_session_id(
 ///
 /// 只在两处**都是合法 uuid** 时才算冲突：一处非法时 [`incoming_session_id`] 本来就只认另
 /// 一处，那不是冲突，是客户端只给对了一个。
-pub(super) fn session_id_conflict(
+pub(crate) fn session_id_conflict(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
 ) -> Option<(String, String)> {
@@ -86,7 +86,7 @@ pub(super) fn session_id_conflict(
 
 /// 选号时这条请求的会话那一侧，见 [`session_plan`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SessionPlan {
+pub(crate) struct SessionPlan {
     /// 这条请求的会话键（`session_bindings` 与流水的 `session_key` 列），取法见
     /// [`session_binding_key`]。
     pub key: Option<String>,
@@ -135,7 +135,7 @@ pub(super) struct SessionPlan {
 ///
 /// **匿名侧查询不占会话名额**（`follow_only`）：没有设备身份的来访（模拟路径），标题生成、安全
 /// 分类、预热、额度探测、WebSearch / WebFetch 辅助调用这些一次性请求（`side_class`，见
-/// [`super::CcRequestKind::is_side_query`]）没有设备亲和可依，主线程落在哪个号上只能凭会话键
+/// [`super::CcRequestKind::is_side_query`](crate::proxy::CcRequestKind::is_side_query)）没有设备亲和可依，主线程落在哪个号上只能凭会话键
 /// 去找：同一个键有活跃绑定就跟过去（官方同一会话本来就在同一个号上），找不到（来访没带会话
 /// id、前缀指纹与主线程不同，或主线程那条已过期）就分散到负载最低的号，**不新建绑定**——否则每条
 /// 侧查询各占一份名额、白占到 TTL。流水上的键换成带类别的 [`anon_session_key`]，后台据此把这类
@@ -147,7 +147,7 @@ pub(super) struct SessionPlan {
 /// 主线程走。带会话头却不带 `metadata` 的 `/v1/messages`（v0.3.12 记过 CC Desktop 有这种）也
 /// 走这里：多轮对话会话内粘住，不再每轮换号。出站会话 id 沿用来访那个（[`bare_session_id`]
 /// 按账号钉住），不占派生槽位（`passthrough`）。
-pub(super) fn session_plan(
+pub(crate) fn session_plan(
     flags: store::ForwardFlags,
     simulating: bool,
     has_device: bool,
@@ -209,7 +209,7 @@ pub(super) fn needs_prefix_key(
 ///
 /// 两者都取不到时返回 `None`：这时来访要么两处都没有会话 id，要么带的两处都不是 uuid，
 /// 没有任何依据凭空造一个（`bare_session` 那条路才有派生的前提，见它的六个条件）。
-pub(super) fn outbound_session_id(
+pub(crate) fn outbound_session_id(
     headers: &HeaderMap,
     body: Option<&serde_json::Value>,
     bare_session: Option<&str>,
@@ -223,7 +223,7 @@ pub(super) fn outbound_session_id(
 }
 
 /// 来访没带 `metadata.user_id` 时用来补一份的 session_id；不需要补时为 `None`。
-/// 语义与各项前提见 [`Upstream::bare_session`]。
+/// 语义与各项前提见 [`Upstream::bare_session`](crate::proxy::Upstream::bare_session)。
 ///
 /// 六个前提缺一不可：
 /// - `sim.is_none()`：模拟那条路自己带 session_id，不走这里；
@@ -233,14 +233,14 @@ pub(super) fn outbound_session_id(
 /// - `flags.spoof_identity`：身份伪装总开关——补出来的那份身份正是它管的东西，
 ///   它关着还补，等于绕过总开关；
 /// - `billable`：非计费路径（count_tokens）出站体一律原样透传，补了也发不出去；
-/// - `!has_user_id`：字段已经在就交给 [`spoof_identity`] 原格式改写，两条路只能有一条动它；
-/// - `spoof_device_id` 有值：这是 [`ensure_cc_metadata`] 造身份的前提（无 `account_uuid`
+/// - `!has_user_id`：字段已经在就交给 [`spoof_identity`](crate::proxy::spoof_identity) 原格式改写，两条路只能有一条动它；
+/// - `spoof_device_id` 有值：这是 [`ensure_cc_metadata`](crate::proxy::ensure_cc_metadata) 造身份的前提（无 `account_uuid`
 ///   就造不出自洽身份）。不满足时连头也不补——否则会补出一个「头上有会话 id、体里没
 ///   metadata」的新破绽，比两处都缺更显眼。
 ///
 /// **不再排除真 CC 客户端**：实测 CC Desktop 等客户端有时不带 `metadata.user_id`，
 /// 上游对无 metadata 的请求走更严的限流通道，触发裸 429。补上后同一条请求立即 200。
-pub(super) fn bare_session_id(
+pub(crate) fn bare_session_id(
     headers: &HeaderMap,
     flags: store::ForwardFlags,
     sim: Option<&Simulation>,
@@ -277,7 +277,7 @@ pub(super) fn bare_session_id(
 /// 那个槽位，由选号时的会话绑定分配（`session_bindings.slot`），槽位释放后下一个对话复用同一个
 /// 会话 id，上游看到的每个账号只在会话上限那么多个 id 之间轮转。没有槽位的（带设备身份、不写
 /// 会话绑定的模拟请求）退回按缓存前缀（[`sim_session_key`]）派生，与 v0.3.126 相同。
-pub(super) fn session_id_for(cred: &crate::credentials::Credential, seed: &str) -> String {
+pub(crate) fn session_id_for(cred: &crate::credentials::Credential, seed: &str) -> String {
     crate::credentials::derive_session_id(
         &crate::credentials::session_account_key(cred.account_uuid.as_deref(), cred.id),
         seed,
@@ -297,11 +297,11 @@ pub(super) fn session_id_for(cred: &crate::credentials::Credential, seed: &str) 
 /// 看到的是一条全新的会话配一台全新的设备，自洽。
 ///
 /// 三处都走这一份（[`outbound_session_id`]、[`bare_session_id`]、[`Simulation::detect`]），
-/// 与 [`spoof_identity`] 同一道闸：这是在改客户端写的身份字段，身份伪装关着时来访原值照发。
+/// 与 [`spoof_identity`](crate::proxy::spoof_identity) 同一道闸：这是在改客户端写的身份字段，身份伪装关着时来访原值照发。
 /// 前缀与 [`session_id_for`] 不同、输入也不同（那边是设备指纹，这边是来访会话 id），不会撞
 /// 出同值。没有 `account_uuid` 的凭证派生不出来（返回 `None`，调用方沿用来访原值）——那种
 /// 号的身份本来就补不出来（`spoof_device_id` 同样为 `None`）。
-pub(super) fn account_session_id(
+pub(crate) fn account_session_id(
     cred: &crate::credentials::Credential,
     client_session: &str,
 ) -> Option<String> {
@@ -310,7 +310,7 @@ pub(super) fn account_session_id(
 
 /// [`account_session_id`] 的开关版：`pin` 为真（[`store::ForwardFlags::spoof_identity`]）时按账号
 /// 钉住，派生不出来或开关关着都沿用来访原值。
-pub(super) fn pin_session_id(
+pub(crate) fn pin_session_id(
     cred: &crate::credentials::Credential,
     client_session: String,
     pin: bool,

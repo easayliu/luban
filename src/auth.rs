@@ -3,7 +3,7 @@
 //!
 //! 四种角色见 [`UserRole`]：唯一的 admin、唯一的只读访客、代理、用户。密码用 argon2id 存在
 //! `users.password_hash`；旧版存在 settings 里的无盐 sha256 迁移时带上前缀搬过来，登录校验
-//! 通过即换成 argon2（见 [`store::migrate_users`]）。admin 与访客的密码仍可由
+//! 通过即换成 argon2（见 `store::migrate_users`）。admin 与访客的密码仍可由
 //! `LUBAN_ADMIN_PASSWORD` / `LUBAN_VIEWER_PASSWORD` 接管，接管时库里的哈希不起作用。
 //!
 //! **未设管理密码时管理接口一律拒绝**，本机也不例外。默认监听 `0.0.0.0`、Docker 也把端口发布

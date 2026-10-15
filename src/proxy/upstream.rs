@@ -22,7 +22,7 @@ use super::{Simulation, error_response, header_opt};
 /// 存在的理由是**重试**：签名降级重试必须和首发除了 body 之外逐字节一致，否则「重试成功了」
 /// 有可能只是因为顺手换了别的东西，排查时会被带偏。把这些一次装好、两次共用，就不存在
 /// 「重建时漏了一项」的可能。
-pub(super) struct Upstream<'a> {
+pub(crate) struct Upstream<'a> {
     /// 本次请求该用的出站客户端——**由选中的那个凭证决定**，配了专用代理的号走它自己的
     /// 那一份。首发与换号重试各自重建 [`Upstream`]，所以换号时这里也跟着换，不会出现
     /// 「用 A 号的代理发 B 号的 token」。见 [`crate::clients::ClientPool`]。
@@ -31,10 +31,10 @@ pub(super) struct Upstream<'a> {
     pub(super) _state: std::marker::PhantomData<&'a AppState>,
     pub(super) method: Method,
     pub(super) url: String,
-    /// [`build_forward_headers`] 的产物，逐次 clone 后发出。
+    /// [`build_forward_headers_for`](crate::proxy::build_forward_headers_for) 的产物，逐次 clone 后发出。
     pub(super) headers: HeaderMap,
     pub(super) flags: store::ForwardFlags,
-    /// 见 [`is_billable_messages`]。为假时出站体一律原样透传，见 [`Self::shape`]。
+    /// 见 [`is_billable_messages`](crate::proxy::is_billable_messages)。为假时出站体一律原样透传，见 [`Self::shape`]。
     pub(super) billable: bool,
     /// 非 CC 客户端的模拟参数；`None` 即来访本来就是 CC 形态。见 [`Simulation`]。
     pub(super) sim: Option<Simulation>,
@@ -42,16 +42,16 @@ pub(super) struct Upstream<'a> {
     /// （`sim` 为 `Some` 时恒为 `None`——那条路的会话 id 在 [`Simulation::session_id`] 里）。
     ///
     /// 这条路**只服务第三方 CC 兼容客户端**：系统提示词学了官方的，metadata 却不发。官方
-    /// 每条请求都带那个字段，缺了就是一处白给的判据，所以替它补上（[`ensure_cc_metadata`]）。
+    /// 每条请求都带那个字段，缺了就是一处白给的判据，所以替它补上（[`ensure_cc_metadata`](crate::proxy::ensure_cc_metadata)）。
     /// 真实 CC 客户端（UA 自报 `claude-cli/`）不在此列——它没带就是它的真实形态，见
-    /// [`bare_session_id`] 的前提。
+    /// [`bare_session_id`](crate::proxy::bare_session_id) 的前提。
     /// 取值优先用来访自己带的 `X-Claude-Code-Session-Id`：官方头体两处逐字相同，另派生一个
-    /// 只会让它们对不上，那比两处都缺更显眼；没带才派生，并由 [`build_forward_headers`]
+    /// 只会让它们对不上，那比两处都缺更显眼；没带才派生，并由 [`build_forward_headers_for`](crate::proxy::build_forward_headers_for)
     /// 把同一个值补进头里。
-    pub(super) bare_session: Option<String>,
+    pub(crate) bare_session: Option<String>,
     /// 这条请求出站时两处（`X-Claude-Code-Session-Id` 头与 `metadata.user_id`）都要落的
     /// **同一个**会话 id；模拟路径为 `None`（那条的在 [`Simulation::session_id`]）。
-    /// 取值与理由见 [`outbound_session_id`]。
+    /// 取值与理由见 [`outbound_session_id`](crate::proxy::outbound_session_id)。
     pub(super) session_out: Option<String>,
     /// 来访是非流式、要改写成 `stream:true` 发出（回程再聚合成整段 JSON）。
     /// 见 [`store::ForwardFlags::nonstream_as_sse`]。
@@ -60,13 +60,13 @@ pub(super) struct Upstream<'a> {
     /// 此时请求与回程两侧都零开销。见 [`ToolNameMap`]。
     pub(super) tool_names: Option<std::sync::Arc<ToolNameMap>>,
     /// **真实 CC 来访**（非模拟）要补的会话关联字段：`(会话 id, 链)`。
-    /// 判据与取值见 [`client_session_link`]；模拟那条路的链在 [`Simulation::link`] 里。
+    /// 判据与取值见 [`client_session_link`](crate::proxy::client_session_link)；模拟那条路的链在 [`Simulation::link`] 里。
     pub(super) client_link: Option<(String, CcSessionLink)>,
     /// 这条来访属于哪一类官方 profile。除了会话链，它还管住「别把官方非流式请求改成
     /// 流式」与「别给额度探测补 system」两条，见 [`CcRequestKind`]。
     pub(super) cc_kind: CcRequestKind,
-    /// 出站体要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`]）；`None` 即不补。
-    /// 有值时出站头已带 `server-side-fallback` beta（[`build_forward_headers_for`]）。
+    /// 出站体要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`](crate::proxy::refusal_fallbacks_for)）；`None` 即不补。
+    /// 有值时出站头已带 `server-side-fallback` beta（[`build_forward_headers_for`](crate::proxy::build_forward_headers_for)）。
     pub(super) refusal_fallbacks: Option<&'static str>,
 }
 
@@ -95,12 +95,12 @@ impl Upstream<'_> {
     /// `Value` 建在手里（见 [`rewrite_body_out`]）——借它走一趟只要 0.6ms，而从字节重新解析
     /// 一份 1.8MB 的会话要 6.7ms。两者的产物逐字相同。
     ///
-    /// `inbound` 是来访体已经解析好的那份（[`handle_inner`] 里的 `body_json`）：改写没动过
+    /// `inbound` 是来访体已经解析好的那份（[`handle_inner`](crate::proxy::handle_inner) 里的 `body_json`）：改写没动过
     /// 体的时候出站字节与来访逐字节相同，摘要拿它算即可，同样不必重新解析。
     ///
     /// **`Value` 不外泄**：只返回摘要那三个小 String。解析态的 `Value` 通常是字节数的几倍，
     /// 把它交出去让调用方一路拿着穿过上游那次往返，是拿内存峰值换 CPU——那笔账不划算。
-    pub(super) fn shape_outbound(
+    pub(crate) fn shape_outbound(
         &self,
         body: &Bytes,
         cred: &crate::credentials::Credential,
@@ -193,7 +193,7 @@ impl Upstream<'_> {
 }
 
 /// 从上游响应里取出决定「响应体怎么读」的两项：是否 SSE 流、以及我们解不开的
-/// `content-encoding`（正常恒为 `None`，见 [`handle`] 里的说明）。
+/// `content-encoding`（正常恒为 `None`，见 [`handle`](crate::proxy::handle) 里的说明）。
 pub(super) fn resp_shape(up: &wreq::Response) -> (bool, Option<String>) {
     let is_stream = up
         .headers()
@@ -290,7 +290,7 @@ pub(super) async fn relay_upstream(
 
 /// 把上游响应包成流式回传：首块到达记 TTFT，边转发边嗅探用量；
 /// 流结束（或客户端断开）时 `rl` 在 Drop 里记 total、输出一条日志并落库。
-fn stream_upstream(
+pub(crate) fn stream_upstream(
     up: wreq::Response,
     mut rl: ReqLog,
     tool_names: Option<std::sync::Arc<ToolNameMap>>,
@@ -334,7 +334,7 @@ fn stream_upstream(
 /// 用量嗅探照旧按 SSE 逐行走——**比非流式那条路更准**：整段 JSON 模式有 1MB 的累积上限，
 /// 超了就整条丢用量，逐行模式没有这个限制。TTFT 记的是上游首字节，客户端感知不到（它只会
 /// 在末尾一次性收到整段），故日志里这两列会不一致，`sse_aggregated=true` 用来标出这类记录。
-pub(super) async fn aggregate_sse(
+pub(crate) async fn aggregate_sse(
     up: wreq::Response,
     mut rl: ReqLog,
     tool_names: Option<&ToolNameMap>,
@@ -432,7 +432,7 @@ pub(super) async fn aggregate_sse(
 ///
 /// **认不出来的类型一律 500**，不是 200：它确实是个错误，回 200 会让客户端与统计都把它
 /// 当成功。500 是最不误导的兜底——客户端会当服务端故障重试，而不是把错误体当成模型输出。
-pub(super) fn error_status(payload: &serde_json::Value) -> StatusCode {
+pub(crate) fn error_status(payload: &serde_json::Value) -> StatusCode {
     let kind =
         payload.get("error").and_then(|e| e.get("type")).and_then(|t| t.as_str()).unwrap_or("");
     match kind {
@@ -460,7 +460,7 @@ pub(super) fn error_status(payload: &serde_json::Value) -> StatusCode {
 }
 
 /// [`SseAggregator::finish`] 的三种结局。
-pub(super) enum Aggregated {
+pub(crate) enum Aggregated {
     /// 收到了 `message_stop`，攒出一条完整 Message。
     Message(serde_json::Value),
     /// 流中来了 `event: error`，带上那份错误 JSON 原样回给客户端。
@@ -485,7 +485,7 @@ pub(super) enum Aggregated {
 /// 时这里不用改。**未知的 `delta.type` 会丢内容**，故打一条 warn 而不是静默——那是唯一需要
 /// 跟着上游演进的地方。
 #[derive(Default)]
-pub(super) struct SseAggregator {
+pub(crate) struct SseAggregator {
     /// 未处理完的行尾（`feed` 按行切，最后一段不完整的留着等下一块）。
     buf: Vec<u8>,
     /// `message_start` 给的骨架；没收到它就说明流从一开始就不对。
@@ -689,7 +689,7 @@ fn event_index(v: &serde_json::Value) -> Option<usize> {
     v.get("index")?.as_u64().map(|i| i as usize)
 }
 
-/// 上游拒了 luban 补的 `fallbacks`（见 [`is_fallback_rejection`]）：同一个号、同一份客户端
+/// 上游拒了 luban 补的 `fallbacks`（见 [`is_fallback_rejection`](crate::proxy::is_fallback_rejection)）：同一个号、同一份客户端
 /// 体，**不补 `fallbacks`** 再发一次。头上的 `server-side-fallback` beta 留着——「有 beta
 /// 没字段」本身就是官方形态（[`config::known_fingerprint_gaps`] 第 7 条）。
 ///
@@ -919,13 +919,13 @@ pub type UpstreamLoad = std::sync::Arc<parking_lot::Mutex<UpstreamLoadTable>>;
 
 /// 发送记录的统计窗口。取 60 秒是因为上游那套限额本身就是「每分钟」的口径——窗口对不齐，
 /// 读数与限额就没法直接比大小，而这条日志的全部用处就在这个可比性上。
-pub(super) const UPSTREAM_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const UPSTREAM_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`UpstreamLoad`] 的表体。
 #[derive(Default)]
 pub struct UpstreamLoadTable {
     /// `(账号, 模型)` → 此刻在上游那边跑着的请求数。**归零即删键**，故不像
-    /// [`TransientStreaks`] 那样需要清扫：模型名同样来自来访请求体（乱编就能造键），
+    /// [`TransientStreaks`](crate::proxy::TransientStreaks) 那样需要清扫：模型名同样来自来访请求体（乱编就能造键），
     /// 但这里的键活不过它那几条请求。
     pub(super) in_flight: std::collections::HashMap<(i64, String), u32>,
     /// 账号 → 最近发出去的那些请求的 `(发送时刻, 声明的 max_tokens)`，按时刻升序。
@@ -967,7 +967,7 @@ impl Drop for UpstreamRouteGuard {
 ///
 /// **必须在 `send` 之前调用**：上游是按它收到请求的那一刻计数的，我们这边晚记一步，读数就会
 /// 在最要紧的那一瞬（一批并发同时在飞）系统性偏小。
-pub(super) fn note_upstream_send(
+pub(crate) fn note_upstream_send(
     load: &UpstreamLoad,
     cred_id: i64,
     model: &str,
@@ -1006,7 +1006,7 @@ pub(crate) fn in_flight_of(load: &UpstreamLoad, cred_ids: &[i64]) -> i64 {
 }
 
 /// 一发裸 429 落地时，我们这一侧的发送密度读数，见 [`UpstreamLoad`]。
-pub(super) struct UpstreamLoadSnapshot {
+pub(crate) struct UpstreamLoadSnapshot {
     /// 这条「账号 + 模型」路线此刻的在飞数，**含发起这次查询的这条请求自己**（它的格子还没归还）。
     pub(super) route_in_flight: u32,
     /// 这个账号全部模型合计的在飞数。组织/工作区那套限额不分模型，故这一项才是与限额同口径的
@@ -1019,7 +1019,7 @@ pub(super) struct UpstreamLoadSnapshot {
 }
 
 /// 取一份 [`UpstreamLoadSnapshot`]；顺手把这个账号已滚出窗口的发送记录丢掉（空了就删键）。
-pub(super) fn upstream_load_snapshot(
+pub(crate) fn upstream_load_snapshot(
     load: &UpstreamLoad,
     cred_id: i64,
     model: &str,

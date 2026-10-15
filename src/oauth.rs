@@ -424,7 +424,7 @@ const PERSONAL_ORG_TYPES: [&str; 3] = ["claude_max", "claude_pro", "claude_free"
 ///
 /// 只给**团队/企业号**用：个人号的档位由 `has_claude_max`/`has_claude_pro` 直接给出，
 /// 更权威；团队号那两个标志恒为 false，这个字段是唯一的信息来源。
-fn tier_from_rate_limit(rate_limit_tier: Option<&str>) -> Option<String> {
+pub(crate) fn tier_from_rate_limit(rate_limit_tier: Option<&str>) -> Option<String> {
     let raw = rate_limit_tier?.to_ascii_lowercase();
     let base = ["max", "pro", "free"].into_iter().find(|k| raw.split('_').any(|seg| seg == *k))?;
     Some(with_mult(&humanize_tier(base), multiplier(rate_limit_tier)))

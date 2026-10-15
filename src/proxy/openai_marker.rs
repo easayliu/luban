@@ -2,7 +2,7 @@ use super::body::{first_turn_index, is_system_directive};
 
 /// 请求体里一处 OpenAI 格式转换残留，见 [`find_openai_marker`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OpenAiMarker {
+pub(crate) struct OpenAiMarker {
     /// JSON 路径，如 `messages.0.content.1`、`tool_choice`、`n`。
     pub(super) location: String,
     /// 残留类别（进日志按类聚合）：`image_url` / `system_role` / `foreign_role` /
@@ -156,7 +156,7 @@ pub(super) fn remap_call_ids(body: &mut serde_json::Value) -> usize {
 ///   回 200。所以这一条不是「省一次 400」，是纯粹的转换指纹：Anthropic 侧签发的 id 恒为
 ///   `toolu_` 开头，`call_` 只可能来自 OpenAI 的 `tool_calls[].id` 被原样回填。其余各条上游
 ///   同样回 400，本地拒只是省一次往返、把原因说清楚。
-pub(super) fn find_openai_marker(
+pub(crate) fn find_openai_marker(
     body: Option<&serde_json::Value>,
     cc_shaped: bool,
     strict: bool,

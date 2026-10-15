@@ -64,7 +64,7 @@ impl std::error::Error for ModelUnsupported {}
 /// 不占槽位：[`free_session_slot`] 只从 0 起找空位，负数永远不与之相撞。
 pub const PASSTHROUGH_SLOT: i64 = -1;
 
-/// [`CredentialStore::select_for_device`] 里这条请求按哪张表粘住账号、占哪种名额。
+/// [`crate::store::CredentialStore::select_with_slot`] 里这条请求按哪张表粘住账号、占哪种名额。
 /// 两张表列名不同、上限字段不同、拒绝的错误类型不同，其余规则逐条相同。
 #[derive(Clone, Copy)]
 pub(super) enum Binding<'a> {
@@ -104,7 +104,7 @@ impl<'a> Binding<'a> {
     }
 }
 
-/// [`CredentialStore::select_for_device`] 的入参。
+/// [`crate::store::CredentialStore::select_with_slot`] 的入参。
 ///
 /// 做成结构体而不是一串位置参数：两个 `Option<&str>`（`device_id` 与 `model`）挨在一起，
 /// 位置传参写反了照样编译得过，而那是一个「设备粘性按模型名走」的静默错误。
@@ -121,13 +121,13 @@ pub struct Select<'a> {
     /// `lb:v2:sid:<来访自带的会话 id>` 或 `lb:v2:pfx:<缓存前缀加首条用户消息的指纹>`——命名空间
     /// 加口径版本加来源段，取法见 `crate::proxy::session_binding_key`。
     /// `Some` 且 `device_id` 为 `None` 时按它粘住账号并占该账号
-    /// 的**会话名额**（`session_bindings`，上限 `session_limit` / [`DEFAULT_SESSION_LIMIT`]），
+    /// 的**会话名额**（`session_bindings`，上限 `session_limit` / [`DEFAULT_SESSION_LIMIT`](crate::store::DEFAULT_SESSION_LIMIT)），
     /// 规则与设备绑定逐条相同（TTL、软绑定、改绑、全满时拒——[`SessionLimitReached`]）。
     /// `device_id` 有值时只在 [`Self::per_session`] 下才用它，否则按设备绑定，一条请求不占两份
     /// 名额。非模拟路径只有 `per_session` 时才有值（真实客户端自带的会话 id，没带时按前缀指纹）。
     ///
     /// 绑定行还记着这条会话在该号上占的**槽位**（[`free_session_slot`]）：出站会话 id 由
-    /// 「账号 + 槽位」派生，槽位释放后下一个对话复用同一个 id，见 [`CredentialStore::session_slot`]。
+    /// 「账号 + 槽位」派生，槽位释放后下一个对话复用同一个 id，见 `CredentialStore::session_slot`。
     pub session_key: Option<&'a str>,
     /// 带设备身份的来访也**按会话**占名额（[`Self::session_key`] 那张表与 `session_limit`），
     /// 设备上限不再生效。代理在「上游看到的设备身份已经收敛」时置真：设备指纹归一化开着、
@@ -152,7 +152,7 @@ pub struct Select<'a> {
     /// 留着，设备回来时优先回原号。`<= 0` 表示永久保留（只要不被解绑/停号就一直在）。
     pub retention_secs: i64,
     /// 模拟会话绑定的有效期与保留期，语义同上面两项，只是作用在 `session_bindings` 上、
-    /// 单独配置（[`SESSION_BINDING_TTL`] / [`SESSION_BINDING_RETENTION`]）。
+    /// 单独配置（[`SESSION_BINDING_TTL`](crate::store::SESSION_BINDING_TTL) / [`SESSION_BINDING_RETENTION`](crate::store::SESSION_BINDING_RETENTION)）。
     pub session_ttl_secs: i64,
     pub session_retention_secs: i64,
     /// 本次请求是否计入裸请求速率上限（只有真正消耗额度的路径才该计，见
@@ -383,7 +383,7 @@ impl CredentialStore {
             }
             // 选号本身的错误（含 SQL 出错使事务作废、提交随之失败的情况）优先上报。
             (Err(e), _) => Err(e),
-            (Ok(_), Err(e)) => Err(e.into()),
+            (Ok(_), Err(e)) => Err(e),
         }
     }
 

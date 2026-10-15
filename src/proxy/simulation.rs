@@ -19,10 +19,10 @@ use super::{
 
 /// 一条**非 Claude Code 请求**要装成官方客户端时的全部派生量。
 ///
-/// `Some` 即本条请求走模拟路径：转发头整套换成官方那套（[`official_headers`]）、`system`
-/// 补上官方前缀（[`simulate_system`]）、`metadata` 补上身份（[`ensure_cc_metadata`]）。
+/// `Some` 即本条请求走模拟路径：转发头整套换成官方那套（[`official_headers`](crate::proxy::official_headers)）、`system`
+/// 补上官方前缀（[`simulate_system`]）、`metadata` 补上身份（[`ensure_cc_metadata`](crate::proxy::ensure_cc_metadata)）。
 /// `None` 即来访本来就是 CC 形态、或自带 `metadata.user_id`（同样是 CC 系客户端的记号，
-/// 判据见 [`Self::detect`]）、或开关关着，照既有路径走，一个字节都不多改。
+/// 判据见 [`Self::detect`](crate::proxy::Simulation::detect)）、或开关关着，照既有路径走，一个字节都不多改。
 ///
 /// **存在的理由**：订阅(OAuth)凭证在上游是「只授权给 Claude Code 用」的，`system` 里缺那句
 /// [`config::CC_SYSTEM_IDENTITY`] 就用不了额度。于是任何非 CC 客户端（各种 SDK、第三方
@@ -37,7 +37,7 @@ use super::{
 /// [`store::SIMULATE_CC`] 关掉，代价是这类请求退回「上游直接拒」。
 /// [`Simulation::detect`] 派生会话 id 的来源，见那里的 `session_id` 注释。
 #[derive(Debug, Clone, Copy)]
-pub(super) enum SimSessionSeed<'a> {
+pub(crate) enum SimSessionSeed<'a> {
     /// 选号时占到了会话槽位（[`crate::credentials::slot_session_seed`]）：来访自带的会话 id
     /// 也换成槽位那个（除非不改身份）。
     Slot(&'a str),
@@ -46,7 +46,7 @@ pub(super) enum SimSessionSeed<'a> {
     Prefix(&'a str),
 }
 
-pub(super) struct Simulation {
+pub(crate) struct Simulation {
     /// 按模型族选出的官方基座提示词；模型认不出来时 `None`——基座是逐字节从抓包取的，
     /// 猜错一族（把 sonnet 的 10682 字节发给 opus）比不发更糟。见 [`cc_system_base`]。
     pub(super) base: Option<&'static str>,
@@ -92,11 +92,11 @@ pub(super) struct Simulation {
     /// [`crate::store::ForwardFlags::sim_trim_tools`] 与 [`crate::proxy::cc_tools_core`]）。
     pub(super) trim_tools: bool,
     /// 只注 `system[0]` 的最小 billing header、其余注入全部跳过（开关 `sim_billing_only`，见
-    /// [`crate::store::ForwardFlags::sim_billing_only`]）。开着时 [`rewrite_body_out`] 里的下游
+    /// [`crate::store::ForwardFlags::sim_billing_only`]）。开着时 [`rewrite_body_out`](crate::proxy::rewrite_body_out) 里的下游
     /// 整形（身份句、基座、第四块、工具、metadata、thread、顶层重排等）一律不做。
     pub(super) billing_only: bool,
     /// 这条要不要带 `anthropic-usage-limit: extended`（[`config::CC_USAGE_LIMIT_HEADER`]）：主线程
-    /// 的工具续轮，且这个号进了那个实验、额外用量停用着，见 [`usage_limit_wanted`]。
+    /// 的工具续轮，且这个号进了那个实验、额外用量停用着，见 [`usage_limit_wanted`](crate::proxy::usage_limit_wanted)。
     pub(super) usage_limit: bool,
     /// 出站体按 message thread 改写后，等回程提交的那份（[`ThreadPending`]）：由
     /// [`crate::proxy::rewrite_body_out`] 写（[`Self::set_thread`]），`ReqLog` 取走
@@ -261,7 +261,7 @@ pub(super) fn inbound_facts(v: &serde_json::Value) -> InboundFacts {
 impl Simulation {
     /// 判定 + 派生一次做完：判定见 [`simulates_cc`]（它说不模拟就返回 `None`），这里只负责
     /// 把模拟身份——profile、会话 id、会话链——派生出来。
-    pub(super) fn detect(
+    pub(crate) fn detect(
         body: Option<&serde_json::Value>,
         headers: &HeaderMap,
         from_cc_client: bool,
@@ -329,7 +329,7 @@ impl Simulation {
 }
 
 /// 这条请求会不会被模拟路径接管——[`Simulation::detect`] 的判定部分，单拎出来是因为
-/// **设备指纹要在 detect 之前就知道出站 UA**（[`device_fingerprint`] / [`outbound_ua`]）：
+/// **设备指纹要在 detect 之前就知道出站 UA**（[`device_fingerprint`](crate::proxy::device_fingerprint) / `outbound_ua`）：
 /// 模拟路径整套换头，UA 恒为 [`config::CC_USER_AGENT`]，与来访自报的那串是两台设备。
 /// detect 自己也调它，两处判据只有这一份，不会各判各的。
 ///
@@ -345,7 +345,7 @@ impl Simulation {
 ///
 /// **依赖 `merge_beta`**：模拟出来的 `anthropic-beta` 要靠它落位并补上 `oauth`，关掉它
 /// 就是「system 装成了 CC、头上却没有 oauth beta」的自相矛盾（且上游直接拒）。同
-/// [`rewrite_body`] 里 `system_shape` 依赖 `merge_beta` 是一个道理。
+/// [`rewrite_body_out`](crate::proxy::rewrite_body_out) 里 `system_shape` 依赖 `merge_beta` 是一个道理。
 pub(super) fn simulates_cc(
     body: Option<&serde_json::Value>,
     headers: &HeaderMap,
@@ -491,7 +491,7 @@ pub(super) fn simulation_reason(
 ///
 /// 用 `contains` 而不是 `starts_with`：谁把那句话塞在自己提示词中间，那也是在自称 CC，
 /// 再给他前面插一份官方前缀只会得到两句身份声明。`system` 是字符串形态的一并认。
-pub(super) fn is_cc_shaped(v: &serde_json::Value) -> bool {
+pub(crate) fn is_cc_shaped(v: &serde_json::Value) -> bool {
     let texts: Vec<&str> = match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => {
             blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
@@ -547,7 +547,7 @@ fn has_cc_base_prompt(v: &serde_json::Value) -> bool {
 /// `cap/auto-2.1.285-20260930/00064`）：body 与 beta 同上，只是第 2、3 条换成主线程那一套——
 /// billing header **不带** `cc_is_subagent`、第二块逐字是 CC 身份句。两套各自成对才算，
 /// 子代理标记配 CC 身份句、或主线程 billing 配 SDK 身份句都不认。
-pub(super) fn is_official_helper_request(v: &serde_json::Value, beta: &[String]) -> bool {
+pub(crate) fn is_official_helper_request(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
     if blocks.len() != 2 {
         return false;
@@ -605,7 +605,7 @@ pub(super) const CC_BASE_PROMPT_MIN_LEN: usize = 1000;
 /// device_id 与会话 id 也换成模拟派生的——一条 `claude-cli/2.1.220` 的主线程会话中途冒出一台
 /// 2.1.260 的新设备发了一条搜索（`ban/luban-ban-13`、`ban-14` 各 2、3 条，`ban-37` 3 条；出站
 /// system 是 `[billing, 身份, 基座, 57 字节]`，末块正是那句搜索助手提示）。放行后走透传路径：
-/// 头、身份、会话与主线程同源；没带 billing header 的由 [`ensure_cc_system_prefix`] 补前缀，
+/// 头、身份、会话与主线程同源；没带 billing header 的由 [`ensure_cc_system_prefix`](crate::proxy::ensure_cc_system_prefix) 补前缀，
 /// server tool 在工具改名那步本来就按原名保留。
 ///
 /// 逐项对，缺一不算：
@@ -678,7 +678,7 @@ pub(super) fn is_official_count_tokens(v: &serde_json::Value, beta: &[String]) -
 /// `tools` 列表是否看起来像真正的 CC 客户端：没有 `tools`（count_tokens 等场景）算是，
 /// 有 `tools` 但里面至少有一个 [`config::CC_TOOL_NAMES`] 里的官方工具名也算是。
 /// **有 tools 却一个官方名都找不到**说明 UA 是第三方中转冒用的。
-fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
+pub(crate) fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
     let Some(tools) = v.get("tools").and_then(|t| t.as_array()) else {
         return true; // 没有 tools 字段不是判据
     };
@@ -715,7 +715,7 @@ pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
 /// 官方第四块的模板（2.1.293：opus / sonnet 一份，fable、haiku-4.5、haiku-5-5 各一份）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
 /// 知识截止，2.1.277 起的第四块不再写这些，只剩记忆目录一处随机器变。
-pub(super) fn cc_system_rest(model: &str) -> Option<&'static str> {
+pub(crate) fn cc_system_rest(model: &str) -> Option<&'static str> {
     if !is_claude_family(model) {
         return None;
     }
@@ -748,7 +748,7 @@ static CC_SYSTEM_REST_FABLE_5: std::sync::LazyLock<String> = std::sync::LazyLock
 /// 这条是不是 2.1.277 起 message-threads 的**官方续轮**（`cap/2.1.277/00035`、`00037`、`00040`、
 /// `00048`、`00051` 等 30 余条，主线程与子代理都有）。官方续轮只发新增消息，`system` 只剩
 /// billing header 一块、不带 `tools`——形态上像「抄了 billing header 却没基座」的第三方，
-/// [`simulation_reason`] 得在基座判据之前放它，[`probe_signature`] 那条「有 system、没 tools、
+/// [`simulation_reason`] 得在基座判据之前放它，[`probe_signature`](crate::proxy::probe_signature) 那条「有 system、没 tools、
 /// 一条消息」也得放它。
 ///
 /// 正因为它放的是一条**不完整**的请求，判据不能只看 `thread` 两个字段——那两个字段谁都写得
@@ -771,7 +771,7 @@ static CC_SYSTEM_REST_FABLE_5: std::sync::LazyLock<String> = std::sync::LazyLock
 /// 第三方要冒充得把这六项全抄对，而抄全了它就**是**一条续轮——透传出去与官方无异，且上游
 /// 会按 `previous_message_id` 校验线程，接不上的自然被拒。`thread.type == "create"` 的首轮是
 /// 完整请求，不在此列，照常过基座与工具判据。
-pub(super) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[String]) -> bool {
+pub(crate) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(thread) = v.get("thread") else { return false };
     if thread.get("type").and_then(|t| t.as_str()) != Some("continue") {
         return false;
@@ -840,7 +840,7 @@ fn thread_tools_changed(v: &serde_json::Value) -> bool {
 /// 第四块里那台「机器」的环境：家目录，与记忆目录里的项目段。来访自己写了工作目录就用它
 /// 那份（[`client_env`]），没写才按账号 + 设备派生一台（[`sim_env_for`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SimEnv {
+pub(crate) struct SimEnv {
     /// `/Users/<user>`。
     pub(super) home: String,
     /// 记忆目录的项目段：官方把 cwd 里的 `/` 与 `_` 换成 `-`（`/Users/easayliu/Works/easay/opdash`
@@ -956,7 +956,7 @@ pub(super) fn sim_env_for(cred: &crate::credentials::Credential, device_fp: &str
 /// 记忆目录与裸路径同时出现时**不让裸路径压 cwd**：裸路径只是提到一个绝对路径（`Read
 /// /Users/sam/.config/app/settings.json` 之类的指令里就是一条），谈不上「我在这儿干活」；只有
 /// 带标签那条才算明写了工作目录，才有资格盖掉记忆目录倒推的 cwd。
-pub(super) fn client_env(v: &serde_json::Value) -> Option<SimEnv> {
+pub(crate) fn client_env(v: &serde_json::Value) -> Option<SimEnv> {
     let system = text_blocks(v.get("system"));
     let first_user = text_blocks(
         v.get("messages")
@@ -1100,7 +1100,7 @@ fn is_segment(s: &str) -> bool {
 /// 把第四块模板里的 `{{…}}` 占位填成这条请求的取值。占位表见 [`config::CC_SYSTEM_REST`]：
 /// 2.1.277 起只剩记忆目录里的 `{{home}}` 与 `{{cwd_slug}}`（2.1.280 那一节叫 `# auto memory`，
 /// 2.1.285 又改回 `# Memory`；2.1.291 的 haiku 那份仍是 `# auto memory`）。三份模板占位相同。
-pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
+pub(crate) fn render_system_rest(template: &str, env: &SimEnv) -> String {
     template.replace("{{cwd_slug}}", &env.slug).replace("{{home}}", &env.home)
 }
 
@@ -1112,15 +1112,15 @@ pub(super) fn render_system_rest(template: &str, env: &SimEnv) -> String {
 /// 与请求内容对不上的用途标记，比装成主线程更假。
 ///
 /// 例外是 luban 自己发的额度探测：那条本来就是官方 `QuotaProbe` 那个形态，由
-/// [`probe_simulation`] 直接指定 profile，不走这里。
+/// [`probe_simulation`](crate::proxy::probe_simulation) 直接指定 profile，不走这里。
 ///
 /// 四族的差异见 [`config::CC_PROFILES`]；认不出的模型退回 sonnet 那份（与 2.1.258 时
 /// [`config::cc_beta_order_is_not_a_table`] 记的口径一致）。
-pub(super) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
+pub(crate) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
     config::cc_profile(cc_profile_kind_for(model))
 }
 
-/// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta_for`] 也用它（再按来访自报的
+/// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta_for`](crate::proxy::merge_beta_for) 也用它（再按来访自报的
 /// 版本经 [`config::cc_profile_at`] 取对应那一版的行）。
 pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
     let m = model.to_ascii_lowercase();
@@ -1187,7 +1187,7 @@ const TITLE_PROMPT_MIN_LEN: usize = 300;
 /// 换成 380 字节的 kebab-case 起名说明。标题那份 3059 字节，阈值按两者里短的那个定。
 ///
 /// 它与 Helper 是两种请求：Helper 是子代理（SDK 身份句、两块），标题生成是主线程身份（CC
-/// 身份句、带长提示词）。两条都在第三条判据的豁免里，见 [`probe_signature`] 里标题生成为什么
+/// 身份句、带长提示词）。两条都在第三条判据的豁免里，见 [`probe_signature`](crate::proxy::probe_signature) 里标题生成为什么
 /// 必须豁免。
 pub(super) fn is_official_title_request(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
@@ -1244,7 +1244,7 @@ fn thinking_type(v: &serde_json::Value) -> Option<&str> {
 
 /// 来访的 CC 身份是否**格式合法**：`metadata.user_id` 按 CC 格式解析出的 device 段（若有）
 /// 是 64 位小写 hex、session 段（若有）是 uuid，`X-Claude-Code-Session-Id` 头（若带了、非空）
-/// 也是 uuid。三处都没带算合法——「没带」由 [`bare_session_id`] 那条路补，不是这里的事。
+/// 也是 uuid。三处都没带算合法——「没带」由 [`bare_session_id`](crate::proxy::bare_session_id) 那条路补，不是这里的事。
 ///
 /// 是 [`Simulation::detect`] 放行透传的前提之一。官方两处身份恒为 64 位 hex + uuid（`cap/`
 /// 37 份样本无一例外）；按 CC 格式写却写错的（`ban.log` 里 `device_id=channel-test`、
@@ -1258,7 +1258,7 @@ fn thinking_type(v: &serde_json::Value) -> Option<&str> {
 /// 眼里是「没带」（它只认字串），但官方这两个字段恒为字串——写了这个键却不是字串，同样是
 /// 抄错了；放它透传的话 `spoof_identity` 只换 device 与 account 段，那个 `null` 会原样留在出站的
 /// `user_id` 里。故这里另看一眼原始 JSON：键在，就必须是非空字串。
-pub(super) fn cc_identity_well_formed(headers: &HeaderMap, v: &serde_json::Value) -> bool {
+pub(crate) fn cc_identity_well_formed(headers: &HeaderMap, v: &serde_json::Value) -> bool {
     let header_ok = headers
         .get("x-claude-code-session-id")
         .and_then(|h| h.to_str().ok())
@@ -1291,7 +1291,7 @@ fn cc_identity_fields_are_strings(v: &serde_json::Value) -> bool {
     })
 }
 
-/// 字段「等于没有」：缺失、`null`、空数组。给 [`probe_signature`] 用——探针加一个 `tools: []`
+/// 字段「等于没有」：缺失、`null`、空数组。给 [`probe_signature`](crate::proxy::probe_signature) 用——探针加一个 `tools: []`
 /// 不该算成「带了 tools」。
 pub(super) fn field_is_empty(v: Option<&serde_json::Value>) -> bool {
     match v {
@@ -1342,7 +1342,7 @@ pub(super) const MAX_CACHE_BREAKPOINTS: usize = 4;
 
 /// 官方 `system` **最多 5 块**：2.1.258 的 fable-5-1（`cap/2.1.258/00013`）是
 /// `[billing, 身份句, reporting, 基座, 其余]`，opus-5 / sonnet-5 / haiku 是去掉 reporting 的
-/// 4 块（2.1.251 时四族都是 5 块）；API-key 模式那三份是 3 块合并态（见 [`align_system_shape`]）。
+/// 4 块（2.1.251 时四族都是 5 块）；API-key 模式那三份是 3 块合并态（见 [`align_system_shape`](crate::proxy::align_system_shape)）。
 ///
 /// 曾以为块数超了就不再是 CC 形态、上游按第三方应用计费（客户端看到
 /// `Third-party apps now draw from your extra usage, not your plan limits.`），把封顶当成
@@ -1351,7 +1351,7 @@ pub(super) const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// 提示文案；上游对块数没有可观测的上限。当年那条 400 的判据另有其物（10-11 复盘指向具体
 /// 第三方产品的提示词原文）。故封顶与合并（[`cap_system_blocks`]、[`merge_system_blocks`]）
 /// 如今只为与官方形态对齐，不再承担计费防线。
-pub(super) const MAX_SYSTEM_BLOCKS: usize = 5;
+pub(crate) const MAX_SYSTEM_BLOCKS: usize = 5;
 
 /// 把非 CC 请求的 `system` 换成官方形态（2.1.260，fable 族五块、其余四块）：
 ///
@@ -1377,7 +1377,7 @@ pub(super) const MAX_SYSTEM_BLOCKS: usize = 5;
 /// 再加就会让整条请求被上游拒——那是把「形态更像」换成「根本发不出去」。预算不够时基座与
 /// 末块照发，只是不带断点（少一次缓存复用，不影响正确性）。预算在**合并之后**才算：
 /// 合并会消掉客户端 `system` 里那几个断点，先算就是按一个已经不存在的数字克扣基座。
-pub(super) fn simulate_system(
+pub(crate) fn simulate_system(
     v: &mut serde_json::Value,
     sim: &Simulation,
     cache: CacheShape,
@@ -1522,7 +1522,7 @@ pub(super) fn simulate_system(
 /// 出现不是文本块的成员（`text` 不是字符串）就**原样交回**——`system` 里只能放文本块，
 /// 别的东西是我们不认识的形态，宁可照发也不猜着改。正文全空的一并丢掉：发一个空文本块
 /// 既没意义，上游也不收。
-fn merge_system_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+pub(crate) fn merge_system_blocks(blocks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     if blocks.len() <= 1 {
         return blocks;
     }
@@ -1621,7 +1621,7 @@ pub(super) fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 }
 
 /// `system[0]` 那条 billing header 的正文，给**真实 CC 客户端**缺 billing header 时补用
-/// （[`ensure_cc_system_prefix`]）。`cch` 不在这里补——那是 [`ensure_billing_cch`] 的活。
+/// （[`ensure_cc_system_prefix`](crate::proxy::ensure_cc_system_prefix)）。`cch` 不在这里补——那是 [`ensure_billing_cch`](crate::proxy::ensure_billing_cch) 的活。
 ///
 /// `cc_version` 的第四段（如 `76b`）由 [`cc_version_suffix`] 从请求 body 动态派生，
 /// 与模拟路径（[`simulated_billing_header_text`]）同一套算法。
@@ -1634,7 +1634,7 @@ pub(super) fn cap_system_blocks(v: &mut serde_json::Value) -> bool {
 /// `entrypoint` 同理取 UA 括号里第二段（[`super::body::cc_ua_entrypoint`]）：官方
 /// `cc_entrypoint` 与它同源，`(external, sdk-cli)` 的来访补一条 `cc_entrypoint=cli` 就是 UA 与
 /// billing 自相矛盾。读不出才写 `cli`。
-pub(super) fn billing_header_text(
+pub(crate) fn billing_header_text(
     v: &serde_json::Value,
     version: Option<&str>,
     entrypoint: Option<&str>,
@@ -1659,12 +1659,12 @@ pub(super) fn billing_header_text(
 /// `cc_is_subagent` → `cc_prev_req` → `cc_prompt_id` → `cc_turn_origin`（2.1.277 起，
 /// `cap/2.1.277/00023`：`…cch=X; cc_prompt_id=U; cc_turn_origin=human;`）→ `cc_prompt_index` →
 /// `cc_turn_index`（2.1.285 起）。`cch` 在这里就一次写好，不再等
-/// [`ensure_billing_cch`] 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
+/// [`ensure_billing_cch`](crate::proxy::ensure_billing_cch) 事后追加——那个函数只管给**真实 CC 来访**缺的那条补。
 ///
 /// 第四段按 [`cc_version_suffix`] 从 `v`（此刻还是来访自己的 `messages`）派生：同一个对话
 /// 每轮首条消息不变，后缀也就整段会话不变，与官方一致。此前写的是抓包那一个会话的值（2.1.277 的 `d56`），经 luban
 /// 的每一个模拟会话后缀都相同，而官方的后缀随会话首句变。
-fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> String {
+pub(crate) fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> String {
     let p = sim.profile;
     let mut s = format!(
         "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch={};",
@@ -1726,7 +1726,7 @@ fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulation) -> Str
 /// 仍对不上的两类，都不是模拟路径会发的形态：message-threads **续轮**（只发新增消息，首句
 /// 不在体里，后缀沿用会话首轮那个）与 2.1.277 的 workflow 子代理（`385`，恰是对空串算的）。
 /// 真 CC 来访自己带着 billing header，这两类走不到补写。
-pub(super) fn cc_version_suffix(v: &serde_json::Value, version: &str) -> String {
+pub(crate) fn cc_version_suffix(v: &serde_json::Value, version: &str) -> String {
     let text = first_user_text(v);
     let char_at = |i: usize| text.chars().nth(i).unwrap_or('0');
     let chars: String = [char_at(4), char_at(7), char_at(20)].iter().collect();

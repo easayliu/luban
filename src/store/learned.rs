@@ -22,7 +22,7 @@ pub struct ModelDenial {
 ///   截下的上游回复开头，见 `crate::proxy::known_empty_reply`；
 /// - `kind = "refusal"`：上游分类器拒答过某条提示词（`field = "prompt_sha"`，`value` 是提示词
 ///   哈希），逐字相同的重发命中时**原样回放上游那次的响应**（[`Self::reply`]：200 + 同一段体），
-///   `message` 是「[类别] stop_details=…」的判决文案，控制台与日志看，见
+///   `message` 是「\[类别] stop_details=…」的判决文案，控制台与日志看，见
 ///   `crate::proxy::known_refused_prompt`；
 /// - `kind = "app_refusal"`：上游分类器拒答过某个**识别不了会话的应用**（`field = "system_sha"`，
 ///   `value` 是来访 system 的哈希），同一模型 + 同一份 system 的请求命中时同样回放；拒答至少
@@ -81,7 +81,7 @@ pub fn model_denial_key(model: &str) -> String {
 
 /// 该模型是否属于「只有高档套餐才含」的那一族（fable / mythos）。
 ///
-/// **只用于选号排序**（见 [`CredentialStore::select_for_device`] 的 `plan_rank`），不是准入
+/// **只用于选号排序**（见 [`crate::store::CredentialStore::select_with_slot`] 的 `plan_rank`），不是准入
 /// 判据：真正的「能不能用」由上游回答并记进 [`ModelDenial`]。这里猜错的代价仅是多一次换号。
 pub fn premium_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();

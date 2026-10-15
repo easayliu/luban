@@ -3,7 +3,7 @@
 use super::*;
 
 /// 模拟路径的 message thread（`message-threads-2026-08-12`），规则见
-/// [`crate::proxy::session_link::ThreadState`]：
+/// [`crate::proxy::ThreadState`]：
 ///
 /// - 会话里这段对话的第一条，或历史接不上上一轮（客户端改了历史、重新生成、自己裁剪了上下文，
 ///   换了模型 / effort / system / tools，上一条失败或被取消）：`thread: {type: create}`，完整上下文。
@@ -27,7 +27,7 @@ use super::*;
 /// 落位按**当前**模型自带的 beta——跨模型族时切回不支持中途 system 消息的旧模型，
 /// 按这一轮的 beta 自然就落成提醒块，不会给上游发它拒绝的 `role: system` 消息。
 ///
-/// `raw_fps` 是**插环境说明之前**的 `messages` 指纹（见 [`rewrite_body`] 里采样）。线程前缀匹配
+/// `raw_fps` 是**插环境说明之前**的 `messages` 指纹（见 [`rewrite_body_out`] 里采样）。线程前缀匹配
 /// 要用这份，形态随模型漂来漂去也不打断上一轮的链路。续轮（`continue`）上游线程里仍留着
 /// 历史切换说明，这里不重补；`create` 把完整历史重发，得补上。模型说明与 `<total_tokens>`
 /// 同在指纹算完之后才补。
@@ -211,7 +211,7 @@ pub(super) fn cap_thread_breakpoints(v: &mut serde_json::Value) -> usize {
 /// 已有一块 `<total_tokens>` 提醒，这里同样跳过。
 ///
 /// 返回这一轮是否写进了一条 `<total_tokens>`（只补了模型说明、或整个跳过的都是 `false`）：写了的
-/// 才记进线程状态，`create` 时由 [`replay_total_tokens_reminders`] 在历史原位重现。
+/// 才记进线程状态，`create` 时由 `replay_total_tokens_reminders` 在历史原位重现。
 fn insert_total_tokens_reminder(
     msgs: &mut Vec<serde_json::Value>,
     tokens_left: u64,
@@ -390,7 +390,7 @@ fn take_last_cache_control(m: &mut serde_json::Value) -> Option<serde_json::Valu
 
 /// 插环境说明之前那份 `messages` 的线程指纹（[`apply_sim_thread`] 的 `raw_fps`）。
 ///
-/// 环境说明不进指纹，但 [`rewrite_body`] 后面对历史消息本身做的改动要先在快照上做一遍，与
+/// 环境说明不进指纹，但 [`rewrite_body_out`] 后面对历史消息本身做的改动要先在快照上做一遍，与
 /// 最终出站一致——回复指纹记的是上游看到的那份：目前只有工具名混淆（[`apply_tool_names`]），
 /// 它只看块本身，与中间别的步骤无关，在快照上先做就与出站一致。
 pub(super) fn thread_snapshot(
