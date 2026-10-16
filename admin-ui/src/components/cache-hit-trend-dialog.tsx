@@ -1,7 +1,7 @@
 import { Fragment, useRef, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { BarChart3Icon, DatabaseZapIcon, TableIcon } from 'lucide-react'
-import { getCacheSeries } from '@/api/metrics'
+import { getCacheSeries, type CacheSeriesPoint } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
 import {
   bucketCacheSeries,
@@ -29,6 +29,7 @@ import {
   CacheHitColumns,
   CacheHitTable,
   cacheSplitText,
+  noInputText,
 } from '@/components/cache-hit-chart'
 import { ChartLegend } from '@/components/chart-legend'
 import { UsageBreakdown } from '@/components/usage-breakdown'
@@ -71,15 +72,17 @@ export function CacheHitTrendDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const titleRef = useRef<HTMLHeadingElement>(null)
   const [range, setRange] = useState<CacheRangeKey>(DEFAULT_CACHE_RANGE)
   const [view, setView] = useState<'chart' | 'table'>('chart')
   const { query, slots, granularity, summary, recent } = useCacheSeries(range, open)
   const hasTraffic = slots.some((s) => s.hasTraffic)
   const preset = CACHE_RANGES[range]
-  const card = (label: string, p: { input_tokens: number; cached_tokens: number; written_tokens: number } | null) => {
-    const empty = !p || p.input_tokens === 0
+  const card = (label: string, p: CacheSeriesPoint | null) => {
+    // 有没有请求看请求数：只有失败请求的时段输入为 0，命中率算不出，但不是「无请求」。
+    const empty = !p || p.requests === 0
+    const noInput = !!p && p.input_tokens <= 0
     // 标签 / 数值 / 说明三行堆叠，而不是数值与说明并排 baseline 对齐：并排时两枚块一个装满、
     // 一个只有「无请求」，同一行的内容长度差把整行拉得参差；堆叠后两枚等高。
     // 大数字不带 `tabular-nums`——等宽数位是给需要竖向对齐的数字列用的，单独一个大号读数
@@ -88,10 +91,10 @@ export function CacheHitTrendDialog({
       <div className="rounded-xl border bg-muted/32 px-4 py-3">
         <p className="text-2xs font-medium text-muted-foreground">{label}</p>
         <p className="mt-1 text-2xl font-semibold leading-none">
-          {empty ? '—' : formatPercent(cacheHitRate(p.input_tokens, p.cached_tokens))}
+          {empty || noInput ? '—' : formatPercent(cacheHitRate(p.input_tokens, p.cached_tokens))}
         </p>
         <p className="mt-1.5 text-2xs text-muted-foreground tabular-nums">
-          {empty ? t('无请求', 'No requests') : cacheSplitText(p, t)}
+          {empty ? t('无请求', 'No requests') : noInput ? noInputText(p.requests, t, locale) : cacheSplitText(p, t)}
         </p>
       </div>
     )
@@ -167,13 +170,15 @@ export function CacheHitTrendDialog({
             {view === 'chart' && hasTraffic && !query.isPending && !query.error ? (
               <ChartLegend
                 items={[
-                  { swatch: 'bg-chart-1', label: t('缓存读 ×0.1', 'Cache read ×0.1') },
-                  { swatch: 'bg-chart-1/40', label: t('缓存写 ×1.25', 'Cache write ×1.25') },
-                  { swatch: 'bg-muted-foreground/24', label: t('输入 ×1', 'Input ×1') },
+                  // 图例与柱子自上而下同序，也正是官方定价表的顺序。
+                  { swatch: 'bg-muted-foreground/24', label: t('输入', 'Input') },
+                  { swatch: 'bg-chart-1/32', label: t('5m 缓存写', '5m cache writes') },
+                  { swatch: 'bg-chart-1/56', label: t('1h 缓存写', '1h cache writes') },
+                  { swatch: 'bg-chart-1', label: t('缓存读', 'Cache reads') },
                 ]}
                 hint={t(
-                  '命中率即颜色最深一段（缓存读）的高度。缓存写多而缓存读少，说明前缀每轮都在变化；两者都少，说明客户端未设置缓存断点。',
-                  'The hit rate is the height of the darkest segment (cache read). Many cache writes but few cache reads means the prefix changes every turn; few of both means the client sets no cache breakpoints.',
+                  '命中率即颜色最深一段（缓存读）的高度。按官方定价，5m 缓存写为输入价的 1.25 倍、1h 缓存写为 2 倍，缓存读为 0.1 倍（部分新模型更低）。缓存写多而缓存读少，说明前缀每轮都在变化；两者都少，说明客户端未设置缓存断点。',
+                  'The hit rate is the height of the darkest segment (cache reads). At official prices, 5m cache writes cost 1.25× input, 1h writes 2×, and cache reads 0.1× (lower on some newer models). Many cache writes but few cache reads means the prefix changes every turn; few of both means the client sets no cache breakpoints.',
                 )}
               />
             ) : (

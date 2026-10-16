@@ -16,6 +16,8 @@ fn billing_rec(cred: i64, key: Option<i64>, model: &str, cost: f64) -> UsageReco
         input_tokens: Some(10),
         output_tokens: Some(5),
         cache_creation_tokens: Some(3),
+        cache_5m_tokens: Some(2),
+        cache_1h_tokens: Some(1),
         cache_read_tokens: Some(2),
         cost_usd: Some(cost),
         ..Default::default()
@@ -87,9 +89,210 @@ async fn billing_attribution_is_fixed_at_write_time(pool: PgPool) {
     );
     let row = &store.billing_breakdown(&only_u, BillingDim::Cred).await.unwrap()[0];
     assert_eq!(
-        (row.input_tokens, row.output_tokens, row.cache_write_tokens, row.cache_read_tokens),
-        (20, 10, 6, 4)
+        (
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_write_tokens,
+            row.cache_write_1h_tokens,
+            row.cache_read_tokens
+        ),
+        (20, 10, 6, 2, 4)
     );
+}
+
+/// 迁移 0011 给历史账单回填 1h 档缓存写：流水里没有 Key，对账只能对到「小时 + 号 + 模型」。
+/// 只在能确定每一行各是哪一档时回填——组里只有一行、或整组全是 5m / 全是 1h；多行且两档混着的
+/// 留 NULL（未分档）。按比例分摊会把「Key A 全是 1h、Key B 全是 5m」摊成两行各一半。
+#[sqlx::test]
+async fn billing_1h_backfill_only_fills_rows_whose_tier_is_certain(pool: PgPool) {
+    let store = CredentialStore::for_test(pool).await;
+    let admin = store.admin_user().await.unwrap().id;
+    let cred = store.insert("a", None, "t", "r", 0, None, None, admin).await.unwrap().id;
+    let mut keys = Vec::new();
+    for i in 0..3 {
+        keys.push(
+            store
+                .create_api_key(&format!("k{i}"), &format!("key-{i}"), &[])
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let t0 = 1_800_000_000 / 3600 * 3600;
+    let rec = |key: i64, model: &str, write: i64, w1h: i64| UsageRecord {
+        cache_creation_tokens: Some(write),
+        cache_5m_tokens: Some(write - w1h),
+        cache_1h_tokens: Some(w1h),
+        ..billing_rec(cred, Some(key), model, 0.1)
+    };
+    let logs = [
+        // mixed：Key A 全 1h、Key B 全 5m，组内合计 1h=100 / 5m=100，各行归属不知道。
+        rec(keys[0], "mixed", 100, 100),
+        rec(keys[1], "mixed", 100, 0),
+        // all5m：三行全是 5m → 每行 1h 都是 0。
+        rec(keys[0], "all5m", 7, 0),
+        rec(keys[1], "all5m", 9, 0),
+        rec(keys[2], "all5m", 11, 0),
+        // all1h：两行全是 1h → 每行 1h 等于它自己的缓存写。
+        rec(keys[0], "all1h", 30, 30),
+        rec(keys[1], "all1h", 50, 50),
+        // single：只有一行，两档混着也照流水回填。
+        rec(keys[0], "single", 900, 300),
+        // withzero：Key A 没有缓存写，有缓存写的只有 Key B 一行 → 两行都确定。
+        rec(keys[0], "withzero", 0, 0),
+        rec(keys[1], "withzero", 100, 40),
+        // mixedzero：Key A 没有缓存写记 0；B、C 两档混着留未分档。
+        rec(keys[0], "mixedzero", 0, 0),
+        rec(keys[1], "mixedzero", 100, 100),
+        rec(keys[2], "mixedzero", 100, 0),
+    ];
+    for (i, r) in logs.iter().enumerate() {
+        store.insert_usage_log_at(r, Some(t0 + i as i64)).await.unwrap();
+    }
+    sqlx::query("UPDATE billing_hourly SET cache_write_1h_tokens = NULL")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    run_billing_backfill(&store).await;
+
+    let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT model, key_id, cache_write_1h_tokens FROM billing_hourly ORDER BY model, key_id",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    let (k0, k1, k2) = (keys[0], keys[1], keys[2]);
+    assert_eq!(
+        rows,
+        vec![
+            ("all1h".into(), k0, Some(30)),
+            ("all1h".into(), k1, Some(50)),
+            ("all5m".into(), k0, Some(0)),
+            ("all5m".into(), k1, Some(0)),
+            ("all5m".into(), k2, Some(0)),
+            ("mixed".into(), k0, None),
+            ("mixed".into(), k1, None),
+            ("mixedzero".into(), k0, Some(0)),
+            ("mixedzero".into(), k1, None),
+            ("mixedzero".into(), k2, None),
+            ("single".into(), k0, Some(300)),
+            ("withzero".into(), k0, Some(0)),
+            ("withzero".into(), k1, Some(40)),
+        ]
+    );
+    // 升级后 Key A 在同一小时继续写 100 个 1h：它那一行是确定的 0，累加后照实记 100，
+    // 不会被算成未分档。
+    store.insert_usage_log_at(&rec(k0, "mixedzero", 100, 100), Some(t0 + 100)).await.unwrap();
+    let a: Option<i64> = sqlx::query_scalar(
+        "SELECT cache_write_1h_tokens FROM billing_hourly WHERE model = 'mixedzero' AND key_id = $1",
+    )
+    .bind(k0)
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(a, Some(100));
+}
+
+/// 跑迁移 0011 里账单那段回填（加列之后的全部语句）。
+async fn run_billing_backfill(store: &CredentialStore) {
+    let sql = include_str!("../../migrations/0011_rollup_cache_ttl_cost.sql");
+    let add_column = "ALTER TABLE billing_hourly ADD COLUMN cache_write_1h_tokens BIGINT;";
+    let backfill = &sql[sql.find(add_column).unwrap() + add_column.len()..];
+    sqlx::raw_sql(sqlx::AssertSqlSafe(backfill.to_string())).execute(&store.pool).await.unwrap();
+}
+
+/// 迁移 0011 只给「流水集合 = 入账集合」的组回填 1h 档：删号后还在途的请求只记流水不进账单，
+/// 拿它的 1h 写入去改写账单会把「5m=100、1h=0」改成「5m=0、1h=100」。对不上的组、流水已裁掉的
+/// 小时一律留 NULL（未知），不猜成 5m 也不猜成 1h。号还在时它的流水都入了账，条数对得上就是
+/// 同一批，最早一条流水所在的那一小时也照常回填。
+#[sqlx::test]
+async fn billing_1h_backfill_skips_groups_that_do_not_reconcile(pool: PgPool) {
+    let store = CredentialStore::for_test(pool).await;
+    let admin = store.admin_user().await.unwrap().id;
+    let a = store.insert("a", None, "t", "r", 0, None, None, admin).await.unwrap().id;
+    let b = store.insert("b", None, "t2", "r2", 0, None, None, admin).await.unwrap().id;
+    let t0 = 1_800_000_000 / 3600 * 3600;
+    let rec = |cred: i64, write: i64, w1h: i64| UsageRecord {
+        cache_creation_tokens: Some(write),
+        cache_5m_tokens: Some(write - w1h),
+        cache_1h_tokens: Some(w1h),
+        ..billing_rec(cred, None, "m", 0.1)
+    };
+    // a：删号前一条纯 5m 入账，删号后在途的一条 1h 只记流水。
+    store.insert_usage_log_at(&rec(a, 100, 0), Some(t0 + 10)).await.unwrap();
+    assert!(store.delete(a).await.unwrap());
+    store.insert_usage_log_at(&rec(a, 100, 100), Some(t0 + 20)).await.unwrap();
+    // c：删号前一条入账、流水也都在，条数对得上——号已删就证明不了没裁过（裁剪分批删、不按
+    // 时间顺序），仍留未知；它另一个模型那行没有缓存写，确定是 0。
+    let c = store.insert("c", None, "t3", "r3", 0, None, None, admin).await.unwrap().id;
+    store.insert_usage_log_at(&rec(c, 100, 0), Some(t0 + 15)).await.unwrap();
+    let no_write = UsageRecord { model: Some("m3".into()), ..rec(c, 0, 0) };
+    store.insert_usage_log_at(&no_write, Some(t0 + 16)).await.unwrap();
+    assert!(store.delete(c).await.unwrap());
+    // b：对得上的一组；再往前一小时有一行账单，流水已被裁掉。
+    store.insert_usage_log_at(&rec(b, 100, 40), Some(t0 + 30)).await.unwrap();
+    store.insert_usage_log_at(&rec(b, 100, 0), Some(t0 - 3600 + 30)).await.unwrap();
+    // 裁剪按时刻切，切点落在前一小时中间：那一小时的流水只剩切点之后的（这里是一条没号的
+    // 本地拒绝），最早一条流水在那一小时里，它整小时都不能信。
+    sqlx::query("DELETE FROM usage_logs WHERE ts < $1")
+        .bind(t0)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let reject = UsageRecord { status: 429, ..Default::default() };
+    store.insert_usage_log_at(&reject, Some(t0 - 1000)).await.unwrap();
+    // 号还在：最早那一小时里切点之后的一组（另一个模型）是完整的，照常回填。
+    let tail = UsageRecord { model: Some("m2".into()), ..rec(b, 20, 5) };
+    store.insert_usage_log_at(&tail, Some(t0 - 900)).await.unwrap();
+
+    sqlx::query("UPDATE billing_hourly SET cache_write_1h_tokens = NULL")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    run_billing_backfill(&store).await;
+
+    let rows: Vec<(i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT cred_id, hour, cache_write_1h_tokens FROM billing_hourly
+          ORDER BY cred_id, hour, model",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (a, t0, None),
+            (b, t0 - 3600, None),
+            (b, t0 - 3600, Some(5)),
+            (b, t0, Some(40)),
+            (c, t0, None),
+            (c, t0, Some(0)),
+        ],
+        "a 那组流水比账单多一条、b 前一小时 m 那组流水已裁、c 号已删，都留未知；没有缓存写的确定是 0；\
+         b 前一小时 m2 那组与 b 这一小时对得上照常回填"
+    );
+    // 未知的那部分单独报出来，不算进 5m 也不算进 1h。
+    let f = BillingFilter { since: t0 - 7200, until: t0 + 7200, ..Default::default() };
+    let total = store.billing_breakdown(&f, BillingDim::Model).await.unwrap();
+    assert_eq!(
+        (
+            total[0].cache_write_tokens,
+            total[0].cache_write_1h_tokens,
+            total[0].cache_write_unknown_tokens
+        ),
+        (400, 40, 300)
+    );
+    // 未知的格子之后再累加仍是未知（NULL + x = NULL），新建的格子照实记。
+    store.insert_usage_log_at(&rec(b, 10, 10), Some(t0 - 3600 + 40)).await.unwrap();
+    store.insert_usage_log_at(&rec(b, 10, 10), Some(t0 + 7200)).await.unwrap();
+    let after: Vec<Option<i64>> = sqlx::query_scalar(
+        "SELECT cache_write_1h_tokens FROM billing_hourly WHERE cred_id = $1 ORDER BY hour, model",
+    )
+    .bind(b)
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(after, vec![None, Some(5), Some(40), Some(10)]);
 }
 
 /// 按日拆：以给定时区的本地零点切日界。

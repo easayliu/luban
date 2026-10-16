@@ -170,6 +170,8 @@ pub(super) async fn get_billing(
             total.input_tokens += row.input_tokens;
             total.output_tokens += row.output_tokens;
             total.cache_write_tokens += row.cache_write_tokens;
+            total.cache_write_1h_tokens += row.cache_write_1h_tokens;
+            total.cache_write_unknown_tokens += row.cache_write_unknown_tokens;
             total.cache_read_tokens += row.cache_read_tokens;
             total.cost_usd += row.cost_usd;
             BillingItem { label: labels.get(&row.key).cloned(), row }

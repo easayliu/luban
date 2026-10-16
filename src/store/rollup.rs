@@ -9,7 +9,7 @@
 //! - **三个维度各存一份**（`dim`）：`all`（只有时间，给两张趋势图）、`model`、`cred`（给拆分表）。
 //!   拆分表按哪一维看就只读哪一维，7 天窗口读的是几百到几万行小记录，与流量无关。
 //! - **延迟分布用 OpenTelemetry 指数直方图**（[`LatencyHist`]，scale 5），相对误差上界约 1.08%；
-//!   平均、吞吐、请求数、token、省下的钱都是精确累加的。
+//!   平均、吞吐、请求数、token、等价 API 费用都是精确累加的。
 //! - **窗口对齐到桶**：只算起点不早于 `since`（向上取整到 15 分钟）的桶——窗口不会越过 `since`
 //!   取到更早的数，最新的数一定在；代价是窗口最早那一段至多少算 15 分钟。
 //!
@@ -167,8 +167,12 @@ pub(super) struct RollupAgg {
     pub(super) input_tokens: i64,
     pub(super) cached_tokens: i64,
     pub(super) written_tokens: i64,
-    /// 缓存省下的钱，见 [`BreakdownRow::cache_saved_usd`]。
-    pub(super) saved_usd: f64,
+    /// 其中写进 1 小时档的部分；5 分钟档是 `written_tokens` 减它。
+    pub(super) written_1h_tokens: i64,
+    /// 全部请求的输出 token（与 `gen_tokens` 不同，不限成功、不限有 TTFT）。
+    pub(super) output_tokens: i64,
+    /// 按价目表估的等价 API 费用（流水的 `cost_usd`，含输出），见 [`BreakdownRow::cost_usd`]。
+    pub(super) cost_usd: f64,
     /// 参与延迟统计的成功请求数（status = 200 且记了 TTFT）与它们的 TTFT 之和（算平均）。
     pub(super) lat_count: i64,
     pub(super) ttft_sum: i64,
@@ -181,8 +185,7 @@ pub(super) struct RollupAgg {
 
 /// 一条流水在汇总里要用的那几列。
 #[derive(Debug, Clone, Copy)]
-pub(super) struct RollupInput<'a> {
-    pub(super) model: Option<&'a str>,
+pub(super) struct RollupInput {
     pub(super) status: i64,
     pub(super) ttft_ms: Option<i64>,
     pub(super) total_ms: Option<i64>,
@@ -192,23 +195,25 @@ pub(super) struct RollupInput<'a> {
     pub(super) cache_creation_tokens: Option<i64>,
     pub(super) cache_5m_tokens: Option<i64>,
     pub(super) cache_1h_tokens: Option<i64>,
+    pub(super) cost_usd: Option<f64>,
 }
 
 impl RollupAgg {
     /// 一条流水的贡献。
-    pub(super) fn of(row: RollupInput<'_>) -> Self {
+    pub(super) fn of(row: RollupInput) -> Self {
         let plain = row.input_tokens.unwrap_or(0);
         let cached = row.cache_read_tokens.unwrap_or(0);
-        let (creation, c5, c1) =
-            (row.cache_creation_tokens, row.cache_5m_tokens, row.cache_1h_tokens);
-        // 老记录只有细分档没有合计列时，拿两档相加兜底。
-        let written = creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0));
+        let (c5, c1) = (row.cache_5m_tokens.unwrap_or(0), row.cache_1h_tokens.unwrap_or(0));
+        // 老记录只有细分档没有合计列时，拿两档相加兜底。没有细分的整笔算 5 分钟档，与计价同口径。
+        let written = row.cache_creation_tokens.unwrap_or(c5 + c1);
         let mut agg = Self {
             requests: 1,
             input_tokens: plain + written + cached,
             cached_tokens: cached,
             written_tokens: written,
-            saved_usd: cache_saved_usd(row.model, plain, cached, creation, c5, c1),
+            written_1h_tokens: c1,
+            output_tokens: row.output_tokens.unwrap_or(0),
+            cost_usd: row.cost_usd.unwrap_or(0.0),
             ..Default::default()
         };
         if row.status == 200
@@ -233,7 +238,9 @@ impl RollupAgg {
         self.input_tokens += other.input_tokens;
         self.cached_tokens += other.cached_tokens;
         self.written_tokens += other.written_tokens;
-        self.saved_usd += other.saved_usd;
+        self.written_1h_tokens += other.written_1h_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cost_usd += other.cost_usd;
         self.lat_count += other.lat_count;
         self.ttft_sum += other.ttft_sum;
         self.gen_tokens += other.gen_tokens;
@@ -271,6 +278,10 @@ impl RollupAgg {
             input_tokens: self.input_tokens,
             cached_tokens: self.cached_tokens,
             written_tokens: self.written_tokens,
+            written_1h_tokens: self.written_1h_tokens,
+            requests: self.requests,
+            output_tokens: self.output_tokens,
+            cost_usd: self.cost_usd,
         }
     }
 }
@@ -350,7 +361,6 @@ pub(super) async fn rollup_record(
     rec: &UsageRecord,
 ) -> Result<()> {
     let delta = RollupAgg::of(RollupInput {
-        model: rec.model.as_deref(),
         status: i64::from(rec.status),
         ttft_ms: rec.ttft_ms,
         total_ms: rec.total_ms,
@@ -360,6 +370,7 @@ pub(super) async fn rollup_record(
         cache_creation_tokens: rec.cache_creation_tokens,
         cache_5m_tokens: rec.cache_5m_tokens,
         cache_1h_tokens: rec.cache_1h_tokens,
+        cost_usd: rec.cost_usd,
     });
     let bucket = rollup_bucket(ts);
     let mut dims = Vec::with_capacity(3);
@@ -374,8 +385,8 @@ pub(super) async fn rollup_record(
     let old: Vec<(String, Option<Vec<u8>>)> = sqlx::query_as(
         "INSERT INTO usage_rollup AS r
              (dim, bucket, key, label, requests, input_tokens, cached_tokens, written_tokens,
-              saved_usd, lat_count, ttft_sum, gen_tokens, gen_ms)
-         SELECT t.dim, $1, t.key, t.label, $5, $6, $7, $8, $9, $10, $11, $12, $13
+              written_1h_tokens, output_tokens, cost_usd, lat_count, ttft_sum, gen_tokens, gen_ms)
+         SELECT t.dim, $1, t.key, t.label, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
            FROM unnest($2::TEXT[], $3::TEXT[], $4::TEXT[]) WITH ORDINALITY AS t(dim, key, label, ord)
           ORDER BY t.ord
          ON CONFLICT (dim, bucket, key) DO UPDATE SET
@@ -383,7 +394,9 @@ pub(super) async fn rollup_record(
              input_tokens = r.input_tokens + excluded.input_tokens,
              cached_tokens = r.cached_tokens + excluded.cached_tokens,
              written_tokens = r.written_tokens + excluded.written_tokens,
-             saved_usd = r.saved_usd + excluded.saved_usd,
+             written_1h_tokens = r.written_1h_tokens + excluded.written_1h_tokens,
+             output_tokens = r.output_tokens + excluded.output_tokens,
+             cost_usd = r.cost_usd + excluded.cost_usd,
              lat_count = r.lat_count + excluded.lat_count,
              ttft_sum = r.ttft_sum + excluded.ttft_sum,
              gen_tokens = r.gen_tokens + excluded.gen_tokens,
@@ -398,7 +411,9 @@ pub(super) async fn rollup_record(
     .bind(delta.input_tokens)
     .bind(delta.cached_tokens)
     .bind(delta.written_tokens)
-    .bind(delta.saved_usd)
+    .bind(delta.written_1h_tokens)
+    .bind(delta.output_tokens)
+    .bind(delta.cost_usd)
     .bind(delta.lat_count)
     .bind(delta.ttft_sum)
     .bind(delta.gen_tokens)
@@ -442,7 +457,8 @@ impl CredentialStore {
     pub(super) async fn rollup_cells(&self, dim: RollupDim, since: i64) -> Result<Vec<RollupCell>> {
         let rows = sqlx::query(
             "SELECT bucket, key, label, requests, input_tokens, cached_tokens, written_tokens,
-                    saved_usd, lat_count, ttft_sum, gen_tokens, gen_ms, ttft_hist
+                    written_1h_tokens, output_tokens, cost_usd, lat_count, ttft_sum, gen_tokens,
+                    gen_ms, ttft_hist
                FROM usage_rollup
               WHERE dim = $1 AND bucket >= $2
               ORDER BY bucket",
@@ -453,7 +469,7 @@ impl CredentialStore {
         .await?;
         rows.iter()
             .map(|r| {
-                let hist: Option<Vec<u8>> = r.try_get(12)?;
+                let hist: Option<Vec<u8>> = r.try_get(14)?;
                 Ok(RollupCell {
                     bucket: r.try_get(0)?,
                     key: r.try_get(1)?,
@@ -463,11 +479,13 @@ impl CredentialStore {
                         input_tokens: r.try_get(4)?,
                         cached_tokens: r.try_get(5)?,
                         written_tokens: r.try_get(6)?,
-                        saved_usd: r.try_get(7)?,
-                        lat_count: r.try_get(8)?,
-                        ttft_sum: r.try_get(9)?,
-                        gen_tokens: r.try_get(10)?,
-                        gen_ms: r.try_get(11)?,
+                        written_1h_tokens: r.try_get(7)?,
+                        output_tokens: r.try_get(8)?,
+                        cost_usd: r.try_get(9)?,
+                        lat_count: r.try_get(10)?,
+                        ttft_sum: r.try_get(11)?,
+                        gen_tokens: r.try_get(12)?,
+                        gen_ms: r.try_get(13)?,
                         ttft: hist.as_deref().and_then(LatencyHist::decode).unwrap_or_default(),
                     },
                 })
@@ -491,7 +509,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::usage::tests::{db_now, store_with};
-    use super::super::{BreakdownBy, cache_saved_usd, series_grid};
+    use super::super::{BreakdownBy, series_grid};
     use super::*;
 
     /// 分位数来自指数直方图（OTel scale 5）：与 nearest-rank 精确值的相对误差在 1.1% 以内。
@@ -585,6 +603,7 @@ mod tests {
                 cache_5m_tokens: Some((r % 400) as i64),
                 cache_1h_tokens: Some((r % 300) as i64),
                 cache_read_tokens: Some((r % 20_000) as i64),
+                cost_usd: (!r.is_multiple_of(11)).then_some((r % 1000) as f64 / 1e4),
                 ttft_ms: (!r.is_multiple_of(13)).then_some(ttft),
                 total_ms: Some(ttft + (r % 30_000) as i64),
                 ..Default::default()
@@ -594,13 +613,15 @@ mod tests {
             raw.push(rec);
         }
 
-        // 从原始行精确算：按模型分组的请求数、token、省下的钱、延迟平均 / 吞吐 / 分位。
+        // 从原始行精确算：按模型分组的请求数、token、等价费用、延迟平均 / 吞吐 / 分位。
         struct Exact {
             requests: i64,
             input: i64,
             cached: i64,
             written: i64,
-            saved: f64,
+            written_1h: i64,
+            output: i64,
+            cost: f64,
             ttft: Vec<i64>,
             gen_tokens: i64,
             gen_ms: i64,
@@ -612,7 +633,9 @@ mod tests {
                 input: 0,
                 cached: 0,
                 written: 0,
-                saved: 0.0,
+                written_1h: 0,
+                output: 0,
+                cost: 0.0,
                 ttft: vec![],
                 gen_tokens: 0,
                 gen_ms: 0,
@@ -626,14 +649,9 @@ mod tests {
             e.input += plain + written + cached;
             e.cached += cached;
             e.written += written;
-            e.saved += cache_saved_usd(
-                rec.model.as_deref(),
-                plain,
-                cached,
-                rec.cache_creation_tokens,
-                rec.cache_5m_tokens,
-                rec.cache_1h_tokens,
-            );
+            e.written_1h += rec.cache_1h_tokens.unwrap_or(0);
+            e.output += rec.output_tokens.unwrap_or(0);
+            e.cost += rec.cost_usd.unwrap_or(0.0);
             if rec.status == 200
                 && let Some(t) = rec.ttft_ms
             {
@@ -660,12 +678,8 @@ mod tests {
                 (row.cache.input_tokens, row.cache.cached_tokens, row.cache.written_tokens),
                 (e.input, e.cached, e.written)
             );
-            assert!(
-                (row.cache_saved_usd - e.saved).abs() < 1e-9,
-                "{} vs {}",
-                row.cache_saved_usd,
-                e.saved
-            );
+            assert_eq!((row.cache.written_1h_tokens, row.output_tokens), (e.written_1h, e.output));
+            assert!((row.cost_usd - e.cost).abs() < 1e-9, "{} vs {}", row.cost_usd, e.cost);
             assert_eq!(row.latency.count, e.ttft.len() as i64);
             assert_eq!(row.latency.avg_ms, e.ttft.iter().sum::<i64>() / e.ttft.len() as i64);
             let tps = e.gen_tokens as f64 * 1000.0 / e.gen_ms as f64;
@@ -688,6 +702,78 @@ mod tests {
             ttft.summary.count,
             "各桶之和等于合计"
         );
+    }
+
+    /// 迁移 0011 给预聚合回填 1h 写入、输出与费用：只看格子的请求数是否等于流水条数——预聚合
+    /// 每条流水都记，流水只会被裁，条数相等这一格就是完整的。首条流水落在桶起点之后（新部署、
+    /// 清库后不久升级）那一桶照样回填；流水裁掉一部分的格子留 0。
+    #[sqlx::test]
+    async fn rollup_backfill_fills_every_complete_cell(pool: sqlx::PgPool) {
+        let (store, ids) = store_with(pool, &["a"]).await;
+        let now = db_now(&store).await;
+        let first = first_bucket(now - 3 * 3600);
+        let rec = |w1h: i64, out: i64, cost: f64| UsageRecord {
+            cred_id: Some(ids[0]),
+            model: Some("claude-opus-5".into()),
+            status: 200,
+            output_tokens: Some(out),
+            cache_creation_tokens: Some(w1h),
+            cache_1h_tokens: Some(w1h),
+            cost_usd: Some(cost),
+            ..Default::default()
+        };
+        // 首条流水在桶起点后 60 秒；下一桶两条，其中一条之后被裁掉。
+        store.insert_usage_log_at(&rec(100, 1000, 1.25), Some(first + 60)).await.unwrap();
+        let next = first + ROLLUP_BUCKET_SECS;
+        store.insert_usage_log_at(&rec(10, 10, 0.5), Some(next + 1)).await.unwrap();
+        store.insert_usage_log_at(&rec(10, 10, 0.5), Some(next + 2)).await.unwrap();
+        sqlx::query("DELETE FROM usage_logs WHERE ts = $1")
+            .bind(next + 1)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE usage_rollup SET written_1h_tokens = 0, output_tokens = 0, cost_usd = 0",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let sql = include_str!("../../migrations/0011_rollup_cache_ttl_cost.sql");
+        let rollup = &sql[..sql.find("ALTER TABLE billing_hourly").unwrap()];
+        let backfill = &rollup[rollup.find("WITH logs").unwrap()..];
+        sqlx::raw_sql(sqlx::AssertSqlSafe(backfill.to_string()))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        for dim in [RollupDim::All, RollupDim::Model, RollupDim::Cred] {
+            let cells = store.rollup_cells(dim, first).await.unwrap();
+            let got: Vec<_> = cells
+                .iter()
+                .map(|c| (c.bucket, c.agg.written_1h_tokens, c.agg.output_tokens, c.agg.cost_usd))
+                .collect();
+            assert_eq!(got, vec![(first, 100, 1000, 1.25), (next, 0, 0, 0.0)], "{dim:?}");
+        }
+    }
+
+    /// 只有失败请求（没有 usage）的时段也留在缓存趋势里：请求数照计，输入为 0，合计不少算。
+    #[sqlx::test]
+    async fn cache_series_keeps_buckets_with_only_failed_requests(pool: sqlx::PgPool) {
+        let (store, ids) = store_with(pool, &["a"]).await;
+        let now = db_now(&store).await;
+        let since = first_bucket(now - 3 * 3600);
+        let failed = UsageRecord { cred_id: Some(ids[0]), status: 503, ..Default::default() };
+        store.insert_usage_log_at(&failed, Some(since + 60)).await.unwrap();
+        store
+            .insert_usage_log_at(
+                &UsageRecord { status: 429, ..Default::default() },
+                Some(since + 61),
+            )
+            .await
+            .unwrap();
+        let report = store.cache_report(since, 3600, 0).await.unwrap();
+        assert_eq!(report.points.len(), 1);
+        assert_eq!((report.points[0].requests, report.points[0].input_tokens), (2, 0));
+        assert_eq!(report.summary.requests, 2);
     }
 
     /// 并发写同一格：直方图是读出来在 Rust 里合并再写回的，两个事务同时累加同一格不能

@@ -51,7 +51,11 @@ pub struct BillingRow {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// 缓存写合计 = 5 分钟档 + 1 小时档 + 未分档。
     pub cache_write_tokens: i64,
+    pub cache_write_1h_tokens: i64,
+    /// 分不出档的历史缓存写：升级前、流水对不上账单的格子（见迁移 0011），不算进任何一档。
+    pub cache_write_unknown_tokens: i64,
     pub cache_read_tokens: i64,
     pub cost_usd: f64,
 }
@@ -77,10 +81,15 @@ pub(super) async fn billing_record(
     owner: i64,
 ) -> Result<()> {
     let Some(cred_id) = rec.cred_id else { return Ok(()) };
+    // 老记录只有细分档没有合计列时，拿两档相加兜底（同预聚合）。
+    let cache_write = rec
+        .cache_creation_tokens
+        .unwrap_or(rec.cache_5m_tokens.unwrap_or(0) + rec.cache_1h_tokens.unwrap_or(0));
     sqlx::query(
         "INSERT INTO billing_hourly AS b
              (hour, owner_id, cred_id, key_id, group_id, model, requests, input_tokens,
-              output_tokens, cache_write_tokens, cache_read_tokens, cost_usd)
+              output_tokens, cache_write_tokens, cache_write_1h_tokens, cache_read_tokens,
+              cost_usd)
          VALUES ($1, $2, $3, COALESCE($4, 0),
                  COALESCE(
                      (SELECT kg.group_id FROM api_key_groups kg
@@ -88,12 +97,13 @@ pub(super) async fn billing_record(
                        WHERE kg.key_id = $4 ORDER BY kg.ord LIMIT 1),
                      (SELECT MIN(group_id) FROM credential_groups WHERE cred_id = $3),
                      0),
-                 $5, 1, $6, $7, $8, $9, $10)
+                 $5, 1, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (hour, owner_id, cred_id, key_id, group_id, model) DO UPDATE SET
              requests = b.requests + 1,
              input_tokens = b.input_tokens + excluded.input_tokens,
              output_tokens = b.output_tokens + excluded.output_tokens,
              cache_write_tokens = b.cache_write_tokens + excluded.cache_write_tokens,
+             cache_write_1h_tokens = b.cache_write_1h_tokens + excluded.cache_write_1h_tokens,
              cache_read_tokens = b.cache_read_tokens + excluded.cache_read_tokens,
              cost_usd = b.cost_usd + excluded.cost_usd",
     )
@@ -104,7 +114,8 @@ pub(super) async fn billing_record(
     .bind(rec.model.clone().unwrap_or_default())
     .bind(rec.input_tokens.unwrap_or(0))
     .bind(rec.output_tokens.unwrap_or(0))
-    .bind(rec.cache_creation_tokens.unwrap_or(0))
+    .bind(cache_write)
+    .bind(rec.cache_1h_tokens.unwrap_or(0))
     .bind(rec.cache_read_tokens.unwrap_or(0))
     .bind(rec.cost_usd.unwrap_or(0.0))
     .execute(conn)
@@ -168,6 +179,8 @@ impl CredentialStore {
         let sql = format!(
             "SELECT {key_expr} AS k, SUM(requests)::BIGINT, SUM(input_tokens)::BIGINT,
                     SUM(output_tokens)::BIGINT, SUM(cache_write_tokens)::BIGINT,
+                    COALESCE(SUM(cache_write_1h_tokens), 0)::BIGINT,
+                    COALESCE(SUM(cache_write_tokens) FILTER (WHERE cache_write_1h_tokens IS NULL), 0)::BIGINT,
                     SUM(cache_read_tokens)::BIGINT, SUM(cost_usd) AS cost
                FROM billing_hourly WHERE {} GROUP BY k ORDER BY {order}",
             clauses.join(" AND ")
@@ -181,8 +194,10 @@ impl CredentialStore {
                     input_tokens: r.try_get(2)?,
                     output_tokens: r.try_get(3)?,
                     cache_write_tokens: r.try_get(4)?,
-                    cache_read_tokens: r.try_get(5)?,
-                    cost_usd: r.try_get(6)?,
+                    cache_write_1h_tokens: r.try_get(5)?,
+                    cache_write_unknown_tokens: r.try_get(6)?,
+                    cache_read_tokens: r.try_get(7)?,
+                    cost_usd: r.try_get(8)?,
                 })
             })
             .collect()

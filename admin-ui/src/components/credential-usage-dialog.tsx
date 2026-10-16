@@ -13,6 +13,7 @@ import {
   formatUsd,
   parseSessionKey,
   sideClassLabel,
+  cacheWriteTiers,
 } from '@/lib/utils'
 import { PaginationBar } from '@/components/pagination-bar'
 import { RequestLookupDialog } from '@/components/request-lookup-dialog'
@@ -402,8 +403,8 @@ export function UsageCards({
               <LogFact label={t('输入 / 输出', 'In / out')}>
                 {num(log.input_tokens, locale)} / {num(log.output_tokens, locale)}
               </LogFact>
-              <LogFact label={t('缓存写 / 读', 'Cache w/r')}>
-                {num(log.cache_creation_tokens, locale)} / {num(log.cache_read_tokens, locale)}
+              <LogFact label={t('缓存写 5m / 1h · 读', 'Cache writes 5m / 1h · reads')}>
+                {num(cacheWriteTiers(log).w5m, locale)} / {num(cacheWriteTiers(log).w1h, locale)} · {num(log.cache_read_tokens, locale)}
               </LogFact>
               <LogFact label={t('首字 / 总耗时', 'TTFT / total')}>
                 {ms(log.ttft_ms)} / {ms(log.total_ms)}
@@ -523,9 +524,10 @@ export function UsageTable({
           <TableHead className="whitespace-nowrap">{t('时间', 'Time')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('状态', 'Status')}</TableHead>
           <TableHead className="whitespace-nowrap">{t('模型', 'Model')}</TableHead>
+          {/* token 按官方顺序：输入 → 缓存写（5m / 1h）→ 缓存读 → 输出。 */}
           <TableHead className="whitespace-nowrap text-right">{t('输入', 'Input')}</TableHead>
+          <TableHead className="whitespace-nowrap text-right normal-case">{t('缓存写 5m / 1h · 读', 'Cache writes 5m / 1h · reads')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('输出', 'Output')}</TableHead>
-          <TableHead className="whitespace-nowrap text-right">{t('缓存写/读', 'Cache w/r')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('首字 / 总耗时', 'TTFT / total')}</TableHead>
           <TableHead className="whitespace-nowrap text-right">{t('花费', 'Cost')}</TableHead>
           {full && (<>
@@ -601,10 +603,10 @@ export function UsageTable({
                 {num(log.input_tokens, locale)}
               </TableCell>
               <TableCell className="whitespace-nowrap text-right tabular-nums">
-                {num(log.output_tokens, locale)}
+                {num(cacheWriteTiers(log).w5m, locale)} / {num(cacheWriteTiers(log).w1h, locale)} · {num(log.cache_read_tokens, locale)}
               </TableCell>
               <TableCell className="whitespace-nowrap text-right tabular-nums">
-                {num(log.cache_creation_tokens, locale)} / {num(log.cache_read_tokens, locale)}
+                {num(log.output_tokens, locale)}
               </TableCell>
               <Hint
                 label={log.sse_aggregated

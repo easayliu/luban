@@ -189,8 +189,8 @@ struct BreakdownResp {
     since: i64,
     by: String,
     rows: Vec<store::BreakdownRow>,
-    /// 全部分组（不止返回的前 12 行）缓存省下的钱合计（USD），见 `BreakdownRow::cache_saved_usd`。
-    cache_saved_usd_total: f64,
+    /// 全部分组（不止返回的前 12 行）等价 API 费用合计（USD），见 `BreakdownRow::cost_usd`。
+    cost_usd_total: f64,
 }
 
 #[derive(Deserialize)]
@@ -258,9 +258,9 @@ pub(super) async fn get_usage_breakdown(
         // 合计要覆盖全部分组，先不截断；前端只拿前 12 行。
         let mut rows =
             state.store.usage_breakdown(since, by, usize::MAX).await.map_err(internal)?;
-        let cache_saved_usd_total = rows.iter().map(|r| r.cache_saved_usd).sum();
+        let cost_usd_total = rows.iter().map(|r| r.cost_usd).sum();
         rows.truncate(12);
-        Ok(BreakdownResp { since, by: by_name.into(), rows, cache_saved_usd_total })
+        Ok(BreakdownResp { since, by: by_name.into(), rows, cost_usd_total })
     })
     .await
 }

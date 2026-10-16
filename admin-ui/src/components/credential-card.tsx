@@ -1157,7 +1157,7 @@ function QuotaFacts({
         suffix="req"
       />
       {dot}
-      {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按 ×0.1 计价，
+      {/* 费用是按价目表估的、token 是上游实报的，两个数**不成正比**：缓存读按折扣价计，
           重度吃缓存的号「token 一大堆、花费很少」。所以两项并列而不是只留其中一个。 */}
       <QuotaFact
         label={t('总 token', 'Total tokens')}
@@ -1165,8 +1165,8 @@ function QuotaFacts({
         hint={tokens == null
           ? undefined
           : t(
-            `${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
-            `${tokens.toLocaleString(locale)} (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+            `${tokens.toLocaleString(locale)}（输入 + 缓存写 + 缓存读 + 输出，官方 usage 口径，不加权）`,
+            `${tokens.toLocaleString(locale)} (input + cache writes + cache reads + output, per the official usage fields, unweighted)`,
           )}
       />
       {dot}

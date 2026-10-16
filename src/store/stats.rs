@@ -19,11 +19,26 @@ pub struct CacheBucket {
     /// 分不出「没命中」和「没写入」，拆开才知道该查什么：写入多命中少是前缀每轮在变，
     /// 写入命中都少是客户端根本没标断点。
     pub written_tokens: i64,
+    /// 写入里 1 小时档的部分；5 分钟档是 `written_tokens` 减它。
+    pub written_1h_tokens: i64,
+    /// 请求数（含失败的）、输出 token 与等价 API 费用：明细表与拆分表同一套列。
+    pub requests: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
 }
 
 impl CacheBucket {
     pub(super) fn empty(ts: i64) -> Self {
-        Self { ts, input_tokens: 0, cached_tokens: 0, written_tokens: 0 }
+        Self {
+            ts,
+            input_tokens: 0,
+            cached_tokens: 0,
+            written_tokens: 0,
+            written_1h_tokens: 0,
+            requests: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+        }
     }
 }
 
@@ -60,38 +75,6 @@ pub struct TtftReport {
     pub recent: TtftBucket,
 }
 
-/// 一条请求里缓存省下的钱：命中与写入都按原价算一遍减去实际计价。命中省 0.9 倍输入价，
-/// 5 分钟档写入多付 0.25 倍、1 小时档多付 1 倍；模型认不出价目时记 0。
-pub(super) fn cache_saved_usd(
-    model: Option<&str>,
-    plain: i64,
-    cached: i64,
-    creation: Option<i64>,
-    c5: Option<i64>,
-    c1: Option<i64>,
-) -> f64 {
-    use crate::pricing::{Usage, estimate_usd};
-    let written = creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0));
-    let actual = estimate_usd(Usage {
-        model,
-        input_tokens: Some(plain),
-        cache_read_tokens: Some(cached),
-        cache_creation_total: creation,
-        cache_5m_tokens: c5,
-        cache_1h_tokens: c1,
-        ..Default::default()
-    });
-    let baseline = estimate_usd(Usage {
-        model,
-        input_tokens: Some(plain + cached + written),
-        ..Default::default()
-    });
-    match (actual, baseline) {
-        (Some(a), Some(b)) => b - a,
-        _ => 0.0,
-    }
-}
-
 /// 拆分维度，见 [`CredentialStore::usage_breakdown`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakdownBy {
@@ -107,19 +90,30 @@ pub struct BreakdownRow {
     pub key: String,
     /// 展示名：模型名本身，或凭证的 label（已删的号是 `#<id>`）。
     pub label: String,
-    /// 按账号拆时该号的套餐（`Max 5x` / `Pro` …）；按模型拆或号已删为 `None`。Max 号和 Pro 号
-    /// 上游的排队本来就不同，混在一起比延迟没有意义。
-    pub tier: Option<String>,
+    /// 按账号拆时该号的套餐与组织信息（界面照账号卡片画套餐徽章）；按模型拆或号已删为 `None`。
+    /// Max 号和 Pro 号上游的排队本来就不同，混在一起比延迟没有意义。
+    pub plan: Option<AccountPlan>,
     /// 这段时间里的全部请求数（含失败的）。
     pub requests: i64,
-    /// 缓存给这一组省下的钱（USD）：把命中与写入都按原价算一遍再减去实际——命中按十分之一
-    /// 计价省下来的，减掉写入按 1.25 倍（1 小时档 2 倍）多付的。可能为负：只写不命中就是亏。
-    /// 模型认不出价目的行不计。
-    pub cache_saved_usd: f64,
+    /// 全部请求（含失败的）的输出 token。
+    pub output_tokens: i64,
+    /// 按官方价目估的等价 API 费用（USD）：流水 `cost_usd` 之和，含输出；模型认不出价目的
+    /// 记录按 0 计。
+    pub cost_usd: f64,
     /// 延迟统计（只算成功且记了 TTFT 的请求），`ts` 一律是窗口起点。
     pub latency: TtftBucket,
     /// 缓存三段 token（所有请求）。
     pub cache: CacheBucket,
+}
+
+/// 账号的套餐徽章要用的几项，字段名与账号接口一致，界面直接复用账号卡片的徽章。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct AccountPlan {
+    pub tier: Option<String>,
+    pub org_type: Option<String>,
+    pub org_name: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub subscription_created_at: Option<String>,
 }
 
 /// 单账号用量统计的一格：一个时间桶，或整个窗口的合计（`ts` 是桶起点 / 窗口起点）。
@@ -137,7 +131,9 @@ pub struct CredentialStatsBucket {
     pub rejected: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// 缓存写合计；其中 1 小时档见下一项，5 分钟档是两者之差。
     pub cache_write_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub cache_read_tokens: i64,
     pub cost_usd: f64,
 }
@@ -150,6 +146,7 @@ impl CredentialStatsBucket {
         self.input_tokens += row.input_tokens;
         self.output_tokens += row.output_tokens;
         self.cache_write_tokens += row.cache_write_tokens;
+        self.cache_write_1h_tokens += row.cache_write_1h_tokens;
         self.cache_read_tokens += row.cache_read_tokens;
         self.cost_usd += row.cost_usd;
     }
@@ -336,7 +333,8 @@ impl CredentialStore {
         let cells = self.rollup_cells(RollupDim::All, since).await?;
         Ok(regroup(&cells, bucket_secs, tz_offset_secs)
             .into_iter()
-            .filter(|(_, agg)| agg.input_tokens > 0)
+            // 按请求数留桶：只有失败 / 本地拒绝（没有 usage）的时段也有请求，命中率算不出由界面显示。
+            .filter(|(_, agg)| agg.requests > 0)
             .map(|(ts, agg)| agg.cache(ts))
             .collect())
     }
@@ -354,6 +352,10 @@ impl CredentialStore {
             acc.input_tokens += b.input_tokens;
             acc.cached_tokens += b.cached_tokens;
             acc.written_tokens += b.written_tokens;
+            acc.written_1h_tokens += b.written_1h_tokens;
+            acc.requests += b.requests;
+            acc.output_tokens += b.output_tokens;
+            acc.cost_usd += b.cost_usd;
             acc
         });
         let now = db_now(&self.pool).await?;
@@ -420,13 +422,21 @@ impl CredentialStore {
             BreakdownBy::Model => RollupDim::Model,
             BreakdownBy::Account => RollupDim::Cred,
         };
-        // 账号名与套餐档：账号表就几十行，一次读进来。
-        let creds: HashMap<String, (String, Option<String>)> = if by == BreakdownBy::Account {
-            let rows: Vec<(i64, String, Option<String>)> =
-                sqlx::query_as("SELECT id, label, tier FROM credentials")
-                    .fetch_all(&self.pool)
-                    .await?;
-            rows.into_iter().map(|(id, label, tier)| (id.to_string(), (label, tier))).collect()
+        // 账号名与套餐：账号表就几十行，一次读进来。
+        let creds: HashMap<String, (String, AccountPlan)> = if by == BreakdownBy::Account {
+            let rows = sqlx::query(
+                "SELECT id, label, tier, org_type, org_name, rate_limit_tier, subscription_created_at
+                   FROM credentials",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            rows.iter()
+                .map(|r| {
+                    let id: i64 = r.try_get("id")?;
+                    let label: String = r.try_get("label")?;
+                    Ok((id.to_string(), (label, <AccountPlan as sqlx::FromRow<_>>::from_row(r)?)))
+                })
+                .collect::<Result<_>>()?
         } else {
             HashMap::new()
         };
@@ -438,10 +448,10 @@ impl CredentialStore {
         let mut out: Vec<BreakdownRow> = groups
             .into_iter()
             .map(|(key, (recorded, agg))| {
-                let (label, tier) = match by {
+                let (label, plan) = match by {
                     BreakdownBy::Model => (key.clone(), None),
                     BreakdownBy::Account => match creds.get(&key) {
-                        Some((label, tier)) => (label.clone(), tier.clone()),
+                        Some((label, plan)) => (label.clone(), Some(plan.clone())),
                         // 已删账号退回汇总里记下的名字（窗口内最早那一桶第一条流水的），
                         // 那也没有就记 `#id`。
                         None if !recorded.is_empty() => (recorded, None),
@@ -450,9 +460,10 @@ impl CredentialStore {
                 };
                 BreakdownRow {
                     label,
-                    tier,
+                    plan,
                     requests: agg.requests,
-                    cache_saved_usd: agg.saved_usd,
+                    output_tokens: agg.output_tokens,
+                    cost_usd: agg.cost_usd,
                     latency: agg.latency(since),
                     cache: agg.cache(since),
                     key,
@@ -514,6 +525,7 @@ impl CredentialStore {
                 output_tokens: r.try_get(6)?,
                 // 老记录只有细分档没有合计列时，拿两档相加兜底。
                 cache_write_tokens: creation.unwrap_or(c5.unwrap_or(0) + c1.unwrap_or(0)),
+                cache_write_1h_tokens: c1.unwrap_or(0),
                 cache_read_tokens: r.try_get(10)?,
                 cost_usd: r.try_get(11)?,
             };
@@ -699,6 +711,7 @@ mod tests {
             cache_read_tokens: Some(read),
             ttft_ms: Some(ttft),
             total_ms: Some(total),
+            cost_usd: Some(0.01),
             ..Default::default()
         };
         // 最近半小时：opus 五条成功（TTFT 100..500，吞吐 1000 token / 1s），一条失败（不进延迟）。
@@ -784,6 +797,12 @@ mod tests {
         let cache_report = store.cache_report(now - 6 * 3600, 3600, 0).await.unwrap();
         assert_eq!(cache_report.points.len(), 2);
         assert_eq!(cache_report.summary.input_tokens, 1100, "合计是各桶之和");
+        assert_eq!(
+            (cache_report.summary.requests, cache_report.summary.output_tokens),
+            (7, 5000),
+            "请求数含失败的那条；输出只有五条成功的 opus 各 1000"
+        );
+        assert!((cache_report.summary.cost_usd - 0.07).abs() < 1e-9);
         assert_eq!(cache_report.recent.cached_tokens, 300);
 
         // 拆分：按模型请求数降序（opus 6 条在前），延迟只算成功的；按账号带 label，limit 生效。
@@ -796,22 +815,20 @@ mod tests {
         assert_eq!(by_model[0].cache.cached_tokens, 300);
         assert_eq!(by_model[1].key, "claude-sonnet-5");
         assert_close(by_model[1].latency.p95_ms, 4000);
-        // 省钱：opus-5 输入 $5/MTok，命中 300 省 0.9×5×300e-6 = 0.00135，写入 100（5m 档）多付
-        // 0.25×5×100e-6 = 0.000125 → 0.001225；sonnet 那组没缓存是 0；按模型拆没有套餐。
-        assert!(
-            (by_model[0].cache_saved_usd - 0.001225).abs() < 1e-9,
-            "{}",
-            by_model[0].cache_saved_usd
-        );
-        assert_eq!(by_model[1].cache_saved_usd, 0.0);
-        assert_eq!(by_model[0].tier, None);
+        // 等价费用是流水 cost_usd 之和：opus 六条、sonnet 一条各 0.01；写入没有细分，1h 档为 0。
+        assert!((by_model[0].cost_usd - 0.06).abs() < 1e-9, "{}", by_model[0].cost_usd);
+        assert!((by_model[1].cost_usd - 0.01).abs() < 1e-9, "{}", by_model[1].cost_usd);
+        assert_eq!(by_model[0].cache.written_1h_tokens, 0);
+        assert_eq!(by_model[0].output_tokens, 5000, "五条成功各 1000，失败那条 0");
+        assert_eq!(by_model[0].plan, None);
         let _ = store.set_tier(a, Some("Max 5x")).await;
         let by_account =
             store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 10).await.unwrap();
         assert_eq!(by_account[0].key, a.to_string());
         assert_eq!(by_account[0].label, "a");
         assert_eq!(by_account[1].label, "b");
-        assert_eq!(by_account[1].tier, None);
+        assert_eq!(by_account[0].plan.as_ref().unwrap().tier.as_deref(), Some("Max 5x"));
+        assert_eq!(by_account[1].plan.as_ref().unwrap().tier, None);
         assert_eq!(
             store.usage_breakdown(now - 6 * 3600, BreakdownBy::Account, 1).await.unwrap().len(),
             1

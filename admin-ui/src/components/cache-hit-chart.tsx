@@ -5,6 +5,7 @@ import {
   cn,
   formatPercent,
   formatTokens,
+  formatUsd,
   slotLabel,
   tickStep,
   type CacheGranularity,
@@ -24,16 +25,26 @@ function slotReadout(
   if (!slot.hasTraffic) {
     return { when, axis, rate: '—', detail: t('该时段没有请求', 'No requests in this period') }
   }
-  const uncached = uncachedTokens(slot)
+  const n = (v: number) => v.toLocaleString(locale)
+  if (slot.inputTokens <= 0) {
+    return { when, axis, rate: '—', detail: noInputText(slot.requests, t, locale) }
+  }
+  const w5 = written5mTokens(slot)
   return {
     when,
     axis,
     rate: formatPercent(cacheHitRate(slot.inputTokens, slot.cachedTokens)),
+    // 按官方 usage / 定价表的顺序：输入 → 5m 缓存写 → 1h 缓存写 → 缓存读。
     detail: t(
-      `缓存读 ${slot.cachedTokens.toLocaleString(locale)} · 缓存写 ${slot.writtenTokens.toLocaleString(locale)} · 输入 ${uncached.toLocaleString(locale)} token`,
-      `Cache read ${slot.cachedTokens.toLocaleString(locale)} · Cache write ${slot.writtenTokens.toLocaleString(locale)} · Input ${uncached.toLocaleString(locale)} tokens`,
+      `输入 ${n(uncachedTokens(slot))} · 5m 缓存写 ${n(w5)} · 1h 缓存写 ${n(slot.written1hTokens)} · 缓存读 ${n(slot.cachedTokens)} token`,
+      `Input ${n(uncachedTokens(slot))} · 5m cache writes ${n(w5)} · 1h cache writes ${n(slot.written1hTokens)} · Cache reads ${n(slot.cachedTokens)} tokens`,
     ),
   }
+}
+
+/** 5 分钟档写入：合计减 1 小时档（没有细分的整笔算 5 分钟档，与计价同口径）。 */
+function written5mTokens(slot: { writtenTokens: number; written1hTokens: number }): number {
+  return Math.max(0, slot.writtenTokens - slot.written1hTokens)
 }
 
 /** 三段之外的那部分：既没命中也没写入、按原价算的输入。 */
@@ -84,7 +95,7 @@ export function CacheHitColumns({
   const readouts = slots.map((s) => slotReadout(s, granularity, t, locale))
   const maxInput = Math.max(0, ...slots.map((s) => s.inputTokens))
   const dipIndex = slots.reduce<number | null>((lowest, s, i) => {
-    if (!s.hasTraffic || s.inputTokens < maxInput * DIP_MIN_VOLUME_SHARE) return lowest
+    if (!s.hasTraffic || s.inputTokens <= 0 || s.inputTokens < maxInput * DIP_MIN_VOLUME_SHARE) return lowest
     const rate = cacheHitRate(s.inputTokens, s.cachedTokens) ?? 1
     const best = lowest == null ? null : cacheHitRate(slots[lowest].inputTokens, slots[lowest].cachedTokens) ?? 1
     return best == null || rate < best ? i : lowest
@@ -117,11 +128,13 @@ export function CacheHitColumns({
             ))}
             <div className="absolute inset-0 flex items-end">
               {slots.map((slot, i) => {
-                const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
+                // 有请求但没有输入 token（全是失败 / 本地拒绝）时命中率算不出，与空格一样画基线。
+                const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) : null
                 const share = (tokens: number) =>
                   slot.inputTokens > 0 ? (tokens / slot.inputTokens) * 100 : 0
                 const uncachedPct = share(uncachedTokens(slot))
-                const writtenPct = share(slot.writtenTokens)
+                const written5mPct = share(written5mTokens(slot))
+                const written1hPct = share(slot.written1hTokens)
                 return (
                   <div
                     key={slot.ts}
@@ -148,8 +161,8 @@ export function CacheHitColumns({
                         className="relative h-0.5 w-full max-w-6 rounded-full bg-muted-foreground/24"
                       />
                     ) : (
-                      // 一根柱子叠三段：底下深色是命中、中间浅色是写入、顶上灰色是未缓存，
-                      // 三段加起来撑满——命中率就是深色那段的高度，写入多命中少一眼能看出来。
+                      // 一根柱子叠四段，自上而下正是官方的顺序：灰色未缓存输入、浅色 5m 写入、
+                      // 稍深的 1h 写入、深色命中，加起来撑满——命中率就是深色那段的高度。
                       <span
                         aria-hidden
                         className="relative flex w-full max-w-6 flex-col justify-end overflow-hidden rounded-t"
@@ -160,8 +173,12 @@ export function CacheHitColumns({
                           style={{ height: `${uncachedPct}%` }}
                         />
                         <span
-                          className={cn('w-full bg-chart-1/40', segmentGap(writtenPct))}
-                          style={{ height: `${writtenPct}%` }}
+                          className={cn('w-full bg-chart-1/32', segmentGap(written5mPct))}
+                          style={{ height: `${written5mPct}%` }}
+                        />
+                        <span
+                          className={cn('w-full bg-chart-1/56', segmentGap(written1hPct))}
+                          style={{ height: `${written1hPct}%` }}
                         />
                         {/* 最底下这段坐在基线上，下面没有东西要分隔，不开缝。 */}
                         <span className="w-full bg-chart-1" style={{ height: `max(0.125rem, ${rate * 100}%)` }} />
@@ -224,27 +241,38 @@ export function CacheHitTable({
 
   return (
     <ChartTable caption={t('缓存命中率按时段明细', 'Cache hit rate by period')}>
+      {/* 与下面「缓存命中拆分」同一套列与写法：token 按官方定价表的顺序与叫法、缩写成 K / M，
+          悬停看完整数值；表头默认大写，TTL 前缀保留小写。命中率的分母（全部输入）不再单列。 */}
       <TableHeader>
         <TableRow>
           <TableHead>{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</TableHead>
+          <TableHead className="text-end">{t('请求', 'Requests')}</TableHead>
           <TableHead className="text-end">{t('命中率', 'Hit rate')}</TableHead>
-          <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
-          <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
           <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
-          <TableHead className="text-end">{t('输入合计', 'Input total')}</TableHead>
+          <TableHead className="text-end normal-case">{t('5m 缓存写', '5m cache writes')}</TableHead>
+          <TableHead className="text-end normal-case">{t('1h 缓存写', '1h cache writes')}</TableHead>
+          <TableHead className="text-end">{t('缓存读', 'Cache reads')}</TableHead>
+          <TableHead className="text-end">{t('输出', 'Output')}</TableHead>
+          <TableHead className="text-end">{t('API 价', 'API cost')}</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.map((slot) => {
           const r = slotReadout(slot, granularity, t, locale)
+          const tokens = (v: number) => (
+            <TableCell className="text-end" title={v.toLocaleString(locale)}>{formatTokens(v)}</TableCell>
+          )
           return (
             <TableRow key={slot.ts}>
               <TableCell>{r.when}</TableCell>
+              <TableCell className="text-end">{slot.requests.toLocaleString(locale)}</TableCell>
               <TableCell className="text-end font-medium">{r.rate}</TableCell>
-              <TableCell className="text-end">{slot.cachedTokens.toLocaleString(locale)}</TableCell>
-              <TableCell className="text-end">{slot.writtenTokens.toLocaleString(locale)}</TableCell>
-              <TableCell className="text-end">{uncachedTokens(slot).toLocaleString(locale)}</TableCell>
-              <TableCell className="text-end text-muted-foreground">{slot.inputTokens.toLocaleString(locale)}</TableCell>
+              {tokens(uncachedTokens(slot))}
+              {tokens(written5mTokens(slot))}
+              {tokens(slot.written1hTokens)}
+              {tokens(slot.cachedTokens)}
+              {tokens(slot.outputTokens)}
+              <TableCell className="text-end">{formatUsd(slot.costUsd)}</TableCell>
             </TableRow>
           )
         })}
@@ -262,7 +290,7 @@ export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; cl
   return (
     <span aria-hidden className={cn('flex h-5 min-w-0 max-w-20 flex-1 items-end gap-px', className)}>
       {slots.map((slot, i) => {
-        const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) ?? 0 : null
+        const rate = slot.hasTraffic ? cacheHitRate(slot.inputTokens, slot.cachedTokens) : null
         const last = i === slots.length - 1
         return (
           <span
@@ -280,14 +308,24 @@ export function CacheHitSparkline({ slots, className }: { slots: CacheSlot[]; cl
   )
 }
 
-/** 三段写全：缓存读 · 缓存写 · 输入。 */
+/** 四段写全，按官方顺序：输入 · 5m 缓存写 · 1h 缓存写 · 缓存读。 */
 export function cacheSplitText(
-  p: { input_tokens: number; cached_tokens: number; written_tokens: number },
+  p: { input_tokens: number; cached_tokens: number; written_tokens: number; written_1h_tokens: number },
   t: (zh: string, en: string) => string,
 ): string {
   const uncached = Math.max(0, p.input_tokens - p.cached_tokens - p.written_tokens)
+  const w5 = Math.max(0, p.written_tokens - p.written_1h_tokens)
   return t(
-    `缓存读 ${formatTokens(p.cached_tokens)} · 缓存写 ${formatTokens(p.written_tokens)} · 输入 ${formatTokens(uncached)}`,
-    `Cache read ${formatTokens(p.cached_tokens)} · Cache write ${formatTokens(p.written_tokens)} · Input ${formatTokens(uncached)}`,
+    `输入 ${formatTokens(uncached)} · 5m 缓存写 ${formatTokens(w5)} · 1h 缓存写 ${formatTokens(p.written_1h_tokens)} · 缓存读 ${formatTokens(p.cached_tokens)}`,
+    `Input ${formatTokens(uncached)} · 5m writes ${formatTokens(w5)} · 1h writes ${formatTokens(p.written_1h_tokens)} · Cache reads ${formatTokens(p.cached_tokens)}`,
+  )
+}
+
+/** 有请求、但没有输入 token（全是失败 / 本地拒绝，上游没回 usage）：命中率算不出。 */
+export function noInputText(requests: number, t: (zh: string, en: string) => string, locale: string): string {
+  const n = requests.toLocaleString(locale)
+  return t(
+    `${n} 个请求，均无 token 用量（多为失败请求），命中率无法计算`,
+    `${n} requests without token usage (mostly failed), so no hit rate`,
   )
 }

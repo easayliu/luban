@@ -998,7 +998,7 @@ queryClient.setQueryData(['metrics'], { rpm: 128, in_flight: 3, window_secs: 60 
   const todayStart = Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() / 1000)
   const today = {
     requests: 1286, input_tokens: 412_000, output_tokens: 1_830_000,
-    cache_write_tokens: 2_460_000, cache_read_tokens: 48_900_000, cost_usd: 86.42,
+    cache_write_tokens: 2_460_000, cache_write_1h_tokens: 1_620_000, cache_read_tokens: 48_900_000, cost_usd: 86.42,
   }
   queryClient.setQueryData(['billing-today', null, todayStart], {
     from: todayStart, to: todayStart + 86400, rows: [{ key: String(todayStart), label: null, ...today }], total: today,
@@ -1036,6 +1036,8 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   input_tokens: index === 9 ? null : 12_480 + index * 913,
   output_tokens: index === 9 ? null : 840 + index * 47,
   cache_creation_tokens: index === 9 ? null : 2_048 + index * 128,
+  cache_5m_tokens: index === 9 ? null : 512,
+  cache_1h_tokens: index === 9 ? null : 1_536 + index * 128,
   cache_read_tokens: index === 9 ? null : 18_400 + index * 771,
   ttft_ms: index === 9 ? null : 480 + index * 63,
   total_ms: index === 9 ? null : 3_280 + index * 211,
@@ -1085,6 +1087,7 @@ for (const cred of previewCredentials) {
         input_tokens: requests * 1400,
         output_tokens: requests * 900,
         cache_write_tokens: requests * 2600,
+        cache_write_1h_tokens: requests * 1700,
         cache_read_tokens: requests * 21000,
         cost_usd: requests * 0.031,
       }
@@ -1097,9 +1100,10 @@ for (const cred of previewCredentials) {
       input_tokens: acc.input_tokens + p.input_tokens,
       output_tokens: acc.output_tokens + p.output_tokens,
       cache_write_tokens: acc.cache_write_tokens + p.cache_write_tokens,
+      cache_write_1h_tokens: acc.cache_write_1h_tokens + p.cache_write_1h_tokens,
       cache_read_tokens: acc.cache_read_tokens + p.cache_read_tokens,
       cost_usd: acc.cost_usd + p.cost_usd,
-    }), { ts: now - hours * 3600, requests: 0, errors: 0, rejected: 0, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, cost_usd: 0 })
+    }), { ts: now - hours * 3600, requests: 0, errors: 0, rejected: 0, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_write_1h_tokens: 0, cache_read_tokens: 0, cost_usd: 0 })
     const group = (key: string, share: number, errShare = 0.02) => ({
       key,
       requests: Math.round(summary.requests * share),

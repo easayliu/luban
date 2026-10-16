@@ -4,13 +4,13 @@ import { getUsageBreakdown, type BreakdownBy, type BreakdownRow } from '@/api/me
 import { useI18n } from '@/lib/i18n'
 import { cacheHitRate, cn, extractError, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
 import { formatMs, formatTokensPerSec } from '@/components/ttft-trend-dialog'
+import { AccountTierBadge } from '@/components/credential-shared'
 import { RequestLookupDialog, type UsageDrillFilter } from '@/components/request-lookup-dialog'
 import {
   COMPACT_TABLE_BODY_CLASS,
   COMPACT_TABLE_HEADER_CLASS,
   COMPACT_TABLE_LINK_CLASS,
 } from '@/components/usage-shared'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -109,10 +109,14 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
               ) : (
                 <>
                   <TableHead className="text-end">{t('命中率', 'Hit rate')}</TableHead>
-                  <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
-                  <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
+                  {/* token 各列按官方定价表的顺序与叫法：基础输入 → 5m 缓存写 → 1h 缓存写 → 缓存读 → 输出，
+                      与价目从便宜到贵、从左到右对得上。表头默认大写，TTL 前缀得保留小写（5m 不是 5M）。 */}
                   <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
-                  <TableHead className="text-end">{t('节省', 'Saved')}</TableHead>
+                  <TableHead className="text-end normal-case">{t('5m 缓存写', '5m cache writes')}</TableHead>
+                  <TableHead className="text-end normal-case">{t('1h 缓存写', '1h cache writes')}</TableHead>
+                  <TableHead className="text-end">{t('缓存读', 'Cache reads')}</TableHead>
+                  <TableHead className="text-end">{t('输出', 'Output')}</TableHead>
+                  <TableHead className="text-end">{t('API 价', 'API cost')}</TableHead>
                 </>
               )}
             </TableRow>
@@ -122,39 +126,27 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
               <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={() => openRow(row)} />
             ))}
           </TableBody>
-          {/* 合计是表格的一部分，落在 tfoot 里、和「省下」那一列对齐。
-              原来它是表格下面的一句话——数字离它的列有半个表格远，还要在句子里重读一遍列名。
-              怎么算出来的那句话收进悬浮层：它解释的是口径，不是这一格的值。 */}
+          {/* 合计是表格的一部分，落在 tfoot 里、和「API 价」那一列对齐；口径收进悬浮层。 */}
           {kind === 'cache' && query.data && (
             <TableFooter className="[&>tr>*]:border-t [&>tr>*]:bg-surface-subtle [&>tr>*]:px-3 [&>tr>*]:py-1.5 [&>tr>*]:font-medium">
               <tr>
                 <th className="text-start" scope="row">{t('合计', 'Total')}</th>
-                {/* 缓存表共 7 列：模型 / 请求 / 命中率 / 缓存读 / 缓存写 / 输入 / 节省。
-                    合计只有「省下」这一列有值，中间 5 列留空。 */}
-                <td colSpan={5} />
+                {/* 缓存表共 9 列：模型 / 请求 / 命中率 / 输入 / 5m 缓存写 / 1h 缓存写 / 缓存读 / 输出 / API 价。
+                    合计只有「API 价」这一列有值，中间 7 列留空。 */}
+                <td colSpan={7} />
                 <td className="text-end">
                   <Tooltip>
                     <TooltipTrigger
-                      className={cn(
-                        'cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4',
-                        query.data.cache_saved_usd_total < 0 && 'text-warning-foreground',
-                      )}
+                      className="cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4"
                       render={<span />}
                     >
-                      {query.data.cache_saved_usd_total >= 0
-                        ? formatUsd(query.data.cache_saved_usd_total)
-                        : `-${formatUsd(-query.data.cache_saved_usd_total)}`}
+                      {formatUsd(query.data.cost_usd_total)}
                     </TooltipTrigger>
                     <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                      {query.data.cache_saved_usd_total >= 0
-                        ? t(
-                            '缓存读按 0.1 倍计价节省的金额，减去缓存写按 1.25 倍计价多付的金额。',
-                            'Savings from cache reads billed at 0.1×, minus the extra paid for cache writes billed at 1.25×.',
-                          )
-                        : t(
-                            '缓存写多付的金额超过了缓存读节省的金额，通常是因为前缀每轮都在变化。',
-                            'The extra paid for cache writes exceeded the savings from cache reads; the prefix is usually changing every turn.',
-                          )}
+                      {t(
+                        '按官方 API 价目估算的等价费用，含输入、输出与缓存；缓存写 5m 按输入价 1.25 倍、1h 按 2 倍计，缓存读按各模型的折扣价计。',
+                        'Equivalent cost at official API list prices, covering input, output and cache; 5m cache writes at 1.25× input, 1h at 2×, cache reads at each model\'s discounted rate.',
+                      )}
                     </TooltipPopup>
                   </Tooltip>
                 </td>
@@ -186,6 +178,7 @@ function BreakdownTr({
   const { t } = useI18n()
   const rate = cacheHitRate(row.cache.input_tokens, row.cache.cached_tokens)
   const uncached = Math.max(0, row.cache.input_tokens - row.cache.cached_tokens - row.cache.written_tokens)
+  const written5m = Math.max(0, row.cache.written_tokens - row.cache.written_1h_tokens)
   const noLatency = row.latency.count === 0
   return (
     <TableRow className="cursor-pointer hover:bg-muted/40" onClick={onOpen}>
@@ -202,7 +195,8 @@ function BreakdownTr({
             </Button>
           </Hint>
           {/* 按账号拆时带套餐：Max 号和 Pro 号上游的排队本来就不同，混着比延迟没有意义。 */}
-          {row.tier && <Badge variant="outline" size="sm" className="shrink-0">{row.tier}</Badge>}
+          {/* 与账号卡片同一枚徽章：组织号带楼形图标、套餐名去掉重复的组织前缀（Team Standard → Standard）。 */}
+          {row.plan && <span className="shrink-0"><AccountTierBadge cred={row.plan} size="xs" /></span>}
         </span>
       </TableCell>
       <TableCell className="whitespace-nowrap text-end tabular-nums">{row.requests.toLocaleString(locale)}</TableCell>
@@ -220,12 +214,12 @@ function BreakdownTr({
       ) : (
         <>
           <TableCell className="whitespace-nowrap text-end font-medium tabular-nums">{formatPercent(rate)}</TableCell>
-          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.cached_tokens)}</TableCell>
-          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.written_tokens)}</TableCell>
           <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(uncached)}</TableCell>
-          <TableCell className={cn('whitespace-nowrap text-end tabular-nums', row.cache_saved_usd < 0 && 'text-warning')}>
-            {row.cache_saved_usd < 0 ? `-${formatUsd(-row.cache_saved_usd)}` : formatUsd(row.cache_saved_usd)}
-          </TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(written5m)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.written_1h_tokens)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.cache.cached_tokens)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatTokens(row.output_tokens)}</TableCell>
+          <TableCell className="whitespace-nowrap text-end tabular-nums">{formatUsd(row.cost_usd)}</TableCell>
         </>
       )}
     </TableRow>

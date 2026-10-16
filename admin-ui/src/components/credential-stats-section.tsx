@@ -63,6 +63,7 @@ function emptyBucket(ts: number): CredentialStatsBucket {
     input_tokens: 0,
     output_tokens: 0,
     cache_write_tokens: 0,
+    cache_write_1h_tokens: 0,
     cache_read_tokens: 0,
     cost_usd: 0,
   }
@@ -110,11 +111,17 @@ function fillSlots(
     slot.input_tokens += p.input_tokens
     slot.output_tokens += p.output_tokens
     slot.cache_write_tokens += p.cache_write_tokens
+    slot.cache_write_1h_tokens += p.cache_write_1h_tokens
     slot.cache_read_tokens += p.cache_read_tokens
     slot.cost_usd += p.cost_usd
     slot.hasTraffic = slot.hasTraffic || p.requests > 0
   }
   return out
+}
+
+/** 5 分钟档缓存写：合计减 1 小时档（没有细分的整笔算 5 分钟档，与计价同口径）。 */
+function write5m(b: CredentialStatsBucket): number {
+  return Math.max(0, b.cache_write_tokens - b.cache_write_1h_tokens)
 }
 
 function totalTokens(b: CredentialStatsBucket): number {
@@ -134,8 +141,9 @@ function slotLabel(ts: number, granularity: CacheGranularity): { when: string; a
  * 一根柱子分几段、每段什么颜色。段的顺序是**自下而上**。
  *
  * 请求数：成功垫底、失败叠在上面，失败走 destructive——这一格里坏了多少一眼可见。
- * token：四项同一色系由深到浅，缓存读放最上面用灰：它通常占大头、却按 0.1 倍计价，
- * 染成主色会让「token 很多」看起来像「很贵」。费用只有一段。
+ * token：自下而上按官方 usage / 定价表的顺序（输入 → 5m 缓存写 → 1h 缓存写 → 缓存读 → 输出），
+ * 与图例、明细表同序。缓存读用灰：它通常占大头、却按折扣价计，染成主色会让「token 很多」
+ * 看起来像「很贵」。费用只有一段。
  */
 function segmentsOf(slot: CredentialStatsBucket, metric: Metric): { value: number; className: string }[] {
   if (metric === 'requests') {
@@ -146,10 +154,11 @@ function segmentsOf(slot: CredentialStatsBucket, metric: Metric): { value: numbe
   }
   if (metric === 'tokens') {
     return [
-      { value: slot.output_tokens, className: 'bg-chart-1' },
       { value: slot.input_tokens, className: 'bg-chart-1/60' },
-      { value: slot.cache_write_tokens, className: 'bg-chart-1/32' },
+      { value: write5m(slot), className: 'bg-chart-1/40' },
+      { value: slot.cache_write_1h_tokens, className: 'bg-chart-1/24' },
       { value: slot.cache_read_tokens, className: 'bg-muted-foreground/24' },
+      { value: slot.output_tokens, className: 'bg-chart-1' },
     ]
   }
   return [{ value: slot.cost_usd, className: 'bg-chart-1' }]
@@ -175,10 +184,11 @@ function legendOf(metric: Metric, t: Translate): ChartLegendItem[] {
   }
   if (metric === 'tokens') {
     return [
-      { swatch: 'bg-chart-1', label: t('输出', 'Output') },
       { swatch: 'bg-chart-1/60', label: t('输入', 'Input') },
-      { swatch: 'bg-chart-1/32', label: t('缓存写', 'Cache write') },
-      { swatch: 'bg-muted-foreground/24', label: t('缓存读', 'Cache read') },
+      { swatch: 'bg-chart-1/40', label: t('5m 缓存写', '5m cache writes') },
+      { swatch: 'bg-chart-1/24', label: t('1h 缓存写', '1h cache writes') },
+      { swatch: 'bg-muted-foreground/24', label: t('缓存读', 'Cache reads') },
+      { swatch: 'bg-chart-1', label: t('输出', 'Output') },
     ]
   }
   return [{ swatch: 'bg-chart-1', label: t('等价 API 费用', 'Equivalent API cost') }]
@@ -370,19 +380,20 @@ function SummaryCards({ summary }: { summary: CredentialStatsBucket }) {
       {card(
         t('总 token', 'Total tokens'),
         formatTokens(tokens),
-        // 四项一行在手机半格里放不下，会在随便哪个「·」后面折断；固定拆成「入 · 出」「写 · 读」两行，sm 起连成一行。
+        // 按官方顺序：入 → 写 → 读 → 出（写的 5m / 1h 两档见图与明细表）。四项一行在手机半格里
+        // 放不下，会在随便哪个「·」后面折断；固定拆成「入 · 写」「读 · 出」两行，sm 起连成一行。
         <>
           <span className="block sm:inline">
             {t(
-              `入 ${formatTokens(summary.input_tokens)} · 出 ${formatTokens(summary.output_tokens)}`,
-              `in ${formatTokens(summary.input_tokens)} · out ${formatTokens(summary.output_tokens)}`,
+              `入 ${formatTokens(summary.input_tokens)} · 写 ${formatTokens(summary.cache_write_tokens)}`,
+              `in ${formatTokens(summary.input_tokens)} · write ${formatTokens(summary.cache_write_tokens)}`,
             )}
           </span>
           <span className="max-sm:hidden"> · </span>
           <span className="block sm:inline">
             {t(
-              `写 ${formatTokens(summary.cache_write_tokens)} · 读 ${formatTokens(summary.cache_read_tokens)}`,
-              `write ${formatTokens(summary.cache_write_tokens)} · read ${formatTokens(summary.cache_read_tokens)}`,
+              `读 ${formatTokens(summary.cache_read_tokens)} · 出 ${formatTokens(summary.output_tokens)}`,
+              `read ${formatTokens(summary.cache_read_tokens)} · out ${formatTokens(summary.output_tokens)}`,
             )}
           </span>
         </>,
@@ -557,10 +568,12 @@ function StatsTable({ slots, granularity }: { slots: StatsSlot[]; granularity: C
           <TableHead>{granularity === 'hour' ? t('时段', 'Hour') : t('日期', 'Day')}</TableHead>
           <TableHead className="text-end">{t('请求', 'Requests')}</TableHead>
           <TableHead className="text-end">{t('失败', 'Failed')}</TableHead>
+          {/* token 各列按官方定价表的顺序与叫法；表头默认大写，TTL 前缀保留小写。 */}
           <TableHead className="text-end">{t('输入', 'Input')}</TableHead>
+          <TableHead className="text-end normal-case">{t('5m 缓存写', '5m cache writes')}</TableHead>
+          <TableHead className="text-end normal-case">{t('1h 缓存写', '1h cache writes')}</TableHead>
+          <TableHead className="text-end">{t('缓存读', 'Cache reads')}</TableHead>
           <TableHead className="text-end">{t('输出', 'Output')}</TableHead>
-          <TableHead className="text-end">{t('缓存写', 'Cache write')}</TableHead>
-          <TableHead className="text-end">{t('缓存读', 'Cache read')}</TableHead>
           <TableHead className="text-end">{t('费用', 'Cost')}</TableHead>
         </TableRow>
       </TableHeader>
@@ -571,9 +584,10 @@ function StatsTable({ slots, granularity }: { slots: StatsSlot[]; granularity: C
             <TableCell className="text-end font-medium">{n(s.requests)}</TableCell>
             <TableCell className={cn('text-end', s.errors > 0 ? 'text-destructive-foreground' : 'text-muted-foreground')}>{n(s.errors)}</TableCell>
             <TableCell className="text-end">{n(s.input_tokens)}</TableCell>
-            <TableCell className="text-end">{n(s.output_tokens)}</TableCell>
-            <TableCell className="text-end">{n(s.cache_write_tokens)}</TableCell>
+            <TableCell className="text-end">{n(write5m(s))}</TableCell>
+            <TableCell className="text-end">{n(s.cache_write_1h_tokens)}</TableCell>
             <TableCell className="text-end text-muted-foreground">{n(s.cache_read_tokens)}</TableCell>
+            <TableCell className="text-end">{n(s.output_tokens)}</TableCell>
             <TableCell className="text-end">{formatUsd(s.cost_usd)}</TableCell>
           </TableRow>
         ))}

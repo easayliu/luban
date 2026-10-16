@@ -46,7 +46,7 @@ const COL = {
   cost: 'w-28',
 } as const
 
-type SortKey = 'cost' | 'requests' | 'input' | 'output' | 'cache_write' | 'cache_read' | 'name'
+type SortKey = 'cost' | 'requests' | 'input' | 'output' | 'cache_write_5m' | 'cache_write_1h' | 'cache_read' | 'name'
 type SortDir = 'asc' | 'desc'
 
 type RangeKey = 'today' | '7d' | '30d' | 'month' | 'last-month'
@@ -196,7 +196,8 @@ export function BillingPage({
       case 'requests': return row.requests
       case 'input': return row.input_tokens
       case 'output': return row.output_tokens
-      case 'cache_write': return row.cache_write_tokens
+      case 'cache_write_5m': return write5m(row)
+      case 'cache_write_1h': return row.cache_write_1h_tokens
       case 'cache_read': return row.cache_read_tokens
       case 'name': return activeDim === 'day' ? Number(row.key) : nameOf(row).toLowerCase()
     }
@@ -215,7 +216,8 @@ export function BillingPage({
     return { key, dir: key === 'name' ? 'asc' : 'desc' }
   })
   // 表头：与账号池列表同款的小号大写标签，点一下按这一列排序，再点反向。数值列右对齐。
-  const sortHead = (label: string, key: SortKey, className: string, numeric = true) => {
+  // `keepCase`：表头默认大写，带 TTL 前缀的列（5m / 1h）要保留小写。
+  const sortHead = (label: string, key: SortKey, className: string, numeric = true, keepCase = false) => {
     const active = effectiveSort.key === key
     const Arrow = active && effectiveSort.dir === 'asc' ? ChevronUpIcon : ChevronDownIcon
     return (
@@ -227,6 +229,7 @@ export function BillingPage({
           <Button
             className={cn(
               'w-full px-0 text-2xs font-semibold uppercase tracking-[0.06em] sm:text-2xs',
+              keepCase && 'normal-case',
               numeric ? 'justify-end text-right' : 'justify-start text-left',
             )}
             size="xs"
@@ -442,10 +445,12 @@ export function BillingPage({
                   <TableRow>
                     {sortHead(columnLabel[activeDim], 'name', COL.name, false)}
                     {sortHead(t('请求数', 'Requests'), 'requests', COL.requests)}
+                    {/* token 各列按官方定价表的顺序与叫法：输入 → 5m 缓存写 → 1h 缓存写 → 缓存读 → 输出。 */}
                     {sortHead(t('输入', 'Input'), 'input', COL.tokens)}
+                    {sortHead(t('5m 缓存写', '5m cache writes'), 'cache_write_5m', COL.tokens, true, true)}
+                    {sortHead(t('1h 缓存写', '1h cache writes'), 'cache_write_1h', COL.tokens, true, true)}
+                    {sortHead(t('缓存读', 'Cache reads'), 'cache_read', COL.tokens)}
                     {sortHead(t('输出', 'Output'), 'output', COL.tokens)}
-                    {sortHead(t('缓存写', 'Cache write'), 'cache_write', COL.tokens)}
-                    {sortHead(t('缓存读', 'Cache read'), 'cache_read', COL.tokens)}
                     <TableHead className={cn(COL.share, 'text-2xs font-semibold uppercase tracking-[0.06em]')}>
                       {t('占比', 'Share')}
                     </TableHead>
@@ -478,9 +483,10 @@ export function BillingPage({
                         </TableCell>
                         <TableCell className={cn(COL.requests, 'text-right tabular-nums')}>{number(row.requests)}</TableCell>
                         <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>{formatTokens(row.input_tokens)}</TableCell>
-                        <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>{formatTokens(row.output_tokens)}</TableCell>
-                        <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>{formatTokens(row.cache_write_tokens)}</TableCell>
+                        <CacheTierCell row={row} value={write5m(row)} />
+                        <CacheTierCell row={row} value={row.cache_write_1h_tokens} />
                         <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>{formatTokens(row.cache_read_tokens)}</TableCell>
+                        <TableCell className={cn(COL.tokens, 'text-right tabular-nums')}>{formatTokens(row.output_tokens)}</TableCell>
                         <TableCell className={COL.share}>
                           {/* 条吃掉剩余宽度、百分比定宽右对齐：每一行的条起止都在同一条竖线上。
                               条长按占全部费用的比例，不按本页最大值拉满——拉满会让「61%」与「100%」看着一样长。 */}
@@ -501,6 +507,15 @@ export function BillingPage({
                 </TableBody>
               </Table>
             )}
+            {/* 所选范围里有升级前、分不出 5m / 1h 的缓存写：整体说一句，免得只看两列以为是全部。 */}
+            {total && total.cache_write_unknown_tokens > 0 && rows.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t(
+                  `所选范围内有 ${formatTokens(total.cache_write_unknown_tokens)} token 缓存写为升级前的历史数据，无法区分 5m / 1h，未计入这两列。`,
+                  `${formatTokens(total.cache_write_unknown_tokens)} cache-write tokens in this range are pre-upgrade history that cannot be split into 5m / 1h and are excluded from both columns.`,
+                )}
+              </p>
+            )}
             {canDrill && rows.length > 0 && (
               <p className="mt-2 text-xs text-muted-foreground">{t('点击成员可查看其明细。', 'Click a member to see their details.')}</p>
             )}
@@ -509,5 +524,45 @@ export function BillingPage({
       </main>
       <AppFooter />
     </div>
+  )
+}
+
+/** 5 分钟档缓存写：合计减 1 小时档与未分档（上游没给细分的整笔算 5 分钟档，与计价同口径）。 */
+function write5m(row: BillingRow): number {
+  return Math.max(0, row.cache_write_tokens - row.cache_write_1h_tokens - row.cache_write_unknown_tokens)
+}
+
+/**
+ * 5m / 1h 缓存写的一格。整行都分不出档时写「未知」，不显示成确定的 0；部分分不出时数字下面加
+ * 虚线、悬停说明有多少没算进两档——不猜成哪一档，也不让人以为两档加起来就是全部。
+ */
+function CacheTierCell({ row, value }: { row: BillingRow; value: number }) {
+  const { t, locale } = useI18n()
+  const unknown = row.cache_write_unknown_tokens
+  const allUnknown = unknown > 0 && unknown >= row.cache_write_tokens
+  return (
+    <TableCell className={cn(COL.tokens, 'text-right tabular-nums', allUnknown && 'text-muted-foreground')}>
+      {allUnknown ? (
+        <Hint
+          label={t(
+            '这一行的缓存写都是升级前的历史数据，无法区分 5m / 1h。',
+            'All cache writes in this row are pre-upgrade history and cannot be split into 5m / 1h.',
+          )}
+        >
+          <span className="cursor-help underline decoration-dotted underline-offset-4">{t('未知', 'Unknown')}</span>
+        </Hint>
+      ) : unknown > 0 ? (
+        <Hint
+          label={t(
+            `另有 ${unknown.toLocaleString(locale)} token 缓存写为升级前的历史数据，无法区分 5m / 1h，未计入这两列。`,
+            `Another ${unknown.toLocaleString(locale)} cache-write tokens are pre-upgrade history that cannot be split into 5m / 1h and are excluded from both columns.`,
+          )}
+        >
+          <span className="cursor-help underline decoration-dotted underline-offset-4">{formatTokens(value)}</span>
+        </Hint>
+      ) : (
+        formatTokens(value)
+      )}
+    </TableCell>
   )
 }

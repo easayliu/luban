@@ -1411,6 +1411,7 @@ mod tests {
         assert_eq!(s.summary.rejected, 1);
         assert!((s.summary.cost_usd - 2.0).abs() < 1e-9);
         assert_eq!(s.summary.cache_write_tokens, 3 * 3 + 10);
+        assert_eq!(s.summary.cache_write_1h_tokens, 6, "只有细分档那条的 1h 档");
         assert_eq!(
             s.points.iter().map(|p| (p.ts, p.requests)).collect::<Vec<_>>(),
             vec![(base, 3), (base + day, 2)]

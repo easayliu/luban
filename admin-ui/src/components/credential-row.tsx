@@ -1408,8 +1408,8 @@ function ListQuotaDetails({
                 {tokens == null
                   ? t('本周期总 token：暂无数据', 'Total tokens this period: no data')
                   : t(
-                    `本周期总 token ${tokens.toLocaleString(locale)}（输入 + 输出 + 缓存写 + 缓存读，官方 usage 口径，不加权）`,
-                    `${tokens.toLocaleString(locale)} tokens this period (input + output + cache write + cache read, per the official usage fields, unweighted)`,
+                    `本周期总 token ${tokens.toLocaleString(locale)}（输入 + 缓存写 + 缓存读 + 输出，官方 usage 口径，不加权）`,
+                    `${tokens.toLocaleString(locale)} tokens this period (input + cache writes + cache reads + output, per the official usage fields, unweighted)`,
                   )}
               </TooltipPopup>
             </Tooltip>

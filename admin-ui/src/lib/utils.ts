@@ -631,6 +631,11 @@ export interface CacheSlot {
   inputTokens: number
   cachedTokens: number
   writtenTokens: number
+  /** 写入里 1 小时档的部分；5 分钟档是 `writtenTokens` 减它。 */
+  written1hTokens: number
+  requests: number
+  outputTokens: number
+  costUsd: number
   hasTraffic: boolean
 }
 
@@ -638,7 +643,16 @@ export interface CacheSlot {
  * 把后端那串逐小时的点铺成**连续的**若干格。补齐空格、按本地时区合「天」。
  */
 export function bucketCacheSeries(
-  points: readonly { ts: number; input_tokens: number; cached_tokens: number; written_tokens?: number }[],
+  points: readonly {
+    ts: number
+    input_tokens: number
+    cached_tokens: number
+    written_tokens?: number
+    written_1h_tokens?: number
+    requests?: number
+    output_tokens?: number
+    cost_usd?: number
+  }[],
   granularity: CacheGranularity,
   slots: number,
   nowMs: number = Date.now(),
@@ -666,6 +680,10 @@ export function bucketCacheSeries(
     inputTokens: 0,
     cachedTokens: 0,
     writtenTokens: 0,
+    written1hTokens: 0,
+    requests: 0,
+    outputTokens: 0,
+    costUsd: 0,
     hasTraffic: false,
   }))
   const indexOf = new Map(starts.map((ts, i) => [ts, i]))
@@ -679,6 +697,10 @@ export function bucketCacheSeries(
     out[i].inputTokens += p.input_tokens
     out[i].cachedTokens += p.cached_tokens
     out[i].writtenTokens += p.written_tokens ?? 0
+    out[i].written1hTokens += p.written_1h_tokens ?? 0
+    out[i].requests += p.requests ?? 0
+    out[i].outputTokens += p.output_tokens ?? 0
+    out[i].costUsd += p.cost_usd ?? 0
     out[i].hasTraffic = true
   }
   return out
@@ -787,4 +809,19 @@ export function relativeTime(
   return language === 'zh-CN'
     ? `${days} 天前`
     : `${days} ${days === 1 ? 'day' : 'days'} ago`
+}
+
+/**
+ * 单条流水的缓存写按官方两档拆开：上游给了细分就用细分；没给细分的整笔算 5 分钟档（与计价
+ * 同口径）；连合计都没有（没嗅探到 usage）为 null。
+ */
+export function cacheWriteTiers(log: {
+  cache_creation_tokens: number | null
+  cache_5m_tokens: number | null
+  cache_1h_tokens: number | null
+}): { w5m: number | null; w1h: number | null } {
+  if (log.cache_5m_tokens == null && log.cache_1h_tokens == null) {
+    return log.cache_creation_tokens == null ? { w5m: null, w1h: null } : { w5m: log.cache_creation_tokens, w1h: 0 }
+  }
+  return { w5m: log.cache_5m_tokens ?? 0, w1h: log.cache_1h_tokens ?? 0 }
 }

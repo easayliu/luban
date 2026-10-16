@@ -5,7 +5,7 @@ import { listUsage, type UsageLog } from '@/api/credentials'
 import { useSeesWholePool } from '@/lib/role'
 import { useI18n } from '@/lib/i18n'
 import {
-  cn, displayCredentialLabel, extractError, formatFullTime, formatMs, formatUsd, parseSessionKey, sideClassLabel,
+  cacheWriteTiers, cn, displayCredentialLabel, extractError, formatFullTime, formatMs, formatUsd, parseSessionKey, sideClassLabel,
 } from '@/lib/utils'
 import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -210,6 +210,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
   // 代理和用户：设备、会话这几格后端已抹掉（见 `web::usage::for_owner`），整格不出。
   const full = useSeesWholePool()
   const num = (v: number | null) => (v == null ? '—' : v.toLocaleString(locale))
+  const tiers = cacheWriteTiers(log)
   const deviceShort = log.device_id
     ? log.device_id.startsWith('sim:') ? `sim:${log.device_id.slice(4, 12)}` : log.device_id.slice(0, 8)
     : '—'
@@ -233,8 +234,11 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
         <Fact label={t('模型', 'Model')}><Hint label={log.model}><span>{log.model ?? '—'}</span></Hint></Fact>
+        {/* token 按官方顺序：输入 → 5m 缓存写 → 1h 缓存写 → 缓存读 → 输出。 */}
         <Fact label={t('输入 / 输出', 'In / out')}>{num(log.input_tokens)} / {num(log.output_tokens)}</Fact>
-        <Fact label={t('缓存写 / 读', 'Cache w/r')}>{num(log.cache_creation_tokens)} / {num(log.cache_read_tokens)}</Fact>
+        <Fact label={t('缓存写 5m / 1h · 读', 'Cache writes 5m / 1h · reads')}>
+          {num(tiers.w5m)} / {num(tiers.w1h)} · {num(log.cache_read_tokens)}
+        </Fact>
         <Fact label={t('首字 / 总耗时', 'TTFT / total')}>{formatMs(log.ttft_ms)} / {formatMs(log.total_ms)}</Fact>
         <Fact label={t('花费', 'Cost')}>
           <span className={cn(log.cost_usd == null && 'text-muted-foreground')}>

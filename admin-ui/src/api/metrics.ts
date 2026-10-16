@@ -43,6 +43,12 @@ export interface CacheSeriesPoint {
   cached_tokens: number
   /** 其中写进缓存的。命中率一个数分不出「没命中」和「没写入」，拆开才知道该查什么。 */
   written_tokens: number
+  /** 写入里 1 小时档的部分；5 分钟档是 `written_tokens` 减它。 */
+  written_1h_tokens: number
+  /** 请求数（含失败的）、输出 token 与等价 API 费用。 */
+  requests: number
+  output_tokens: number
+  cost_usd: number
 }
 
 export interface CacheSeries {
@@ -97,17 +103,28 @@ export async function getTtftSeries({ hours, bucketSecs }: SeriesParams): Promis
 
 export type BreakdownBy = 'model' | 'account'
 
+/** 套餐徽章要用的几项，见 `AccountTierBadge`。 */
+export interface AccountPlan {
+  tier: string | null
+  org_type: string | null
+  org_name: string | null
+  rate_limit_tier: string | null
+  subscription_created_at: string | null
+}
+
 export interface BreakdownRow {
   /** 模型名，或凭证 id 的十进制串。 */
   key: string
   /** 模型名，或凭证 label（已删的号是 `#<id>`）。 */
   label: string
-  /** 按账号拆时该号的套餐；按模型拆或号已删为 null。 */
-  tier: string | null
+  /** 按账号拆时该号的套餐与组织信息（字段同账号接口，照账号卡片画徽章）；按模型拆或号已删为 null。 */
+  plan: AccountPlan | null
   /** 这段时间里的全部请求数（含失败的）。 */
   requests: number
-  /** 缓存给这一组省下的钱（USD）：命中省的减去写入多付的，可能为负。 */
-  cache_saved_usd: number
+  /** 全部请求（含失败的）的输出 token。 */
+  output_tokens: number
+  /** 按官方价目估的等价 API 费用（USD），含输出；模型认不出价目的记录按 0 计。 */
+  cost_usd: number
   /** 延迟（只算成功且记了 TTFT 的请求）。 */
   latency: TtftSeriesPoint
   /** 缓存三段 token（所有请求）。 */
@@ -118,8 +135,8 @@ export interface Breakdown {
   since: number
   by: BreakdownBy
   rows: BreakdownRow[]
-  /** 全部分组（不止前 12 行）缓存省下的钱合计（USD）。 */
-  cache_saved_usd_total: number
+  /** 全部分组（不止前 12 行）等价 API 费用合计（USD）。 */
+  cost_usd_total: number
 }
 
 // ---------- 本地拒绝 ----------

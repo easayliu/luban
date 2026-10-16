@@ -39,8 +39,8 @@ export interface Quota {
   /**
    * 当前 5h / 7d 窗口内用掉的**总 token**，窗口与上面的费用/请求数完全一致。
    *
-   * 口径按官方 `usage` 的四项相加：输入 + 输出 + 缓存写 + 缓存读（官方这四项互不重叠，
-   * 缓存命中的部分不再计进输入）。**不加权**——计价才有缓存写 ×1.25、缓存读 ×0.1 的倍率，
+   * 口径按官方 `usage` 的四项相加：输入 + 缓存写 + 缓存读 + 输出（官方这四项互不重叠，
+   * 缓存命中的部分不再计进输入）。**不加权**——计价才有缓存写 ×1.25 / ×2、缓存读打折的倍率，
    * token 数跟着加权就和上游用量页对不上了。所以「token 很多、花费很少」是常态（缓存读通常
    * 占大头），两个数要一起看。
    */
@@ -298,6 +298,9 @@ export interface UsageLog {
   input_tokens: number | null
   output_tokens: number | null
   cache_creation_tokens: number | null
+  /** 缓存写的两档细分；上游没给细分时都为 null，整笔按 5 分钟档算。 */
+  cache_5m_tokens: number | null
+  cache_1h_tokens: number | null
   cache_read_tokens: number | null
   /** 首字节耗时（毫秒）。 */
   ttft_ms: number | null
@@ -553,7 +556,9 @@ export interface CredentialStatsBucket {
   rejected: number
   input_tokens: number
   output_tokens: number
+  /** 缓存写合计；其中 1 小时档见下一项，5 分钟档是两者之差。 */
   cache_write_tokens: number
+  cache_write_1h_tokens: number
   cache_read_tokens: number
   cost_usd: number
 }
