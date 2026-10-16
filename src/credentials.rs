@@ -1,4 +1,4 @@
-//! 凭证记录模型与刷新判定。持久化在 SQLite，见 [`crate::store`]。
+//! 凭证记录模型与刷新判定。持久化在 PostgreSQL，见 [`crate::store`]。
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
@@ -33,7 +33,7 @@ pub fn priority_tiers_by_rank(
     map
 }
 
-/// 一条 Claude OAuth 凭证（对应 SQLite 一行）。
+/// 一条 Claude OAuth 凭证（对应 `credentials` 表一行）。
 #[derive(Debug, Clone)]
 pub struct Credential {
     pub id: i64,

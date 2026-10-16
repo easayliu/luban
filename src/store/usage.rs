@@ -434,6 +434,10 @@ const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
              $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44,
              $45, $46, $47)";
 
+/// 流水事务的提交方式，见 [`CredentialStore::insert_usage_log_at`]：`$1` 为 `'off'` 即本事务
+/// 不等 WAL 落盘，为 NULL 即照库的当前设置（原样写回，等于不改）。
+const SET_SYNC_COMMIT_SQL: &str = "SELECT set_config('synchronous_commit', COALESCE($1, current_setting('synchronous_commit')), true)";
+
 /// 落账（`credential_stats` 与 `device_costs`）的那条 SQL：不带额度快照的。设备账本在 CTE 里，
 /// `$4`（device_id）为 NULL 时不记。
 const LEDGER_SQL: &str = "WITH dev AS (
@@ -534,23 +538,35 @@ impl CredentialStore {
     ) -> Result<()> {
         let cleaned = without_nul(rec);
         let rec = cleaned.as_ref().unwrap_or(rec);
-        let mut tx = self.pool.begin().await?;
-        let (ts, owner) = if ts.is_some() && rec.cred_id.is_none() {
-            (ts.unwrap_or_default(), None)
-        } else {
-            // 号主列为空时记 0（同 SQLite 版），这样 None 只表示「没有这一行」。
-            let (now, owner): (i64, Option<i64>) = sqlx::query_as(
-                "SELECT unixepoch(),
-                        (SELECT COALESCE(owner_id, 0) FROM credentials WHERE id = $1 FOR KEY SHARE)",
-            )
-            .bind(rec.cred_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            (ts.unwrap_or(now), owner)
-        };
         // 工具名清单拆出去按 sha 存一份（见 [`split_tool_names`]），流水里只留 sha。
         let (shape, tool_set) = split_tool_names(rec.forensics.shape.as_deref());
         let new_tool_set = tool_set.filter(|(sha, _)| !self.known_tool_sets.lock().contains(sha));
+        // 这笔通常**提交不等 WAL 落盘**（`synchronous_commit = off`，只管本事务）：它最后改的是
+        // 预聚合里全库最热的那一行（见下方 [`rollup_record`]），行锁一直持到提交，等 fsync 的
+        // 那一下会摊到所有并发流水的排队上。代价是 PG 本身崩溃时丢最后几百毫秒的流水与账目，
+        // 数据不会损坏。设置随在本事务第一条语句里，不多一次往返。
+        //
+        // 例外是这笔要插**新工具集**：提交后它的 sha 就记进 `known_tool_sets`，往后同一工具集
+        // 不再补写。若提交没落盘而 PG 崩了，库里那行没了、内存里却还认得它，之后的流水就一直
+        // 查不到工具名——这就不止丢最后几百毫秒了。新工具集很少，这一笔照库的默认同步提交。
+        let sync_commit = if new_tool_set.is_some() { None } else { Some("off") };
+        let mut tx = self.pool.begin().await?;
+        let (ts, owner) = if ts.is_some() && rec.cred_id.is_none() {
+            sqlx::query(SET_SYNC_COMMIT_SQL).bind(sync_commit).execute(&mut *tx).await?;
+            (ts.unwrap_or_default(), None)
+        } else {
+            // 号主列为空时记 0（同 SQLite 版），这样 None 只表示「没有这一行」。
+            let (_, now, owner): (String, i64, Option<i64>) =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "{SET_SYNC_COMMIT_SQL}, unixepoch(),
+                        (SELECT COALESCE(owner_id, 0) FROM credentials WHERE id = $2 FOR KEY SHARE)"
+                )))
+                .bind(sync_commit)
+                .bind(rec.cred_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            (ts.unwrap_or(now), owner)
+        };
         if let Some((sha, names)) = &new_tool_set {
             sqlx::query(
                 "INSERT INTO tool_sets (sha, names) VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -931,6 +947,23 @@ pub(super) mod tests {
     }
 
     /// 裁剪只动流水，不动账本：累计费用/最近使用/额度快照在裁剪后原样保留。
+    /// 流水事务的提交方式（[`SET_SYNC_COMMIT_SQL`]）：`'off'` 只关本事务，NULL 原样保留库的
+    /// 设置——要插新工具集的那笔靠后者照常同步提交。
+    #[sqlx::test]
+    async fn usage_tx_sync_commit_setting(pool: sqlx::PgPool) {
+        let current = "SELECT current_setting('synchronous_commit')";
+        let default: String = sqlx::query_scalar(current).fetch_one(&pool).await.unwrap();
+        for (arg, want) in [(Some("off"), "off"), (None, default.as_str())] {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query(SET_SYNC_COMMIT_SQL).bind(arg).execute(&mut *tx).await.unwrap();
+            let got: String = sqlx::query_scalar(current).fetch_one(&mut *tx).await.unwrap();
+            assert_eq!(got, want, "参数 {arg:?}");
+            tx.commit().await.unwrap();
+            let after: String = sqlx::query_scalar(current).fetch_one(&pool).await.unwrap();
+            assert_eq!(after, default, "只管本事务，提交后回到库的设置");
+        }
+    }
+
     #[sqlx::test]
     async fn prune_keeps_ledger(pool: sqlx::PgPool) {
         let (store, ids) = store_with(pool, &["a"]).await;

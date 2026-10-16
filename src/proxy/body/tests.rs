@@ -6841,3 +6841,40 @@ fn agent_text_cache_overflow_still_serves_the_given_text() {
         assert!(!desc.contains("Several at once spend tokens in a burst"), "{k}: 不退回内置正文");
     }
 }
+
+/// 改写复用来访已解析好的那份（[`crate::proxy::body::rewrite_body_out_parsed`]）与从字节重新
+/// 解析，出站字节与交回的 `Value` 必须逐字节相同——模拟与非模拟、带转义的 thinking 块都算上。
+#[test]
+fn rewriting_from_parsed_matches_reparsing() {
+    let body = r#"{"model":"claude-opus-5-5","max_tokens":1024,"system":"sys 中","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"a\/b é","signature":"Ab\/+cd=="},{"type":"redacted_thinking","data":"Zz\/9"},{"type":"text","text":"ok"}]},{"role":"user","content":"next"}]}"#;
+    let bytes = Bytes::from(body);
+    let sim = sim_for(body);
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for sim in [None, Some(&sim)] {
+        let run = |p: Option<&serde_json::Value>| {
+            crate::proxy::body::rewrite_body_out_parsed(
+                &bytes,
+                p,
+                &test_cred(),
+                "fp",
+                all_on(),
+                sim,
+                None,
+                None,
+                false,
+                None,
+                true,
+                true,
+                None,
+                None,
+                super::CcRequestKind::Main,
+                None,
+            )
+        };
+        let (a, av) = run(None);
+        let (b, bv) = run(Some(&parsed));
+        assert_eq!(a, b, "模拟={}：出站字节应相同", sim.is_some());
+        assert_eq!(av, bv, "模拟={}：交回的 Value 应相同", sim.is_some());
+        assert!(av.is_some(), "全开时应当改写过");
+    }
+}

@@ -251,8 +251,9 @@ impl CredentialStore {
     ///
     /// 只给选号用：它每条请求都要提交一次，而且在全局锁里提交，等 fsync 的那一下直接摊在
     /// 所有请求的排队上。它写的是绑定续期、计数与绑定事件——PG 本身崩溃时丢最后几百毫秒，
-    /// 代价是个别会话下一条请求重新选号，数据不会损坏，可以接受。流水、账单、后台的配置改动
-    /// 照旧走 [`Self::begin_write`]。设置随在拿锁那条语句里，不多一次往返。
+    /// 代价是个别会话下一条请求重新选号，数据不会损坏，可以接受。后台的配置改动等别的串行
+    /// 写入照旧走 [`Self::begin_write`]；流水不走全局锁，同样不等落盘，见
+    /// [`Self::insert_usage_log_at`]。设置随在拿锁那条语句里，不多一次往返。
     pub(crate) async fn begin_write_async_commit(&self) -> Result<WriteTx> {
         let guard = self.write_lock.clone().lock_owned().await;
         let tx = begin_locked(&self.pool, true).await?;

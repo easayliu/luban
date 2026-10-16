@@ -1,7 +1,7 @@
 //! luban —— Claude Code 授权代理。
 //!
-//! 当前实现「登录授权 + 多凭证管理」：通过 Claude Code 的 OAuth 流程用订阅账号登录，
-//! 多个账号的 access/refresh token 存于 SQLite。后续在此基础上加转发代理（`serve`）。
+//! 通过 Claude Code 的 OAuth 流程用订阅账号登录，多个账号的 access/refresh token 加密存于
+//! PostgreSQL；`serve` 起转发代理与管理后台。
 
 mod admin_ui;
 mod auth;

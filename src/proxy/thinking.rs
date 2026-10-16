@@ -339,20 +339,22 @@ fn thinking_block_byte_ranges(json: &str) -> Vec<ThinkingBlockRef> {
             if !(s.contains("\"thinking\"") || s.contains("\"redacted_thinking\"")) {
                 continue;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                match v.get("type").and_then(|t| t.as_str()) {
-                    Some("thinking") | Some("redacted_thinking") => {}
-                    _ => continue,
-                }
-            } else {
+            // 只取判定与配对要的三个字段，`thinking` 正文（块里最大的那段）不建出来。
+            #[derive(Deserialize)]
+            struct Blk {
+                #[serde(rename = "type")]
+                kind: Option<String>,
+                signature: Option<serde_json::Value>,
+                data: Option<serde_json::Value>,
+            }
+            let Ok(blk) = serde_json::from_str::<Blk>(s) else { continue };
+            if !matches!(blk.kind.as_deref(), Some("thinking" | "redacted_thinking")) {
                 continue;
             }
             let start = s.as_ptr() as usize - base;
-            let key = serde_json::from_str::<serde_json::Value>(s).ok().and_then(|v| {
-                ["signature", "data"]
-                    .iter()
-                    .find_map(|k| v.get(*k).and_then(|x| x.as_str()).map(str::to_string))
-            });
+            let key = [blk.signature, blk.data]
+                .into_iter()
+                .find_map(|v| v.and_then(|x| x.as_str().map(str::to_string)));
             out.push(ThinkingBlockRef {
                 msg: mi,
                 turn: turn - 1,

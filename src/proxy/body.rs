@@ -117,6 +117,63 @@ pub(crate) fn rewrite_body_out(
     // 要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`]），`None` 即不补、只归一形态。
     fallbacks: Option<&str>,
 ) -> (Bytes, Option<serde_json::Value>) {
+    rewrite_body_out_parsed(
+        body,
+        None,
+        cred,
+        device_fp,
+        flags,
+        sim,
+        bare_session,
+        session_out,
+        force_stream,
+        tool_names,
+        display_beta,
+        adv_beta,
+        client,
+        client_link,
+        cc_kind,
+        fallbacks,
+    )
+}
+
+/// 同 [`rewrite_body_out`]，`parsed` 是调用方手里**已解析好的同一份** `body`（来访的 `body_json`）。
+/// 要改写时拿它 `clone` 而不是从字节重新解析：真实 0.5MB 会话解析 3.1ms、`clone` 1.6ms。
+/// `parsed` 必须与 `body` 逐值相同，否则出站体就是另一份——只在
+/// [`Upstream::shape_outbound`](crate::proxy::Upstream::shape_outbound) 传，那里两者出自
+/// 同一个 `Inbound`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rewrite_body_out_parsed(
+    body: &Bytes,
+    parsed: Option<&serde_json::Value>,
+    cred: &crate::credentials::Credential,
+    device_fp: &str,
+    flags: store::ForwardFlags,
+    sim: Option<&Simulation>,
+    bare_session: Option<&str>,
+    // 出站两处要落的同一个会话 id（非模拟路径），见 [`outbound_session_id`]。头那侧由
+    // [`build_forward_headers_for`] 落，体这侧由 [`sync_metadata_session`] 落。
+    session_out: Option<&str>,
+    force_stream: bool,
+    tool_names: Option<&ToolNameMap>,
+    // 出站头里已经带了 `thinking-display-updates` beta（由调用方从实际发出的头上判定）。
+    // 只有它为真，fable 请求的 body 才补 `thinking.display:"updates"`，见 [`fill_thinking_display`]。
+    display_beta: bool,
+    // 出站头里已经带了 `advanced-tool-use` beta（同样由调用方从实际发出的头上判定）。
+    // 真 CC 路径只有它为真才给工具补 `eager_input_streaming`，见 [`eager_tools_wanted`]。
+    adv_beta: bool,
+    // 来访**自报**的客户端身份（`claude-cli/x.y.z (external, <entrypoint>)`，版本解不出为
+    // `None`）。给真实 CC 补 billing header（[`ensure_cc_system_prefix`]）与按版本取舍字段时用。
+    client: Option<CcClient<'_>>,
+    // 真实 CC 来访要补的会话关联字段（`cc_prev_req` / `cc_prompt_id` /
+    // `diagnostics.previous_message_id`）；模拟路径为 `None`，它的链在 `sim.link` 里。
+    // 判据见 [`client_session_link`]。
+    client_link: Option<&CcSessionLink>,
+    // 这条来访属于哪一类官方 profile，见 [`CcRequestKind`]。
+    cc_kind: CcRequestKind,
+    // 要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`]），`None` 即不补、只归一形态。
+    fallbacks: Option<&str>,
+) -> (Bytes, Option<serde_json::Value>) {
     // `system_shape` 不连着 `merge_beta`：它只负责拆块，而裸的 `{"type":"ephemeral"}` 是 GA
     // 能力，不需要任何 beta 声明。断点上那两项可选字段才各自要一个 beta。
     let shape = flags.system_shape;
@@ -176,7 +233,11 @@ pub(crate) fn rewrite_body_out(
     // 补 metadata 用的 session_id：模拟模式取 Simulation 那份，CC 形态来访取 `bare_session`
     // （见 [`Upstream::bare_session`]）。两者都与出站头上的 `X-Claude-Code-Session-Id` 同值。
     let meta_session = sim.map(|s| s.session_id.as_str()).or(bare_session);
-    let mut v: serde_json::Value = match serde_json::from_slice(body) {
+    let parsed_owned = match parsed {
+        Some(v) => Ok(v.clone()),
+        None => serde_json::from_slice(body),
+    };
+    let mut v: serde_json::Value = match parsed_owned {
         Ok(v) => v,
         Err(_) => return (body.clone(), None),
     };

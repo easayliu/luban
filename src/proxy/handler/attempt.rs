@@ -360,9 +360,14 @@ pub(super) async fn prepare<'a>(
         // 确认，分组改变了这条的 `Agent` 说明就在发出前重新整形，让这个会话从首条起就是这次的分组
         // （曝光也跟这份，见 [`crate::proxy::lucky_cerf`]）。重试路径同样会二次整形，改写可重入。
         if let Some(first) = cerf_first {
-            let model = serde_json::from_slice::<serde_json::Value>(&sent)
+            // 只取出站体的 `model`，其余字段跳过不建 `Value`。
+            #[derive(serde::Deserialize)]
+            struct Model {
+                model: Option<String>,
+            }
+            let model = serde_json::from_slice::<Model>(&sent)
                 .ok()
-                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned))
+                .and_then(|m| m.model)
                 .unwrap_or_default();
             if first.settle(&model) {
                 (sent, sent_bits) =

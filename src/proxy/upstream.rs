@@ -9,7 +9,7 @@ use crate::web::AppState;
 
 use super::body::{
     CcClient, ToolNameMap, cc_ua_entrypoint, declares_no_tools, injected_tools_of,
-    restore_tool_names_stream, rewrite_body_out, trusted_cc_version,
+    restore_tool_names_stream, rewrite_body_out_parsed, trusted_cc_version,
 };
 use super::headers::{is_resp_forwardable, orig_header_case};
 use super::logging::{ReqLog, ShapeBits, UsageSniffer, shape_summary_of};
@@ -86,13 +86,13 @@ impl Upstream<'_> {
         cred: &crate::credentials::Credential,
         device_fp: &str,
     ) -> Bytes {
-        self.shape_with(body, cred, device_fp, self.refusal_fallbacks).0
+        self.shape_with(body, None, cred, device_fp, self.refusal_fallbacks).0
     }
 
     /// [`Self::shape`] 外加一份**出站体的取证摘要**（[`shape_summary_of`]）。
     ///
     /// 转发主路径走这个。摘要在这里算而不是等落库时再从字节解析，是因为改写刚好把出站体的
-    /// `Value` 建在手里（见 [`rewrite_body_out`]）——借它走一趟只要 0.6ms，而从字节重新解析
+    /// `Value` 建在手里（见 [`rewrite_body_out`](crate::proxy::rewrite_body_out)）——借它走一趟只要 0.6ms，而从字节重新解析
     /// 一份 1.8MB 的会话要 6.7ms。两者的产物逐字相同。
     ///
     /// `inbound` 是来访体已经解析好的那份（[`handle_inner`](crate::proxy::handle_inner) 里的 `body_json`）：改写没动过
@@ -107,7 +107,8 @@ impl Upstream<'_> {
         device_fp: &str,
         inbound: Option<&serde_json::Value>,
     ) -> (Bytes, ShapeBits) {
-        let (sent, outbound) = self.shape_with(body, cred, device_fp, self.refusal_fallbacks);
+        let (sent, outbound) =
+            self.shape_with(body, inbound, cred, device_fp, self.refusal_fallbacks);
         let mut bits = match outbound.as_ref().or(inbound) {
             Some(v) => shape_summary_of(v),
             None => ShapeBits::default(),
@@ -122,10 +123,12 @@ impl Upstream<'_> {
     }
 
     /// [`Self::shape`] 指定要不要补 `fallbacks`：重试路径（[`retry_without_fallbacks`]）
-    /// 传 `None`，其余一律传 `self.refusal_fallbacks`。
+    /// 传 `None`，其余一律传 `self.refusal_fallbacks`。`parsed` 是 `body` 已解析好的那份，
+    /// 改写时拿它省一次解析，见 [`rewrite_body_out_parsed`]。
     fn shape_with(
         &self,
         body: &Bytes,
+        parsed: Option<&serde_json::Value>,
         cred: &crate::credentials::Credential,
         device_fp: &str,
         fallbacks: Option<&'static str>,
@@ -157,8 +160,9 @@ impl Upstream<'_> {
             // `sim_billing_only` 的两处置空（`tool_names` / `refusal_fallbacks`）不在这里做，而是
             // 在 [`AttemptPlan`] 生成时统一门控——那样请求头的 beta、请求体、重试与错误学习用的是
             // 同一份状态（见 [`crate::proxy::handler::attempt`]）。这里原样透传即可。
-            rewrite_body_out(
+            rewrite_body_out_parsed(
                 body,
+                parsed,
                 cred,
                 device_fp,
                 self.flags,
@@ -702,7 +706,7 @@ pub(super) async fn retry_without_fallbacks(
     client_body: &Bytes,
     rl: &mut ReqLog,
 ) -> Option<wreq::Response> {
-    let retried = upstream.shape_with(client_body, cred, device_fp, None).0;
+    let retried = upstream.shape_with(client_body, None, cred, device_fp, None).0;
     let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,
         Err(e) => {
@@ -749,7 +753,8 @@ pub(super) async fn retry_thread_as_create(
 ) -> Option<wreq::Response> {
     let failed = rl.cc_thread.take()?;
     CcSessionLink::drop_thread(&failed);
-    let retried = upstream.shape_with(client_body, cred, device_fp, upstream.refusal_fallbacks).0;
+    let retried =
+        upstream.shape_with(client_body, None, cred, device_fp, upstream.refusal_fallbacks).0;
     let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,
         Err(e) => {
