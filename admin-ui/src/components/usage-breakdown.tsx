@@ -17,7 +17,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableFooter, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
-import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Hint } from '@/components/ui/tooltip'
 
 /**
  * 趋势对话框下面那张「谁在拖后腿」的表：这段时间按模型或按账号拆开，按请求数降序取前 12。
@@ -91,8 +91,9 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
         </p>
       ) : (
         // 滚动容器当 Table 的外壳传进 `render`，sticky 表头才粘得住，见 COMPACT_TABLE_HEADER_CLASS。
+        // 缓存表 9 列，数字列左右留白从 12px 收到 8px，弹窗里一屏放得下「API 价」；首列（名称）不动。
         <Table
-          className="text-xs"
+          className={cn('text-xs', kind === 'cache' && '[&_td:not(:first-child)]:px-2 [&_th:not(:first-child)]:px-2')}
           render={<div className={cn('max-h-64 overflow-auto rounded-xl border transition-opacity', query.isFetching && !query.isPending && 'opacity-60')} />}
         >
           <TableHeader className={COMPACT_TABLE_HEADER_CLASS}>
@@ -135,20 +136,16 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
                     合计只有「API 价」这一列有值，中间 7 列留空。 */}
                 <td colSpan={7} />
                 <td className="text-end">
-                  <Tooltip>
-                    <TooltipTrigger
-                      className="cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4"
-                      render={<span />}
-                    >
+                  <Hint
+                    label={t(
+                      '按官方 API 价目估算的等价费用，含输入、输出与缓存；缓存写 5m 按输入价 1.25 倍、1h 按 2 倍计，缓存读按各模型的折扣价计。',
+                      'Equivalent cost at official API list prices, covering input, output and cache; 5m cache writes at 1.25× input, 1h at 2×, cache reads at each model\'s discounted rate.',
+                    )}
+                  >
+                    <span className="cursor-help rounded-sm tabular-nums underline decoration-dotted underline-offset-4">
                       {formatUsd(query.data.cost_usd_total)}
-                    </TooltipTrigger>
-                    <TooltipPopup className="max-w-72 whitespace-normal text-left leading-5">
-                      {t(
-                        '按官方 API 价目估算的等价费用，含输入、输出与缓存；缓存写 5m 按输入价 1.25 倍、1h 按 2 倍计，缓存读按各模型的折扣价计。',
-                        'Equivalent cost at official API list prices, covering input, output and cache; 5m cache writes at 1.25× input, 1h at 2×, cache reads at each model\'s discounted rate.',
-                      )}
-                    </TooltipPopup>
-                  </Tooltip>
+                    </span>
+                  </Hint>
                 </td>
               </tr>
             </TableFooter>
@@ -182,8 +179,9 @@ function BreakdownTr({
   const noLatency = row.latency.count === 0
   return (
     <TableRow className="cursor-pointer hover:bg-muted/40" onClick={onOpen}>
-      <TableCell className="max-w-56">
-        <span className="flex min-w-0 items-center gap-1.5">
+      {/* 宽度上限写在里面这层：auto 布局的表格不认 td 的 max-width，名称 + 徽章会把列撑开或溢出。 */}
+      <TableCell>
+        <span className="flex w-max min-w-0 max-w-64 items-center gap-1.5">
           {/* 「点击查看该组最近的请求」原先挂在整行上；行里不再套提示，并到这枚名称按钮上，顺带补上被截断的全名。 */}
           <Hint
             label={row.label

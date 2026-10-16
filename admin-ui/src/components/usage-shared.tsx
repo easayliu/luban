@@ -30,9 +30,13 @@ export function statusVariant(status: number): BadgeProps['variant'] {
  */
 export const COMPACT_TABLE_HEADER_CLASS = 'sticky top-0 z-10 bg-surface-subtle [&_th]:h-7 [&_th]:border-b [&_th]:px-3'
 export const COMPACT_TABLE_BODY_CLASS = '[&_td]:px-3 [&_td]:py-1.5 [&_td]:leading-4'
-/** 紧凑表里的下钻名称：链接样式的按钮，去掉按钮的高度、内边距与边框，与旁边的纯文本行高一致。 */
+/**
+ * 紧凑表里的下钻名称：链接样式的按钮，去掉按钮的高度、内边距与边框，与旁边的纯文本行高一致。
+ * `shrink` 盖掉按钮自带的 `shrink-0`：名称后面跟着徽章时（按账号拆带套餐），名称得先让出
+ * 位置截断，不然徽章会被挤出格子、压到下一列上。
+ */
 export const COMPACT_TABLE_LINK_CLASS =
-  'block h-auto min-w-0 max-w-full truncate rounded-sm border-0 p-0 text-start font-normal text-xs sm:h-auto'
+  'block h-auto min-w-0 max-w-full shrink truncate rounded-sm border-0 p-0 text-start font-normal text-xs sm:h-auto'
 
 /** 复制按钮缩成与 `text-xs` 正文同高：图标 12px、不要按钮的方块尺寸与内边距。触屏热区靠 Button 自带的 `::after` 撑大。 */
 const INLINE_COPY_CLASS =
