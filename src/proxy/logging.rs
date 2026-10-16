@@ -121,6 +121,9 @@ pub(crate) struct ReqLog {
     /// `rewrites` 列打 [`REWRITE_TOOLS_FILLED`]：与 `injected_tool_called` 一比，就知道这项注入
     /// 波及了多少请求、其中多少次模型真去调了。
     pub(super) tools_filled: bool,
+    /// 客户端 system 被挪进了首条用户消息（出站 system 里留着占位块）。收尾时在 `rewrites` 列打
+    /// [`REWRITE_SYS_RELOCATED`]，线上第三方 400 回溯时一眼看出那条有没有挪。
+    pub(super) sys_relocated: bool,
     pub(super) store: std::sync::Arc<store::CredentialStore>,
     /// 在途计数句柄，见 [`InFlightGuard`]：只为让计数活到流结束，字段本身不读。
     pub(super) _in_flight: InFlightGuard,
@@ -267,6 +270,13 @@ impl Drop for ReqLog {
                 tags.push(',');
             }
             tags.push_str(REWRITE_TOOLS_FILLED);
+        }
+        if self.sys_relocated {
+            let tags = self.forensics.rewrites.get_or_insert_with(String::new);
+            if !tags.is_empty() {
+                tags.push(',');
+            }
+            tags.push_str(REWRITE_SYS_RELOCATED);
         }
         let tool_uses_col =
             if tool_uses.is_empty() { "-".to_string() } else { tool_uses.join(",") };
@@ -671,6 +681,8 @@ const REWRITE_INJECTED_TOOL_CALLED: &str = "injected_tool_called";
 /// 流水 `rewrites` 列里标「来访没带工具、模拟路径替它补了官方工具」的标签，见
 /// [`ReqLog::tools_filled`]。
 const REWRITE_TOOLS_FILLED: &str = "tools_filled";
+/// 流水 `rewrites` 列里标「客户端 system 挪进了首条用户消息」的标签，见 [`ReqLog::sys_relocated`]。
+const REWRITE_SYS_RELOCATED: &str = "sys_relocated";
 
 /// 组一份 [`store::BanContext`]：状态码、上游 `error.type`/完整 message、两侧请求 id。
 pub(super) fn ban_context(
@@ -919,6 +931,11 @@ pub(crate) struct ShapeBits {
     pub(super) injected_tools: Vec<&'static str>,
     /// 来访一个工具都没声明、出站却带上了注入的官方工具（开关 `fill_absent_tools`）。
     pub(super) tools_filled: bool,
+    /// 出站 `system` 里有挪位留下的占位块（[`crate::proxy::simulation::system_relocated`]）。
+    pub(super) sys_relocated: bool,
+    /// 出站体带已知必被判第三方的特征（[`crate::proxy::known_third_party_signature`]），值是标签；
+    /// 发送前按开关 `reject_known_third_party` 本地拒绝。
+    pub(crate) known_third_party: Option<&'static str>,
     /// 改写**动过**体、且出站体里有 `ttl:"1h"` 的缓存断点（[`crate::proxy::has_cache_ttl_1h`]）。
     /// 给发送前补 `extended-cache-ttl` beta 用：改写手里本来就有出站 `Value`，顺手判掉，
     /// 不必为一个布尔值把几 MB 的出站体再解析一遍。只有 [`crate::proxy::Upstream::shape_outbound`]

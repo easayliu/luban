@@ -762,6 +762,9 @@ fn body_flags_off_passes_through_byte_for_byte() {
         sim_billing_keep_user_id: false,
         real_billing_keep_user_id: false,
         sim_billing_mimic_all: false,
+        relocate_client_system: false,
+        reject_known_third_party: false,
+        sim_billing_relocate: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -1673,6 +1676,9 @@ fn strip_extra_fields_is_wired_and_switchable() {
             sim_billing_keep_user_id: false,
             real_billing_keep_user_id: false,
             sim_billing_mimic_all: false,
+            relocate_client_system: false,
+            reject_known_third_party: false,
+            sim_billing_relocate: false,
             sim_message_threads: false,
             fill_metadata: false,
             rate_limit_retry: false,
@@ -2354,6 +2360,9 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         sim_billing_keep_user_id: false,
         real_billing_keep_user_id: false,
         sim_billing_mimic_all: false,
+        relocate_client_system: false,
+        reject_known_third_party: false,
+        sim_billing_relocate: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,
@@ -5952,7 +5961,8 @@ fn env_note_matches_the_2_1_293_captures() {
         sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/easayliu", cwd));
         sim.trim_tools = false;
         let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(super::insert_env_note(&mut v, &sim, cred).inserted, "{model}");
+        let root = super::env_note::env_root_of(&v);
+        assert!(super::insert_env_note(&mut v, &sim, cred, root).inserted, "{model}");
         assert_eq!(v["messages"][1]["role"], "system", "{model}");
         let text = v["messages"][1]["content"][0]["text"].as_str().unwrap();
 
@@ -6001,7 +6011,8 @@ fn env_note_is_a_system_message_after_the_first_prompt() {
     for (trim, cred) in [(false, 4242), (true, 4245)] {
         sim.trim_tools = trim;
         let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert!(super::insert_env_note(&mut v, &sim, cred).inserted);
+        let root = super::env_note::env_root_of(&v);
+        assert!(super::insert_env_note(&mut v, &sim, cred, root).inserted);
         let msgs = v["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "system");
@@ -6031,7 +6042,8 @@ fn env_note_is_a_system_message_after_the_first_prompt() {
         assert!(text.contains("- update-config:") && !text.contains("commit-commands:"));
         assert!(!text.contains("ToolSearch") && !text.contains("# MCP Server"), "{text}");
         let again = v.clone();
-        assert!(!super::insert_env_note(&mut v, &sim, cred).inserted, "已有一份就不再补");
+        let root = super::env_note::env_root_of(&v);
+        assert!(!super::insert_env_note(&mut v, &sim, cred, root).inserted, "已有一份就不再补");
         assert_eq!(v, again);
     }
 }
@@ -6044,7 +6056,8 @@ fn env_note_on_haiku_is_reminders_before_the_prompt() {
     let mut sim = crate::proxy::test_support::sim_for(body);
     sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
     let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert!(super::insert_env_note(&mut v, &sim, 4243).inserted);
+    let root = super::env_note::env_root_of(&v);
+    assert!(super::insert_env_note(&mut v, &sim, 4243, root).inserted);
     assert_eq!(v["messages"].as_array().unwrap().len(), 1, "不追加 system 消息");
     let texts: Vec<&str> = v["messages"][0]["content"]
         .as_array()
@@ -6080,7 +6093,8 @@ fn env_note_is_identical_on_every_turn() {
     sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
     let note = |body: &str| {
         let mut v: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert!(super::insert_env_note(&mut v, &sim, 4244).inserted);
+        let root = super::env_note::env_root_of(&v);
+        assert!(super::insert_env_note(&mut v, &sim, 4244, root).inserted);
         v["messages"][1].clone()
     };
     let a = note(first);
@@ -6668,9 +6682,9 @@ fn model_notice_survives_a_trailing_client_system_message() {
     }
 }
 
-/// 模拟路径上开头夹着一条指令：客户端那段长 system 整段留在 system 末块、环境说明跟在首条
-/// **用户**消息后面，指令本身一个字节都不动。不跳过它的话，说明会塞进指令里，指令就成了一条
-/// 开头的普通 system。严格检查开（默认，不提升）与关（提升）两种都要成立。
+/// 模拟路径上开头夹着一条指令：客户端那段长 system 要挪进首条**用户**消息、环境说明跟在它后面，
+/// 指令本身一个字节都不动。不跳过它的话，正文会塞进指令里，指令就成了一条开头的普通 system。
+/// 严格检查开（默认，不提升）与关（提升）两种都要成立。
 #[test]
 fn simulation_skips_a_leading_system_directive() {
     use crate::proxy::test_support::{detect_for, rewrite_body};
@@ -6694,9 +6708,9 @@ fn simulation_skips_a_leading_system_directive() {
         assert_eq!(msgs[0], directive, "指令原样: {ctx}");
         assert_eq!(msgs[1]["role"], "user", "{ctx}");
         let first = msgs[1]["content"][0]["text"].as_str().unwrap();
-        assert_eq!(first, format!("开头指令·{strict}"), "首条用户消息原样: {ctx}");
+        assert!(first.contains("客户端规则。"), "长 system 进了首条用户消息: {ctx}");
         let tail = v["system"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap();
-        assert_eq!(tail, "客户端规则。".repeat(400), "长 system 整段留在末块: {ctx}");
+        assert_eq!(tail, crate::proxy::CLIENT_SYSTEM_PLACEHOLDER, "末块只留占位: {ctx}");
         assert!(
             msgs[2]["content"][0]["text"].as_str().unwrap().starts_with("# Environment"),
             "环境说明跟在首条用户消息后面: {ctx}"
@@ -7173,4 +7187,264 @@ fn rewriting_from_parsed_matches_reparsing() {
         assert_eq!(av, bv, "模拟={}：交回的 Value 应相同", sim.is_some());
         assert!(av.is_some(), "全开时应当改写过");
     }
+}
+
+/// 固定会话里客户端 system 超长且每轮都变（带时间戳那类）：挪位把它写进首条用户消息，指纹若按
+/// 挪位之后算，首条消息每轮不同、谱系根就对不上——`<total_tokens>` 回到 1500 万、历史提醒全丢。
+/// 指纹与形态哈希都要按**挪位之前**采：system 变了照旧 `create`（形态哈希含 system 正文），
+/// 但谱系接得上，倒数接着上一轮；system 没变的续轮照常 `continue`。
+#[test]
+fn sim_threads_keep_the_lineage_when_a_relocated_system_changes() {
+    use crate::proxy::session_link::CcSessionLink;
+    let rules = "规则。".repeat(700);
+    let body = |stamp: &str, messages: serde_json::Value| {
+        // 会话 id 由客户端钉住（OpenClaw 那类都带 `metadata.user_id`）：没带的话模拟会按缓存前缀
+        // 派生，system 一变就成了另一个会话，测不到谱系这一层。
+        serde_json::json!({
+            "model": "claude-opus-5-5",
+            "system": format!("{rules}\n更新于 {stamp}"),
+            "messages": messages,
+            "max_tokens": 32000,
+            "metadata": { "user_id": "user_deadbeef_account_acct-1_session_8d1d2c0e-5b7a-4f3e-9c2b-1a2b3c4d5e6f" },
+        })
+    };
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·动态 system 第一问" });
+    let (v1, p1) = thread_turn(&body("10:00", serde_json::json!([user1])), all_on());
+    assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{v1}");
+    let sys = v1["system"].as_array().unwrap();
+    assert_eq!(
+        sys.last().unwrap()["text"],
+        crate::proxy::CLIENT_SYSTEM_PLACEHOLDER,
+        "挪走了: {v1}"
+    );
+    assert!(
+        v1["messages"][0]["content"][0]["text"].as_str().unwrap().contains("更新于 10:00"),
+        "客户端 system 进了首条消息: {v1}"
+    );
+    CcSessionLink::record_thread(
+        &p1.expect("create 也要等回程提交"),
+        "msg_A",
+        vec!["toolu_1".into()],
+        reply_of(serde_json::json!([
+            { "type": "text", "text": "我看一下" },
+            bash_use("toolu_1", "ls"),
+        ])),
+        40232,
+    );
+    let assistant = serde_json::json!({ "role": "assistant", "content": [
+            { "type": "text", "text": "我看一下" },
+            { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } },
+        ] });
+    let result = serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt" },
+        ] });
+    let msgs2 = serde_json::json!([user1, assistant, result]);
+
+    // system 没变：挪位不妨碍续轮。
+    let (v2, p2) = thread_turn(&body("10:00", msgs2.clone()), all_on());
+    assert_eq!(
+        v2["thread"],
+        serde_json::json!({ "type": "continue", "previous_message_id": "msg_A" }),
+        "{v2}"
+    );
+    CcSessionLink::record_thread(
+        &p2.expect("continue 等回程提交"),
+        "msg_B",
+        vec!["toolu_2".into()],
+        reply_of(serde_json::json!([bash_use("toolu_2", "cat a.txt")])),
+        50000,
+    );
+    let assistant2 = serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_2", "name": "Bash", "input": { "command": "cat a.txt" } },
+        ] });
+    let result2 = serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_2", "content": "hello" },
+        ] });
+    let msgs3 = serde_json::json!([user1, assistant, result, assistant2, result2]);
+
+    // system 变了（时间戳走了一分钟）：重新 create，但谱系没丢，倒数接着上一轮的 50000 往下算。
+    let (v3, p3) = thread_turn(&body("10:01", msgs3), all_on());
+    assert_eq!(v3["thread"], serde_json::json!({ "type": "create" }), "system 变了要重建: {v3}");
+    assert!(p3.is_some_and(|p| !p.is_continue()));
+    assert!(
+        v3["messages"][0]["content"][0]["text"].as_str().unwrap().contains("更新于 10:01"),
+        "新 system 随完整历史重发: {v3}"
+    );
+    let text = v3["messages"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("<total_tokens>14950000 tokens left</total_tokens>"),
+        "倒数接着上一轮而不是回到 1500 万: {text}"
+    );
+}
+
+/// 固定会话、客户端 system 超长且每轮都变：环境状态键里首条消息的指纹若按挪位之后算，每轮都
+/// 像一段新对话——先从 opus 切到 sonnet、再更新一次 system 的时间戳，首轮那份环境说明就被改成
+/// sonnet、历史里的切换说明也丢了。键要用挪位之前的稳定指纹（[`super::env_note::env_root_of`]）。
+#[test]
+fn env_pin_survives_a_relocated_system_change_after_a_model_switch() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let flags = store::ForwardFlags { sim_message_threads: false, ..all_on() };
+    let rules = "规则。".repeat(700);
+    let run = |model: &str, stamp: &str, msgs: serde_json::Value| {
+        let body = serde_json::json!({
+            "model": model,
+            "system": format!("{rules}\n更新于 {stamp}"),
+            "messages": msgs,
+            "max_tokens": 16,
+            "metadata": { "user_id": "user_deadbeef_account_acct-1_session_3f0e9d8c-7b6a-4e5d-9c1b-2a3b4c5d6e7f" },
+        });
+        let b = Bytes::from(body.to_string());
+        let sim = detect_for(&b, flags).expect("走模拟");
+        let out = rewrite_body(&b, &test_cred(), "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let text = |m: &serde_json::Value| m["content"][0]["text"].as_str().unwrap().to_string();
+    let u1 = serde_json::json!({ "role": "user", "content": "环境键·挪位切模型 第一问" });
+    let v1 = run("claude-opus-5-5", "10:00", serde_json::json!([u1]));
+    assert_eq!(
+        v1["system"].as_array().unwrap().last().unwrap()["text"],
+        crate::proxy::CLIENT_SYSTEM_PLACEHOLDER,
+        "客户端 system 挪走了: {v1}"
+    );
+    assert!(text(&v1["messages"][1]).contains("named Opus 5.5."), "{v1}");
+
+    let a1 = serde_json::json!({ "role": "assistant", "content": "好" });
+    let u2 = serde_json::json!({ "role": "user", "content": "第二问" });
+    let v2 = run("claude-sonnet-5-5", "10:00", serde_json::json!([u1, a1, u2]));
+    let out = v2["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 5, "{v2}");
+    assert!(text(&out[1]).contains("named Opus 5.5."), "首轮那份不改");
+    assert!(text(&out[4]).contains("named Sonnet 5.5."), "换模型那一轮补说明: {v2}");
+
+    // 第三轮：时间戳走了一分钟，挪进首条消息的那段跟着变。环境状态仍是同一段对话：首轮
+    // 那份仍写 Opus，切换说明回到 u2 之后的原位。
+    let a2 = serde_json::json!({ "role": "assistant", "content": "好的" });
+    let u3 = serde_json::json!({ "role": "user", "content": "第三问" });
+    let v3 = run("claude-sonnet-5-5", "10:01", serde_json::json!([u1, a1, u2, a2, u3]));
+    assert!(text(&v3["messages"][0]).contains("更新于 10:01"), "新 system 进了首条消息: {v3}");
+    let out = v3["messages"].as_array().unwrap();
+    assert_eq!(out.len(), 7, "历史切换说明在原位: {v3}");
+    assert!(text(&out[1]).contains("named Opus 5.5."), "首轮那份仍写首轮模型: {v3}");
+    assert_eq!(out[3]["role"], "user");
+    assert_eq!(out[4]["role"], "system", "u2 后面原位插切换说明: {v3}");
+    assert!(text(&out[4]).contains("named Sonnet 5.5."), "{v3}");
+    assert_eq!(out[6]["role"], "user", "末条是 u3，没有再补一条切换说明: {v3}");
+}
+
+/// 形态哈希里的工具要按**最终出站**体算：来访没声明工具、首轮靠 `fill_absent_tools` 注了官方
+/// 工具，会话中途把这个开关关掉，出站就不再带 `tools`。若形态哈希在注入之前采样，两轮看起来
+/// 一样、会错发 `continue`，上游继续沿用首轮注进去的工具。
+#[test]
+fn sim_threads_create_when_tool_filling_is_switched_off_mid_session() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·中途关补工具 第一问" });
+    let (v1, p1) =
+        thread_turn(&thread_body("claude-opus-5-5", serde_json::json!([user1])), all_on());
+    assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{v1}");
+    assert!(v1["tools"].as_array().is_some_and(|t| !t.is_empty()), "首轮注了官方工具: {v1}");
+    CcSessionLink::record_thread(
+        &p1.expect("create 也要等回程提交"),
+        "msg_T",
+        vec!["toolu_t".into()],
+        reply_of(serde_json::json!([bash_use("toolu_t", "ls")])),
+        40232,
+    );
+    let msgs2 = serde_json::json!([
+        user1,
+        { "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_t", "name": "Bash", "input": { "command": "ls" } },
+        ] },
+        { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_t", "content": "a.txt" },
+        ] },
+    ]);
+    // 开关没动：照常续轮。
+    let (v2, _) = thread_turn(&thread_body("claude-opus-5-5", msgs2.clone()), all_on());
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+    // 关掉补工具（开关随 `Simulation::detect` 进 sim）：出站没有 `tools`，形态变了，必须重新 create。
+    let no_fill = store::ForwardFlags { fill_absent_tools: false, ..all_on() };
+    let raw = Bytes::from(thread_body("claude-opus-5-5", msgs2).to_string());
+    let sim = crate::proxy::test_support::detect_for(&raw, no_fill).expect("走模拟");
+    assert!(!sim.fill_absent_tools);
+    let out = rewrite_body(&raw, &test_cred(), "fp", no_fill, Some(&sim), None);
+    let v3: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let p3 = sim.take_thread();
+    assert!(v3.get("tools").is_none(), "{v3}");
+    assert_eq!(v3["thread"], serde_json::json!({ "type": "create" }), "工具变了要重建: {v3}");
+    assert!(p3.is_some_and(|p| !p.is_continue()));
+}
+
+/// 同一会话中途切「挪位」开关：首轮挪进首条消息并续上工具调用，关掉开关再提交工具结果时客户端
+/// 指令回到了 system 末块，出站落点变了，不能 `continue` 沿用上游线程里的旧落点，要重新 `create`；
+/// 反向切回去同样如此。
+#[test]
+fn sim_threads_recreate_when_the_relocation_switch_flips() {
+    use crate::proxy::session_link::CcSessionLink;
+    let body = |messages: serde_json::Value| {
+        serde_json::json!({
+            "model": "claude-opus-5-5",
+            "system": "规则。".repeat(700),
+            "messages": messages,
+            "max_tokens": 32000,
+            "metadata": { "user_id": "user_deadbeef_account_acct-1_session_3c9e8a1f-7d2b-4e5a-8f6c-0b1d2e3f4a5b" },
+        })
+    };
+    let on = all_on();
+    let off = store::ForwardFlags { relocate_client_system: false, ..all_on() };
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·切挪位 第一问" });
+    let (v1, p1) = thread_turn(&body(serde_json::json!([user1])), on);
+    assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{v1}");
+    assert_eq!(
+        v1["system"].as_array().unwrap().last().unwrap()["text"],
+        crate::proxy::CLIENT_SYSTEM_PLACEHOLDER
+    );
+    CcSessionLink::record_thread(
+        &p1.expect("create 也要等回程提交"),
+        "msg_A",
+        vec!["toolu_1".into()],
+        reply_of(serde_json::json!([bash_use("toolu_1", "ls")])),
+        40232,
+    );
+    let assistant = serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } },
+        ] });
+    let result = serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt" },
+        ] });
+    let msgs2 = serde_json::json!([user1, assistant, result]);
+
+    // 开关没动：照常续上。
+    let (v2, _) = thread_turn(&body(msgs2.clone()), on);
+    assert_eq!(v2["thread"]["type"], "continue", "{v2}");
+
+    // 关掉挪位：客户端指令回到 system 末块，落点变了，重新 create。
+    let (v3, p3) = thread_turn(&body(msgs2.clone()), off);
+    assert_eq!(v3["thread"], serde_json::json!({ "type": "create" }), "切了开关要重建: {v3}");
+    let tail = v3["system"].as_array().unwrap().last().unwrap()["text"].as_str().unwrap();
+    assert!(tail.starts_with("规则。"), "{v3}");
+    CcSessionLink::record_thread(
+        &p3.expect("create 也要等回程提交"),
+        "msg_B",
+        vec!["toolu_2".into()],
+        reply_of(serde_json::json!([bash_use("toolu_2", "cat a.txt")])),
+        50000,
+    );
+    let assistant2 = serde_json::json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_2", "name": "Bash", "input": { "command": "cat a.txt" } },
+        ] });
+    let result2 = serde_json::json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_2", "content": "hello" },
+        ] });
+    let msgs3 = serde_json::json!([user1, assistant, result, assistant2, result2]);
+
+    // 关着不动：续上关着那条线程。
+    let (v4, _) = thread_turn(&body(msgs3.clone()), off);
+    assert_eq!(v4["thread"]["previous_message_id"], "msg_B", "{v4}");
+
+    // 再开回来：又变了落点，重新 create。
+    let (v5, _) = thread_turn(&body(msgs3), on);
+    assert_eq!(v5["thread"], serde_json::json!({ "type": "create" }), "切回来同样重建: {v5}");
 }

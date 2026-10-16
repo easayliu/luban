@@ -31,10 +31,15 @@ use super::*;
 /// 前提是这条请求会注入官方工具——Agent 类型与技能清单说的是 `Agent` / `Skill` 两个工具，来访一个工具都
 /// 没声明、[`inject_cc_tools`] 又不补的（开关 `fill_absent_tools` 关着，或强制调某个工具）就整段不补，
 /// 判据与它逐条相同（[`injects_cc_tools`]）。
+///
+/// `root` 是环境状态键里首条用户消息的指纹，由调用方在**挪客户端 system 之前**用 [`env_root_of`]
+/// 算好：挪位把客户端那段写进首条用户消息，system 每轮都变的客户端（带时间戳那类）首条消息就每轮
+/// 不同，在这里现算等于每轮新开一段对话——首轮模型被改成这一轮的、历史切换说明全丢。
 pub(in crate::proxy) fn insert_env_note(
     v: &mut serde_json::Value,
     sim: &Simulation,
     cred_id: i64,
+    root: u64,
 ) -> EnvNoted {
     let none = EnvNoted::default();
     if !crate::proxy::simulation::sim_is_main_thread(sim) {
@@ -61,7 +66,7 @@ pub(in crate::proxy) fn insert_env_note(
         .rfind(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .map_or(0, |m| thread_msg_of(m).fp);
     let pin = pin_env(
-        PinKey { cred_id, session_id: &sim.session_id, root: thread_msg_of(first).fp },
+        PinKey { cred_id, session_id: &sim.session_id, root },
         PinFirst {
             model_line,
             haiku: sim.profile.kind == config::CcProfileKind::MainHaiku,
@@ -139,6 +144,16 @@ pub(in crate::proxy) fn insert_env_note(
         )),
     );
     noted
+}
+
+/// [`insert_env_note`] 环境状态键里的「首条用户消息指纹」：第一条非指令式 system 的消息
+/// （[`is_system_directive`]）的线程指纹，没有就是 0。要在挪客户端 system 之前算，见
+/// [`insert_env_note`] 的 `root`。
+pub(in crate::proxy) fn env_root_of(v: &serde_json::Value) -> u64 {
+    v.get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| msgs.iter().find(|m| !is_system_directive(m)))
+        .map_or(0, |m| thread_msg_of(m).fp)
 }
 
 /// [`insert_env_note`] 的结果。

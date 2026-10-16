@@ -92,6 +92,25 @@ pub struct ForwardFlags {
     /// - **关**：这一块不发，出站 `system` 只剩 `[billing, 身份, 基座]` 加客户端那块（haiku 实测
     ///   385 token，开着是 2978），不注入任何环境信息，客户端的 system 也不被官方提示词稀释。
     pub simulate_full_system: bool,
+    /// 模拟路径上客户端自己那段 system 超过 [`crate::proxy::MAX_CLIENT_SYSTEM_BYTES`]（1900 字节）
+    /// 时挪进首条用户消息（[`Self::simulate_cc`] 的子项；billing-only 下不走这条，那边看
+    /// [`Self::sim_billing_relocate`]）。
+    ///
+    /// - **开**（默认）：超长的客户端 system 整段裹成官方那种 `<system-reminder>` 块插在首条用户
+    ///   消息最前，末块原地留一行 `(see conversation)` 占位（[`crate::proxy::relocate_long_client_system`]）。
+    ///   2026-10-16 实测上游按 `system` 正文里的产品特征词组合判第三方（OpenClaw 的提示词 46 字节
+    ///   就能触发），同样文本放进用户消息不触发；v0.3.243 删掉挪位上线当天线上第三方 400 从每天
+    ///   个位数涨到每小时 70 条。代价：客户端那段指令降级成用户轮文本，少一层 system 优先级。
+    /// - **关**：不论多长都整段留在 system 末块（v0.3.243 ～ v0.3.249 的行为）。
+    pub relocate_client_system: bool,
+    /// 出站体带**已知必定**被上游判成第三方应用的特征时本地拒绝、不出门，原地回上游那条 400
+    /// （`rejected_locally:third-party`）。完整模拟与 billing-only 都生效；判的是出站体，挪位与
+    /// 工具名混淆已经藏掉的不算。判据见 [`crate::proxy::known_third_party_signature`]：
+    /// OpenClaw 提示词的两个原文片段同时出现、`mcp_` 单下划线工具名。
+    ///
+    /// - **开**（默认）：这类请求不再打到上游——每一条都会被判第三方、记一次，白耗号的信誉。
+    /// - **关**：照发，由上游拒。
+    pub reject_known_third_party: bool,
     /// 模拟路径上来访**一个工具都没声明**（没有 `tools` 键、`tools: null`、`tools: []`）时，也按
     /// 主线程补齐官方工具（[`Self::simulate_cc`] 的子项）；来访 `tool_choice` 是 `any` / 指定工具
     /// 时不补。
@@ -162,6 +181,15 @@ pub struct ForwardFlags {
     /// - **关**：只改 `mcp_`（单下划线）开头的那一类（`proxy::build_billing_only_tool_name_map`），别名
     ///   `mcp__luban__<原名>`，其余客户端工具原样透传——改动最小，但别的产品的名字判据不管。
     pub sim_billing_mimic_all: bool,
+    /// billing-only 下也把超过 [`crate::proxy::MAX_CLIENT_SYSTEM_BYTES`] 的客户端 system 挪进首条用户
+    /// 消息（[`Self::sim_billing_only`] 的子项）。
+    ///
+    /// - **关**（默认）：客户端 system 原块透传，与 billing-only「只补 billing header」的口径一致。
+    /// - **开**：billing header 之后的客户端块合计超过 1900 字节时，整段裹成 `<system-reminder>` 插在
+    ///   首条用户消息最前，system 里只留 billing header 加一行占位
+    ///   （[`crate::proxy::relocate_billing_only_client_system`]）。2026-10-16 实测 billing-only 下同一段
+    ///   OpenClaw 提示词放 system 照样 400、挪进用户消息 200，判据与完整模拟一致。
+    pub sim_billing_relocate: bool,
     /// 模拟路径的主线程按官方的 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项；
     /// 2.1.285 的 fable-5-1 除外——官方那一版不发，2.1.291 起发）。
     ///
@@ -433,12 +461,15 @@ impl Default for ForwardFlags {
             redacted_thinking_retry: true,
             simulate_cc: true,
             simulate_full_system: true,
+            relocate_client_system: true,
+            reject_known_third_party: true,
             fill_absent_tools: true,
             sim_trim_tools: true,
             sim_billing_only: false,
             sim_billing_keep_user_id: true,
             real_billing_keep_user_id: true,
             sim_billing_mimic_all: true,
+            sim_billing_relocate: false,
             sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,

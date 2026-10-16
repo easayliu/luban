@@ -186,6 +186,16 @@ pub const REAL_BILLING_KEEP_USER_ID: &str = "real_billing_keep_user_id";
 /// 缺省视为开启，见 [`ForwardFlags::sim_billing_mimic_all`]。
 pub const SIM_BILLING_MIMIC_ALL: &str = "sim_billing_mimic_all";
 
+/// 模拟路径上超过 1900 字节的客户端 system 挪进首条用户消息的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::relocate_client_system`]。
+pub const RELOCATE_CLIENT_SYSTEM: &str = "relocate_client_system";
+
+/// 出站体带已知第三方特征时本地拒绝的 settings 键名。缺省视为开启，见 [`ForwardFlags::reject_known_third_party`]。
+pub const REJECT_KNOWN_THIRD_PARTY: &str = "reject_known_third_party";
+
+/// billing-only 下也挪客户端 system 的 settings 键名。缺省视为关闭，见 [`ForwardFlags::sim_billing_relocate`]。
+pub const SIM_BILLING_RELOCATE: &str = "sim_billing_relocate";
+
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。
 pub const SIM_MESSAGE_THREADS: &str = "sim_message_threads";
@@ -740,6 +750,15 @@ impl CredentialStore {
         if let Some(v) = on(SIM_BILLING_MIMIC_ALL) {
             flags.sim_billing_mimic_all = v;
         }
+        if let Some(v) = on(RELOCATE_CLIENT_SYSTEM) {
+            flags.relocate_client_system = v;
+        }
+        if let Some(v) = on(REJECT_KNOWN_THIRD_PARTY) {
+            flags.reject_known_third_party = v;
+        }
+        if let Some(v) = on(SIM_BILLING_RELOCATE) {
+            flags.sim_billing_relocate = v;
+        }
         if let Some(v) = on(SIM_MESSAGE_THREADS) {
             flags.sim_message_threads = v;
         }
@@ -1106,6 +1125,9 @@ mod tests {
             (SIM_BILLING_KEEP_USER_ID, "0"),
             (REAL_BILLING_KEEP_USER_ID, "0"),
             (SIM_BILLING_MIMIC_ALL, "0"),
+            (RELOCATE_CLIENT_SYSTEM, "0"),
+            (REJECT_KNOWN_THIRD_PARTY, "0"),
+            (SIM_BILLING_RELOCATE, "0"),
             (SIM_MESSAGE_THREADS, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
@@ -1156,6 +1178,9 @@ mod tests {
                 sim_billing_keep_user_id: false,
                 real_billing_keep_user_id: false,
                 sim_billing_mimic_all: false,
+                relocate_client_system: false,
+                reject_known_third_party: false,
+                sim_billing_relocate: false,
                 sim_message_threads: false,
                 fill_metadata: false,
                 rate_limit_retry: false,

@@ -104,7 +104,7 @@ pub(super) async fn prepare<'a>(
     prepared: &Prepared,
     pick: &Pick,
 ) -> Result<Attempt<'a>, Response> {
-    let Ctx { state, request_id, .. } = *cx;
+    let Ctx { state, request_id, log_state } = *cx;
     let Inbound {
         ref method,
         ref headers,
@@ -309,6 +309,25 @@ pub(super) async fn prepare<'a>(
     };
     let (mut sent, mut sent_bits) =
         upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+    // 已知**必定**被上游判成第三方应用的出站特征（OpenClaw 那组 system 原文、`mcp_` 单下划线
+    // 工具名，见 [`crate::proxy::known_third_party_signature`]）：不出门，原地回上游那条 400。
+    // 按**出站体**判——挪位与工具名混淆已经藏掉的不算；完整模拟与 billing-only 都生效。
+    if billable
+        && flags.reject_known_third_party
+        && let Some(signature) = sent_bits.known_third_party
+    {
+        tracing::warn!(
+            method = %method, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), signature,
+            "rejected locally: the outbound request carries a known third-party signature"
+        );
+        *log_state.local_reject.lock() = Some("third-party");
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            crate::proxy::THIRD_PARTY_REJECT_MESSAGE,
+        ));
+    }
     // 按**出站体**判的那几条学到的规则（废弃的采样参数、prefill，见 [`ShapeProbe::on_outbound`]）：
     // 改写之后、发送之前才查。入口那道只查来访原件判得准的那几条——模拟路径注入 thinking 时会
     // 剥掉冲突的 `temperature` / `top_p`，拿来访原件去拦会拦下一条出站本来不会触犯规则的请求。

@@ -151,14 +151,18 @@ pub(crate) use learned_rules::{
 };
 
 pub(crate) mod simulation;
+mod third_party;
 #[cfg(test)]
 use simulation::SimSessionSeed;
 #[cfg(test)]
 use simulation::{
-    CC_BASE_PROMPT_MIN_LEN, MAX_CACHE_BREAKPOINTS, SimEnv, SimulationReason, cap_system_blocks,
-    inbound_facts, looks_like_uuid, sim_env_for, simulates_cc, simulation_reason,
+    CC_BASE_PROMPT_MIN_LEN, CLIENT_SYSTEM_PLACEHOLDER, CLIENT_SYSTEM_REMINDER_LEAD,
+    MAX_CACHE_BREAKPOINTS, MAX_CLIENT_SYSTEM_BYTES, SimEnv, SimulationReason, cap_system_blocks,
+    inbound_facts, looks_like_uuid, relocate_long_client_system, sim_env_for, simulates_cc,
+    simulation_reason,
 };
 pub(crate) use simulation::{Simulation, is_cc_shaped};
+pub(crate) use third_party::{THIRD_PARTY_REJECT_MESSAGE, known_third_party_signature};
 
 mod handler;
 pub(crate) use handler::handle_inner;

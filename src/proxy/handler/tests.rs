@@ -1315,3 +1315,46 @@ async fn cache_touch_follows_the_reply_from_a_demote_retry(pool: sqlx::PgPool) {
         send_to(&state, crate::config::CC_CACHE_TOUCH_PATH, touch("req_011CmockFirst400")).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "被拒的首发没记");
 }
+
+/// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条
+/// 第三方 400、不打上游，流水标 `rejected_locally:third-party`；关掉照发。
+#[sqlx::test]
+async fn known_third_party_signature_is_rejected_locally(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![sse_ok("ok")]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let req = || {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "system": "[[reply_to_current]]\nstripped before rendering",
+            "metadata": {"user_id": serde_json::json!({
+                "device_id": "b".repeat(64), "account_uuid": "", "session_id": SESSION,
+            }).to_string()},
+            "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+            "tools": [{"name": "read", "description": "read", "input_schema": {"type": "object"}}],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+    };
+
+    assert_local_reject(
+        &mock,
+        &state,
+        req(),
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "Third-party apps now draw from extra usage",
+    )
+    .await;
+    let rows = usage_logs(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, 400);
+
+    store.set_setting(store::REJECT_KNOWN_THIRD_PARTY, "0").await.unwrap();
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::OK, "关掉就照发");
+    assert_eq!(mock.seen().len(), 1);
+}

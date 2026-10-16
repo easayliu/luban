@@ -198,6 +198,7 @@ async fn relay_ok(
     let learns = billable && inb.probe_prewarm.is_none();
     let injected_tools = sent_bits.injected_tools.clone();
     let tools_filled = sent_bits.tools_filled;
+    let sys_relocated = sent_bits.sys_relocated;
     fill_shape_forensics(&mut forensics, sent_bits);
     let mut rl = ReqLog {
         started,
@@ -261,6 +262,7 @@ async fn relay_ok(
         empty_replies: state.empty_replies.clone(),
         injected_tools,
         tools_filled,
+        sys_relocated,
         store: state.store.clone(),
         _in_flight: guards.in_flight,
         _session_concurrency: guards.session_concurrency,

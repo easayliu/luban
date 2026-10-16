@@ -117,8 +117,11 @@ impl Upstream<'_> {
         if let (Some(sim), Some(inb), Some(out)) = (self.sim.as_ref(), inbound, outbound.as_ref()) {
             bits.injected_tools = injected_tools_of(inb, out, sim.profile);
             bits.tools_filled = !bits.injected_tools.is_empty() && declares_no_tools(inb);
+            bits.sys_relocated = crate::proxy::simulation::system_relocated(out);
         }
         bits.cache_ttl_1h = outbound.as_ref().is_some_and(crate::proxy::has_cache_ttl_1h);
+        bits.known_third_party =
+            outbound.as_ref().or(inbound).and_then(crate::proxy::known_third_party_signature);
         (sent, bits)
     }
 

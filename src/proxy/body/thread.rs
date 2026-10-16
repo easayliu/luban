@@ -27,8 +27,12 @@ use super::*;
 /// 落位按**当前**模型自带的 beta——跨模型族时切回不支持中途 system 消息的旧模型，
 /// 按这一轮的 beta 自然就落成提醒块，不会给上游发它拒绝的 `role: system` 消息。
 ///
-/// `raw_fps` 是**插环境说明之前**的 `messages` 指纹（见 [`rewrite_body_out`] 里采样）。线程前缀匹配
-/// 要用这份，形态随模型漂来漂去也不打断上一轮的链路。续轮（`continue`）上游线程里仍留着
+/// `raw_fps` 是**插环境说明、挪客户端 system 之前**的 `messages` 指纹，`raw_sys_shape` 是同一时刻
+/// system 正文的指纹（[`thread_system_shape`]；见 [`rewrite_body_out`] 里采样）。线程前缀匹配要用
+/// 这份，形态随模型漂来漂去、客户端 system 每轮都变也不打断上一轮的谱系。形态哈希里的其余几样
+/// （模型、`tools`、`thinking`、`output_config`）按**最终出站**体算（[`thread_shape_of`]）：工具是
+/// 注入之后才定下来的，提前采就看不见「这一轮不再注工具」这类变化，会错发 `continue` 让上游沿用
+/// 首轮的工具。续轮（`continue`）上游线程里仍留着
 /// 历史切换说明，这里不重补；`create` 把完整历史重发，得补上。模型说明与 `<total_tokens>`
 /// 同在指纹算完之后才补。
 pub(super) fn apply_sim_thread(
@@ -37,6 +41,7 @@ pub(super) fn apply_sim_thread(
     cred_id: i64,
     env_note: &EnvNoted,
     raw_fps: &[ThreadMsg],
+    raw_sys_shape: u64,
 ) -> bool {
     if !crate::proxy::simulation::sim_is_main_thread(sim) {
         return false;
@@ -53,8 +58,8 @@ pub(super) fn apply_sim_thread(
     let fps = raw_fps;
     let regular_prompt = crate::telemetry::last_is_new_prompt_body(v);
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
-    let (mut decision, pending, tokens_left) =
-        thread_decision(key, thread_shape_of(v), fps, regular_prompt);
+    let shape = thread_shape_of(v, raw_sys_shape);
+    let (mut decision, pending, tokens_left) = thread_decision(key, shape, fps, regular_prompt);
     let has_tool_choice = v.get("tool_choice").is_some_and(|c| !c.is_null());
     if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
         decision = ThreadDecision::Create;
@@ -486,13 +491,43 @@ fn message_fingerprint(m: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-/// 线程形态指纹：模型、system 正文（billing header 那块除外——`cch` 与会话链字段每条都变）、
-/// `tools`、`thinking`、`output_config`。全部去掉 `cache_control` 再算，见
-/// [`crate::proxy::session_link::ThreadPending`] 的 `shape`。
-fn thread_shape_of(v: &serde_json::Value) -> u64 {
+/// 把「客户端 system 挪没挪进首条用户消息」并进 [`thread_system_shape`] 的结果：挪位开关中途切换时
+/// 出站落点变了，上游线程里还是旧落点，形态不同就得重新 `create`。没在算线程（`shape == 0`）
+/// 时原样返回。
+pub(super) fn thread_shape_with_relocation(shape: u64, relocated: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if shape == 0 {
+        return shape;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    shape.hash(&mut h);
+    relocated.hash(&mut h);
+    h.finish()
+}
+
+/// 线程形态指纹：模型、system 正文（`sys_shape`，由 [`thread_system_shape`] 在挪客户端 system
+/// 之前算好）、`tools`、`thinking`、`output_config`。后三样按传入的（最终出站）体算，全部去掉
+/// `cache_control`，见 [`crate::proxy::session_link::ThreadPending`] 的 `shape`。
+fn thread_shape_of(v: &serde_json::Value, sys_shape: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.get("model").and_then(|m| m.as_str()).unwrap_or_default().hash(&mut h);
+    sys_shape.hash(&mut h);
+    for key in ["tools", "thinking", "output_config"] {
+        key.hash(&mut h);
+        if let Some(x) = v.get(key) {
+            hash_without_cache_control(x, &mut h);
+        }
+    }
+    h.finish()
+}
+
+/// 线程形态指纹里 system 正文那一份：billing header 那块除外（`cch` 与会话链字段每条都变），
+/// 去掉 `cache_control` 再算。要在挪客户端 system（[`relocate_long_client_system`]）**之前**采：
+/// 挪位之后末块只剩占位，再算就看不见 system 变没变。
+pub(super) fn thread_system_shape(v: &serde_json::Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
     match v.get("system") {
         Some(serde_json::Value::Array(blocks)) => {
             for b in blocks {
@@ -507,12 +542,6 @@ fn thread_shape_of(v: &serde_json::Value) -> u64 {
         }
         Some(other) => hash_without_cache_control(other, &mut h),
         None => {}
-    }
-    for key in ["tools", "thinking", "output_config"] {
-        key.hash(&mut h);
-        if let Some(x) = v.get(key) {
-            hash_without_cache_control(x, &mut h);
-        }
     }
     h.finish()
 }

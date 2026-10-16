@@ -125,6 +125,12 @@ struct ForwardingResp {
     real_billing_keep_user_id: bool,
     /// billing-only 下工具名混淆按完整白名单改全部非官方名；关掉只改 `mcp_` 开头那一类。
     sim_billing_mimic_all: bool,
+    /// 模拟路径上超过 1900 字节的客户端 system 挪进首条用户消息。
+    relocate_client_system: bool,
+    /// 出站体带已知第三方特征时本地拒绝、不出门。
+    reject_known_third_party: bool,
+    /// billing-only 下也挪客户端 system；默认关。
+    sim_billing_relocate: bool,
     /// 模拟路径的主线程按官方 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项）。
     sim_message_threads: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
@@ -195,6 +201,9 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             sim_billing_keep_user_id: f.sim_billing_keep_user_id,
             real_billing_keep_user_id: f.real_billing_keep_user_id,
             sim_billing_mimic_all: f.sim_billing_mimic_all,
+            relocate_client_system: f.relocate_client_system,
+            reject_known_third_party: f.reject_known_third_party,
+            sim_billing_relocate: f.sim_billing_relocate,
             sim_message_threads: f.sim_message_threads,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,

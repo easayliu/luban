@@ -14,7 +14,8 @@ use super::session_link::{
 };
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, SimEnv, Simulation, billing_header_text, cap_system_blocks,
-    cc_profile_for, cc_profile_kind_for, has_cc_identity, is_cc_shaped, simulate_system,
+    cc_profile_for, cc_profile_kind_for, has_cc_identity, is_cc_shaped,
+    relocate_billing_only_client_system, relocate_long_client_system, simulate_system,
 };
 use super::thinking::preserve_thinking_encoding;
 use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
@@ -253,16 +254,41 @@ pub(crate) fn rewrite_body_out_parsed(
     // 但后面那几步对历史消息本身的改动要按**出站**的算：上一轮回复的指纹记的是上游看到的那份
     // （混淆后的工具名、剥掉了空块），这里不跟着做，客户端原样带回来的那条 assistant 就永远对
     // 不上，每个工具续轮都退回 `create`。见 [`thread_snapshot`]。
+    //
+    // 也排在挪客户端 system 之前：挪位把客户端那段写进首条用户消息，system 每轮都变的客户端
+    // （带时间戳那类）首条消息就每轮不同，谱系根对不上，`<total_tokens>` 回到初值、历史提醒全丢。
+    // 环境状态键里的首条消息指纹（`env_root`）同理，也在挪位之前采，不然每轮都像一段新对话。
+    // 线程形态哈希里 system 正文那一份（`raw_sys_shape`）同样在挪位之前算：system 变了照旧
+    // `create`，只是谱系接得上；挪位之后末块只剩占位，再算就看不见 system 变没变。其余几样
+    // （模型、工具、thinking、effort）按最终出站体算，见 [`apply_sim_thread`]。
     let raw_fps: Vec<crate::proxy::session_link::ThreadMsg> = sim
         .filter(|_| simulated && flags.sim_message_threads && !billing_only)
         .and_then(|_| v.get("messages"))
         .map(|m| thread_snapshot(m, tool_names))
         .unwrap_or_default();
+    let raw_sys_shape = if raw_fps.is_empty() { 0 } else { thread::thread_system_shape(&v) };
+    let env_root = if simulated && !billing_only { env_note::env_root_of(&v) } else { 0 };
+    // 模拟后末块是客户端的自有 system（线程指纹与形态哈希已在上面采完）。上游对它有内容级检测——第三方产品提示词里的特征词组合
+    // 一出现就判第三方（见 [`MAX_CLIENT_SYSTEM_BYTES`](super::simulation::MAX_CLIENT_SYSTEM_BYTES)），
+    // 同样文本放进用户消息则不触发。超过那条线的整段挪进首条用户消息、末块只留一行占位：
+    // 完整模拟看 `relocate_client_system`（默认开），billing-only 看子开关 `sim_billing_relocate`
+    // （默认关，那条路的客户端块是原块透传，挪的是 billing header 之后的全部）。
+    let sys_relocated = simulated
+        && sim.is_some_and(|s| {
+            if billing_only {
+                flags.sim_billing_relocate && relocate_billing_only_client_system(&mut v)
+            } else {
+                flags.relocate_client_system && relocate_long_client_system(&mut v, s)
+            }
+        });
+    // 挪没挪要并进形态哈希：同一会话中途切开关，客户端那段指令从首条用户消息回到 system
+    // 末块（或反之），出站形态已变，上游线程里留的却是旧落点——只有重新 `create` 才换得过来。
+    let raw_sys_shape = thread::thread_shape_with_relocation(raw_sys_shape, sys_relocated);
     // 官方首轮那份环境说明（工作目录、模型、Agent 类型、技能、日期），每轮在同一位置补同一份，
     // 见 [`insert_env_note`]。跟在挪客户端 system 之后：haiku 那种写法里客户端那块要排在环境各段
     // 之后、日期之前；在补末条断点之前：首轮它就是末条，断点要落在它身上。
     let env_note = match sim {
-        Some(s) if simulated && !billing_only => insert_env_note(&mut v, s, cred.id),
+        Some(s) if simulated && !billing_only => insert_env_note(&mut v, s, cred.id, env_root),
         _ => EnvNoted::default(),
     };
     // 换模型那一轮的模型说明：开着 message thread 时交给 [`apply_sim_thread`] 与 `<total_tokens>`
@@ -533,10 +559,13 @@ pub(crate) fn rewrite_body_out_parsed(
     // （工具名已混淆、断点已落位），切增量也得切这一份。见 [`apply_sim_thread`]。
     let threaded = flags.sim_message_threads
         && !billing_only
-        && sim.is_some_and(|s| apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps));
+        && sim.is_some_and(|s| {
+            apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps, raw_sys_shape)
+        });
     tracing::debug!(
         billing_only,
         simulated,
+        sys_relocated,
         env_noted,
         sim_meta,
         meta_stripped,
@@ -573,6 +602,7 @@ pub(crate) fn rewrite_body_out_parsed(
         && !cch_added
         && !link_added
         && !simulated
+        && !sys_relocated
         && !env_noted
         && !sim_meta
         && !meta_stripped

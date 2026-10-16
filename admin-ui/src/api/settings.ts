@@ -90,6 +90,12 @@ export interface Settings {
   /** 仅注入 billing 标识时真实客户端带 metadata.user_id（自带的按身份规则改写，没带补一份，代替 fill_metadata）；停用后整个剥离；默认启用。 */
   real_billing_keep_user_id: boolean
   sim_billing_mimic_all: boolean
+  /** 模拟路径上超过 1900 字节的客户端 system 挪进首条用户消息；默认启用。 */
+  relocate_client_system: boolean
+  /** 出站请求带已知第三方特征时本地拒绝、不发上游；默认启用。 */
+  reject_known_third_party: boolean
+  /** 仅注入 billing 标识时也挪客户端 system；默认停用。 */
+  sim_billing_relocate: boolean
   /** 模拟路径的主线程按官方 message threads 形态写 thread：首轮 create，接得上的续轮 continue 只发增量（2.1.291 起四族都写）；并在末尾补官方的 total_tokens 提醒。 */
   sim_message_threads: boolean
   /** 已是 CC 形态但不带 metadata.user_id 的请求，补一份官方形态的身份（含同值的会话 id 头）。 */
@@ -164,6 +170,9 @@ export type ForwardingKey =
   | 'sim_billing_keep_user_id'
   | 'real_billing_keep_user_id'
   | 'sim_billing_mimic_all'
+  | 'relocate_client_system'
+  | 'reject_known_third_party'
+  | 'sim_billing_relocate'
   | 'sim_message_threads'
   | 'fill_metadata'
   | 'rate_limit_retry'

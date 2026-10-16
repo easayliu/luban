@@ -463,6 +463,38 @@ export function ForwardingSettingsContent() {
           }
         />
         <ForwardingToggle
+          k="sim_billing_relocate"
+          label={t('仅 billing 标识下也挪客户端 system', 'Also move client system in billing-only mode')}
+          summary={t(
+            '仅 billing 标识模式下，客户端 system 合计超过 1900 字节时挪进首条用户消息；默认停用。',
+            'In billing-identifier-only mode, move the client system into the first user message when it exceeds 1900 bytes in total; disabled by default.',
+          )}
+          description={
+            <>
+              {t(
+                '只在「仅 billing 标识」模式下有意义。上游对 system 正文的内容级检测在这一模式下同样生效：实测（2026-10-16）同一段 OpenClaw 提示词放在 system 中返回第三方应用 400，挪进用户消息则正常计入订阅用量。停用（默认）：客户端 system 各块原样透传，与本模式「只补 billing 标识」的口径一致。启用：billing 标识之后的客户端各块正文按空行拼成一段，裹成 <system-reminder> 块插在首条用户消息最前，system 只剩 billing 标识加一行占位，占位继承原末块的缓存断点；请求明细的 rewrites 列标注 sys_relocated。代价与完整对齐下的同名开关相同。',
+                'Only meaningful in “billing identifier only” mode. The upstream content check on the system prompt applies here as well: tested 2026-10-16, the same OpenClaw prompt in system returned the third-party 400, while moved into the user message it was billed against the plan as usual. Disabled (default): the client system blocks pass through unchanged, consistent with this mode only adding the billing identifier. Enabled: the client blocks after the billing identifier are joined with blank lines, wrapped as a <system-reminder> block at the start of the first user message, and system keeps only the billing identifier plus a one-line placeholder that inherits the last block’s cache breakpoint; such records are tagged sys_relocated in the request log. Costs are the same as the switch of the same name under full alignment.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="reject_known_third_party"
+          label={t('拦截已知第三方特征', 'Block known third-party signatures')}
+          summary={t(
+            '出站请求命中已验证必被判为第三方应用的特征时，由 luban 直接返回同样的 400，不再发往上游。',
+            'When an outbound request carries a signature verified to be classified as a third-party app, luban returns the same 400 itself instead of sending it upstream.',
+          )}
+          description={
+            <>
+              {t(
+                '判据来自线上流水与本地对拍（2026-10-16），每条都已验证为必定触发：一是 OpenClaw 系统提示词中的两个原文片段「[[reply_to_current]]」与「stripped before rendering」同时出现在 system 中，二是以 mcp_（单下划线）开头的工具名。判定看的是发往上游的请求：被「超长客户端 system 挪入首条消息」挪走的、被「工具名混淆」改名的都不再命中，本项只拦那两步覆盖不到的情形，如不足 1900 字节的短提示词或混淆停用时。启用（默认）：命中即在本地返回与上游逐字相同的 400，请求明细标注 rejected_locally:third-party，账号不再为这类请求反复留下第三方记录。停用：照常发往上游，由上游拒绝。完整对齐与「仅 billing 标识」两种模式下均生效。',
+                'The rules come from production logs and local comparison (2026-10-16), each verified to trigger every time: two verbatim fragments of the OpenClaw system prompt, “[[reply_to_current]]” and “stripped before rendering”, appearing together in system, and any tool name beginning with mcp_ (single underscore). The check runs on the request as it would be sent upstream: a system moved by “Move long client system into the first message” or a name rewritten by “Tool name obfuscation” no longer matches, so this only catches what those two cannot, such as prompts under 1900 bytes or obfuscation being disabled. Enabled (default): a match returns the same 400 as the upstream, verbatim, from luban itself; such records are tagged rejected_locally:third-party and the account stops accumulating third-party rejections for them. Disabled: the request is sent upstream and rejected there. Applies in both full alignment and “billing identifier only” modes.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
           k="eager_tool_streaming"
           label={t('工具声明对齐 eager 流式', 'Match official eager tool streaming')}
           summary={t(
@@ -602,6 +634,23 @@ export function ForwardingSettingsContent() {
               {t(
                 '官方 2.1.291 主线程的 system 由四块组成：billing、身份句、基座，以及基座之后的「其余」段（会话指引、记忆说明、模型清单、上下文管理）。末尾的缓存断点即位于这一块。opus 与 sonnet 共用一份，fable、haiku 各有一份，haiku 的基座也是单独的一份，且篇幅更长。启用后，按 2.1.291 抓包的原文填充这一块：其中唯一随机器变化的是记忆目录，优先使用客户端自己写的工作目录，客户端未提供时才按账号与设备派生一个固定的虚拟路径；模板已删除依赖 ToolSearch 与 WebSearch 的段落，因为模拟不注入这两个工具。客户端自己的 system 单独占最后一块（超过 1,900 字节时移入首条消息，原位置留一行占位；约合 633 个汉字），因此启用时出站是五块，比官方多一块。注意：回答也会受影响。这一块会提示模型自己是 Claude Code，经测试，当客户端 system 要求「只回复某个标记」时，模型虽回复了该标记，但仍会附加一句自我介绍。代价：每条模拟请求多出约 1,200 至 4,000 token 的前缀（视模型族而定）；它带 1h 断点、在同一会话内稳定，基本按缓存读价计费。停用后不发送这一块：system 由 billing、身份句、基座加客户端那块组成，恰好四块，客户端那块落在官方「其余」段的位置上，记忆目录也随这一块一并不发。随首条消息补上的环境说明（工作目录、平台、模型、Agent 类型、技能清单，约 10 KB）不受本开关影响，模拟主线程照常补上。',
                 'The official 2.1.291 main-thread system prompt has four blocks: billing, identity, base, and a “rest” section after the base (session guidance, memory instructions, model list, context management), which carries the final cache breakpoint. Opus and sonnet share one text, fable and haiku each have their own, and haiku also uses a separate, longer base. When enabled, this block is filled verbatim from the 2.1.291 captures: the only machine-specific part, the memory directory, follows the client’s own working directory, falling back to a fixed placeholder path derived from the account and device only when the client provides none; the paragraphs that depend on ToolSearch and WebSearch are removed, since emulation does not inject those tools. The client’s own system prompt occupies the last block on its own (moved into the first message above 1,900 bytes, roughly 633 CJK characters, leaving a one-line placeholder), so with this on the request has five blocks, one more than the official shape. Note: answers are affected too. This block tells the model it is Claude Code; in testing, when the client’s system prompt asked for a single marker only, the model returned the marker but still added a line introducing itself. Cost: roughly 1,200 to 4,000 extra prefix tokens per emulated request depending on the model family, behind a 1h breakpoint and stable within a session, so mostly billed at cache-read price. Disable to drop this block: the system prompt is then billing, identity and base plus the client’s block, exactly four blocks, with the client’s block in the official “rest” position, and the memory directory goes with it. The environment note sent with the first message (working directory, platform, model, agent types and skill list, about 10 KB) is not affected by this switch and is still added to emulated main-thread requests.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="relocate_client_system"
+          label={t('超长客户端 system 挪入首条消息', 'Move long client system into the first message')}
+          summary={t(
+            '客户端 system 超过 1900 字节时整段挪进首条用户消息，system 末块只留一行占位。',
+            'When the client system exceeds 1900 bytes it is moved into the first user message, leaving a one-line placeholder as the last system block.',
+          )}
+          requires={simulateRequires}
+          description={
+            <>
+              {t(
+                '上游对 system 正文有内容级检测：命中第三方产品提示词里的特征词组合即判为第三方应用，与长度、工具描述、模型无关（2026-10-16 实测 OpenClaw 的提示词仅 46 字节即触发），而同样的文字放在用户消息里不触发。启用（默认）：超过 1900 字节的客户端 system 裹成官方首条用户消息里的 <system-reminder> 块插在最前，末块原地留一行占位，断点与块数形态不变；请求明细的 rewrites 列标注 sys_relocated。1900 字节是「短到装不下一份产品提示词」的经验线，不是上游的阈值。代价：客户端那段指令降级为用户轮文本，少一层 system 优先级。停用：不论多长都整段留在 system 末块，这正是 v0.3.243 至 v0.3.249 的行为——上线当天线上第三方 400 由每天个位数涨到每小时约 70 条。',
+                'The upstream inspects system prompt content: a match on the characteristic phrases of a third-party product prompt classifies the request as a third-party app, regardless of length, tool descriptions or model (tested 2026-10-16: 46 bytes of the OpenClaw prompt were enough), while the same text in a user message does not trigger it. Enabled (default): a client system over 1900 bytes is wrapped as the official <system-reminder> block at the start of the first user message and a one-line placeholder stays as the last system block, keeping breakpoints and block count unchanged; such records are tagged sys_relocated in the request log. 1900 bytes is a rule of thumb for “too short to hold a product prompt”, not an upstream threshold. Cost: the client instructions become user-turn text and lose one level of system priority. Disabled: the system stays in the last block whatever its length, the behaviour of v0.3.243 to v0.3.249, which raised third-party 400s from a handful per day to about 70 per hour on the day it shipped.',
               )}
             </>
           }
@@ -1700,6 +1749,7 @@ const BILLING_ONLY_SKIPPED: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>(
   'cache_ttl_1h',
   'inject_thinking',
   'simulate_full_system',
+  'relocate_client_system',
   'fill_absent_tools',
   'sim_trim_tools',
   'sim_message_threads',
@@ -1712,6 +1762,7 @@ const BILLING_ONLY_EXCLUSIVE: ReadonlySet<ForwardingKey> = new Set<ForwardingKey
   'sim_billing_keep_user_id',
   'real_billing_keep_user_id',
   'sim_billing_mimic_all',
+  'sim_billing_relocate',
 ])
 
 /** 当前改写模式下页面不显示这一项：「已改动」计数与「全部恢复默认」都跳过它。 */
