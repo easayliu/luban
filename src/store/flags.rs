@@ -251,6 +251,12 @@ pub struct ForwardFlags {
     ///
     /// 代价：回程每个 chunk 要做 N 次字节替换（N = 被混淆的工具数），且客户端增删工具会让
     /// 整套假名重算、上游 prompt cache 失效一次。关掉即完全退回原样转发。
+    ///
+    /// **billing-only 下收窄**（[`Self::billing_only`] 生效时）：客户端工具原则上原样透传，白名单
+    /// 混淆不做；只把 `mcp_`（单下划线）开头的名字改成 `mcp__luban__<原名>`——这一类名字单独就会
+    /// 让上游回第三方 400，2026-10-16 本地对拍与线上 30 天流水都对得上，见
+    /// [`crate::proxy::is_mcp_underscore_name`] 与 `proxy::build_billing_only_tool_name_map`。
+    /// 假名直接拼原名，客户端增删别的工具不影响它。关掉则 billing-only 下也原样出站。
     pub tool_name_mimic: bool,
     /// 模拟路径下是否注入 `thinking`（及配套的 `context_management`）。
     ///
@@ -394,7 +400,8 @@ impl ForwardFlags {
 
     /// [`Self::sim_billing_only`] 实际生效：它挂在「模拟 Claude Code」下（后者又要 `merge_beta`），
     /// 父开关关着就不生效。生效时**所有来访**——模拟的第三方与不走模拟的真实 CC 客户端——都只
-    /// 保证 `system[0]` 有合法 billing header，其余请求体原样透传。
+    /// 保证 `system[0]` 有合法 billing header，其余请求体原样透传（唯一例外：[`Self::tool_name_mimic`]
+    /// 开着时 `mcp_` 开头的客户端工具名改进官方 MCP 命名空间，见那条的说明）。
     pub fn billing_only(self) -> bool {
         self.sim_billing_only && self.simulate_cc && self.merge_beta
     }

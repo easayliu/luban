@@ -64,11 +64,20 @@ impl Prepared {
             && !cc_kind.keeps_nonstream()
             && body_json.as_ref().is_some_and(|v| !stream_requested(v));
         // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
-        // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 不混淆**：客户端工具原样透传，这里
-        // 直接不建映射，请求侧与所有回程/重试（它们都读这一份）因此一致为空——避免用旧映射把
-        // 错误体 / SSE error 里碰巧匹配假名的内容误改。对所有来访生效，见 [`store::ForwardFlags::billing_only`]。
-        let tool_names = (billable && flags.tool_name_mimic && !flags.billing_only())
-            .then(|| build_tool_name_map(body_json.as_ref()).map(std::sync::Arc::new))
+        // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 只改一类名字**：客户端工具原则上
+        // 原样透传，但 `mcp_`（单下划线）开头的名字单独就会被上游判成第三方（实测见
+        // [`crate::proxy::is_mcp_underscore_name`]），这类改进 `mcp__luban__<原名>`，其余不动——窄映射见
+        // [`build_billing_only_tool_name_map`]。没有命中就不建映射，请求侧与所有回程/重试（它们都
+        // 读这一份）因此一致为空。对所有来访生效，见 [`store::ForwardFlags::billing_only`]。
+        let tool_names = (billable && flags.tool_name_mimic)
+            .then(|| {
+                if flags.billing_only() {
+                    build_billing_only_tool_name_map(body_json.as_ref())
+                } else {
+                    build_tool_name_map(body_json.as_ref())
+                }
+                .map(std::sync::Arc::new)
+            })
             .flatten();
         if let Some(map) = &tool_names {
             tracing::debug!(count = map.forward.len(), "obfuscating tool names");

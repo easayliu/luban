@@ -22,12 +22,13 @@ use super::ban::{
     log_third_party_rejection, park_org_oauth_disallowed, parse_upstream_error,
 };
 use super::body::{
-    below_min_client_version, body_has_user_id, build_tool_name_map, cc_cli_version,
-    cc_ua_entrypoint, client_supplied_fallbacks, device_fingerprint, ensure_beta_query,
-    extract_device_id, extract_session_id, is_billable_messages, is_fallback_rejection,
-    known_latest_release, misplaced_system_role, outbound_carries_fallbacks, refusal_fallbacks_for,
-    remember_fallback_rejection, sim_device_fingerprint, sim_device_id, sim_session_key,
-    stream_requested, trusted_cc_version, ua_of,
+    below_min_client_version, body_has_user_id, build_billing_only_tool_name_map,
+    build_tool_name_map, cc_cli_version, cc_ua_entrypoint, client_supplied_fallbacks,
+    device_fingerprint, ensure_beta_query, extract_device_id, extract_session_id,
+    is_billable_messages, is_fallback_rejection, known_latest_release, misplaced_system_role,
+    outbound_carries_fallbacks, refusal_fallbacks_for, remember_fallback_rejection,
+    sim_device_fingerprint, sim_device_id, sim_session_key, stream_requested, trusted_cc_version,
+    ua_of,
 };
 use super::connectivity::{prewarm_body, prewarm_upstream, session_start, spawn_session_handshake};
 use super::digest::redact_headers;

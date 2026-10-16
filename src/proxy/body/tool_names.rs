@@ -77,6 +77,65 @@ pub(crate) fn should_mimic_tool(t: &serde_json::Value) -> bool {
     !config::CC_TOOL_NAMES.contains(&name)
 }
 
+/// 工具名是否命中上游那条**单独成立**的第三方判据：小写 `mcp_` 开头、后面至少一个非下划线字符
+/// （`^mcp_[^_]`）。
+///
+/// 2026-10-16 本地对拍（billing-only、非 CC 客户端、同一条请求只换一个工具名）：`mcp_call_tool` /
+/// `mcp_get_tool_description` / `mcp_describe` / `mcp_foo` / `mcp_a` 一律 400 `Third-party apps…`，
+/// 描述改成中性文字照样 400；去前缀的 `call_tool`、双下划线的 `mcp__srv__x`（官方 CC 的 MCP
+/// 命名空间）、`mcpcall`、`xmcp_call`、`call_mcp_tool`、大写 `MCP_call_tool`、`mcp-call-tool`、
+/// 光秃秃的 `mcp_` 全 200。sonnet-5 / opus-5 一致。线上 30 天同款客户端带这两个工具的 12 条全拒、
+/// 不带的 33 条全过。它是充分条件不是必要条件：别的产品指纹另有判据，这里只管这一条。
+pub(crate) fn is_mcp_underscore_name(name: &str) -> bool {
+    name.strip_prefix("mcp_").is_some_and(|rest| !rest.is_empty() && !rest.starts_with('_'))
+}
+
+/// billing-only 下的窄映射：只把命中 [`is_mcp_underscore_name`] 的客户端工具改进官方 MCP 命名空间，
+/// 假名就是 `mcp__luban__<原名>`，其余工具一个不动。
+///
+/// 与 [`build_tool_name_map`] 的差别是取舍不同：billing-only 的承诺是客户端的工具与参数原样透传，
+/// 所以这里不按白名单一律混淆，只处理已证实会单独触发 400 的那一类名字；假名直接拼原名而不是
+/// 哈希出的别名，日志里一眼认得出，客户端增删别的工具也不会让它变、不多断一次 prompt cache
+/// （原名长到装不下 128 字符上限的，见 [`billing_only_alias`]，截头加哈希尾巴，仍对原名恒定）。
+/// 还原走同一个 [`ToolNameMap::restore`]：前缀同为 [`FAKE_TOOL_NS`]。
+/// 没有命中的工具返回 `None`，两侧零开销。
+pub(crate) fn build_billing_only_tool_name_map(
+    body: Option<&serde_json::Value>,
+) -> Option<ToolNameMap> {
+    let tools = body?.get("tools")?.as_array()?;
+    let declared: std::collections::HashSet<&str> =
+        tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
+    let real: Vec<&str> = tools
+        .iter()
+        .filter(|t| should_mimic_tool(t))
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|name| is_mcp_underscore_name(name))
+        .collect();
+    finish_map(&declared, &real, |name, _| billing_only_alias(name))
+}
+
+/// 工具名的上限：API 规定 `^[a-zA-Z0-9_-]{1,128}$`。
+const TOOL_NAME_MAX: usize = 128;
+/// 给撞名后缀 `_N` 留的位子（[`finish_map`]），别名主体不超过 `TOOL_NAME_MAX - 这个数`。
+/// 只是让常见的几位后缀不必裁主体；后缀更长时 [`finish_map`] 会按最终长度裁，上限由它兜底。
+const ALIAS_SUFFIX_RESERVE: usize = 4;
+
+/// billing-only 别名：装得下就是 `mcp__luban__<原名>`；原名太长（加前缀后超过
+/// [`TOOL_NAME_MAX`] 减 [`ALIAS_SUFFIX_RESERVE`]）就截头、尾部拼 `_` 加 sha256 前 8 位十六进制，
+/// 对同一个原名恒定，也不会和别的长名截出同一段。
+fn billing_only_alias(name: &str) -> String {
+    let budget = TOOL_NAME_MAX - ALIAS_SUFFIX_RESERVE;
+    let plain = format!("{FAKE_TOOL_NS}{name}");
+    if plain.chars().count() <= budget {
+        return plain;
+    }
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes());
+    let tag: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let head_len = budget - FAKE_TOOL_NS.len() - 1 - tag.len();
+    let head: String = name.chars().take(head_len).collect();
+    format!("{FAKE_TOOL_NS}{head}_{tag}")
+}
+
 /// 从请求体扫出要混淆的工具名，生成映射。没有可混淆的（`tools` 不是数组／全是官方名或 `mcp__` 前缀）
 /// 返回 `None`，此后请求与回程两侧都零开销。
 ///
@@ -106,25 +165,50 @@ pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
     let digest = sha2::Digest::finalize(hasher);
     let seed = u64::from_be_bytes(digest[..8].try_into().expect("sha256 至少 8 字节"));
 
-    let mut forward = std::collections::HashMap::with_capacity(real.len());
-    let mut reverse = Vec::with_capacity(real.len());
-    for (i, name) in real.iter().enumerate() {
-        if forward.contains_key(*name) {
-            continue; // 同名工具重复声明：一个映射就够。
-        }
+    finish_map(&declared, &real, |name, i| {
         let prefix = FAKE_TOOL_PREFIXES
             [(seed.wrapping_add(i as u64) % FAKE_TOOL_PREFIXES.len() as u64) as usize];
         // 取真名开头三个 ASCII 字母数字，纯粹为了假名在日志里还认得出是谁。
         let head: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
-        let stem = format!("{FAKE_TOOL_NS}{prefix}{head}{i:02}");
-        let mut fake = stem.clone();
-        // 假名撞上任何已声明工具都会让上游分不清该调谁。序号已保证假名之间唯一，
-        // 这里再兜住来访本来就声明了同名 MCP 工具的极端情形。
-        let mut collision = 0usize;
-        while declared.contains(fake.as_str()) {
-            collision += 1;
-            fake = format!("{stem}_{collision}");
+        format!("{FAKE_TOOL_NS}{prefix}{head}{i:02}")
+    })
+}
+
+/// 按 `stem(真名, 序号)` 给每个要改的名字造假名，装成 [`ToolNameMap`]。两种映射共用：撞名兜底、
+/// 去重、反向表按假名长度倒序都在这一处。`real` 为空返回 `None`。
+fn finish_map(
+    declared: &std::collections::HashSet<&str>,
+    real: &[&str],
+    stem: impl Fn(&str, usize) -> String,
+) -> Option<ToolNameMap> {
+    if real.is_empty() {
+        return None;
+    }
+    let mut forward = std::collections::HashMap::with_capacity(real.len());
+    let mut reverse = Vec::with_capacity(real.len());
+    let mut used: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(real.len());
+    for (i, name) in real.iter().enumerate() {
+        if forward.contains_key(*name) {
+            continue; // 同名工具重复声明：一个映射就够。
         }
+        let stem = stem(name, i);
+        let mut fake = stem.clone();
+        // 假名撞上任何已声明工具、或撞上前面已经发出去的别名，都会让上游分不清该调谁、回程还原
+        // 还错人。白名单混淆的序号已保证假名之间唯一，billing-only 的别名拼的是原名，
+        // `mcp_foo` 让位成 `…_1` 后恰好撞上 `mcp_foo_1` 本来的别名——所以两头都查。
+        // 后缀位数没有上限（[`ALIAS_SUFFIX_RESERVE`] 只是常见情形的预留），每次拼完都按最终长度
+        // 裁 stem，别名绝不超过 [`TOOL_NAME_MAX`]；裁过的仍回到同一个判重循环，唯一性不受影响。
+        // stem 至少是 [`FAKE_TOOL_NS`] 加内容，裁到 `TOOL_NAME_MAX - 后缀` 不会伤到还原靠的前缀。
+        let mut collision = 0usize;
+        while declared.contains(fake.as_str()) || used.contains(fake.as_str()) {
+            collision += 1;
+            let suffix = format!("_{collision}");
+            let keep = TOOL_NAME_MAX.saturating_sub(suffix.len());
+            let head: String = stem.chars().take(keep).collect();
+            fake = format!("{head}{suffix}");
+        }
+        used.insert(fake.clone());
         reverse.push((fake.clone(), (*name).to_string()));
         forward.insert((*name).to_string(), fake);
     }

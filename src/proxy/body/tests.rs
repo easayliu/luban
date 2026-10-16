@@ -1056,6 +1056,213 @@ fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
     assert!(build_tool_name_map(Some(&legacy_only)).is_none());
 }
 
+/// 上游那条「`mcp_` 单下划线开头」的判据边界：2026-10-16 本地对拍，命中的全 400、其余全 200。
+#[test]
+fn mcp_underscore_rule_matches_exactly_the_probed_boundary() {
+    use super::is_mcp_underscore_name;
+    for hit in ["mcp_call_tool", "mcp_get_tool_description", "mcp_describe", "mcp_foo", "mcp_a"] {
+        assert!(is_mcp_underscore_name(hit), "{hit} 实测 400，该命中");
+    }
+    for miss in [
+        "call_tool",
+        "get_tool_description",
+        "mcp__srv__call_tool",
+        "mcp__luban__mcp_call_tool",
+        "mcpcall",
+        "xmcp_call",
+        "call_mcp_tool",
+        "MCP_call_tool",
+        "mcp-call-tool",
+        "mcp_",
+        "zzqq_call_tool",
+    ] {
+        assert!(!is_mcp_underscore_name(miss), "{miss} 实测 200，不该命中");
+    }
+}
+
+/// billing-only 的窄映射：只改 `mcp_` 开头的客户端工具，假名就是 `mcp__luban__<原名>`；
+/// 其余非官方名（白名单混淆会改的）原样透传；一个都没命中就不建映射。
+#[test]
+fn billing_only_tool_map_renames_only_mcp_underscore_names_into_the_namespace() {
+    use super::build_billing_only_tool_name_map;
+    let body = serde_json::json!({"tools": [
+        {"name": "list_dir", "input_schema": {"type": "object"}},
+        {"name": "mcp_get_tool_description", "input_schema": {"type": "object"}},
+        {"name": "mcp_call_tool", "input_schema": {"type": "object"}},
+        {"name": "mcp__srv__x", "input_schema": {"type": "object"}},
+        {"name": "Read", "input_schema": {"type": "object"}},
+        {"name": "web_search", "type": "web_search_20250305"},
+        {"name": "mcp_call_tool", "input_schema": {"type": "object"}},
+    ]});
+    let map = build_billing_only_tool_name_map(Some(&body)).expect("有 mcp_ 名就该有映射");
+    assert_eq!(map.forward.len(), 2, "只改两个 mcp_ 名（重复声明合一）: {:?}", map.forward);
+    assert_eq!(map.forward["mcp_call_tool"], format!("{FAKE_TOOL_NS}mcp_call_tool"));
+    assert_eq!(
+        map.forward["mcp_get_tool_description"],
+        format!("{FAKE_TOOL_NS}mcp_get_tool_description")
+    );
+    for kept in ["list_dir", "mcp__srv__x", "Read", "web_search"] {
+        assert!(!map.forward.contains_key(kept), "{kept} 在 billing-only 下该原样透传");
+    }
+    assert_eq!(
+        map.reverse[0].0,
+        format!("{FAKE_TOOL_NS}mcp_get_tool_description"),
+        "反向表长假名在前"
+    );
+
+    // 应用到请求体：声明、历史里的 tool_use 一起换；还原回程时换回真名。
+    let mut v = serde_json::json!({
+        "tools": body["tools"],
+        "messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "mcp_call_tool", "input": {}},
+            {"type": "tool_use", "id": "t2", "name": "list_dir", "input": {}},
+        ]}],
+    });
+    assert!(apply_tool_names(&mut v, &map));
+    assert_eq!(v["tools"][2]["name"], serde_json::json!(format!("{FAKE_TOOL_NS}mcp_call_tool")));
+    assert_eq!(v["tools"][0]["name"], serde_json::json!("list_dir"));
+    assert_eq!(
+        v["messages"][0]["content"][0]["name"],
+        serde_json::json!(format!("{FAKE_TOOL_NS}mcp_call_tool"))
+    );
+    assert_eq!(v["messages"][0]["content"][1]["name"], serde_json::json!("list_dir"));
+    let reply =
+        format!(r#"{{"type":"tool_use","name":"{FAKE_TOOL_NS}mcp_call_tool","input":{{}}}}"#);
+    assert_eq!(
+        String::from_utf8(map.restore(reply.as_bytes())).unwrap(),
+        r#"{"type":"tool_use","name":"mcp_call_tool","input":{}}"#
+    );
+
+    // 客户端本来就声明了会撞上假名的工具：兜底加序号，不会两条同名。
+    let clash = serde_json::json!({"tools": [
+        {"name": "mcp_call_tool", "input_schema": {"type": "object"}},
+        {"name": format!("{FAKE_TOOL_NS}mcp_call_tool"), "input_schema": {"type": "object"}},
+    ]});
+    let map = build_billing_only_tool_name_map(Some(&clash)).unwrap();
+    assert_eq!(map.forward["mcp_call_tool"], format!("{FAKE_TOOL_NS}mcp_call_tool_1"));
+
+    // 没有 mcp_ 名：不建映射，哪怕全是白名单混淆会改的业务名。
+    let plain = serde_json::json!({"tools": [
+        {"name": "list_dir", "input_schema": {"type": "object"}},
+        {"name": "sessions_spawn", "input_schema": {"type": "object"}},
+    ]});
+    assert!(build_billing_only_tool_name_map(Some(&plain)).is_none());
+    assert!(build_tool_name_map(Some(&plain)).is_some(), "对照：完整混淆仍会改这些名");
+}
+
+/// 评审 P2：别名去重得同时看已分配的别名。`mcp_foo` 因撞上客户端自己声明的
+/// `mcp__luban__mcp_foo` 让位成 `…_1`，恰好是 `mcp_foo_1` 本来的别名——两个真名不能共用一个假名，
+/// 否则出站重名、回程 `mcp_foo_1` 的调用被还原成 `mcp_foo`。
+#[test]
+fn billing_only_tool_map_never_hands_two_real_names_the_same_alias() {
+    use super::build_billing_only_tool_name_map;
+    let body = serde_json::json!({"tools": [
+        {"name": "mcp_foo", "input_schema": {"type": "object"}},
+        {"name": "mcp_foo_1", "input_schema": {"type": "object"}},
+        {"name": format!("{FAKE_TOOL_NS}mcp_foo"), "input_schema": {"type": "object"}},
+    ]});
+    let map = build_billing_only_tool_name_map(Some(&body)).unwrap();
+    assert_eq!(map.forward.len(), 2);
+    let a = &map.forward["mcp_foo"];
+    let b = &map.forward["mcp_foo_1"];
+    assert_ne!(a, b, "两个真名拿到了同一个别名: {a}");
+    assert_eq!(a, &format!("{FAKE_TOOL_NS}mcp_foo_1"));
+    assert_eq!(b, &format!("{FAKE_TOOL_NS}mcp_foo_1_1"), "后来的那个要再让一位");
+    let declared: std::collections::HashSet<&str> =
+        map.forward.values().map(String::as_str).collect();
+    assert_eq!(declared.len(), 2, "别名之间互不相同");
+    assert!(!declared.contains(&*format!("{FAKE_TOOL_NS}mcp_foo")), "不撞客户端自己声明的名");
+
+    // 回程：各还原各的。
+    let reply = format!(r#"[{{"name":"{b}"}},{{"name":"{a}"}}]"#);
+    assert_eq!(
+        String::from_utf8(map.restore(reply.as_bytes())).unwrap(),
+        r#"[{"name":"mcp_foo_1"},{"name":"mcp_foo"}]"#
+    );
+
+    // 白名单混淆同样受益：序号本来就唯一，这里只确认没把它弄坏。
+    let map = build_tool_name_map(Some(&body)).unwrap();
+    let fakes: std::collections::HashSet<&str> = map.forward.values().map(String::as_str).collect();
+    assert_eq!(fakes.len(), map.forward.len());
+}
+
+/// 评审 P2：别名要守 API 的 128 字符上限，并给撞名后缀留位。合法的 128 字符原名加 12 字符前缀
+/// 会到 140，上游直接 400 参数错误；长名改用「截头 + `_` + sha256 前 8 位」的稳定别名。
+#[test]
+fn billing_only_tool_map_keeps_aliases_within_the_api_name_limit() {
+    use super::build_billing_only_tool_name_map;
+    let long = format!("mcp_{}", "a".repeat(124));
+    assert_eq!(long.len(), 128, "原名本身合法");
+    let long2 = format!("mcp_{}b", "a".repeat(123));
+    let fits = format!("mcp_{}", "x".repeat(108)); // 12 + 112 = 124，刚好装下
+    let body = serde_json::json!({"tools": [
+        {"name": long, "input_schema": {"type": "object"}},
+        {"name": long2, "input_schema": {"type": "object"}},
+        {"name": fits, "input_schema": {"type": "object"}},
+    ]});
+    let map = build_billing_only_tool_name_map(Some(&body)).unwrap();
+    for (real, fake) in &map.forward {
+        assert!(fake.len() <= 128, "{real} 的别名 {} 字符，超上限: {fake}", fake.len());
+        assert!(fake.starts_with(FAKE_TOOL_NS), "还原靠这个前缀: {fake}");
+        assert!(fake.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'), "{fake}");
+    }
+    let f1 = &map.forward[&long];
+    let f2 = &map.forward[&long2];
+    assert_ne!(f1, f2, "截头相同的两个长名靠哈希尾巴区分");
+    assert!(
+        f1.len() <= 124 && f2.len() <= 124,
+        "长名别名给 `_N` 留 4 位: {} / {}",
+        f1.len(),
+        f2.len()
+    );
+    assert_eq!(map.forward[&fits], format!("{FAKE_TOOL_NS}{fits}"), "装得下的仍直接拼原名");
+
+    // 同一个长名两次构造得到同一个别名，上游 prompt cache 才稳。
+    let again = build_billing_only_tool_name_map(Some(&body)).unwrap();
+    assert_eq!(again.forward[&long], *f1);
+
+    // 长名撞上客户端自己声明的同名工具：加后缀后仍不超限。
+    let clash = serde_json::json!({"tools": [
+        {"name": long, "input_schema": {"type": "object"}},
+        {"name": f1, "input_schema": {"type": "object"}},
+    ]});
+    let map = build_billing_only_tool_name_map(Some(&clash)).unwrap();
+    let f = &map.forward[&long];
+    assert_eq!(f, &format!("{f1}_1"));
+    assert!(f.len() <= 128);
+}
+
+/// 评审 P3：撞名后缀位数没有上限，固定预留 4 位只装得下 `_999`。客户端声明一个长名、它的别名
+/// stem、再把 `stem_1`…`stem_999` 全占掉（1001 个合法名字），第 1000 次让位得出 `stem_1000`，
+/// 不裁就是 129 字符。拼完后缀按最终长度裁 stem，仍唯一、仍带还原前缀。
+#[test]
+fn billing_only_tool_map_trims_the_stem_when_the_collision_suffix_grows() {
+    use super::build_billing_only_tool_name_map;
+    let long = format!("mcp_{}", "a".repeat(124));
+    let stem = build_billing_only_tool_name_map(Some(&serde_json::json!({"tools": [
+        {"name": long, "input_schema": {"type": "object"}},
+    ]})))
+    .unwrap()
+    .forward[&long]
+        .clone();
+    assert_eq!(stem.len(), 124);
+    let mut tools = vec![serde_json::json!({"name": long, "input_schema": {"type": "object"}})];
+    tools.push(serde_json::json!({"name": stem, "input_schema": {"type": "object"}}));
+    for n in 1..=999 {
+        tools.push(
+            serde_json::json!({"name": format!("{stem}_{n}"), "input_schema": {"type": "object"}}),
+        );
+    }
+    assert!(tools.iter().all(|t| t["name"].as_str().unwrap().len() <= 128), "来访名字都合法");
+    let map = build_billing_only_tool_name_map(Some(&serde_json::json!({"tools": tools}))).unwrap();
+    let fake = &map.forward[&long];
+    assert_eq!(fake.len(), 128, "裁到上限而不是 129: {fake}");
+    assert!(fake.ends_with("_1000"));
+    assert!(fake.starts_with(FAKE_TOOL_NS));
+    assert_eq!(&fake[..123], &stem[..123], "裁的是 stem 尾部");
+    assert!(!tools.iter().any(|t| t["name"].as_str() == Some(fake.as_str())), "仍不与任何声明撞名");
+}
+
 /// 同一组工具名两次构造得到同一套假名——否则每轮请求的假名都变，上游 prompt cache 全丢。
 #[test]
 fn tool_map_is_stable_for_the_same_tool_set() {
