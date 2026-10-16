@@ -1200,20 +1200,61 @@ fn every_generated_alias_lives_under_the_shared_namespace() {
     );
 }
 
+/// 模拟路径的 `thinking.display` 与官方 2.1.301 的 `Bbn` 同口径：客户端带了 `thinking` 没写
+/// `display`（adaptive 或 enabled）就补 `updates`（出站串本来就带 `thinking-display-updates`）；
+/// 显式写了 `summarized` / `highlights` / `omitted` 的原样；billing-only 下一个字节都不动。
+#[test]
+fn sim_fills_display_updates_unless_client_chose_one() {
+    use crate::proxy::test_support::{all_on, detect_for, rewrite_body, test_cred};
+    let body = |thinking: &str| {
+        Bytes::from(format!(
+            r#"{{"model":"claude-opus-5","max_tokens":4000,"thinking":{thinking},"system":[{{"type":"text","text":"CLIENT"}}],"messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+    };
+    let out = |raw: &Bytes, flags: store::ForwardFlags| -> serde_json::Value {
+        let sim = detect_for(raw, flags).expect("非 CC 来访走模拟");
+        assert!(sim.beta.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES), "{}", sim.beta);
+        serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", flags, Some(&sim), None))
+            .unwrap()
+    };
+    let v = out(&body(r#"{"type":"adaptive"}"#), all_on());
+    assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive", "display": "updates"}), "{v}");
+    let v = out(&body(r#"{"type":"enabled","budget_tokens":2000}"#), all_on());
+    assert_eq!(
+        v["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 2000, "display": "updates"}),
+        "enabled 配手动预算官方同样写 updates: {v}"
+    );
+    for d in ["summarized", "highlights", "omitted"] {
+        let v = out(&body(&format!(r#"{{"type":"adaptive","display":"{d}"}}"#)), all_on());
+        assert_eq!(v["thinking"]["display"], d, "客户端显式选的不动: {v}");
+    }
+    let v = out(&body(r#"{"type":"adaptive","display":"updates"}"#), all_on());
+    assert_eq!(v["thinking"]["display"], "updates");
+    // billing-only：参数原样透传，不补。
+    let bo = store::ForwardFlags { sim_billing_only: true, ..all_on() };
+    let v = out(&body(r#"{"type":"adaptive"}"#), bo);
+    assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}), "billing-only 不补: {v}");
+}
+
 /// 官方从不发的顶层字段要剥掉，客户端真正要的语义不能动。
 ///
-/// 判据取自 `cap/raw/00006`/`00009`：两份直连抓包都没有 `tool_choice`，
-/// `thinking` 也都是裸的 `{"type":"adaptive"}`。
+/// 判据取自 `cap/raw/00006`/`00009`：两份直连抓包都没有 `tool_choice`。
+/// `thinking.display` 不再剥：2.1.258 起它是官方形态的一部分，三种取值官方都发。
 #[test]
 fn strips_only_the_fields_official_never_sends() {
-    // 等价于缺省的 tool_choice + thinking.display：都该剥。
+    // 等价于缺省的 tool_choice 剥；客户端显式要的 summarized 留着。
     let mut v = serde_json::json!({
             "model": "claude-opus-5",
             "tool_choice": {"type": "auto"},
             "thinking": {"type": "adaptive", "display": "summarized"}});
-    assert!(strip_extra_fields(&mut v, false));
+    assert!(strip_extra_fields(&mut v));
     assert!(v.get("tool_choice").is_none(), "官方不发 tool_choice: {v}");
-    assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}), "display 应剥掉: {v}");
+    assert_eq!(
+        v["thinking"],
+        serde_json::json!({"type": "adaptive", "display": "summarized"}),
+        "display 是客户端要的摘要，不剥: {v}"
+    );
 
     // 强制选工具 / 强制用工具 / 关并行：都是客户端要的语义，一个都不能动。
     for keep in [
@@ -1222,7 +1263,7 @@ fn strips_only_the_fields_official_never_sends() {
         serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
     ] {
         let mut v = serde_json::json!({ "tool_choice": keep.clone() });
-        assert!(!strip_extra_fields(&mut v, false), "不该动: {keep}");
+        assert!(!strip_extra_fields(&mut v), "不该动: {keep}");
         assert_eq!(v["tool_choice"], keep);
     }
 
@@ -1234,14 +1275,14 @@ fn strips_only_the_fields_official_never_sends() {
         let mut v = serde_json::json!({
                 "model": model,
                 "thinking": {"type": "disabled"}});
-        assert!(!strip_extra_fields(&mut v, false), "{model}: 不该动");
+        assert!(!strip_extra_fields(&mut v), "{model}: 不该动");
         assert_eq!(v["thinking"], serde_json::json!({"type": "disabled"}), "{model}");
     }
 
     // thinking.type == "enabled" 不动。
     let mut v = serde_json::json!({
             "thinking": {"type": "enabled", "budget_tokens": 10000}});
-    assert!(!strip_extra_fields(&mut v, false));
+    assert!(!strip_extra_fields(&mut v));
     assert_eq!(v["thinking"]["type"], "enabled");
 
     // 官方形态本身：走一遍什么也不改（对真实 CC 是空操作）。
@@ -1250,7 +1291,7 @@ fn strips_only_the_fields_official_never_sends() {
             "thinking": {"type": "adaptive"},
             "output_config": {"effort": "high"}});
     let before = official.clone();
-    assert!(!strip_extra_fields(&mut official, false));
+    assert!(!strip_extra_fields(&mut official));
     assert_eq!(official, before);
 }
 
@@ -1270,20 +1311,20 @@ fn leaves_client_thinking_conflicts_to_upstream() {
             "tool_choice": { "type": "any" }, "tools": tools, "messages": [] }),
     ] {
         let mut v = body.clone();
-        assert!(!strip_extra_fields(&mut v, false), "不该动: {body}");
+        assert!(!strip_extra_fields(&mut v), "不该动: {body}");
         assert_eq!(v, body);
     }
 }
 
 /// 2.1.258 起官方 CC 自己发 `thinking: {type: adaptive, display: "updates"}`
-/// （`cap/2.1.258/00013`）。CC 形态的来访不剥 `display`；非 CC 形态照剥。
+/// （`cap/2.1.258/00013`）。不论来访是不是 CC 形态，`display` 都不剥。
 #[test]
 fn keeps_thinking_display_for_cc_shaped_requests() {
     let mut cc = serde_json::json!({
             "model": "claude-fable-5-1",
             "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
             "thinking": {"type": "adaptive", "display": "updates"}});
-    assert!(!strip_extra_fields(&mut cc, true), "官方形态无可剥: {cc}");
+    assert!(!strip_extra_fields(&mut cc), "官方形态无可剥: {cc}");
     assert_eq!(
         cc["thinking"],
         serde_json::json!({"type": "adaptive", "display": "updates"}),
@@ -1294,11 +1335,11 @@ fn keeps_thinking_display_for_cc_shaped_requests() {
             "model": "claude-fable-5-1",
             "system": "You are a helpful assistant.",
             "thinking": {"type": "adaptive", "display": "updates"}});
-    assert!(strip_extra_fields(&mut third_party, false));
+    assert!(!strip_extra_fields(&mut third_party), "第三方写的 display 同样不剥");
     assert_eq!(
         third_party["thinking"],
-        serde_json::json!({"type": "adaptive"}),
-        "非 CC 形态照剥: {third_party}"
+        serde_json::json!({"type": "adaptive", "display": "updates"}),
+        "第三方写的 display 原样: {third_party}"
     );
 }
 
@@ -1450,7 +1491,7 @@ fn strip_extra_fields_is_wired_and_switchable() {
     let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", only_strip, None, None);
     let s = String::from_utf8(out.to_vec()).unwrap();
     assert!(!s.contains("tool_choice"), "{s}");
-    assert!(!s.contains("display"), "{s}");
+    assert!(s.contains("\"display\":\"summarized\""), "display 是官方形态，不剥: {s}");
 
     let off = store::ForwardFlags { strip_extra_fields: false, ..only_strip };
     let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", off, None, None);

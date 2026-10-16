@@ -242,7 +242,6 @@ pub(crate) fn rewrite_body_out_parsed(
         Err(_) => return (body.clone(), None),
     };
     // 来访自己是不是 CC 形态要在模拟之前看——模拟一跑，body 就都是 CC 形态了。
-    // 只喂给 `strip_extra_fields` 判 `thinking.display` 该不该剥。
     let cc_inbound = is_cc_shaped(&v);
     let simulated = sim.is_some_and(|sim| simulate_system(&mut v, sim, cache));
     // 消息线程指纹按**环境说明插入之前**的 `messages` 算：换了模型族时环境说明从 `role: system`
@@ -295,15 +294,23 @@ pub(crate) fn rewrite_body_out_parsed(
     let thinking_filled = flags.inject_thinking
         && !billing_only
         && sim.is_some_and(|sim| ensure_thinking(&mut v, sim.profile));
-    // 真实 CC（API-key 模式）的 fable 请求：头上 `merge_beta` 补了 `thinking-display-updates`，
-    // body 侧才配套补 `thinking.display:"updates"`（订阅端官方形态，`cap/2.1.258/00013`）。
-    // `display_beta` 取自实际发出的头——头上没那项 beta 时体里写 `updates` 是一发稳定 400
-    // （agent-sdk / VSCode 扩展的 beta 串没有 `advisor-tool`，`merge_beta` 不给它补）。
-    let display_filled = sim.is_none()
-        && !billing_only
-        && cc_inbound
-        && flags.merge_beta
-        && display_beta
+    // 客户端带了 `thinking` 却没写 `display`：按官方默认补 `display:"updates"`
+    // （[`fill_thinking_display`]，与官方 2.1.301 的 `Bbn` 同口径；显式写了
+    // `summarized` / `highlights` / `omitted` 的原样发、头上也不带 beta，见
+    // [`thinking_display_explicit`]）。
+    // - 真实 CC（API-key 模式）：头上 `merge_beta` 补了 `thinking-display-updates`，body 侧才配套补
+    //   （订阅端官方形态，`cap/2.1.258/00013`）。`display_beta` 取自实际发出的头——头上没那项 beta
+    //   时体里写 `updates` 是一发稳定 400（agent-sdk / VSCode 扩展的 beta 串没有 `advisor-tool`，
+    //   `merge_beta` 不给它补）。
+    // - 模拟路径：出站串就是 profile 那串，看它有没有这项 beta（haiku 之外的主线程四族都有）。
+    //   第三方客户端照 API 习惯只写 `{"type":"adaptive"}`，原样发出去就是「头有 beta、体是裸
+    //   adaptive」——官方从不产生的组合（官方有 beta 必写 `updates`）。
+    // billing-only 不补：那条路参数原样透传。
+    let display_filled = !billing_only
+        && match sim {
+            Some(s) => s.beta.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES),
+            None => cc_inbound && flags.merge_beta && display_beta,
+        }
         && fill_thinking_display(&mut v);
     let ctx_mgmt = sim.is_some() && !billing_only && ensure_context_management(&mut v);
     // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带，按模型的官方默认档补
@@ -487,10 +494,7 @@ pub(crate) fn rewrite_body_out_parsed(
     let streamed = force_stream && set_stream_true(&mut v);
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
     // 摆在队尾就不必操心谁先谁后。
-    // `display` 的去留：来访本来就是 CC 形态，或 `thinking` 整个是刚按官方形态补的，都留。
-    let stripped = flags.strip_extra_fields
-        && !billing_only
-        && strip_extra_fields(&mut v, cc_inbound || thinking_filled);
+    let stripped = flags.strip_extra_fields && !billing_only && strip_extra_fields(&mut v);
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered = !billing_only

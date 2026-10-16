@@ -2119,7 +2119,7 @@ fn auto_2_1_285_official_shapes_are_recognized() {
         r#"{"thinking":{"type":"adaptive","display":"omitted"},"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#,
     );
     let ctx = BetaCtx::of(Main, omitted.to_string().as_bytes(), Some(&omitted), &[]);
-    assert_eq!(ctx, BetaCtx { display_omitted: true, ..BetaCtx::MAIN });
+    assert_eq!(ctx, BetaCtx { display_explicit: true, ..BetaCtx::MAIN });
     let fable = merge_beta_for(Some(main_beta), Some("claude-fable-5-1"), Some((2, 1, 285)), ctx);
     assert!(!fable.contains("thinking-display-updates"), "{fable}");
 }

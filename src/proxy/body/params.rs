@@ -86,11 +86,14 @@ pub(crate) fn ensure_thinking(v: &mut serde_json::Value, profile: &config::CcPro
     true
 }
 
-/// CC 请求补 `thinking.display:"updates"`：订阅端官方发的是
+/// 补 `thinking.display:"updates"`：订阅端官方发的是
 /// `{"type":"adaptive","display":"updates"}`（2.1.258 只有 fable-5-1 这样，`00013`；
 /// 2.1.260 起 opus 主线程也是，`cap/2.1.260-2/00025`），API-key 端发裸 `adaptive`。
-/// 只在 `thinking.type == "adaptive"` 且客户端没写 `display` 时补；模型族由
-/// [`cc_profile_for`] 判（该族的官方串里有 `thinking-display-updates` 的才算）。
+/// 只在 `thinking.type` 是 `adaptive` 或 `enabled`、且客户端没写 `display` 时补——与官方
+/// 2.1.301 的 `Bbn` 同口径：`display` 没显式给值时（`summarized` / `highlights` / `omitted`
+/// 三种算显式，见 [`thinking_display_explicit`]）一律改成 `updates` 并配 beta，`enabled` 配手动预算
+/// 的也一样（`cap/auto-2.1.299-20261014-full` 子代理那 3 条 `enabled` + `display:"updates"`）。
+/// 模型族由 [`cc_profile_for`] 判（该族的官方串里有 `thinking-display-updates` 的才算）。
 ///
 /// **调用方必须先确认出站头里真有那项 beta**（[`rewrite_body_out`] 的 `display_beta`）：`updates`
 /// 是 beta 才认的取值，头上没声明时上游回 400 `Input should be 'summarized', 'omitted'`。
@@ -103,11 +106,29 @@ pub(crate) fn ensure_thinking(v: &mut serde_json::Value, profile: &config::CcPro
 /// 原来那句「只有 fable」的判断当场就成了错的。
 pub(crate) fn fill_thinking_display(v: &mut serde_json::Value) -> bool {
     let Some(th) = v.get_mut("thinking").and_then(|t| t.as_object_mut()) else { return false };
-    if th.get("type").and_then(|t| t.as_str()) != Some("adaptive") || th.contains_key("display") {
+    if !matches!(th.get("type").and_then(|t| t.as_str()), Some("adaptive" | "enabled"))
+        || th.contains_key("display")
+    {
         return false;
     }
     th.insert("display".into(), "updates".into());
     true
+}
+
+/// 客户端**显式**选了思考展示方式：`thinking.display` 是 `summarized` / `highlights` / `omitted`
+/// 之一。官方 2.1.301 的 `Bbn` 对这三种原样发出、**不带** `thinking-display-updates` beta
+/// （`summarized` 来自设置 `showThinkingSummaries` 或 `--thinking-display`，`omitted` 来自 `-p`
+/// 打印模式；桌面端 `cap/auto-desktop-2.1.295-20261010-sub/00052`、`00057` 两条 `summarized`
+/// 的串里都没有这项 beta）。其余取值（没写、`updates`）跟官方默认走：体写 `updates`、头带 beta。
+///
+/// 两边共用一个判据：[`fill_thinking_display`] 决定体里补不补 `updates`，
+/// [`BetaCtx`](crate::proxy::headers::BetaCtx) / [`simulated_beta_for`](crate::proxy::simulated_beta_for)
+/// 决定头上带不带 beta，口径分头漂移就会拼出「体 `summarized`、头有 beta」这种官方不产生的组合。
+pub(crate) fn thinking_display_explicit(v: &serde_json::Value) -> bool {
+    matches!(
+        v.get("thinking").and_then(|t| t.get("display")).and_then(|d| d.as_str()),
+        Some("summarized" | "highlights" | "omitted")
+    )
 }
 
 /// 补上官方客户端恒发的 `context_management`，落在官方位置（`thinking` 之后、

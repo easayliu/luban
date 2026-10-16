@@ -43,6 +43,7 @@ use headers::merge_beta;
 pub(crate) use headers::{
     BetaCtx, build_forward_headers_for, ensure_cache_ttl_beta, ensure_fallback_beta,
     is_official_non_main_beta, merge_beta_for, orig_header_case, simulated_beta,
+    simulated_beta_for,
 };
 pub(crate) use headers::{has_beta, uuid_v4};
 

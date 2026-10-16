@@ -87,8 +87,10 @@ use super::uuid_from_bytes;
 /// `cap/auto-2.1.285-20260930` 的 137 条 `/v1/messages` 里，这项 beta 在与不在和体里有没有
 /// `"ttl":"1h"` 一一对应——`/compact`、`/btw` 那两条分叉体里一个 1h 断点都没有，头上也就没有它。
 ///
-/// **`thinking.display:"omitted"` 的不补 `thinking-display-updates`**（[`BetaCtx::display_omitted`]）：
-/// `-p` 打印模式四族都写 `omitted`（`00441`、`00554` 等），官方串里就没有这一项。
+/// **`thinking.display` 显式给了值的不补 `thinking-display-updates`**（[`BetaCtx::display_explicit`]）：
+/// `-p` 打印模式四族都写 `omitted`（`00441`、`00554` 等），开了 `showThinkingSummaries` 的写
+/// `summarized`（桌面端 `cap/auto-desktop-2.1.295-20261010-sub/00052`、`00057`），官方串里都没有
+/// 这一项——2.1.301 的 `Bbn` 只在把 `display` 改成 `updates` 的那一步才推这项 beta。
 pub(crate) fn merge_beta_for(
     incoming: Option<&str>,
     model: Option<&str>,
@@ -188,7 +190,7 @@ pub(crate) fn merge_beta_for(
             parts.insert(at, config::CC_BETA_FALLBACK_CREDIT.to_string());
         }
         if seed_has(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
-            if !ctx.display_omitted && !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
+            if !ctx.display_explicit && !has(&parts, config::CC_BETA_THINKING_DISPLAY_UPDATES) {
                 // 官方位置紧跟 `fallback-credit`（2.1.258 fable、2.1.260 四族）。2.1.270 的
                 // sonnet 不发 `fallback-credit` 了，它就紧跟 `effort`（`cap/2.1.270/00017`：
                 // `…effort,thinking-display-updates,afk-mode…`）。锚点链与上面补
@@ -248,8 +250,9 @@ pub(crate) struct BetaCtx {
     pub(super) only_oauth: bool,
     /// 出站体里有 `ttl:"1h"` 的断点：只有这时才补 `extended-cache-ttl`。
     pub(super) ttl_1h: bool,
-    /// `thinking.display` 是 `"omitted"`：不补 `thinking-display-updates`。
-    pub(super) display_omitted: bool,
+    /// `thinking.display` 显式给了 `summarized` / `highlights` / `omitted`：不补
+    /// `thinking-display-updates`（[`super::body::thinking_display_explicit`]）。
+    pub(super) display_explicit: bool,
     /// SDK 子代理：只补 `oauth` 之外还要补 `cache-diagnosis`，见 [`merge_beta_for`]。
     pub(super) subagent: bool,
 }
@@ -258,7 +261,7 @@ impl BetaCtx {
     /// 主线程、体里带 1h 断点、不压思考——订阅端主线程最常见的那一种，也是测试里按 API-key
     /// 端残缺串还原官方串时默认的前提。
     pub(super) const MAIN: Self =
-        Self { only_oauth: false, ttl_1h: true, display_omitted: false, subagent: false };
+        Self { only_oauth: false, ttl_1h: true, display_explicit: false, subagent: false };
 
     /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份，`beta` 是来访自己那串。
     /// 1h 断点先按字节粗筛（[`super::body::body_has_pair`]），命中再按解析好的体逐个断点核
@@ -288,11 +291,7 @@ impl BetaCtx {
             only_oauth: kind.beta_only_oauth() || official_aux,
             ttl_1h: super::body::body_has_pair(raw, b"\"ttl\"", b"\"1h\"")
                 && body.is_some_and(super::body::has_cache_ttl_1h),
-            display_omitted: body
-                .and_then(|v| v.get("thinking"))
-                .and_then(|t| t.get("display"))
-                .and_then(|d| d.as_str())
-                == Some("omitted"),
+            display_explicit: body.is_some_and(super::body::thinking_display_explicit),
             subagent: kind == super::session_link::CcRequestKind::Subagent,
         }
     }
@@ -489,7 +488,7 @@ pub(crate) fn build_forward_headers_for(
     // - CC 形态来访：仍走 [`merge_beta_for`]，按经验规则把订阅端多出来的几项补回官方位置。
     let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
     let beta = match sim {
-        Some(sim) => Some(simulated_beta(&sim.beta, incoming)),
+        Some(sim) => Some(simulated_beta_for(&sim.beta, incoming, beta_ctx.display_explicit)),
         None if flags.merge_beta => {
             // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta_for`]。
             let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
@@ -622,8 +621,24 @@ pub(crate) fn official_headers(sim: &Simulation) -> HeaderMap {
 /// `oauth` 的落位：官方串以 `claude-code-20250219` 开头时紧随其后（opus / fable / sonnet），
 /// 否则排在最前（haiku 三个 profile 的 `claude-code` 在串中间，`oauth` 在队首）。这两种
 /// 排列在 2.1.260 的六份抓包上都成立，也正是 [`merge_beta_for`] 用的同一条规则。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
+    simulated_beta_for(seed, incoming, false)
+}
+
+/// [`simulated_beta`] 的完整版：`display_explicit` 为真（客户端显式写了 `summarized` /
+/// `highlights` / `omitted`，[`BetaCtx::display_explicit`]）时把官方串里的
+/// `thinking-display-updates` 去掉——官方只在把 `display` 改成 `updates` 时才带它，
+/// 见 [`merge_beta_for`] 文档里那条；客户端自己带来的这一项同样不要。
+pub(crate) fn simulated_beta_for(
+    seed: &str,
+    incoming: Option<&str>,
+    display_explicit: bool,
+) -> String {
     let mut parts: Vec<&str> = seed.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    if display_explicit {
+        parts.retain(|p| beta_name(p) != beta_name(config::CC_BETA_THINKING_DISPLAY_UPDATES));
+    }
     let at = usize::from(parts.first() == Some(&config::CC_BETA_CLAUDE_CODE));
     parts.insert(at, config::OAUTH_BETA_HEADER);
     // 客户端自己带的 beta **一项不丢**，去重后追加在官方串之后。
@@ -642,6 +657,9 @@ pub(crate) fn simulated_beta(seed: &str, incoming: Option<&str>) -> String {
                 beta = p,
                 "dropping a client beta that contradicts the official set for this profile"
             );
+            continue;
+        }
+        if display_explicit && beta_name(p) == beta_name(config::CC_BETA_THINKING_DISPLAY_UPDATES) {
             continue;
         }
         // **认不出来的照发，交给上游判**。这里曾按一张白名单把不认识的项丢掉，理由是

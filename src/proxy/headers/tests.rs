@@ -1383,3 +1383,55 @@ fn only_real_cache_breakpoints_count_as_ttl_1h() {
         ] }] });
     assert!(ctx(in_result));
 }
+
+/// 客户端显式写了 `summarized` / `highlights` / `omitted`：官方只在把 `display` 改成 `updates`
+/// 时才带 `thinking-display-updates`（2.1.301 `Bbn`；桌面端 `summarized` 两条抓包的串里都没有），
+/// 所以模拟串与真实路径的合并串都不带它，客户端自己带来的也丢。
+#[test]
+fn explicit_display_drops_the_display_updates_beta() {
+    use crate::config::CcProfileKind::MainOpus;
+    use crate::proxy::CcRequestKind::Main;
+    use crate::proxy::{BetaCtx, merge_beta_for};
+    let opus = config::cc_profile(MainOpus).beta;
+    assert!(opus.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES));
+    let kept = crate::proxy::simulated_beta_for(opus, None, false);
+    assert!(kept.contains(config::CC_BETA_THINKING_DISPLAY_UPDATES), "{kept}");
+    let dropped = crate::proxy::simulated_beta_for(opus, None, true);
+    assert!(!dropped.contains("thinking-display-updates"), "{dropped}");
+    assert_eq!(
+        dropped.replace(",thinking-display-updates", ""),
+        kept.replace(",thinking-display-updates-2026-08-18", ""),
+        "只少这一项，其余位置不变"
+    );
+    let client_too = crate::proxy::simulated_beta_for(
+        opus,
+        Some(config::CC_BETA_THINKING_DISPLAY_UPDATES),
+        true,
+    );
+    assert!(!client_too.contains("thinking-display-updates"), "客户端带来的也丢: {client_too}");
+
+    for d in ["summarized", "highlights", "omitted"] {
+        let body: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"thinking":{{"type":"adaptive","display":"{d}"}},"system":[]}}"#
+        ))
+        .unwrap();
+        let ctx = BetaCtx::of(Main, body.to_string().as_bytes(), Some(&body), &[]);
+        assert!(ctx.display_explicit, "{d}");
+        let merged = merge_beta_for(
+            Some("claude-code-20250219,interleaved-thinking-2025-05-14,advisor-tool-2026-03-01"),
+            Some("claude-opus-5"),
+            Some((2, 1, 301)),
+            ctx,
+        );
+        assert!(!merged.contains("thinking-display-updates"), "{d}: {merged}");
+    }
+    let plain: serde_json::Value =
+        serde_json::from_str(r#"{"thinking":{"type":"adaptive"},"system":[]}"#).unwrap();
+    let ctx = BetaCtx::of(Main, plain.to_string().as_bytes(), Some(&plain), &[]);
+    assert!(!ctx.display_explicit);
+    let updates: serde_json::Value =
+        serde_json::from_str(r#"{"thinking":{"type":"adaptive","display":"updates"},"system":[]}"#)
+            .unwrap();
+    let ctx = BetaCtx::of(Main, updates.to_string().as_bytes(), Some(&updates), &[]);
+    assert!(!ctx.display_explicit, "updates 是默认态，不算显式");
+}

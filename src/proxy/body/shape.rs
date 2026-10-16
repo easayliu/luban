@@ -16,34 +16,22 @@
 ///    是客户端在强制选工具，`disable_parallel_tool_use` 也是它要的行为，删了就是改语义。
 ///    删掉的那种对模型零影响：`auto` 本来就是缺省。
 ///
-/// 2. **`thinking.display`**：2.1.251 及之前官方发的是裸的 `{"type":"adaptive"}`；**2.1.258 起
-///    fable 族官方自己也发 `display:"updates"`**（`cap/2.1.258/00013`，配着
-///    `thinking-display-updates-2026-08-18` beta）。故这一项由 `keep_display` 拨：来访本来
-///    就是 CC 形态（真 CC 带什么 `display` 就发什么），或 `thinking` 整个是
-///    [`ensure_thinking`](crate::proxy::ensure_thinking) 按官方形态补的，都不剥；只剥第三方客户端自己写的 `display`。
+/// 2. **`thinking.display` 不剥**（2026-10-16 起）。这一项曾按 2.1.251 的裸 `{"type":"adaptive"}`
+///    当多余字段剥掉，但 2.1.258 起 `display` 就是官方形态的一部分：默认 `updates`
+///    （配 `thinking-display-updates` beta），设置 `showThinkingSummaries` 或 `--thinking-display`
+///    给 `summarized`，`-p` 给 `omitted`，三种取值官方都发。剥掉 `summarized` 还有实打实的代价
+///    ——上游对没写 `display` 的请求不回思考正文，客户端要的摘要就空了。`display` 的补齐与
+///    beta 的配对另由 [`fill_thinking_display`](crate::proxy::fill_thinking_display) /
+///    [`thinking_display_explicit`](super::thinking_display_explicit) 管。
 ///
-///    **这一项有代价，不是零影响**：`display:"summarized"` 是客户端主动要思考摘要，剥掉之后
-///    上游按缺省的 `omitted` 走，回程的 `thinking` 块文本为空，客户端那边的「思考过程」就空了。
-///    功能不坏（块还在、签名照旧），只是看不到内容。由开关兜底——不接受这个代价就关掉它。
-///
-/// **对真实 CC**：第一项本来就是空操作（官方不发 `tool_choice`），第二项由调用方传
-/// `keep_display = true` 跳过——2.1.258 起 `display` 是官方形态的一部分。
-/// 判定要在模拟**之前**做（[`rewrite_body_out`](crate::proxy::rewrite_body_out) 里的 `cc_inbound`）：模拟一跑 body 就都是 CC 形态了。
-pub(crate) fn strip_extra_fields(v: &mut serde_json::Value, keep_display: bool) -> bool {
+/// **对真实 CC**：官方不发 `tool_choice`，这里是空操作。
+pub(crate) fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
-    let mut changed = false;
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {
         obj.remove("tool_choice");
-        changed = true;
+        return true;
     }
-    // CC 自己发的 / luban 按官方形态补的 `display` 照发；见函数文档第 2 项。
-    if !keep_display
-        && let Some(thinking) = obj.get_mut("thinking").and_then(|t| t.as_object_mut())
-        && thinking.remove("display").is_some()
-    {
-        changed = true;
-    }
-    changed
+    false
 }
 
 /// thinking 开着时剥掉与它冲突的采样参数，返回是否改动过。只给 luban **自己注入**的 thinking
