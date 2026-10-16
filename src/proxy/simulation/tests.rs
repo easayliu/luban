@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.300.ca9; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.301.eca; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -315,7 +315,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.300.ca9; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.301.eca; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1443,11 +1443,11 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.300-20261015-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.301-20261016-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
 /// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00436`、`00260`、`00380`、`00343`）；
-/// fable 只有 auto 模式的（`00541`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00440`、`00261`、`00386`、`00348`）；
+/// fable 只有 auto 模式的（`00549`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
 /// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`）；第四块末尾那段 Artifact `edits` 说明随注入的工具一起出现。
 ///
@@ -1455,10 +1455,10 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_300_captures() {
-    let dir = format!("{}/cap/auto-2.1.300-20261015-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_301_captures() {
+    let dir = format!("{}/cap/auto-2.1.301-20261016-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.300-20261015-full not present");
+        eprintln!("skipped: cap/auto-2.1.301-20261016-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
@@ -1476,7 +1476,7 @@ fn simulated_main_threads_match_the_2_1_300_captures() {
             "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
     crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00436", false), ("00260", false), ("00380", false), ("00343", false), ("00541", true)]
+        [("00440", false), ("00261", false), ("00386", false), ("00348", false), ("00549", true)]
     {
         let path = files
             .iter()
@@ -1531,7 +1531,7 @@ fn simulated_main_threads_match_the_2_1_300_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：2.1.300 五个主线程首轮都是 `create`，模拟出站与之一致。
+        // `thread`：2.1.301 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1563,7 +1563,7 @@ fn simulated_main_threads_match_the_2_1_300_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.300."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.301."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1572,7 +1572,7 @@ fn simulated_main_threads_match_the_2_1_300_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/8234399e-cd24-4171-afd2-ac4cbec19de7/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/f2acbdd2-ad62-4a78-becd-81a53d2469df/scratchpad/calc",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段；
         // 末尾那段 Artifact `edits` 说明留着。

@@ -991,6 +991,102 @@ fn prompt_suggestion_is_its_own_auxiliary_turn() {
     assert_eq!(p.metrics[1].category, "auxiliary");
 }
 
+/// 带缓存保活的猜下一句（真实 2.1.301 透传，`cap/auto-2.1.301-20261016-full/00056`）：客户端在上一条
+/// 主线程提示末尾多打一个标记，messages 里两个断点，`tengu_api_cache_breakpoints` 报
+/// `markerCount: 2` 并在其后带 `querySource`、`parentPromptEndMarked`（同目录 `00065` 的事件）。
+/// 不带保活 beta 的同一份体照旧是 1、不带这两项。
+#[test]
+fn keepalive_suggestion_reports_the_parent_prompt_marker() {
+    for keepalive in [true, false] {
+        let t = Telemetry::default();
+        let mut main = call(cc_body(true), "req_main", "end_turn");
+        main.started_at = frozen_now() - Duration::from_secs(20);
+        t.ingest(main);
+        let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        let mark = json!({"type": "ephemeral", "ttl": "1h"});
+        body["messages"][0] =
+            json!({"role":"user","content":[{"type":"text","text":"first","cache_control":mark}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"text","text":"[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nFIRST: ...","cache_control":mark}]});
+        body["system"][0]["text"] = json!(
+            "x-anthropic-billing-header: cc_version=2.1.260.222; cc_entrypoint=cli; cch=b6499; cc_prev_req=req_main;"
+        );
+        let mut sugg = call(body.to_string().into_bytes(), "req_sugg", "end_turn");
+        sugg.started_at = frozen_now() - Duration::from_secs(5);
+        // 2.1.291 起这条事件按 1% 抽（`sample_event`），测试用更早的版本号让它每次都发；这一支只看
+        // 请求类别、保活 beta 与体里的标记数，不看版本。
+        sugg.ua_out = "claude-cli/2.1.260 (external, cli)".into();
+        sugg.agent.request_class = Some("auxiliary".into());
+        let betas = sugg.betas.clone().unwrap();
+        sugg.betas = Some(if keepalive {
+            format!("{betas},{}", config::CC_BETA_CACHE_KEEPALIVE)
+        } else {
+            betas
+        });
+        t.ingest(sugg);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let bp = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_cache_breakpoints")
+            .map(|(_, e)| meta_of(e))
+            .next_back()
+            .unwrap();
+        assert_eq!(bp["skipCacheWrite"], true);
+        assert_eq!(bp["forkPointPinned"], false);
+        let keys: Vec<&str> = bp.as_object().unwrap().keys().map(String::as_str).collect();
+        if keepalive {
+            assert_eq!(bp["markerCount"], 2, "{bp}");
+            assert_eq!(bp["querySource"], "prompt_suggestion");
+            assert_eq!(bp["parentPromptEndMarked"], true);
+            let at = keys.iter().position(|k| *k == "markerCount").unwrap();
+            assert_eq!(&keys[at + 1..at + 3], ["querySource", "parentPromptEndMarked"], "{bp}");
+        } else {
+            assert_eq!(bp["markerCount"], 1, "{bp}");
+            assert!(bp.get("querySource").is_none() && bp.get("parentPromptEndMarked").is_none());
+        }
+    }
+}
+
+/// 同上，回放真实抓包：`cap/auto-2.1.301-20261016-full` 的主线程 `00055` 与紧随其后的猜下一句
+/// `00056`（auxiliary、带保活 beta、messages 两个断点），后者报 `markerCount: 2`。版本号同样压到
+/// 2.1.291 以前，免得被抽样抽掉。
+#[test]
+fn keepalive_suggestion_capture_reports_two_markers() {
+    let t = Telemetry::default();
+    let mut session = String::new();
+    for (i, f) in ["00055_", "00056_"].into_iter().enumerate() {
+        let rel = format!("auto-2.1.301-20261016-full/{f}");
+        let Some((body, betas)) = cap_request(&rel) else {
+            eprintln!("skipped: cap/auto-2.1.301-20261016-full not present");
+            return;
+        };
+        session = parse_shape(&body).unwrap().session_id.unwrap();
+        let mut c = call(body, &format!("req_{f}"), "end_turn");
+        c.betas = betas;
+        c.ua_out = "claude-cli/2.1.260 (external, cli)".into();
+        c.agent.request_class = cap_header(&rel, "x-claude-code-request-class");
+        c.started_at = frozen_now() - Duration::from_secs(60 - 30 * i as u64);
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let p = st.pending.get(&(7, session)).unwrap();
+    let bp: Vec<Value> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_api_cache_breakpoints")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    let first = bp.first().unwrap();
+    assert_eq!(first["markerCount"], 1, "主线程: {first}");
+    assert!(first.get("querySource").is_none());
+    let sugg = bp.last().unwrap();
+    assert_eq!(sugg["skipCacheWrite"], true, "{sugg}");
+    assert_eq!(sugg["markerCount"], 2, "{sugg}");
+    assert_eq!(sugg["querySource"], "prompt_suggestion");
+    assert_eq!(sugg["parentPromptEndMarked"], true);
+}
+
 /// 会话标题生成：无链、default 权限、无缓存、边界缺失、成功后一条 title_generated。
 #[test]
 fn session_title_generation_is_a_chainless_side_query() {

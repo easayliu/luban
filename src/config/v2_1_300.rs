@@ -1,9 +1,9 @@
-//! 2.1.300 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.300 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.300 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.300 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.300 的 profile 表：2.1.300 来访的 beta 参照（[`cc_profile_at`]）。2.1.301 的表（[`CC_PROFILES`]）
+/// 逐行同这张，只换版本号。
 ///
 /// **各行除版本号外与 2.1.299（[`CC_PROFILES_2_1_299`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.300-20261015-full`（场景同 2.1.299-full）：全部 `/v1/messages` 的
@@ -16,7 +16,7 @@ use super::*;
 ///
 /// 这一版改的在别处：system 第三块 `<pasted_content>` 那条加了一句、第四块末尾多一段 Artifact `edits`
 /// 的说明，`Artifact` 工具多了 `edits` 参数，`Bash` 说明多一句，遥测几条事件多了键。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_300: &[CcProfile] = &[
     at_300(CC_PROFILES_2_1_299[0]),
     at_300(CC_PROFILES_2_1_299[1]),
     at_300(CC_PROFILES_2_1_299[2]),

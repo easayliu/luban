@@ -150,6 +150,12 @@ fn profile_is_main_thread(kind: config::CcProfileKind) -> bool {
 /// （`cap/auto-2.1.300-20261015-full` 89 条 `active` 的主线程回复全是 `ephemeral_5m`，体里写的仍是
 /// `ttl:"1h"`；没开的 6 条是 1h），寿命全靠客户端每 30 秒一发 touch 续。luban 不替模拟会话发 touch，
 /// 带了它就是把模拟会话的缓存从 1 小时缩成 5 分钟。等决定由 luban 自己续命时再打开。
+///
+/// 打开时不止 beta 一项：官方带保活的 `auxiliary` 请求（猜下一句等）在上一条主线程提示末尾多一个
+/// `cache_control`（`tengu_mellow_beacon` 开时，`cap/auto-2.1.300-20261015-full` 42 条、
+/// `cap/auto-2.1.301-20261016-full` 40 条都是两个），遥测 `tengu_api_cache_breakpoints` 随之报
+/// `markerCount: 2` 并带 `querySource`、`parentPromptEndMarked`（见 `telemetry/events/request.rs`）。
+/// 这几处要和 touch 一起补齐。
 const SIM_CACHE_KEEPALIVE: bool = false;
 
 /// 号的缓存保活开着（[`crate::proxy::cache_keepalive::account_enabled`]，服务端开关

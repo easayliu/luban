@@ -268,19 +268,37 @@ impl EventBuilder<'_> {
         );
         // 2.1.258 那版 5 条以上消息会钉住分叉点（markerCount 2），2.1.260 起恒为 1；
         // 猜下一句那条不写缓存。
+        //
+        // 2.1.300 起还有一支报 2：`auxiliary` 请求带着缓存保活 beta、历史里有保活中的主线程回复、
+        // 开关 `tengu_mellow_beacon` 开时，客户端在上一条主线程提示末尾多打一个标记（请求体里
+        // messages 两个 `cache_control`），事件随之多 `querySource`、`parentPromptEndMarked`
+        // （`cap/auto-2.1.301-20261016-full/00065` 两条 `prompt_suggestion`；300 / 301 的 JS 同一份）。
+        // 模拟路径不带保活 beta（`SIM_CACHE_KEEPALIVE`），出站也只有一个标记，落在不报这两项、
+        // 恒为 1 的那一支；真实客户端透传的那种照体里的标记报。开关没开时客户端仍报
+        // `querySource`、标记只有一个——体上与没走这一支的分不出来，不报。
         let pinned = !modern && shape.messages_len > 2;
+        let parent_marked = env.call.agent.request_class.as_deref() == Some("auxiliary")
+            && betas_full.split(',').any(|b| b.trim() == config::CC_BETA_CACHE_KEEPALIVE)
+            && shape.message_markers >= 2;
         // 2.1.285 的离开回顾钉住分叉点，断点仍是一个（`cap/2.1.285/00099`、`00160` 都是
         // `forkPointPinned: true, markerCount: 1`；2.1.280 的 `00048`、`00088` 是 false）。
         let fork_pinned = v285 && kind == Kind::AwaySummary;
-        let breakpoints = json!({
+        let mut breakpoints = json!({
             "totalMessageCount": shape.messages_len,
             "cachingEnabled": shape.has_cache_control,
             // fork 出来的查询不写缓存：猜下一句、子代理摘要与离开回顾都是 true（`cap/2.1.280`、
             // `cap/2.1.285`）。
             "skipCacheWrite": kind.is_fork(),
             "forkPointPinned": pinned || fork_pinned,
-            "markerCount": if pinned { 2 } else { 1 }
+            "markerCount": if parent_marked { shape.message_markers } else if pinned { 2 } else { 1 }
         });
+        if parent_marked {
+            insert_after(
+                &mut breakpoints,
+                "markerCount",
+                vec![("querySource", json!(query_source)), ("parentPromptEndMarked", json!(true))],
+            );
+        }
         // 发请求前的顺序照 `cap/2.1.280/00036`：边界、首块、边界，然后 tether 判定与回声审计，
         // 再是缓存断点和 api_query。
         if kind.has_boundary_marker() && shape.system_blocks >= 2 {

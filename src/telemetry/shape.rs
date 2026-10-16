@@ -187,6 +187,9 @@ pub(super) struct RequestShape {
     /// 是否全是 `system` 角色。`messages` 里一个断点都没有时全为零。`tengu_api_success` 的
     /// `uncoveredTail*` 那组按它报，见那里。
     pub(super) tail_messages: usize,
+    /// `messages` 里带断点（任一内容块有 `cache_control`）的条数。官方带缓存保活的 `auxiliary`
+    /// 请求会在上一条主线程提示末尾多打一个，这时是 2，见 `tengu_api_cache_breakpoints`。
+    pub(super) message_markers: usize,
     pub(super) tail_tokens_est: u64,
     pub(super) tail_all_system: bool,
     /// `system[1..]` 与整个 `tools` 数组各自的紧凑 JSON 长度（UTF-16 计）之和：续用线程时
@@ -815,6 +818,7 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
                 .and_then(|c| c.as_array())
                 .is_some_and(|b| b.iter().any(|x| x.get("cache_control").is_some()))
         };
+        shape.message_markers = msgs.iter().filter(|m| has_breakpoint(m)).count();
         if let Some(bp) = msgs.iter().rposition(has_breakpoint) {
             let tail = &msgs[bp + 1..];
             shape.tail_messages = tail.len();

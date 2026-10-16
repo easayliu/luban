@@ -2300,8 +2300,9 @@ fn core_tool_stubs_are_profile_specific() {
     );
     // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）。
     assert_eq!(d(opus, "Bash").chars().count(), 3098);
-    // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）。
-    assert_eq!(d(opus, "Artifact").chars().count(), 36637);
+    // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）；
+    // 2.1.301 那句「Not allowed with …」去掉了 `root`（2.1.300 是 36637）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 36629);
     assert_eq!(d(haiku, "Bash").chars().count(), 11913);
 }
 
@@ -2423,6 +2424,50 @@ mod billing_only {
         assert!(v.get("metadata").is_none(), "模拟路径剥掉 user_id: {v}");
         let v = out(store::ForwardFlags { real_billing_keep_user_id: false, ..on_flags() });
         assert_eq!(v["metadata"]["user_id"], "client-uid-123", "真实客户端那项不管模拟路径");
+    }
+
+    /// 历史里的 `thinking` / `redacted_thinking` 块一个字节都不动：块本身原样出站，连原始转义
+    /// （`\/`、`\uXXXX`）也保持——上游按字节验签。模拟路径与真实客户端路径各走一遍。
+    #[test]
+    fn keeps_history_thinking_blocks_byte_for_byte() {
+        const THINKING: &str =
+            r#"{"type":"thinking","thinking":"caf\u00e9 \/ plan","signature":"AbC\/dEf+gH=="}"#;
+        const REDACTED: &str = r#"{"type":"redacted_thinking","data":"ZmFrZQ\/ZGF0YQ=="}"#;
+        let raw = format!(
+            concat!(
+                r#"{{"model":"claude-opus-5-5","max_tokens":64,"thinking":{{"type":"adaptive"}},"#,
+                r#""system":[{{"type":"text","text":"CLIENT-A 指令"}}],"#,
+                r#""messages":[{{"role":"user","content":"q"}},"#,
+                r#"{{"role":"assistant","content":[{THINKING},{REDACTED},{{"type":"text","text":"a"}}]}},"#,
+                r#"{{"role":"user","content":"next"}}]}}"#
+            ),
+            THINKING = THINKING,
+            REDACTED = REDACTED,
+        );
+        let raw = Bytes::from(raw);
+        let check = |bytes: Bytes, who: &str| {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains(THINKING), "{who}: thinking 块应原字节出站: {text}");
+            assert!(text.contains(REDACTED), "{who}: redacted_thinking 块应原字节出站: {text}");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let turns: Vec<&str> = v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "assistant")
+                .flat_map(|m| m["content"].as_array().unwrap())
+                .map(|b| b["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(turns, ["thinking", "redacted_thinking", "text"], "{who}: 块序不变");
+            assert_eq!(v["thinking"], serde_json::json!({"type": "adaptive"}), "{who}: 参数不动");
+        };
+        // 模拟路径（非 CC 来访）。
+        let sim = detect_for(&raw, on_flags()).unwrap();
+        assert!(sim.billing_only);
+        check(rewrite_body(&raw, &test_cred(), "fp", on_flags(), Some(&sim), None), "sim");
+        // 真实客户端路径：不模拟、开关同样生效（`flags.billing_only()`）。
+        assert!(on_flags().billing_only());
+        check(rewrite_body(&raw, &test_cred(), "fp", on_flags(), None, Some("sess")), "real");
     }
 
     /// cch 仍按出站字节重算：出站 `system[0]` 里的 cch 等于对（cch 归零后的）出站字节算的真值，
@@ -4259,7 +4304,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 300)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 301)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
