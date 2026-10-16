@@ -6,6 +6,9 @@
 //! - `system` 正文：OpenClaw 提示词「Assistant Output Directives」一节的两个原文片段
 //!   `[[reply_to_current]]` 与 `stripped before rendering` **同时**出现即 400（各自单独、或放进
 //!   用户消息都放行；去一个字符、改大小写都放行），haiku / sonnet 一致，7 发 7 中；
+//! - `system` 正文：pi（badlogic/pi-mono 编码代理）提示词里的 `docs/custom-provider.md` 与
+//!   `pi packages (docs/packages.md)` **同时**出现即 400（顺序无关、中间可夹其他文字；各自单独、
+//!   少一个字符、`Pi` 大写、放进用户消息都放行），haiku / sonnet 一致，线上 10-16 四种变体 100% 复现；
 //! - 工具名：以 `mcp_`（单下划线）开头的客户端工具名，单独一个就 400
 //!   （[`crate::proxy::is_mcp_underscore_name`]）。
 //!
@@ -20,8 +23,10 @@ not plan limits. Ask your workspace admin to add more and keep going.";
 
 /// `system` 正文里**同时**出现才触发的词组，每组一个标签（进日志与流水的 `rejected_locally:<标签>`）。
 /// 匹配区分大小写、逐字：实测大写、少一个方括号都不触发。
-const SYSTEM_SIGNATURES: &[(&str, &[&str])] =
-    &[("openclaw", &["[[reply_to_current]]", "stripped before rendering"])];
+const SYSTEM_SIGNATURES: &[(&str, &[&str])] = &[
+    ("openclaw", &["[[reply_to_current]]", "stripped before rendering"]),
+    ("pi", &["docs/custom-provider.md", "pi packages (docs/packages.md)"]),
+];
 
 /// 工具名命中 [`crate::proxy::is_mcp_underscore_name`] 时的标签。
 const MCP_UNDERSCORE_TOOL: &str = "mcp_-tool";
@@ -90,6 +95,32 @@ mod tests {
         });
         assert_eq!(known_third_party_signature(&in_user), None, "挪进用户消息就不算");
         assert_eq!(known_third_party_signature(&serde_json::json!({ "messages": [] })), None);
+    }
+
+    /// pi 那两个片段同时在 system 里才触发：顺序无关、可夹文字；拆开、改大小写、放进消息都不算。
+    #[test]
+    fn pi_pair_must_co_occur_in_system() {
+        for hit in [
+            "(docs/custom-provider.md pi packages (docs/packages.md)",
+            "pi packages (docs/packages.md) docs/custom-provider.md",
+            "See docs/custom-provider.md for providers. Also read pi packages (docs/packages.md) first.",
+        ] {
+            assert_eq!(known_third_party_signature(&body(hit.into(), &[])), Some("pi"), "{hit}");
+        }
+        for miss in [
+            "docs/custom-provider.md",
+            "pi packages (docs/packages.md)",
+            "custom-provider.md pi packages (docs/packages.md)",
+            "docs/custom-provider.md pi packages docs/packages.md",
+            "docs/custom-provider.md Pi packages (docs/packages.md)",
+        ] {
+            assert_eq!(known_third_party_signature(&body(miss.into(), &[])), None, "{miss}");
+        }
+        let in_user = serde_json::json!({
+            "system": "You are a concise assistant.",
+            "messages": [{ "role": "user", "content": "docs/custom-provider.md pi packages (docs/packages.md)" }],
+        });
+        assert_eq!(known_third_party_signature(&in_user), None, "挪进用户消息就不算");
     }
 
     /// `mcp_` 单下划线工具名单独就触发；官方 `mcp__` 命名空间与混淆后的假名不触发。
