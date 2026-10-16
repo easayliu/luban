@@ -223,8 +223,8 @@ export function ForwardingSettingsContent() {
         description={
           <>
                   {t(
-                    '上游放行须满足两项条件之一：请求 system 中带有身份句，或 system 首块中带有合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关使模拟请求仅满足后者——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 thread/diagnostics/output_config、不重排顶层键；metadata.user_id 由「模拟请求带 user_id」决定。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。本开关对真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：其自带的 billing 标识照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 由「真实客户端带 user_id」决定（代替「补齐设备身份」）；会话关联字段（cc_prompt_id、diagnostics 等）、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过；「工具名混淆」收窄为只处理以 mcp_（单下划线）开头的工具名（见该开关说明）。收益：第三方客户端借用订阅额度时可保留自身的提示词与行为，模型依据客户端的 system 正常作答，不会被赋予 Claude Code 的角色设定。权衡：官方客户端的辅助调用（自动模式分类器、记忆筛选、hook 提示等）正是此形态——system 首块为三段 billing 标识，其后为调用方自有的 system，不带身份句与 thread，记忆筛选还带多轮历史；billing 标识的字段、次序与版本后缀算法均与官方一致（2.1.296 逆向与抓包核对）。差别在于官方辅助调用不带工具，而第三方客户端带自己的工具，故形态近于官方而非逐项相同。实测（2026-10-10）：客户端 system 长达 12KB、system 多达 9 块，均照常计入订阅额度，未被判为第三方应用。建议按需启用。与完整模拟并存，默认停用，可随时回退。',
-                    'Upstream admits a request that meets either of two conditions: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch makes emulated requests meet only the second — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no thread/diagnostics/output_config, and no top-level key reordering; metadata.user_id is governed by “Send user_id on emulated requests”. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. The switch applies equally to real Claude Code clients (including the VSCode extension, agent-sdk and subagents): their own billing identifier is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; metadata.user_id is governed by “Send user_id on real clients” (in place of “Fill missing device identity”); session-chain fields (cc_prompt_id, diagnostics, etc.), system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped; tool-name obfuscation narrows to names beginning with mcp_ (single underscore), see that switch. Benefit: a third-party client using subscription quota keeps its own prompt and behavior, and the model answers according to the client’s system prompt without taking on the Claude Code persona. Trade-off: the official client’s helper calls (the auto-mode classifier, memory selection, hook prompts, etc.) use exactly this shape — a three-field billing identifier as the first system block followed by the caller’s own system, with no identity line and no thread, and memory selection also carries multi-turn history; the billing identifier’s fields, order and version-suffix algorithm all match the official client (checked against the 2.1.296 binary and captures). The difference is that official helper calls carry no tools while third-party clients bring their own, so the shape is close to the official one rather than identical. Tested on 2026-10-10: client system prompts up to 12KB and up to 9 system blocks were billed against plan limits as usual and were not classified as third-party apps. Enable it only as needed. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
+                    '上游放行须满足两项条件之一：请求 system 中带有身份句，或 system 首块中带有合法的 billing 标识（含 cc_version 与 cc_entrypoint，cch 可选）。本开关使模拟请求仅满足后者——在 system 首块注入一条最小 billing 标识（cc_version、cc_entrypoint、cch 三段；cch 跟随「模拟请求计算计费校验值」：启用时按出站请求体算真值，停用时填随机值），其余注入一律跳过：不补身份句、不补官方基座与第四块、不注官方工具、不写 thread/diagnostics/output_config、不重排顶层键；metadata.user_id 由「模拟请求带 user_id」决定。客户端自带的 system 块、工具与参数原样透传，客户端自带的 fallbacks 字符串仍归一为官方数组；换头（官方 UA 等）照常进行。本开关对真实 Claude Code 客户端（含 VSCode 扩展、agent-sdk、子代理）同样生效：其自带的 billing 标识照原样发送（cch 按「计费校验值」开关照旧重算），缺失时只补 billing 标识、不补身份句；metadata.user_id 由「真实客户端带 user_id」决定（代替「补齐设备身份」）；会话关联字段（cc_prompt_id、diagnostics 等）、system 分块与消息断点整形、thinking.display、eager_input_streaming、多余字段剥除一律跳过；「工具名混淆」照常生效，范围由其子开关「改写全部非官方工具名」决定。收益：第三方客户端借用订阅额度时可保留自身的提示词与行为，模型依据客户端的 system 正常作答，不会被赋予 Claude Code 的角色设定。权衡：官方客户端的辅助调用（自动模式分类器、记忆筛选、hook 提示等）正是此形态——system 首块为三段 billing 标识，其后为调用方自有的 system，不带身份句与 thread，记忆筛选还带多轮历史；billing 标识的字段、次序与版本后缀算法均与官方一致（2.1.296 逆向与抓包核对）。差别在于官方辅助调用不带工具，而第三方客户端带自己的工具，故形态近于官方而非逐项相同。实测（2026-10-10）：客户端 system 长达 12KB、system 多达 9 块，均照常计入订阅额度，未被判为第三方应用。建议按需启用。与完整模拟并存，默认停用，可随时回退。',
+                    'Upstream admits a request that meets either of two conditions: an identity line in the request system, or a valid billing identifier in the first system block (with cc_version and cc_entrypoint; cch optional). This switch makes emulated requests meet only the second — it injects a minimal billing identifier as the first system block (cc_version, cc_entrypoint and cch; cch follows “Compute billing checksum for emulated requests”: computed from the outgoing body when enabled, a random value when disabled) and skips every other injection: no identity line, no official base prompt or fourth block, no official tools, no thread/diagnostics/output_config, and no top-level key reordering; metadata.user_id is governed by “Send user_id on emulated requests”. The client’s own system blocks, tools and parameters pass through unchanged; a client-supplied fallbacks string is still normalized to the official array, and header rewriting (official UA, etc.) still applies. The switch applies equally to real Claude Code clients (including the VSCode extension, agent-sdk and subagents): their own billing identifier is sent as-is (cch is still recomputed per the billing checksum switch), and when it is missing only a billing identifier is added, without the identity line; metadata.user_id is governed by “Send user_id on real clients” (in place of “Fill missing device identity”); session-chain fields (cc_prompt_id, diagnostics, etc.), system block and message breakpoint shaping, thinking.display, eager_input_streaming and stripping extra fields are all skipped; tool-name obfuscation still applies, with its scope set by the sub-switch “Obfuscate all non-official tool names”. Benefit: a third-party client using subscription quota keeps its own prompt and behavior, and the model answers according to the client’s system prompt without taking on the Claude Code persona. Trade-off: the official client’s helper calls (the auto-mode classifier, memory selection, hook prompts, etc.) use exactly this shape — a three-field billing identifier as the first system block followed by the caller’s own system, with no identity line and no thread, and memory selection also carries multi-turn history; the billing identifier’s fields, order and version-suffix algorithm all match the official client (checked against the 2.1.296 binary and captures). The difference is that official helper calls carry no tools while third-party clients bring their own, so the shape is close to the official one rather than identical. Tested on 2026-10-10: client system prompts up to 12KB and up to 9 system blocks were billed against plan limits as usual and were not classified as third-party apps. Enable it only as needed. It coexists with full emulation, is disabled by default, and can be reverted at any time.',
                   )}
           </>
         }
@@ -439,8 +439,25 @@ export function ForwardingSettingsContent() {
           description={
             <>
               {t(
-                '工具名是上游判断第三方应用的一项已验证判据：命中后上游返回「Third-party apps now draw from your extra usage」，即使订阅用量充足也改扣超额用量。经测试，3 个业务工具名即足以触发，而以 `mcp__` 开头的名字会被豁免。启用后，luban 把这些名字替换成 `mcp__luban__*` 下的稳定别名再发出，并在响应中换回真名，客户端自始至终看到的都是自己的工具名。官方自带的工具、客户端本就以 MCP 命名的工具和服务端工具都保留原名，因此对真实的官方客户端没有任何影响。代价：响应内容需额外进行一次字符串替换；客户端在会话中途增删工具时，别名会整体重新计算，上游的提示词缓存随之失效一次。「仅补 billing 标识」启用时本项收窄：客户端工具原则上原样透传，只把以 mcp_（单下划线）开头的工具名改为 mcp__luban__ 加原名。实测（2026-10-16）这类名字单独即触发第三方判定，与描述文字、模型无关；改名后同一请求放行，别名直接拼原名，增删其他工具不影响它。',
-                'Tool names are one verified signal the upstream uses to classify third-party apps; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when plan usage remains. In testing, three business tool names were enough to trigger it, while names beginning with `mcp__` are exempt. When enabled, luban forwards affected names as stable aliases under `mcp__luban__*` and restores them in responses, so the client only sees its own names. Official tools, tools that already use MCP names, and server tools remain unchanged, making this a no-op for the genuine official client. Costs: one extra string replacement pass over responses, and adding or removing tools mid-session recomputes aliases and invalidates the upstream prompt cache once. With “billing identifier only” enabled this narrows: client tools pass through as is, and only names beginning with mcp_ (single underscore) are renamed to mcp__luban__ plus the original name. Tested 2026-10-16, such a name alone triggers the third-party classification regardless of description or model; renamed, the same request is accepted, and since the alias is the original name, adding or removing other tools does not affect it.',
+                '工具名是上游判断第三方应用的一项已验证判据：命中后上游返回「Third-party apps now draw from your extra usage」，即使订阅用量充足也改扣超额用量。经测试，3 个业务工具名即足以触发，而以 `mcp__` 开头的名字会被豁免。启用后，luban 把这些名字替换成 `mcp__luban__*` 下的稳定别名再发出，并在响应中换回真名，客户端自始至终看到的都是自己的工具名。官方自带的工具、客户端本就以 MCP 命名的工具和服务端工具都保留原名，因此对真实的官方客户端没有任何影响。代价：响应内容需额外进行一次字符串替换；客户端在会话中途增删工具时，别名会整体重新计算，上游的提示词缓存随之失效一次。「仅 billing 标识」模式下本项照常生效，范围由子开关「改写全部非官方工具名」决定。',
+                'Tool names are one verified signal the upstream uses to classify third-party apps; a match returns “Third-party apps now draw from your extra usage” and bills against extra usage even when plan usage remains. In testing, three business tool names were enough to trigger it, while names beginning with `mcp__` are exempt. When enabled, luban forwards affected names as stable aliases under `mcp__luban__*` and restores them in responses, so the client only sees its own names. Official tools, tools that already use MCP names, and server tools remain unchanged, making this a no-op for the genuine official client. Costs: one extra string replacement pass over responses, and adding or removing tools mid-session recomputes aliases and invalidates the upstream prompt cache once. In “billing identifier only” mode this switch still applies; its scope is set by the sub-switch “Obfuscate all non-official tool names”.',
+              )}
+            </>
+          }
+        />
+        <ForwardingToggle
+          k="sim_billing_mimic_all"
+          label={t('改写全部非官方工具名', 'Obfuscate all non-official tool names')}
+          summary={t(
+            '仅 billing 标识模式下，工具名混淆与完整对齐同一套规则；停用后只改以 mcp_ 开头的工具名。',
+            'In billing-identifier-only mode, tool name obfuscation follows the same rules as full alignment; when disabled only names beginning with mcp_ are renamed.',
+          )}
+          requires={{ key: 'tool_name_mimic', label: t('工具名混淆', 'Tool name obfuscation') }}
+          description={
+            <>
+              {t(
+                '只在「仅 billing 标识」模式下有意义。启用（默认）：与完整对齐同一套规则——不在官方工具名集合内、也不以 mcp__ 开头的客户端工具一律改为 mcp__luban__ 下的稳定别名，响应中换回真名。实测（2026-10-16）：同一天另外几款第三方产品的工具名集合，在描述与 system 全为中性文字的情况下，7 组中有 4 组仅凭名字即被判为第三方应用，判据不止一条。停用：只把以 mcp_（单下划线）开头的工具名改为 mcp__luban__ 加原名，其余客户端工具原样透传。这类名字单独即触发第三方判定，与描述文字、模型无关；别名直接拼原名，增删其他工具不影响它，改动最小，但其他产品的名字判据不在覆盖之内。',
+                'Only meaningful in “billing identifier only” mode. Enabled (default): the same rules as full alignment: every client tool whose name is neither an official tool name nor prefixed with mcp__ is forwarded as a stable alias under mcp__luban__ and restored in responses. Tested 2026-10-16: with neutral descriptions and a neutral system prompt, 4 of 7 tool-name sets from other third-party products seen the same day were classified as third-party apps by their names alone, so there is more than one rule. Disabled: only names beginning with mcp_ (single underscore) are renamed to mcp__luban__ plus the original name, and other client tools pass through unchanged. Such a name alone triggers the classification regardless of description or model; the alias is the original name, so adding or removing other tools does not affect it. This is the smallest change, but the name rules of other products are not covered.',
               )}
             </>
           }
@@ -1677,7 +1694,6 @@ function ModeOption({
 const BILLING_ONLY_SKIPPED: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>([
   'fill_metadata',
   'strip_extra_fields',
-  'tool_name_mimic',
   'eager_tool_streaming',
   'system_shape',
   'cache_scope_global',
@@ -1691,14 +1707,11 @@ const BILLING_ONLY_SKIPPED: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>(
   'opus_refusal_fallback',
 ])
 
-function billingOnlyHides(data: Settings | undefined, k: ForwardingKey) {
-  return BILLING_ONLY_SKIPPED.has(k) && billingOnlyActive(data)
-}
-
-/** 只在「仅 billing 标识」实际生效时才显示的开关（改写模式卡里的两项 `user_id` 子开关）。 */
+/** 只在「仅 billing 标识」实际生效时才显示的开关（改写模式卡里的两项 `user_id` 子开关，以及工具名混淆的范围子开关）。 */
 const BILLING_ONLY_EXCLUSIVE: ReadonlySet<ForwardingKey> = new Set<ForwardingKey>([
   'sim_billing_keep_user_id',
   'real_billing_keep_user_id',
+  'sim_billing_mimic_all',
 ])
 
 /** 当前改写模式下页面不显示这一项：「已改动」计数与「全部恢复默认」都跳过它。 */
@@ -1762,8 +1775,9 @@ function ForwardingToggle({
   const blocked = blockedBy != null || blockedByAny != null
   // 缺省值按后端默认：反向依赖的那几项（如拒绝探针请求）默认启用。
   const overridden = !blocked && inactiveWhileOn != null && data?.[inactiveWhileOn.key] !== false
-  // 「仅 billing 标识」生效时这一项后端整个跳过：拨了也没用，直接不显示（见下面的 return null）。
-  const skipped = billingOnlyHides(data, k)
+  // 当前改写模式下后端不读这一项（「仅 billing 标识」生效时整个跳过的那批，或只在该模式下才有意义的
+  // 子开关）：拨了也没用，直接不显示（见下面的 return null），与「已改动」计数、「全部恢复默认」同一判据。
+  const skipped = hiddenInCurrentMode(data, k)
   const inactive = blocked || overridden
   const changed = isChanged(data, k)
 

@@ -153,6 +153,15 @@ pub struct ForwardFlags {
     /// - **关**：整个剥掉。官方本就有不带 `user_id` 的形态（Claude Desktop 不带，Claude Code 也能用
     ///   环境变量关掉）。
     pub real_billing_keep_user_id: bool,
+    /// billing-only 下「工具名混淆」（[`Self::tool_name_mimic`]）的范围（[`Self::sim_billing_only`] 的子项，
+    /// 混淆关着时无意义）。
+    ///
+    /// - **开**（默认）：与完整模拟同一套白名单规则——不在官方 CC 工具名集合内、也不以 `mcp__` 开头的
+    ///   custom tool 一律改成 `mcp__luban__*` 假名，回程还原。2026-10-16 线上同日另外几款产品的工具名
+    ///   集合只凭名字（描述、system 全中性）在 billing-only 下就 400，7 组里中 4 组，判据不止 `mcp_` 一条。
+    /// - **关**：只改 `mcp_`（单下划线）开头的那一类（`proxy::build_billing_only_tool_name_map`），别名
+    ///   `mcp__luban__<原名>`，其余客户端工具原样透传——改动最小，但别的产品的名字判据不管。
+    pub sim_billing_mimic_all: bool,
     /// 模拟路径的主线程按官方的 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项；
     /// 2.1.285 的 fable-5-1 除外——官方那一版不发，2.1.291 起发）。
     ///
@@ -252,11 +261,11 @@ pub struct ForwardFlags {
     /// 代价：回程每个 chunk 要做 N 次字节替换（N = 被混淆的工具数），且客户端增删工具会让
     /// 整套假名重算、上游 prompt cache 失效一次。关掉即完全退回原样转发。
     ///
-    /// **billing-only 下收窄**（[`Self::billing_only`] 生效时）：客户端工具原则上原样透传，白名单
-    /// 混淆不做；只把 `mcp_`（单下划线）开头的名字改成 `mcp__luban__<原名>`——这一类名字单独就会
+    /// **billing-only 下的范围由 [`Self::sim_billing_mimic_all`] 决定**：开（默认）就是上面这套白名单
+    /// 混淆；关则只把 `mcp_`（单下划线）开头的名字改成 `mcp__luban__<原名>`——这一类名字单独就会
     /// 让上游回第三方 400，2026-10-16 本地对拍与线上 30 天流水都对得上，见
     /// [`crate::proxy::is_mcp_underscore_name`] 与 `proxy::build_billing_only_tool_name_map`。
-    /// 假名直接拼原名，客户端增删别的工具不影响它。关掉则 billing-only 下也原样出站。
+    /// 窄映射的假名直接拼原名，客户端增删别的工具不影响它。本开关关掉则 billing-only 下也原样出站。
     pub tool_name_mimic: bool,
     /// 模拟路径下是否注入 `thinking`（及配套的 `context_management`）。
     ///
@@ -401,7 +410,7 @@ impl ForwardFlags {
     /// [`Self::sim_billing_only`] 实际生效：它挂在「模拟 Claude Code」下（后者又要 `merge_beta`），
     /// 父开关关着就不生效。生效时**所有来访**——模拟的第三方与不走模拟的真实 CC 客户端——都只
     /// 保证 `system[0]` 有合法 billing header，其余请求体原样透传（唯一例外：[`Self::tool_name_mimic`]
-    /// 开着时 `mcp_` 开头的客户端工具名改进官方 MCP 命名空间，见那条的说明）。
+    /// 开着时客户端工具名照 [`Self::sim_billing_mimic_all`] 的范围改进官方 MCP 命名空间）。
     pub fn billing_only(self) -> bool {
         self.sim_billing_only && self.simulate_cc && self.merge_beta
     }
@@ -429,6 +438,7 @@ impl Default for ForwardFlags {
             sim_billing_only: false,
             sim_billing_keep_user_id: true,
             real_billing_keep_user_id: true,
+            sim_billing_mimic_all: true,
             sim_message_threads: true,
             fill_metadata: true,
             rate_limit_retry: true,

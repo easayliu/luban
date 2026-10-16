@@ -64,14 +64,14 @@ impl Prepared {
             && !cc_kind.keeps_nonstream()
             && body_json.as_ref().is_some_and(|v| !stream_requested(v));
         // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
-        // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 只改一类名字**：客户端工具原则上
-        // 原样透传，但 `mcp_`（单下划线）开头的名字单独就会被上游判成第三方（实测见
-        // [`crate::proxy::is_mcp_underscore_name`]），这类改进 `mcp__luban__<原名>`，其余不动——窄映射见
-        // [`build_billing_only_tool_name_map`]。没有命中就不建映射，请求侧与所有回程/重试（它们都
+        // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 的范围看 `sim_billing_mimic_all`**：开（默认）
+        // 与完整模拟同一套白名单混淆；关则只改 `mcp_`（单下划线）开头的名字——这类名字单独就会被上游判成
+        // 第三方（实测见 [`crate::proxy::is_mcp_underscore_name`]），改进 `mcp__luban__<原名>`，其余不动，
+        // 窄映射见 [`build_billing_only_tool_name_map`]。没有命中就不建映射，请求侧与所有回程/重试（它们都
         // 读这一份）因此一致为空。对所有来访生效，见 [`store::ForwardFlags::billing_only`]。
         let tool_names = (billable && flags.tool_name_mimic)
             .then(|| {
-                if flags.billing_only() {
+                if flags.billing_only() && !flags.sim_billing_mimic_all {
                     build_billing_only_tool_name_map(body_json.as_ref())
                 } else {
                     build_tool_name_map(body_json.as_ref())

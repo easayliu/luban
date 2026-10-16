@@ -387,6 +387,7 @@ fn all_flags_off_only_injects_auth() {
         sim_billing_only: false,
         sim_billing_keep_user_id: false,
         real_billing_keep_user_id: false,
+        sim_billing_mimic_all: false,
         sim_message_threads: false,
         fill_metadata: false,
         rate_limit_retry: false,

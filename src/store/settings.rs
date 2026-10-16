@@ -182,6 +182,10 @@ pub const SIM_BILLING_KEEP_USER_ID: &str = "sim_billing_keep_user_id";
 /// 缺省视为开启，见 [`ForwardFlags::real_billing_keep_user_id`]。
 pub const REAL_BILLING_KEEP_USER_ID: &str = "real_billing_keep_user_id";
 
+/// billing-only 下工具名混淆是否按完整白名单改全部非官方名（关掉只改 `mcp_` 开头那一类）的 settings 键名。
+/// 缺省视为开启，见 [`ForwardFlags::sim_billing_mimic_all`]。
+pub const SIM_BILLING_MIMIC_ALL: &str = "sim_billing_mimic_all";
+
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。
 pub const SIM_MESSAGE_THREADS: &str = "sim_message_threads";
@@ -733,6 +737,9 @@ impl CredentialStore {
         if let Some(v) = on(REAL_BILLING_KEEP_USER_ID) {
             flags.real_billing_keep_user_id = v;
         }
+        if let Some(v) = on(SIM_BILLING_MIMIC_ALL) {
+            flags.sim_billing_mimic_all = v;
+        }
         if let Some(v) = on(SIM_MESSAGE_THREADS) {
             flags.sim_message_threads = v;
         }
@@ -1098,6 +1105,7 @@ mod tests {
             (SIM_BILLING_ONLY, "0"),
             (SIM_BILLING_KEEP_USER_ID, "0"),
             (REAL_BILLING_KEEP_USER_ID, "0"),
+            (SIM_BILLING_MIMIC_ALL, "0"),
             (SIM_MESSAGE_THREADS, "0"),
             (FILL_METADATA, "0"),
             (RATE_LIMIT_RETRY, "0"),
@@ -1147,6 +1155,7 @@ mod tests {
                 sim_billing_only: false,
                 sim_billing_keep_user_id: false,
                 real_billing_keep_user_id: false,
+                sim_billing_mimic_all: false,
                 sim_message_threads: false,
                 fill_metadata: false,
                 rate_limit_retry: false,

@@ -123,6 +123,8 @@ struct ForwardingResp {
     sim_billing_keep_user_id: bool,
     /// billing-only 下保留真实客户端自带的 `metadata.user_id`；关掉即剥离。
     real_billing_keep_user_id: bool,
+    /// billing-only 下工具名混淆按完整白名单改全部非官方名；关掉只改 `mcp_` 开头那一类。
+    sim_billing_mimic_all: bool,
     /// 模拟路径的主线程按官方 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项）。
     sim_message_threads: bool,
     /// 已是 CC 形态但不带 `metadata.user_id` 的请求，补一份官方形态的身份。
@@ -192,6 +194,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             sim_billing_only: f.sim_billing_only,
             sim_billing_keep_user_id: f.sim_billing_keep_user_id,
             real_billing_keep_user_id: f.real_billing_keep_user_id,
+            sim_billing_mimic_all: f.sim_billing_mimic_all,
             sim_message_threads: f.sim_message_threads,
             fill_metadata: f.fill_metadata,
             rate_limit_retry: f.rate_limit_retry,
