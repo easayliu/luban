@@ -356,6 +356,10 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('本地拒绝，未转发', 'Rejected locally, not forwarded')
     case 'rejected_locally:refresh-failed':
       return t('账号 token 刷新失败，未转发', 'Account token refresh failed, not forwarded')
+    case 'rejected_locally:third-party':
+      return t('命中已知第三方特征，本地返回 400，未转发', 'Known third-party signature, rejected locally with a 400, not forwarded')
+    case 'rejected_locally:enabled-thinking':
+      return t('该模型不接受 enabled thinking，本地返回 400，未转发', 'Model does not accept enabled thinking, rejected locally with a 400, not forwarded')
     case 'refusal_replay':
       return t('本地回放已学到的上游拒答，未转发', 'Replayed a learned upstream refusal locally, not forwarded')
     case 'app_refusal_replay':

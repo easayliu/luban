@@ -791,6 +791,28 @@ fn shape_gates(
         return Err(error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message));
     }
 
+    // 2.3'') 新一代模型（5 系、opus-4-7 起）配客户端自己写的 `thinking.type:"enabled"` → 本地回
+    //        API Key 直连那条 400（[`ENABLED_THINKING_REJECT_MESSAGE`]）。订阅通道对这个组合静默放行
+    //        （当成 adaptive，预算与 display 都忽略），上游永远不会回这条 400，学习机制学不到，
+    //        只能写死；判据见 [`client_enabled_thinking_rejection`]。官方 CC 只在 haiku-4-5 上发
+    //        `enabled`，真实客户端不会命中。只判计费路径，`reject_enabled_thinking` 拨。
+    if billable
+        && flags.reject_enabled_thinking
+        && client_enabled_thinking_rejection(body_json.as_ref(), req_model.as_deref())
+    {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), cc_shaped,
+            "rejected locally: this model only accepts adaptive thinking on the API-key channel; the subscription channel would silently accept it"
+        );
+        *log_state.local_reject.lock() = Some("enabled-thinking");
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            ENABLED_THINKING_REJECT_MESSAGE,
+        ));
+    }
+
     // 2.3a) OpenAI 格式转换残留 → 本地直接拒，不修补，见 [`find_openai_marker`]。
     //       全部由 `reject_openai_shape` 拨：开着一律拒，关着原样送上去，由上游回官方的 400。
     //       模拟路径不受影响：它只接管**本来就是 Anthropic 形态**的非 CC 请求。

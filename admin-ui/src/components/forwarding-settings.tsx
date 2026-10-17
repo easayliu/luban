@@ -869,6 +869,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="reject_enabled_thinking"
+          label={t('拒绝新模型的 enabled thinking', 'Reject enabled thinking on newer models')}
+          summary={t(
+            '5 系与 opus-4-7 起的模型收到客户端自行写入的 thinking.type:"enabled" 时，于本地返回 API Key 直连的同一条 400。',
+            'When a client sends thinking.type:"enabled" to a Claude 5 or opus-4-7+ model, return locally the same 400 an API-key connection would.',
+          )}
+          description={
+            <>
+              {t(
+                '2026-10-17 实测：API Key 直连下 opus-5-5、sonnet-5-5、haiku-5-5、opus-5、sonnet-5、fable-5-1、opus-4-8、opus-4-7 对 thinking.type:"enabled" 一律返回 400「"thinking.type.enabled" is not supported for this model」，与 budget_tokens 的取值无关；4-6 及更早各代照常接受。而订阅通道对同一请求静默放行，按 adaptive 处理，budget_tokens 与 display 均被忽略，思考正文为空。渠道测试工具正是以这一差异识别中转：上游永远不会返回这条 400，无法从响应中学到，只能写死。判定看客户端发来的原始请求：type 为 enabled 且模型属于上述集合即命中，adaptive、disabled 与未写 thinking 的请求不受影响，模型代号无法识别时放行。上游排在这条之前的校验不在此列：budget_tokens 缺失或不足 1024、display 取值非法、与 thinking 冲突的 temperature、top_k、top_p，两条通道都会返回同样的 400，照常发往上游，由上游返回各自那句原文，以保证客户端看到的文案与直连一致。官方 Claude Code 只对 haiku-4-5 发送 enabled（2.1.258 至 2.1.301 五版抓包一致），真实客户端不会命中。启用（默认）：命中即在本地返回与 API Key 直连逐字相同的 400，请求明细标注 rejected_locally:enabled-thinking。停用：照常发往上游，由订阅通道放行，客户端得到的是 adaptive 的结果。完整对齐与「仅 billing 标识」两种模式下均生效。',
+                'Measured on 2026-10-17: over an API-key connection, opus-5-5, sonnet-5-5, haiku-5-5, opus-5, sonnet-5, fable-5-1, opus-4-8 and opus-4-7 all answer thinking.type:"enabled" with a 400 “"thinking.type.enabled" is not supported for this model”, whatever the budget_tokens; 4-6 and earlier accept it. The subscription channel silently accepts the same request, treating it as adaptive and ignoring budget_tokens and display, with empty thinking text. Relay-detection tools use exactly this difference: the upstream never returns this 400 to luban, so it cannot be learned from responses and has to be hard-coded. The check looks at the request as the client sent it: type enabled on one of those models is a hit; adaptive, disabled and requests without thinking are untouched, and unrecognisable model names pass through. Checks the upstream runs before this one are left to it: a missing budget_tokens or one below 1024, an invalid display value, and temperature, top_k or top_p conflicting with thinking all get the same 400 on both channels, so those requests are forwarded and the upstream returns its own wording, keeping the client-visible message identical to a direct connection. The official Claude Code only sends enabled for haiku-4-5 (consistent across five captured versions, 2.1.258 to 2.1.301), so real clients never hit it. On (default): a hit returns locally the same 400 an API-key connection would, byte for byte, and the request detail is tagged rejected_locally:enabled-thinking. Off: forwarded as is, the subscription channel accepts it and the client gets an adaptive result. Applies in both full-alignment and billing-only modes.',
+              )}
+            </>
+          }
+        />
       </ForwardingGroup>
 
       <ForwardingFilterItem

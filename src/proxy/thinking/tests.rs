@@ -648,3 +648,145 @@ fn preserve_thinking_handles_redacted() {
 }
 
 // ---------- 空 thinking 块剥除 ----------
+
+/// API Key 直连下只收 adaptive 的模型集合（2026-10-17 实测）：5 系全部与 opus 4-7 / 4-8 拒 `enabled`，
+/// 4-6 及更早各代照收；带日期全名与别名同判；认不出代号的按「收」处理。
+#[test]
+fn adaptive_only_models_match_the_api_key_probe() {
+    use crate::proxy::thinking::adaptive_only_model;
+    for m in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5-1",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-7-20260301",
+        "claude-opus-5[1m]",
+        "claude-sonnet-5[1m]",
+        "claude-opus-5-5[1m]",
+        "claude-opus-4-7[1m]",
+        "claude-opus-4-8[1m]",
+    ] {
+        assert!(adaptive_only_model(m), "{m} 应只收 adaptive");
+    }
+    for m in [
+        "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-5",
+        "claude-opus-4-5",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-7",
+        "claude-opus-4-6[1m]",
+        "claude-haiku-4-5[1m]",
+        "claude-opus-4-1",
+        "claude-3-5-sonnet-20241022",
+        "gpt-4o",
+        "",
+    ] {
+        assert!(!adaptive_only_model(m), "{m} 应照收 enabled（或拿不准放行）");
+    }
+}
+
+/// 只有「客户端自己写了 `enabled`」且「模型只收 adaptive」两者同时成立才拦；adaptive / disabled /
+/// 没写 thinking、或模型是 haiku-4-5 都放行。
+#[test]
+fn client_enabled_thinking_rejection_needs_both_conditions() {
+    use crate::proxy::thinking::client_enabled_thinking_rejection as hit;
+    let enabled = serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 1024}});
+    let adaptive = serde_json::json!({"thinking": {"type": "adaptive"}});
+    let disabled = serde_json::json!({"thinking": {"type": "disabled"}});
+    let none = serde_json::json!({"max_tokens": 1024});
+    assert!(hit(Some(&enabled), Some("claude-opus-5-5")));
+    assert!(hit(Some(&enabled), Some("claude-haiku-5-5")));
+    assert!(!hit(Some(&enabled), Some("claude-haiku-4-5")), "haiku-4-5 照收 enabled");
+    assert!(!hit(Some(&adaptive), Some("claude-opus-5-5")));
+    assert!(!hit(Some(&disabled), Some("claude-opus-5-5")), "disabled 那条 400 由上游回");
+    assert!(!hit(Some(&none), Some("claude-opus-5-5")));
+    assert!(!hit(Some(&enabled), None));
+    assert!(!hit(None, Some("claude-opus-5-5")));
+}
+
+/// 上游排在「模型不收 enabled」之前的校验让给上游（API Key 直连 2026-10-17 实测顺序）：预算缺 /
+/// 非整数 / 不足 1024、display 非法、temperature / top_k / top_p 冲突都不在本地拦；`max_tokens`
+/// 超上限排在之后，照拦。
+#[test]
+fn client_enabled_thinking_rejection_yields_to_earlier_upstream_checks() {
+    use crate::proxy::thinking::client_enabled_thinking_rejection as hit;
+    let m = Some("claude-opus-5-5");
+    let j = |v: serde_json::Value| v;
+    for (why, body) in [
+        ("缺 budget", j(serde_json::json!({"thinking": {"type": "enabled"}}))),
+        (
+            "budget 非整数",
+            j(serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": "x"}})),
+        ),
+        (
+            "budget 不足 1024",
+            j(serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 100}})),
+        ),
+        (
+            "display 非法",
+            j(
+                serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 1024, "display": "bogus"}}),
+            ),
+        ),
+        (
+            "temperature 0.5",
+            j(
+                serde_json::json!({"temperature": 0.5, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+        (
+            "top_k",
+            j(
+                serde_json::json!({"top_k": 5, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+        (
+            "top_p 0.5",
+            j(
+                serde_json::json!({"top_p": 0.5, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+    ] {
+        assert!(!hit(Some(&body), m), "{why}：让上游回它自己那句");
+    }
+    for (why, body) in [
+        (
+            "温度恰为 1",
+            j(
+                serde_json::json!({"temperature": 1, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+        (
+            "top_p 0.95",
+            j(
+                serde_json::json!({"top_p": 0.95, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+        (
+            "display summarized",
+            j(
+                serde_json::json!({"thinking": {"type": "enabled", "budget_tokens": 1024, "display": "summarized"}}),
+            ),
+        ),
+        (
+            "预算大于 max_tokens",
+            j(
+                serde_json::json!({"max_tokens": 2048, "thinking": {"type": "enabled", "budget_tokens": 4096}}),
+            ),
+        ),
+        (
+            "max_tokens 超上限",
+            j(
+                serde_json::json!({"max_tokens": 999999, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            ),
+        ),
+    ] {
+        assert!(hit(Some(&body), m), "{why}：上游会放行，本地拦");
+    }
+}

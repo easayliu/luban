@@ -129,6 +129,8 @@ struct ForwardingResp {
     relocate_client_system: bool,
     /// 出站体带已知第三方特征时本地拒绝、不出门。
     reject_known_third_party: bool,
+    /// 新一代模型配客户端 `thinking.type:"enabled"` 时本地回 API Key 直连那条 400。
+    reject_enabled_thinking: bool,
     /// billing-only 下也挪客户端 system；默认关。
     sim_billing_relocate: bool,
     /// 模拟路径的主线程按官方 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项）。
@@ -203,6 +205,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             sim_billing_mimic_all: f.sim_billing_mimic_all,
             relocate_client_system: f.relocate_client_system,
             reject_known_third_party: f.reject_known_third_party,
+            reject_enabled_thinking: f.reject_enabled_thinking,
             sim_billing_relocate: f.sim_billing_relocate,
             sim_message_threads: f.sim_message_threads,
             fill_metadata: f.fill_metadata,

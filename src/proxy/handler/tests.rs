@@ -1316,6 +1316,53 @@ async fn cache_touch_follows_the_reply_from_a_demote_retry(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND, "被拒的首发没记");
 }
 
+/// 非 CC 客户端给新一代模型写 `thinking.type:"enabled"`：开关开着时本地回 API Key 直连那条 400、
+/// 不打上游，流水标 `rejected_locally:enabled-thinking`；同一请求体换成 haiku-4-5 照发；关掉照发。
+#[sqlx::test]
+async fn client_enabled_thinking_on_adaptive_only_model_is_rejected_locally(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![sse_ok("ok"), sse_ok("ok")]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let req = |model: &str| {
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "metadata": {"user_id": serde_json::json!({
+                "device_id": "b".repeat(64), "account_uuid": "", "session_id": SESSION,
+            }).to_string()},
+            "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+    };
+
+    assert_local_reject(
+        &mock,
+        &state,
+        req("claude-opus-5-5"),
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "\"thinking.type.enabled\" is not supported for this model",
+    )
+    .await;
+    let rows = usage_logs(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, 400);
+    assert_eq!(rows[0].forensics.rewrites.as_deref(), Some("rejected_locally:enabled-thinking"));
+
+    let (status, _, _) = send(&state, req("claude-haiku-4-5")).await;
+    assert_eq!(status, StatusCode::OK, "haiku-4-5 照收 enabled，照发");
+    assert_eq!(mock.seen().len(), 1);
+
+    store.set_setting(store::REJECT_ENABLED_THINKING, "0").await.unwrap();
+    let (status, _, _) = send(&state, req("claude-opus-5-5")).await;
+    assert_eq!(status, StatusCode::OK, "关掉就照发");
+    assert_eq!(mock.seen().len(), 2);
+}
+
 /// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条
 /// 第三方 400、不打上游，流水标 `rejected_locally:third-party`；关掉照发。
 #[sqlx::test]

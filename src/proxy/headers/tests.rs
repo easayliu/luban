@@ -402,6 +402,7 @@ fn all_flags_off_only_injects_auth() {
         tool_name_mimic: false,
         inject_thinking: false,
         reject_openai_shape: false,
+        reject_enabled_thinking: false,
         reject_session_conflict: false,
         reject_probes: false,
         reject_probes_strict: false,

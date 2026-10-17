@@ -494,6 +494,28 @@ async fn nonneg_int_settings_clamp_negatives_to_zero(pool: sqlx::PgPool) {
     assert_eq!(store.get_setting(store::SESSION_BINDING_TTL).unwrap().as_deref(), Some("0"));
 }
 
+/// 转发开关的保存接口要认得每一个新开关：拨 `reject_enabled_thinking` 为关，落库为 `false`、
+/// `forward_flags()` 立刻读到关；再拨回开。接口对没列进持久化清单的字段会静默忽略并回成功，
+/// 这条测试就是防那种「页面能拨、后端不认」的漏接。
+#[sqlx::test]
+async fn forwarding_update_persists_reject_enabled_thinking(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let state = AppState::for_test(store.clone());
+    assert!(store.forward_flags().reject_enabled_thinking, "默认开");
+    let req = |on: bool| {
+        Json(serde_json::from_value(serde_json::json!({ "reject_enabled_thinking": on })).unwrap())
+    };
+    let _ = set_forwarding(State(state.clone()), req(false)).await.unwrap();
+    assert_eq!(
+        store.get_setting(store::REJECT_ENABLED_THINKING).unwrap().as_deref(),
+        Some("false")
+    );
+    assert!(!store.forward_flags().reject_enabled_thinking, "关掉后立刻生效");
+    let _ = set_forwarding(State(state), req(true)).await.unwrap();
+    assert_eq!(store.get_setting(store::REJECT_ENABLED_THINKING).unwrap().as_deref(), Some("true"));
+    assert!(store.forward_flags().reject_enabled_thinking);
+}
+
 /// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
 #[sqlx::test]
 async fn series_endpoints_report_the_bucket_width_actually_used(pool: sqlx::PgPool) {

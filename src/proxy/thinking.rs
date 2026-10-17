@@ -8,6 +8,75 @@ use super::logging::{ReqLog, UsageSniffer};
 use super::rate_limit::RateLimitInfo;
 use super::upstream::{Upstream, error_chain, resp_shape};
 
+/// API Key 直连下新一代模型对 `thinking.type: "enabled"` 的 400 原文（2026-10-17 实测，
+/// opus-5-5 / sonnet-5-5 / haiku-5-5 / opus-5 / sonnet-5 / fable-5-1 / opus-4-8 / opus-4-7 八个模型
+/// 逐字相同，与 `budget_tokens` 取值无关）。本地拒绝时原样回给客户端，见
+/// [`crate::store::ForwardFlags::reject_enabled_thinking`]。
+pub(crate) const ENABLED_THINKING_REJECT_MESSAGE: &str = "\"thinking.type.enabled\" is not \
+supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control \
+thinking behavior.";
+
+/// 这个模型在 API Key 直连下是否**只收** `thinking.type: "adaptive"`（`enabled` 直接 400）：
+/// 5 系全部，以及 opus 的 4-7、4-8；4-6 及更早各代（haiku-4-5、sonnet-4-5、opus-4-5、opus-4-6、
+/// sonnet-4-6）照收 `enabled`。按名字里的代号判：`claude-<族>-<主>[-<次>][-<日期>]`，
+/// 带日期全名、别名与 `[1m]` 上下文后缀（`claude-opus-5[1m]`）同判；认不出代号的
+/// （`claude-3-5-sonnet-…` 这类老写法、空串）一律按「收」处理——拿不准就放行，让上游说话。
+pub(crate) fn adaptive_only_model(model: &str) -> bool {
+    let model = model.trim_end_matches("[1m]");
+    let Some(rest) = model.strip_prefix("claude-") else { return false };
+    let mut parts = rest.split('-');
+    // 族名必须是字母（`opus` / `sonnet` / `haiku` / `fable`）：`claude-3-5-sonnet-…` 那种老写法
+    // 第一段是数字，不按这套代号判。
+    let Some(family) = parts.next().filter(|f| f.bytes().all(|b| b.is_ascii_alphabetic())) else {
+        return false;
+    };
+    let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else { return false };
+    // 次版本号：下一段是短数字才算（日期后缀 `20251001` 有 8 位，不会被当成次版本）。
+    let minor =
+        parts.next().filter(|p| p.len() <= 2).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    major >= 5 || (family == "opus" && major == 4 && minor >= 7)
+}
+
+/// 来访体是否「客户端自己写了 `thinking.type: "enabled"`，而模型只收 adaptive」
+/// （[`adaptive_only_model`]）。判的是**来访原件**：模拟路径自己注入的 `enabled`
+/// 只给 haiku 族（[`super::body::ensure_thinking`]），不在此列。
+///
+/// **上游排在这条之前的校验让给上游**：API Key 直连下（2026-10-17 实测）`budget_tokens` 缺失 /
+/// 非整数 / 不足 1024、`display` 非法、与 thinking 冲突的 `temperature` / `top_k` / `top_p` 都先于
+/// 「模型不收 enabled」报错，各回各的那句；订阅通道对这几条同样 400、同样原文，所以这些形态照发，
+/// 让上游说话，本地只拦上游会放行的那种——否则客户端拿到的 400 文案与直连不一致。
+/// `max_tokens` 超上限排在这条**之后**（实测 `999999` 配 `enabled` 回的是 enabled 那句），不用让。
+pub(crate) fn client_enabled_thinking_rejection(
+    body: Option<&serde_json::Value>,
+    model: Option<&str>,
+) -> bool {
+    let Some(body) = body else { return false };
+    let Some(th) = body.get("thinking").and_then(|t| t.as_object()) else { return false };
+    if th.get("type").and_then(|t| t.as_str()) != Some("enabled")
+        || !model.is_some_and(adaptive_only_model)
+    {
+        return false;
+    }
+    // `budget_tokens`：缺、非整数、不足 1024 → 上游先报它。
+    if !th.get("budget_tokens").and_then(|b| b.as_u64()).is_some_and(|b| b >= 1024) {
+        return false;
+    }
+    // `display`：写了就得是上游认的取值（`updates` 要配 beta，luban 出站恒带，按认处理）。
+    if let Some(d) = th.get("display")
+        && !matches!(d.as_str(), Some("summarized" | "omitted" | "updates"))
+    {
+        return false;
+    }
+    // 与 thinking 冲突的采样参数：上游先报它们。
+    if body.get("temperature").is_some_and(|t| t.as_f64() != Some(1.0))
+        || body.get("top_k").is_some()
+        || body.get("top_p").is_some_and(|p| !p.as_f64().is_some_and(|p| p >= 0.95))
+    {
+        return false;
+    }
+    true
+}
+
 /// 上游验不过历史思考块（签名、被改过的编码、`redacted_thinking` 的密文）之后的兜底：把历史
 /// thinking 降级成 text、`redacted_thinking` 整块删掉，用**同一个凭证**重发一次。
 ///

@@ -308,6 +308,25 @@ pub struct ForwardFlags {
     /// 关掉即原样转发，由上游返回官方的 400——客户端自己发错的形态 luban 不再替它修补。
     /// 对话中途的原生 system 消息不算残留，原样出站。模拟路径不受影响：它只接管本来就是 Anthropic 形态的非 CC 请求。
     pub reject_openai_shape: bool,
+    /// 新一代模型（5 系、opus-4-7 起）配客户端自己写的 `thinking.type: "enabled"` 时本地拒绝
+    /// （400，`rejected_locally:enabled-thinking`），回 API Key 直连那句原文
+    /// （[`crate::proxy::ENABLED_THINKING_REJECT_MESSAGE`]），不出门。完整模拟与 billing-only 都生效。
+    ///
+    /// 2026-10-17 实测：API Key 直连下 opus-5-5 / sonnet-5-5 / haiku-5-5 / opus-5 / sonnet-5 /
+    /// fable-5-1 / opus-4-8 / opus-4-7 对 `enabled` 一律 400 `"thinking.type.enabled" is not supported
+    /// for this model`（与预算大小无关），4-6 及更早各代照收；而**订阅通道**对同一请求体静默放行
+    /// （当成 adaptive，`budget_tokens` 与 `display` 都忽略，thinking 正文为空）。渠道测试工具正是拿
+    /// 这一差异识别中转：上游永远不回这条 400，学习机制学不到，只能写死。官方 CC 只在 haiku-4-5
+    /// 上发 `enabled`（2.1.258 ～ 2.1.301 五版抓包一致），真实客户端不会命中。
+    ///
+    /// 上游排在这条之前的校验（预算缺 / 不足 1024、display 非法、`temperature` / `top_k` / `top_p`
+    /// 冲突）不在此列：两条通道都会 400 且原文一致，照发让上游回它自己那句，见
+    /// [`crate::proxy::client_enabled_thinking_rejection`]。订阅侧 2026-10-17 全模型扫过：API Key
+    /// 下拒 `enabled` 的八个模型订阅通道全部 200 放行，4-6 及更早两边都收。
+    ///
+    /// - **开**（默认）：命中即本地 400，与 API Key 直连逐字相同。
+    /// - **关**：照发，由订阅通道放行（客户端拿到的是 adaptive 的结果）。
+    pub reject_enabled_thinking: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
     ///
     /// 官方两处逐字相同，不同值说明来访自己就不自洽——而 luban 拿会话 id 当会话链
@@ -481,6 +500,7 @@ impl Default for ForwardFlags {
             tool_name_mimic: true,
             inject_thinking: true,
             reject_openai_shape: true,
+            reject_enabled_thinking: true,
             reject_session_conflict: true,
             reject_probes: true,
             reject_probes_strict: false,
