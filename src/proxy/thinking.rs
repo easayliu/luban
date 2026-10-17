@@ -77,10 +77,77 @@ pub(crate) fn client_enabled_thinking_rejection(
     true
 }
 
+/// 请求里历史思考块的指纹（[`history_thinking_fingerprints`]）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryFingerprints {
+    /// 靠后的在前，最多 [`crate::store::THINKING_BLOCK_CAP`] 个。
+    pub fps: Vec<String>,
+    /// 请求里的块比上限多，靠前的没取：此时「全部都是本号签发」说的只是取到的这部分，不能据此
+    /// 断言整段历史。
+    pub truncated: bool,
+}
+
+/// 请求里历史 assistant 轮带的 thinking 签名 / `redacted_thinking` 密文的指纹
+/// （[`crate::store::thinking_block_fingerprint`]），靠后的优先、最多 [`crate::store::THINKING_BLOCK_CAP`] 个，
+/// 超出的记 `truncated`。上游以「签名 / 密文无效」拒绝时拿它们查签发者
+/// （`CredentialStore::thinking_block_issuers`）。
+pub(crate) fn history_thinking_fingerprints(
+    body: Option<&serde_json::Value>,
+) -> HistoryFingerprints {
+    let mut out = HistoryFingerprints::default();
+    let Some(msgs) = body.and_then(|b| b.get("messages")).and_then(|m| m.as_array()) else {
+        return out;
+    };
+    for m in msgs.iter().rev() {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else { continue };
+        for b in blocks.iter().rev() {
+            let field = match b.get("type").and_then(|t| t.as_str()) {
+                Some("thinking") => "signature",
+                Some("redacted_thinking") => "data",
+                _ => continue,
+            };
+            if let Some(v) = b.get(field).and_then(|v| v.as_str())
+                && !v.is_empty()
+            {
+                if out.fps.len() >= crate::store::THINKING_BLOCK_CAP {
+                    out.truncated = true;
+                    return out;
+                }
+                out.fps.push(crate::store::thinking_block_fingerprint(v));
+            }
+        }
+    }
+    out
+}
+
+/// 出站体 `messages[mi].content[bi]` 那个思考块的指纹（上游报错点名的坐标，
+/// [`error_block_path`]）：thinking 取 `signature`、`redacted_thinking` 取 `data`。坐标越界、不是思考
+/// 块、签名为空都为 `None`。签名字节经 [`preserve_thinking_encoding`] 原样出站，与客户端手里的
+/// 一致，所以按出站体取到的指纹与按来访原件登记的是同一个。
+pub(crate) fn thinking_block_fingerprint_at(sent: &[u8], mi: usize, bi: usize) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(sent).ok()?;
+    let b = v.get("messages")?.get(mi)?.get("content")?.get(bi)?;
+    let field = match b.get("type")?.as_str()? {
+        "thinking" => "signature",
+        "redacted_thinking" => "data",
+        _ => return None,
+    };
+    let s = b.get(field)?.as_str()?;
+    (!s.is_empty()).then(|| crate::store::thinking_block_fingerprint(s))
+}
+
 /// 上游验不过历史思考块（签名、被改过的编码、`redacted_thinking` 的密文）之后的兜底：把历史
 /// thinking 降级成 text、`redacted_thinking` 整块删掉，用**同一个凭证**重发一次。
 ///
 /// `reason` 只进日志，写的是上游这次点名的是哪一样（三条调用路各自传自己的那句）。
+///
+/// **调用方先确认这条会话确实经过别的号**（请求里历史思考块的签发者，
+/// `CredentialStore::thinking_block_issuers`；有认不出的再退回会话痕迹
+/// `session_credential_history`）再来：历史全是本号签发的，验不过就是客户端改坏的，
+/// 该原样回上游 400，不该替它救活。
 ///
 /// 成功则返回重试那次的上游响应，并把 `rl` 改按它记账（交给调用方 [`stream_upstream`](crate::proxy::stream_upstream)）；
 /// 任何一步不成都返回 `None`、`rl` 不动，由调用方继续透传最初那条 400——这条兜底路径在设计上

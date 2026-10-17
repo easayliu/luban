@@ -790,3 +790,64 @@ fn client_enabled_thinking_rejection_yields_to_earlier_upstream_checks() {
         assert!(hit(Some(&body), m), "{why}：上游会放行，本地拦");
     }
 }
+
+/// 请求里历史 assistant 轮的 thinking 签名与 redacted 密文都取到，靠后的在前；用户轮、空签名、
+/// 非字符串都不算。
+#[test]
+fn history_thinking_fingerprints_take_assistant_blocks_latest_first() {
+    use crate::proxy::thinking::history_thinking_fingerprints as fps;
+    let fp = crate::store::thinking_block_fingerprint;
+    let body = serde_json::json!({"messages": [
+        {"role": "user", "content": [{"type": "thinking", "thinking": "x", "signature": "USER"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "a", "signature": "S1"},
+            {"type": "redacted_thinking", "data": "D1"},
+            {"type": "thinking", "thinking": "b", "signature": ""},
+            {"type": "text", "text": "t"}]},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "c", "signature": "S2"}]},
+    ]});
+    let got = fps(Some(&body));
+    assert_eq!(got.fps, vec![fp("S2"), fp("D1"), fp("S1")]);
+    assert!(!got.truncated);
+    assert!(fps(None).fps.is_empty());
+    assert!(fps(Some(&serde_json::json!({"messages": "nope"}))).fps.is_empty());
+
+    // 超过上限：只取靠后的那些，并标记截断。
+    let many: Vec<serde_json::Value> = (0..=crate::store::THINKING_BLOCK_CAP)
+        .map(|i| {
+            serde_json::json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": format!("SIG{i}")}]})
+        })
+        .collect();
+    let got = fps(Some(&serde_json::json!({"messages": many})));
+    assert_eq!(got.fps.len(), crate::store::THINKING_BLOCK_CAP);
+    assert!(got.truncated);
+    assert_eq!(got.fps[0], fp(&format!("SIG{}", crate::store::THINKING_BLOCK_CAP)));
+    assert!(!got.fps.contains(&fp("SIG0")), "最早的那块没取到");
+}
+
+/// 按上游点名的坐标从出站体取思考块指纹：thinking 取签名、redacted 取密文；越界、非思考块、空签名
+/// 都取不到。
+#[test]
+fn named_block_fingerprint_follows_upstream_coordinates() {
+    use crate::proxy::thinking::thinking_block_fingerprint_at;
+    let fp = crate::store::thinking_block_fingerprint;
+    let sent = serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "t", "signature": "S1"},
+            {"type": "redacted_thinking", "data": "D1"},
+            {"type": "thinking", "thinking": "t", "signature": ""},
+            {"type": "text", "text": "x"}]},
+    ]})
+    .to_string();
+    let sent = sent.as_bytes();
+    assert_eq!(thinking_block_fingerprint_at(sent, 1, 0), Some(fp("S1")));
+    assert_eq!(thinking_block_fingerprint_at(sent, 1, 1), Some(fp("D1")));
+    assert_eq!(thinking_block_fingerprint_at(sent, 1, 2), None, "空签名");
+    assert_eq!(thinking_block_fingerprint_at(sent, 1, 3), None, "不是思考块");
+    assert_eq!(thinking_block_fingerprint_at(sent, 0, 0), None, "用户轮正文是字符串");
+    assert_eq!(thinking_block_fingerprint_at(sent, 9, 0), None, "越界");
+    assert_eq!(thinking_block_fingerprint_at(b"not json", 0, 0), None);
+}

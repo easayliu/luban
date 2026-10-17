@@ -1270,8 +1270,423 @@ async fn cache_touch_goes_back_to_the_account_that_served_the_reply(pool: sqlx::
     assert_eq!(mock.seen().len(), 2);
 }
 
+/// 测试请求里那个历史 thinking 块的签名（`cc_request` 用例共用）。
+const HISTORY_SIGNATURE: &str = "c2lnbmF0dXJl";
+
+/// 给 `cc_request` 那条会话铺一条「另一个号成功应答过」的流水：先用 `sse_ok` 跑一轮拿到它的
+/// 会话键，再按同一键插一条 `cred_id` 不同的 200。此后这条会话在
+/// [`CredentialStore::session_served_by_another_credential`] 眼里就是换过号的——签发者登记一个都
+/// 没有时，历史思考块验不过才凭它降级重试。调用方的 mock 队列开头要多放一条 `sse_ok`。
+async fn seed_session_served_by_other_cred(store: &CredentialStore, state: &AppState) {
+    let (status, _, _) = send(state, cc_request(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = usage_logs(store, 1).await;
+    let key = rows[0].forensics.session_key.clone().expect("CC 来访按会话占名额，流水带会话键");
+    let mut rec = store::UsageRecord {
+        cred_id: Some(999_999),
+        cred_label: "other".into(),
+        status: 200,
+        ..Default::default()
+    };
+    rec.forensics.session_key = Some(key);
+    store.insert_usage_log(&rec).await.unwrap();
+}
+
+/// 历史思考块的签发者一个都不认识、会话没经过别的号、但**当前号此前就在这条会话上应答过**
+/// （渠道测试工具的形态：首轮经这里拿到签名，改坏后回传）：上游那条「thinking 签名无效」400
+/// **原样透传**、不降级重试——从这里发出的签名都登记过，认不出的不可能是本号的真签名，API Key
+/// 直连也是 400。`redacted_thinking` 密文那条同样。
+#[sqlx::test]
+async fn broken_thinking_blocks_pass_through_when_this_credential_served_the_session(
+    pool: sqlx::PgPool,
+) {
+    let mock = MockUpstream::start(vec![
+        sse_ok("first turn"),
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `data` in `redacted_thinking` block",
+        ),
+    ])
+    .await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    // 首轮：当前号在这条会话上应答过（流水里一条本号的 200）。
+    let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    usage_logs(&store, 1).await;
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": "TAMPERED"},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, body) = send(&state, req.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("Invalid `signature`"));
+    assert_eq!(mock.seen().len(), 2, "没有降级重试");
+
+    let (status, _, body) = send(&state, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("redacted_thinking"));
+    assert_eq!(mock.seen().len(), 3, "没有降级重试");
+    let rows = usage_logs(&store, 3).await;
+    assert!(
+        rows.iter().all(|r| r.forensics.rewrites.as_deref().is_none_or(|t| !t.contains("demoted")))
+    );
+}
+
+/// 签发者一个都不认识、对这条会话也一无所知（全新会话键）：保留「历史未知」，按能恢复处理、
+/// 降级重试。这正是审查指出的场景——不带会话 id 的来访 system 一变前缀键就变、落到新号，
+/// 功能上线前的历史没有登记，不能把它当成「确认没换过」拦下。
+#[sqlx::test]
+async fn unknown_history_on_a_fresh_session_still_retries(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+        sse_ok("hi"),
+    ])
+    .await;
+    let (_store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": "UNKNOWN_SIG"},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 2, "降级重试了一次");
+}
+
+/// 部分签名认识（当前号签发的）、部分不认识：不能因为命中的只有本号就关掉恢复——认不出的那块
+/// 可能是旧号签发而没登记的，保留「历史未知」，全新会话上照常重试。
+#[sqlx::test]
+async fn partially_known_history_keeps_the_recovery_path(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+        sse_ok("hi"),
+    ])
+    .await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    store
+        .remember_thinking_blocks(
+            Some(ids[0]),
+            &[store::thinking_block_fingerprint(HISTORY_SIGNATURE)],
+        )
+        .await
+        .unwrap();
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "old", "signature": "UNKNOWN_FROM_A"},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "more"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "new", "signature": HISTORY_SIGNATURE},
+            {"type": "text", "text": "world"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 2, "降级重试了一次");
+}
+
+/// 历史思考块**全部有记录且全是当前号签发的**还验不过：块是客户端改坏的，原样透传 400，不降级
+/// 重试——哪怕这条会话另有别的号的痕迹也不重试，签发者是主判据。
+#[sqlx::test]
+async fn broken_thinking_blocks_pass_through_when_history_was_issued_here(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok("seed"),
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+    ])
+    .await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    seed_session_served_by_other_cred(&store, &state).await;
+    store
+        .remember_thinking_blocks(
+            Some(ids[0]),
+            &[store::thinking_block_fingerprint(HISTORY_SIGNATURE)],
+        )
+        .await
+        .unwrap();
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": HISTORY_SIGNATURE},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, body) = send(&state, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 2, "没有降级重试");
+}
+
+/// 签发者登记一个都不认识时退回会话痕迹：会话经过了别的号（[`seed_session_served_by_other_cred`]）
+/// 就降级重试。
+#[sqlx::test]
+async fn demote_retry_falls_back_to_session_history_when_issuers_are_unknown(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok("seed"),
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+        sse_ok("hi"),
+    ])
+    .await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    seed_session_served_by_other_cred(&store, &state).await;
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": HISTORY_SIGNATURE},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 3, "降级重试了一次");
+}
+
+/// 救活缓存只认救活过的那段历史：会话救活过一次之后，客户端丢掉旧历史、只带着一个**全新的**
+/// 无效签名来（与救活过的历史无关），不能借会话之光放行——本号已在此会话应答过，透传 400。
+#[sqlx::test]
+async fn recovery_cache_does_not_cover_unrelated_new_signatures(pool: sqlx::PgPool) {
+    let sig_err = || {
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.2.content.0: Invalid `signature` in `thinking` block",
+        )
+    };
+    let mock = MockUpstream::start(vec![sig_err(), sse_ok("one"), sig_err()]).await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    let req = |sig: &str| {
+        cc_request(serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": sig},
+                {"type": "text", "text": "hello"}]},
+            {"role": "user", "content": "again"}]}))
+    };
+    let (status, _, _) = send(&state, req("FROM_OLD_ACCOUNT")).await;
+    assert_eq!(status, StatusCode::OK, "旧历史救活");
+    assert_eq!(mock.seen().len(), 2);
+    usage_logs(&store, 1).await;
+
+    let (status, _, body) = send(&state, req("BRAND_NEW_INVALID")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 3, "无关的新签名不借救活之光，原样透传");
+}
+
+/// 混合历史：首次救活的请求里既有外来块 A 也有已登记为本号签发的合法块 B。救活时只有 A 进救活
+/// 缓存、只有 A 记成外来；之后客户端丢掉 A、保留 B，再带一个签名改坏的新块 U 来——B 不能给 U
+/// 当重试凭据，本号已在此会话应答过，透传 400。
+#[sqlx::test]
+async fn legit_blocks_in_a_recovered_request_do_not_vouch_for_new_broken_ones(pool: sqlx::PgPool) {
+    let sig_err = |path: &str| {
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            &format!("{path}: Invalid `signature` in `thinking` block"),
+        )
+    };
+    let mock = MockUpstream::start(vec![
+        sig_err("messages.2.content.0"),
+        sse_ok("one"),
+        sig_err("messages.4.content.0"),
+    ])
+    .await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    let fp = store::thinking_block_fingerprint;
+    store.remember_thinking_blocks(Some(ids[0]), &[fp(HISTORY_SIGNATURE)]).await.unwrap();
+    let turn = |first: &str, second: &str| {
+        cc_request(serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": first},
+                {"type": "text", "text": "a"}]},
+            {"role": "user", "content": "more"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": second},
+                {"type": "text", "text": "b"}]},
+            {"role": "user", "content": "again"}]}))
+    };
+    let (status, _, _) = send(&state, turn("FROM_OLD_ACCOUNT", HISTORY_SIGNATURE)).await;
+    assert_eq!(status, StatusCode::OK, "A 外来 + B 合法：救活");
+    assert_eq!(mock.seen().len(), 2);
+    assert!(store.history_recovered_recently(&[fp("FROM_OLD_ACCOUNT")]), "A 进了救活缓存");
+    assert!(!store.history_recovered_recently(&[fp(HISTORY_SIGNATURE)]), "B 没进救活缓存");
+    usage_logs(&store, 1).await;
+
+    let (status, _, body) = send(&state, turn(HISTORY_SIGNATURE, "BRAND_NEW_INVALID")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 3, "B 不给 U 当重试凭据，原样透传");
+    // 落库的外来登记同样只有 A。
+    for _ in 0..300 {
+        if store.thinking_block_issuers(&[fp("FROM_OLD_ACCOUNT")]).await.unwrap().known == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let got = store
+        .thinking_block_issuers(&[fp("FROM_OLD_ACCOUNT"), fp(HISTORY_SIGNATURE)])
+        .await
+        .unwrap();
+    assert_eq!(got.issuers, vec![None, Some(ids[0])], "A 外来、B 仍是本号");
+}
+
+/// 首次救活之后续轮还能救：未知的旧号历史第一次由当前号降级重试成功，流水里就有了当前号的 200
+/// （`here`），而客户端下一轮仍原样带着那段历史——救活时把它记成了外来，下一轮据此照常重试，
+/// 不会因为「当前号在此会话应答过」被判成改坏而拦下。
+#[sqlx::test]
+async fn recovered_history_stays_recoverable_on_the_next_turn(pool: sqlx::PgPool) {
+    let sig_err = || {
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        )
+    };
+    let mock = MockUpstream::start(vec![sig_err(), sse_ok("one"), sig_err(), sse_ok("two")]).await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    let req = || {
+        cc_request(serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "old", "signature": "FROM_OLD_ACCOUNT"},
+                {"type": "text", "text": "hello"}]},
+            {"role": "user", "content": "again"}]}))
+    };
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::OK, "全新会话、历史未知：救活");
+    assert_eq!(mock.seen().len(), 2);
+    // 成功流水先落库、外来登记还没落（后台写）的窗口里紧接着续轮：进程内的救活标记要兜住。
+    usage_logs(&store, 1).await;
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::OK, "续轮照常救活，不等外来登记落库");
+    assert_eq!(mock.seen().len(), 4, "又降级重试了一次");
+
+    // 外来登记最终也落库（重启后靠它）。
+    let fp = store::thinking_block_fingerprint("FROM_OLD_ACCOUNT");
+    for _ in 0..300 {
+        if store.thinking_block_issuers(std::slice::from_ref(&fp)).await.unwrap().known == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        store.thinking_block_issuers(std::slice::from_ref(&fp)).await.unwrap().issuers,
+        vec![None],
+        "救活过的历史记成外来"
+    );
+}
+
+/// 截断的历史救活之后续轮还能救：最早那块（旧号的、上限之外）被上游点名，救活时按点名坐标把它
+/// 登记成外来、会话也记下救活过——下一轮同一段历史紧接着来，不会因为「取到的 256 块全是本号的」
+/// 加「本号在此会话应答过」被拦。上游点名的坐标是**出站体**的：luban 在首条用户消息后插了一条
+/// 环境说明的 system 消息，来访的 `messages[1]` 出站时在 `messages[2]`。
+#[sqlx::test]
+async fn truncated_history_stays_recoverable_on_the_next_turn(pool: sqlx::PgPool) {
+    let sig_err = || {
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.2.content.0: Invalid `signature` in `thinking` block",
+        )
+    };
+    let mock = MockUpstream::start(vec![sig_err(), sse_ok("one"), sig_err(), sse_ok("two")]).await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    let cap = store::THINKING_BLOCK_CAP;
+    let mut msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+    let mut known = Vec::new();
+    for i in 0..=cap {
+        let sig = format!("SIG{i}");
+        msgs.push(serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "t", "signature": sig},
+            {"type": "text", "text": "x"}]}));
+        msgs.push(serde_json::json!({"role": "user", "content": "more"}));
+        if i >= 1 {
+            known.push(store::thinking_block_fingerprint(&sig));
+        }
+    }
+    store.remember_thinking_blocks(Some(ids[0]), &known).await.unwrap();
+    let req = || cc_request(serde_json::json!({"messages": msgs}));
+
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::OK, "首轮救活");
+    assert_eq!(mock.seen().len(), 2);
+    usage_logs(&store, 1).await;
+    let (status, _, _) = send(&state, req()).await;
+    assert_eq!(status, StatusCode::OK, "续轮照常救活");
+    assert_eq!(mock.seen().len(), 4);
+
+    // 被点名的 SIG0 虽在指纹上限之外，也按坐标登记成了外来。
+    let fp0 = store::thinking_block_fingerprint("SIG0");
+    for _ in 0..300 {
+        if store.thinking_block_issuers(std::slice::from_ref(&fp0)).await.unwrap().known == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        store.thinking_block_issuers(std::slice::from_ref(&fp0)).await.unwrap().issuers,
+        vec![None]
+    );
+}
+
+/// 请求里的历史块多过指纹上限时，取到的那部分全是当前号签发也不能断言整段历史：最早那块可能
+/// 是旧号的——保留「历史未知」，全新会话上照常重试。
+#[sqlx::test]
+async fn truncated_history_does_not_count_as_fully_issued_here(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.1.content.0: Invalid `signature` in `thinking` block",
+        ),
+        sse_ok("hi"),
+    ])
+    .await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    let cap = store::THINKING_BLOCK_CAP;
+    let mut msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+    let mut known = Vec::new();
+    for i in 0..=cap {
+        let sig = format!("SIG{i}");
+        msgs.push(serde_json::json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "t", "signature": sig},
+            {"type": "text", "text": "x"}]}));
+        msgs.push(serde_json::json!({"role": "user", "content": "more"}));
+        if i >= 1 {
+            known.push(store::thinking_block_fingerprint(&sig));
+        }
+    }
+    // 最近的 cap 个都登记在当前号名下；最早的 SIG0 没登记（旧号的）。
+    store.remember_thinking_blocks(Some(ids[0]), &known).await.unwrap();
+    let (status, _, _) = send(&state, cc_request(serde_json::json!({"messages": msgs}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.seen().len(), 2, "截断了就不能说全是本号的，照常救活");
+}
+
 /// 降级重试成功的那一发开了保活：登记的是最终那条回复，客户端 touch 它的 request-id 照样转到原号；
-/// 被拒的首发不留记录。
+/// 被拒的首发不留记录。历史思考块的签名登记成**外来**（不是现有任何一个号签发的），兜底才会出手——这条会话本身是
+/// 全新的、没有任何换号痕迹（审查指出的场景：不带会话 id 的来访 system 一变，前缀键就变、落到
+/// 新号，新键下查不到旧号；靠签发者才判得出换过号）。
 #[sqlx::test]
 async fn cache_touch_follows_the_reply_from_a_demote_retry(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![
@@ -1288,11 +1703,16 @@ async fn cache_touch_follows_the_reply_from_a_demote_retry(pool: sqlx::PgPool) {
         Reply { status: 204, headers: vec![], body: vec![] },
     ])
     .await;
-    let (_store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    // 登记成外来（不是现有任何一个号签发的）。
+    store
+        .remember_thinking_blocks(None, &[store::thinking_block_fingerprint(HISTORY_SIGNATURE)])
+        .await
+        .unwrap();
     let req = cc_request(serde_json::json!({"messages": [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": [
-            {"type": "thinking", "thinking": "let me think", "signature": "c2lnbmF0dXJl"},
+            {"type": "thinking", "thinking": "let me think", "signature": HISTORY_SIGNATURE},
             {"type": "text", "text": "hello"}]},
         {"role": "user", "content": "again"}]}));
     let (status, headers, _) = send(&state, req).await;

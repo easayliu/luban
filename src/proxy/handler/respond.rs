@@ -547,12 +547,34 @@ async fn client_error(
         // 下一条请求就改走别的号。这一发已经到了客户端手里，原样透传。
         park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "forward").await;
     }
+    // 历史思考块验不过（签名 / `redacted_thinking` 密文）的两条兜底，只在**这条会话确实经过别的
+    // 号**时才降级重试：签名由签发它的账号校验，历史全是本号签发的还验不过，就是客户端自己改坏
+    // 了，该把上游的 400 原样回去——API Key 直连就是这样，渠道测试工具拿「改坏签名回传、直连
+    // 400、中转 200」识别中转。判据见 [`session_switched_credential`]；只在命中那两类 400 时才查库。
+    let thinking_block_rejected = status == StatusCode::BAD_REQUEST
+        && !compressed
+        && (is_thinking_signature_error(&err_bytes) || is_redacted_thinking_data_error(&err_bytes));
+    let history = if thinking_block_rejected {
+        // 上游点名的那个块：它才是验不过的那个，不论在不在指纹上限之内都要查、救活了都要登记。
+        let (_, message) = parse_upstream_error(&err_bytes);
+        let named = error_block_path(&message)
+            .and_then(|(mi, bi)| thinking_block_fingerprint_at(sent, mi, bi));
+        Some(thinking_history_check(state, inb, cred.id, named).await)
+    } else {
+        None
+    };
+    let switched = history.as_ref().is_some_and(|h| h.retry);
     // thinking 签名降级重试。
     if status == StatusCode::BAD_REQUEST && !compressed && is_thinking_signature_error(&err_bytes) {
         if !flags.thinking_signature_retry {
             tracing::warn!(
                 cred_id = cred.id, cred = %cred.label,
                 "upstream rejected a thinking-block signature; demote-and-retry is off, passing through as is"
+            );
+        } else if !switched {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                "upstream rejected a thinking-block signature; this session was never served by another credential, so the block arrived broken from the client: passing the 400 through as is"
             );
         } else if let Some(up) = retry_demoted_thinking(
             upstream,
@@ -564,6 +586,7 @@ async fn client_error(
         )
         .await
         {
+            remember_foreign_history(state, history.as_ref());
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
     }
@@ -579,6 +602,11 @@ async fn client_error(
                 cred_id = cred.id, cred = %cred.label,
                 "upstream rejected a redacted_thinking block's data; demote-and-retry is off, passing through as is"
             );
+        } else if !switched {
+            tracing::warn!(
+                cred_id = cred.id, cred = %cred.label,
+                "upstream rejected a redacted_thinking block's data; this session was never served by another credential, so the block arrived broken from the client: passing the 400 through as is"
+            );
         } else if let Some(up) = retry_demoted_thinking(
             upstream,
             cred,
@@ -589,6 +617,7 @@ async fn client_error(
         )
         .await
         {
+            remember_foreign_history(state, history.as_ref());
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
     }
@@ -620,6 +649,102 @@ async fn client_error(
     builder
         .body(Body::from(err_bytes))
         .unwrap_or_else(|e| error_response(StatusCode::BAD_GATEWAY, "api_error", e.to_string()))
+}
+
+/// 历史思考块验不过时的判定结果：该不该降级重试救活，以及请求里**库里认不出**的那些块的指纹
+/// （重试成了只把它们记成外来、进救活缓存，见 [`remember_foreign_history`]；已明确登记为本号
+/// 签发的合法块不算「救活过的历史」）。
+struct ThinkingHistoryCheck {
+    retry: bool,
+    foreign: Vec<String>,
+}
+
+/// 这条请求带的历史思考块该不该降级重试救活（真）还是原样透传上游 400（假）。`named` 是上游
+/// 报错点名的那个块的指纹（[`thinking_block_fingerprint_at`]），有的话一并查、一并登记——它才是
+/// 验不过的那个，而指纹列表有上限，靠前的旧块可能根本不在取到的那部分里。
+///
+/// 先按**正向证据**判——请求里每个 thinking 签名 / `redacted_thinking` 密文的签发者
+/// （[`CredentialStore::thinking_block_issuers`]，经 luban 转发的回复落地时登记；降级重试救活过的
+/// 历史记成外来）：
+/// - 有别的号或外来签发的 → 会话换过号，重试；
+/// - **全部**都有记录、都是当前号签发、且指纹列表没被截断 → 历史没问题、块是客户端改坏的，
+///   透传 400。截断了（块数超过 [`crate::store::THINKING_BLOCK_CAP`]）就只看到了一部分，不能据此断言。
+///
+/// 有认不出的（功能上线前的历史、超过 90 天、签名不是经 luban 发出的，或就是被改坏的）就保留
+/// 「历史未知」：
+/// - 认不出的那些块里有近期救活过的（[`CredentialStore::history_recovered_recently`]，按指纹、进程内、
+///   同步可见）→ 重试；会话里之后新出现的未知签名不在其中，不借光；已明确登记为本号签发的合法块
+///   不参与这一判——它们不是「救活过的历史」，救活时也不进缓存；
+/// - 退到会话痕迹 [`CredentialStore::session_credential_history`]：流水或绑定事件里出现过别的号
+///   → 重试；当前号此前就在这条会话上应答过 → 从这里发出的签名都登记过、救活过的历史也记成了
+///   外来，认不出的不可能是本号的真签名，是改坏的，透传 400（渠道测试工具正是这个形态：首轮经
+///   这里拿到签名，改坏后回传）；对这条会话一无所知 → 按能恢复处理，重试。「查不到」不等于「确认
+///   没换过」：不带会话 id 的来访键是前缀指纹，system 里的时间一变键就变，新键下查不到旧号，
+///   这里不能把真实的换号恢复误拦掉。
+///
+/// 没有会话键的来访判不了，按原先的做法兜底重试；查库出错同样兜底，宁可多救一次。
+async fn thinking_history_check(
+    state: &AppState,
+    inb: &Inbound,
+    cred_id: i64,
+    named: Option<String>,
+) -> ThinkingHistoryCheck {
+    let HistoryFingerprints { mut fps, truncated } =
+        history_thinking_fingerprints(inb.body_json.as_ref());
+    if let Some(n) = named
+        && !fps.contains(&n)
+    {
+        fps.insert(0, n);
+    }
+    let mut foreign = fps.clone();
+    let retry = match state.store.thinking_block_issuers(&fps).await {
+        Ok(issuers) if issuers.any_other(cred_id) => {
+            foreign.retain(|fp| issuers.known_fps.binary_search(fp).is_err());
+            true
+        }
+        Ok(issuers) if !truncated && issuers.all_here(cred_id) => false,
+        Ok(issuers) => {
+            foreign.retain(|fp| issuers.known_fps.binary_search(fp).is_err());
+            if state.store.history_recovered_recently(&foreign) {
+                true
+            } else {
+                match (inb.plan.log_key.as_deref(), inb.plan.key.as_deref()) {
+                    (Some(log_key), Some(key)) => {
+                        match state.store.session_credential_history(log_key, key, cred_id).await {
+                            Ok(h) if h.other => true,
+                            Ok(h) if h.here => false,
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not read the session's credential history; falling back to demote-and-retry");
+                                true
+                            }
+                        }
+                    }
+                    _ => true,
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the thinking-block issuers; falling back to demote-and-retry");
+            true
+        }
+    };
+    ThinkingHistoryCheck { retry, foreign }
+}
+
+/// 降级重试救活了：上游已证明这段历史在当前号上验不过，而降级只改出站体、客户端下一轮还会原样
+/// 带着它来——先在进程内记下这些指纹（含上游点名的那块）救活过
+/// （[`CredentialStore::mark_history_recovered`]，回复发出前就可见），再把它们记成**外来**
+/// （`cred_id` 为空）落库，下一轮据此照常恢复，而不是因为「当前号已在此会话应答过」被判成改坏。
+/// 已登记的指纹不改（首次签发者优先）。
+fn remember_foreign_history(state: &AppState, history: Option<&ThinkingHistoryCheck>) {
+    let Some(h) = history.filter(|h| !h.foreign.is_empty()) else { return };
+    state.store.mark_history_recovered(&h.foreign);
+    let fps = h.foreign.clone();
+    let s = state.store.clone();
+    state.store.spawn_write("foreign thinking blocks", async move {
+        s.remember_thinking_blocks(None, &fps).await
+    });
 }
 
 /// 429 且一个限流头都没带：把能拿到的依据（响应体、request-id、我们这一侧的发送密度）

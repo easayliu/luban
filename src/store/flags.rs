@@ -70,10 +70,21 @@ pub struct ForwardFlags {
     pub orig_header_case: bool,
     /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
     /// （见 [`crate::proxy::demote_thinking_blocks`]）。
+    ///
+    /// 2026-10-17 起只在**这条会话确实经过别的号**时才重试。主判据是请求里历史思考块的签发者
+    /// （[`CredentialStore::thinking_block_issuers`](crate::store::CredentialStore::thinking_block_issuers)，
+    /// 经 luban 转发的每条回复落地时登记，保留 90 天）：有别的号签发的重试，全是本号签发的透传
+    /// 上游 400（签名由签发它的账号校验，历史没问题还验不过就是客户端改坏了，API Key 直连也是
+    /// 400；渠道测试工具正是拿「改坏签名回传、直连 400、中转 200」识别中转）。救活过的历史记成
+    /// 外来，之后续轮照常恢复。有认不出的保留「历史未知」，退回会话痕迹
+    /// （[`session_credential_history`](crate::store::CredentialStore::session_credential_history)）：
+    /// 出现过别的号重试、本号此前在此会话应答过则透传、一无所知按能恢复处理重试；没有会话键也判
+    /// 不了的照旧重试。
     pub thinking_signature_retry: bool,
     /// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，降级历史 thinking 块后重试一次。
     /// 那段密文是上游自己签发的，验不过通常是会话中途换了号、或那一轮 assistant 消息被改写过
-    /// （见 [`crate::proxy::trace_thinking_block`] 那行日志怎么分辨）。
+    /// （见 [`crate::proxy::trace_thinking_block`] 那行日志怎么分辨）。同 [`Self::thinking_signature_retry`]，
+    /// 只在会话确实换过号时才重试。
     pub redacted_thinking_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。

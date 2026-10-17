@@ -396,6 +396,17 @@ impl Drop for ReqLog {
             && has_usage
             && stream_broke.is_none()
             && stream_complete;
+        // 这条回复签发的 thinking 签名 / redacted 密文记在这个号名下（[`store::CredentialStore::remember_thinking_blocks`]）：
+        // 之后上游以「签名 / 密文无效」拒绝带着它们的历史时，据此判会话有没有换过号。只记完整
+        // 成功的回复——半截流里的签名客户端也不会回传。
+        if ok && !self.sniffer.thinking_blocks.is_empty() {
+            let fps = std::mem::take(&mut self.sniffer.thinking_blocks);
+            let s = self.store.clone();
+            let cred_id = self.cred_id;
+            self.store.spawn_write("thinking blocks", async move {
+                s.remember_thinking_blocks(Some(cred_id), &fps).await
+            });
+        }
         // 失败的那些走 `tengu_api_error`。三类里只报**能确定是上游拒了**的两类：
         //
         // - 非 2xx（含流内 `event: error` 改写出来的那个状态码）；
@@ -1130,6 +1141,15 @@ pub(crate) struct UsageSniffer {
     /// 与 `tool_uses` 一起按块序拼成回复指纹（[`Self::reply_fp`]），模拟路径拿它核对下一轮来访
     /// 带回的那条 assistant 是不是这条回复，见 [`CcSessionLink::record_thread`]。
     reply_blocks: Vec<ReplyBlock>,
+    /// 这条回复里 thinking 块的签名、`redacted_thinking` 块的密文的指纹
+    /// （[`store::thinking_block_fingerprint`]），最多 [`store::THINKING_BLOCK_CAP`] 个。回复落地时
+    /// 记成「由这个号签发」（[`ReqLog::drop`] → `remember_thinking_blocks`），历史思考块验不过时
+    /// 据此判会话有没有换过号。流式从 `signature_delta` 与 `content_block_start` 取，非流式看
+    /// 顶层 `content[]`。
+    pub(super) thinking_blocks: Vec<String>,
+    /// 流式 thinking 块的签名按块下标拼接中（`signature_delta` 可能分片），`content_block_stop`
+    /// 或收尾时整段算指纹进 [`Self::thinking_blocks`]。
+    pending_signatures: std::collections::BTreeMap<i64, String>,
     /// 回复拼不出原貌：出现了认不出的增量类型，或块数、入参超了上限被截掉。模拟路径不接这条。
     reply_unverifiable: bool,
     /// `safeguard_results` 里每个 `tool_use` 的判决：`(tool_use.id, not_flagged / flagged / skipped)`。
@@ -1286,7 +1306,17 @@ impl UsageSniffer {
                 self.events += 1;
                 match t {
                     "error" => self.stream_error = Some(v.clone()),
-                    "message_stop" => self.saw_message_stop = true,
+                    "message_stop" => {
+                        self.saw_message_stop = true;
+                        self.flush_pending_signatures();
+                    }
+                    "content_block_stop" => {
+                        if let Some(index) = v.get("index").and_then(|i| i.as_i64())
+                            && let Some(sig) = self.pending_signatures.remove(&index)
+                        {
+                            self.note_thinking_block(Some(&serde_json::Value::String(sig)));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1392,6 +1422,15 @@ impl UsageSniffer {
                     b.fp = reply_text_fp(b.fp, t);
                     b.empty = false;
                 }
+                if delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
+                    == Some("signature_delta")
+                    && let Some(sig) =
+                        delta.and_then(|d| d.get("signature")).and_then(|s| s.as_str())
+                    && (self.pending_signatures.contains_key(&index)
+                        || self.pending_signatures.len() < store::THINKING_BLOCK_CAP)
+                {
+                    self.pending_signatures.entry(index).or_default().push_str(sig);
+                }
                 // 认得的增量才拼得出原貌；别的一律记成拼不出，那条回复不给 `continue` 接。
                 match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                     Some(
@@ -1489,10 +1528,35 @@ impl UsageSniffer {
     }
 
     /// 记一个内容块的类型：思考块只记「出现过」，工具块记名字与入参。
+    /// 记下一个 thinking 签名 / `redacted_thinking` 密文的指纹（[`Self::thinking_blocks`]）；
+    /// 空串与非字符串不记，满了不记。
+    fn note_thinking_block(&mut self, value: Option<&serde_json::Value>) {
+        if let Some(v) = value.and_then(|v| v.as_str())
+            && !v.is_empty()
+            && self.thinking_blocks.len() < store::THINKING_BLOCK_CAP
+        {
+            self.thinking_blocks.push(store::thinking_block_fingerprint(v));
+        }
+    }
+
+    /// 没等到 `content_block_stop` 的签名分片（流在块中途收尾）也按已拼到的整段登记。
+    fn flush_pending_signatures(&mut self) {
+        for (_, sig) in std::mem::take(&mut self.pending_signatures) {
+            self.note_thinking_block(Some(&serde_json::Value::String(sig)));
+        }
+    }
+
     fn note_block(&mut self, index: i64, cb: &serde_json::Value) {
         let ty = cb.get("type").and_then(|t| t.as_str());
         if ty != Some("fallback") {
             self.saw_output_block = true;
+        }
+        // 签发者登记：非流式的 thinking 块在这里就带着完整签名（流式的 `content_block_start`
+        // 里是空串，签名随后由 `signature_delta` 送来）；`redacted_thinking` 两种模式都在这里。
+        match ty {
+            Some("thinking") => self.note_thinking_block(cb.get("signature")),
+            Some("redacted_thinking") => self.note_thinking_block(cb.get("data")),
+            _ => {}
         }
         let kind = match ty {
             Some("text") => Some((ReplyBlockKind::Text, "text")),
@@ -1704,6 +1768,7 @@ impl UsageSniffer {
         {
             self.merge(&v);
         }
+        self.flush_pending_signatures();
     }
 
     /// 响应体开头（[`Self::head`]）按 UTF-8 转成文本；一个字节都没收到时 `None`。

@@ -560,3 +560,52 @@ fn reply_input_chars_matches_the_capture_when_it_is_present() {
     }
     assert_eq!(s.reply_input_chars(), 280);
 }
+
+/// 回复里的 thinking 签名与 `redacted_thinking` 密文都被记成指纹：流式的签名按块把 `signature_delta`
+/// 分片拼成整段、`content_block_stop` 时登记（没等到 stop 的在收尾时登记），`redacted_thinking` 从
+/// `content_block_start` 取，`content_block_start` 里的空签名不算；非流式看顶层 `content[]`。
+#[test]
+fn sniffer_fingerprints_thinking_signatures_and_redacted_data() {
+    let fp = crate::store::thinking_block_fingerprint;
+    let mut s = UsageSniffer::new(true, false);
+    for line in [
+        r#"data: {"type":"message_start","message":{"id":"msg_1","model":"m","usage":{"input_tokens":1}}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"DATA_B"}}"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+        r#"data: {"type":"content_block_stop","index":2}"#,
+        r#"data: {"type":"content_block_start","index":3,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        r#"data: {"type":"content_block_delta","index":3,"delta":{"type":"signature_delta","signature":"tail"}}"#,
+        r#"data: {"type":"message_stop"}"#,
+    ] {
+        s.feed(format!("{line}\n\n").as_bytes());
+    }
+    s.finish();
+    assert_eq!(
+        s.thinking_blocks,
+        vec![fp("sig-abc"), fp("DATA_B"), fp("tail")],
+        "分片拼成整段；没等到 stop 的在 message_stop 时登记"
+    );
+
+    let mut j = UsageSniffer::new(false, false);
+    j.feed(
+        serde_json::json!({
+            "id": "msg_2", "model": "m", "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "hm", "signature": "SIG_C"},
+                {"type": "redacted_thinking", "data": "DATA_D"},
+                {"type": "text", "text": "ok"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    j.finish();
+    assert_eq!(j.thinking_blocks, vec![fp("SIG_C"), fp("DATA_D")]);
+}

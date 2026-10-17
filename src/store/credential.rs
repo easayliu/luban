@@ -194,6 +194,7 @@ impl CredentialStore {
             "device_bindings",
             "session_bindings",
             "session_binding_events",
+            "thinking_blocks",
             "credential_stats",
             "device_costs",
             "model_denials",
@@ -205,6 +206,8 @@ impl CredentialStore {
         }
         let n = sqlx::query("DELETE FROM credentials").execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
+        // 救活缓存里的指纹是围绕旧号判的，号都没了就一并忘掉，别影响重新导入后的号。
+        self.forget_recovered_history();
         Ok(n as usize)
     }
 
@@ -466,7 +469,15 @@ impl CredentialStore {
             .execute(&mut *tx)
             .await?;
         release_bindings(&mut tx, ids, "account_removed").await?;
-        for table in ["credential_stats", "device_costs", "model_denials", "credential_groups"] {
+        // `thinking_blocks` 也按号删：号没了，它签发过的指纹留着只会把重新导入后的新 id 认成
+        // 「别的号」，白白开启降级重试。
+        for table in [
+            "credential_stats",
+            "device_costs",
+            "model_denials",
+            "credential_groups",
+            "thinking_blocks",
+        ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE cred_id = ANY($1)"
             )))
@@ -480,6 +491,8 @@ impl CredentialStore {
             .await?
             .rows_affected();
         tx.commit().await?;
+        // 救活缓存不分号，保守起见整个清掉（落库的外来登记还在，只是少了那层同步窗口）。
+        self.forget_recovered_history();
         // 号没了，它们在内存里的限流窗口与冷却也留着没用（id 不会被复用）。
         for id in ids {
             self.bare_rate.forget(id);

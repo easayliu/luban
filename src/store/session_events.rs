@@ -48,6 +48,15 @@ pub struct SessionEvent {
     pub reason: Option<String>,
 }
 
+/// 一条会话的账号痕迹，见 [`CredentialStore::session_credential_history`]。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionCredentialHistory {
+    /// 别的号在这条会话上应答过、或绑定事件里出现过别的号。
+    pub other: bool,
+    /// 当前号在这条会话上成功应答过。
+    pub here: bool,
+}
+
 use super::CredentialStore;
 use anyhow::Result;
 use sqlx::PgConnection;
@@ -204,6 +213,42 @@ impl CredentialStore {
     /// 一条会话的历史事件，最近的在前。跨账号：改绑之后的事件记在新账号上，同样列出。
     pub async fn session_events(&self, session_key: &str) -> Result<Vec<SessionEvent>> {
         self.query_events("e.session_key = $1", args1(session_key)?).await
+    }
+
+    /// 这条会话的历史里各有哪些账号的痕迹（[`SessionCredentialHistory`]）：`other`——流水里有另一个
+    /// 号成功应答过（`usage_logs`，按 `log_key` 筛、保留 30 天），或绑定事件里出现过另一个号
+    /// （`session_binding_events`，按绑定键筛、保留 7 天，`cred_id` 与 `prev_cred_id` 两列都算）；
+    /// `here`——流水里**当前号**在这条会话上成功应答过。
+    ///
+    /// 给历史思考块验不过时的降级重试当**退路**判据：主判据是请求里那些块的签发者
+    /// （[`Self::thinking_block_issuers`]），有认不出的才看这里。「查不到」不等于「确认没换过」
+    /// ——不带会话 id 的来访键是前缀指纹，system 里的时间一变键就变，新键下查不到旧号；流水与事件
+    /// 也各有保留期。所以这里只能当退路，见 [`crate::proxy::retry_demoted_thinking`]。
+    ///
+    /// 两张表都有按会话键的索引，这一查只在上游回了那类 400 之后才跑。
+    pub async fn session_credential_history(
+        &self,
+        log_key: &str,
+        binding_key: &str,
+        cred_id: i64,
+    ) -> Result<SessionCredentialHistory> {
+        let (other, here): (bool, bool) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM usage_logs \
+                            WHERE session_key = $1 AND cred_id IS NOT NULL AND cred_id <> $3 \
+                              AND status = 200) \
+                 OR EXISTS(SELECT 1 FROM session_binding_events \
+                            WHERE session_key = $2 \
+                              AND ((cred_id IS NOT NULL AND cred_id <> $3) \
+                                OR (prev_cred_id IS NOT NULL AND prev_cred_id <> $3))), \
+                    EXISTS(SELECT 1 FROM usage_logs \
+                            WHERE session_key = $1 AND cred_id = $3 AND status = 200)",
+        )
+        .bind(log_key)
+        .bind(binding_key)
+        .bind(cred_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(SessionCredentialHistory { other, here })
     }
 
     /// 某账号某槽位（也就是某个上游会话 id）的历史：在这个槽位上发生的事件，以及从这个槽位

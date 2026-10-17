@@ -59,10 +59,11 @@ use super::session_id::{
 use super::session_link::{CcRequestKind, client_session_link};
 use super::simulation::{SimSessionSeed, Simulation, inbound_facts, is_cc_shaped, simulates_cc};
 use super::thinking::{
-    ENABLED_THINKING_REJECT_MESSAGE, block_site, client_enabled_thinking_rejection,
-    error_block_path, is_redacted_thinking_data_error, is_thinking_signature_error,
-    latest_assistant_diff, preserve_thinking_encoding, retry_demoted_thinking,
-    thinking_block_error_kind, trace_thinking_block,
+    ENABLED_THINKING_REJECT_MESSAGE, HistoryFingerprints, block_site,
+    client_enabled_thinking_rejection, error_block_path, history_thinking_fingerprints,
+    is_redacted_thinking_data_error, is_thinking_signature_error, latest_assistant_diff,
+    preserve_thinking_encoding, retry_demoted_thinking, thinking_block_error_kind,
+    thinking_block_fingerprint_at, trace_thinking_block,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_chain,

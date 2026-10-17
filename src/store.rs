@@ -49,6 +49,7 @@ mod settings;
 mod stats;
 #[cfg(test)]
 mod tests;
+mod thinking_blocks;
 mod usage;
 mod users;
 
@@ -75,6 +76,7 @@ use session_events::*;
 pub use session_events::{SESSION_EVENT_RETENTION_SECS, SessionEvent};
 pub use settings::*;
 pub use stats::*;
+pub use thinking_blocks::{THINKING_BLOCK_CAP, thinking_block_fingerprint};
 pub use usage::*;
 pub use users::*;
 
@@ -147,6 +149,9 @@ pub struct CredentialStore {
     /// 选号最早该在什么时刻（unix 秒）去放回到点的限流暂停号，见
     /// [`CredentialStore::resume_due_gated`]。没到点就不发那条 UPDATE。
     next_resume_check: std::sync::atomic::AtomicI64,
+    /// 近期降级重试救活过的历史思考块**指纹**（进程内、同步可见），见
+    /// [`CredentialStore::mark_history_recovered`]。
+    recovered_history: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// 后台写入（流水、学到的规则）同时占用的连接数上限。
@@ -231,6 +236,7 @@ impl CredentialStore {
             key_cache: Default::default(),
             known_tool_sets: Mutex::default(),
             next_resume_check: Default::default(),
+            recovered_history: Default::default(),
         })
     }
 

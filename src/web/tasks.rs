@@ -50,6 +50,14 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
                     Err(e) => tracing::warn!(error = %e, "failed to prune usage logs"),
                     _ => {}
                 }
+                // thinking 签发者登记保留 90 天，随这里一起清。
+                match store.prune_thinking_blocks().await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(rows = n, "pruned expired thinking-block issuers")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to prune thinking-block issuers"),
+                    _ => {}
+                }
             }
         });
     }
