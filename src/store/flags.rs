@@ -71,20 +71,13 @@ pub struct ForwardFlags {
     /// 上游以「thinking 块签名无效」拒绝时，把历史 thinking 降级成 text 后重试一次
     /// （见 [`crate::proxy::demote_thinking_blocks`]）。
     ///
-    /// 2026-10-17 起只在**这条会话确实经过别的号**时才重试。主判据是请求里历史思考块的签发者
-    /// （[`CredentialStore::thinking_block_issuers`](crate::store::CredentialStore::thinking_block_issuers)，
-    /// 经 luban 转发的每条回复落地时登记，保留 90 天）：有别的号签发的重试，全是本号签发的透传
-    /// 上游 400（签名由签发它的账号校验，历史没问题还验不过就是客户端改坏了，API Key 直连也是
-    /// 400；渠道测试工具正是拿「改坏签名回传、直连 400、中转 200」识别中转）。救活过的历史记成
-    /// 外来，之后续轮照常恢复。有认不出的保留「历史未知」，退回会话痕迹
-    /// （[`session_credential_history`](crate::store::CredentialStore::session_credential_history)）：
-    /// 出现过别的号重试、本号此前在此会话应答过则透传、一无所知按能恢复处理重试；没有会话键也判
-    /// 不了的照旧重试。
+    /// [`Self::reject_tampered_thinking`]（默认开）同时开着时，只在**这条会话确实经过别的号**时才
+    /// 重试，判法见那里；它关着时一律重试（老行为）。
     pub thinking_signature_retry: bool,
     /// 上游以「`redacted_thinking` 块的 `data` 无效」拒绝时，降级历史 thinking 块后重试一次。
     /// 那段密文是上游自己签发的，验不过通常是会话中途换了号、或那一轮 assistant 消息被改写过
     /// （见 [`crate::proxy::trace_thinking_block`] 那行日志怎么分辨）。同 [`Self::thinking_signature_retry`]，
-    /// 只在会话确实换过号时才重试。
+    /// 受 [`Self::reject_tampered_thinking`] 约束。
     pub redacted_thinking_retry: bool,
     /// 非 Claude Code 客户端的请求，按官方抓包形态模拟成 CC 请求（注入 system 前缀 +
     /// 整套官方头，见 [`crate::proxy::Simulation`]）。
@@ -338,6 +331,19 @@ pub struct ForwardFlags {
     /// - **开**（默认）：命中即本地 400，与 API Key 直连逐字相同。
     /// - **关**：照发，由订阅通道放行（客户端拿到的是 adaptive 的结果）。
     pub reject_enabled_thinking: bool,
+    /// 上游以「签名 / 密文无效」拒绝历史思考块时，先按**签发者登记**判这条会话有没有换过号
+    /// （`thinking_blocks` 表：经 luban 转发的每条回复里 thinking 签名 / `redacted_thinking` 密文由
+    /// 哪个号签发，保留 90 天；判法见 `proxy::handler::respond::thinking_history_check`）：
+    /// 没换过号的，验不过只能是客户端自己改坏了，原样透传上游 400——API Key 直连就是这样，渠道
+    /// 测试工具正是拿「改坏签名回传、直连 400、中转 200」识别中转。
+    ///
+    /// 与两个兜底开关（[`Self::thinking_signature_retry`] / [`Self::redacted_thinking_retry`]）**互相
+    /// 独立**：兜底开着、本项也开着才是「换过号才救」；兜底开着、本项关着是老行为（一律降级重试）；
+    /// 兜底关着时怎样都不重试，本项无事可做。签发者登记不受本项影响，始终记。
+    ///
+    /// - **开**（默认）：没换过号的改坏历史透传 400。
+    /// - **关**：不判，由兜底开关决定。
+    pub reject_tampered_thinking: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
     ///
     /// 官方两处逐字相同，不同值说明来访自己就不自洽——而 luban 拿会话 id 当会话链
@@ -512,6 +518,7 @@ impl Default for ForwardFlags {
             inject_thinking: true,
             reject_openai_shape: true,
             reject_enabled_thinking: true,
+            reject_tampered_thinking: true,
             reject_session_conflict: true,
             reject_probes: true,
             reject_probes_strict: false,

@@ -885,6 +885,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="reject_tampered_thinking"
+          label={t('拒绝改坏的历史思考块', 'Reject tampered thinking history')}
+          summary={t(
+            '上游以签名或密文无效拒绝历史 thinking 时，按签发账号判断会话是否换过账号；没换过的原样返回上游 400，不降级重试。',
+            'When the upstream rejects historical thinking for an invalid signature or ciphertext, decide by issuing account whether the session switched accounts; if not, return the upstream 400 as is instead of retrying.',
+          )}
+          description={
+            <>
+              {t(
+                '签名由签发它的账号校验。会话确实中途换过账号时，历史 thinking 在新账号上必然验不过，「thinking 签名兜底」与「redacted thinking 兜底」把它降级后重试一次是正当的恢复；会话从未换过账号而签名仍无法验证，只可能是客户端自行改动了历史，API Key 直连此时返回 400，中转若替它救活成 200，渠道测试工具正是以此识别中转。判定依据是请求里历史 thinking 签名的签发账号：luban 转发过的每条回复都记下其中的签名由哪个账号签发，保留 90 天；有签发自其他账号的即重试，全部都有记录且均为当前账号签发则原样返回 400；重试成功后这段历史中认不出的部分记为「外来」，之后的续轮照常恢复。有认不出的签名（上线前的历史、超过保留期、非经 luban 发出，或已被改动）时再看该会话：请求流水或绑定事件里出现过其他账号则重试；此前就由当前账号在此会话应答过则视为改坏、返回 400；对该会话一无所知则按可恢复处理、照常重试。没有会话键的请求照常重试。本项与两个兜底开关相互独立：兜底停用时本来就不重试，本项无事可做；兜底启用而本项停用，则恢复为无条件降级重试的旧行为。签发账号的登记不受本项影响，始终进行。完整对齐与「仅 billing 标识」两种模式下均生效。',
+                'Signatures are verified by the account that issued them. When a session really switched accounts midway, its historical thinking cannot verify on the new account, and the thinking-signature and redacted-thinking fallbacks rightly downgrade it and retry once. When the session never switched and a signature still fails, the client itself must have altered the history: an API-key connection returns 400 there, and relay-detection tools flag a relay that rescues it into a 200. The decision is based on which account issued the thinking signatures in the request: every reply luban relays has its signatures recorded against the issuing account for 90 days. Any signature issued by another account triggers the retry; when every signature is on record and all were issued by the current account, the 400 is returned as is. After a successful retry, the unrecognised part of that history is recorded as foreign so later turns keep recovering. With unknown signatures (history predating the feature, past retention, not relayed by luban, or altered) the session is consulted: another account in its request log or binding events means retry; the current account having already answered this session means the block was altered, so the 400 is returned; a session with no history at all is treated as recoverable and retried. Requests with no session key are retried as before. This setting is independent of the two fallbacks: with a fallback off nothing is retried anyway; with a fallback on and this setting off, the old unconditional retry returns. Recording issuing accounts is unaffected and always runs. Applies in both full-alignment and billing-only modes.',
+              )}
+            </>
+          }
+        />
       </ForwardingGroup>
 
       <ForwardingFilterItem
@@ -982,8 +998,8 @@ export function ForwardingSettingsContent() {
               {t('无法验证的历史', 'Unverifiable historical')}{' '}
               <code className="font-mono">thinking</code>{' '}
               {t(
-                '会转为普通文本，并用同一账号重试一次，不会删除原内容。工具续跑仍可能失败；重试会增加一次请求成本，失败时返回原始 400。只在该会话确实经过其他账号时才重试：签名由签发它的账号校验，会话从未切换过账号而签名仍无法验证，说明是客户端自行改动了历史 thinking，此时原样返回上游的 400，与 API Key 直连的行为一致。渠道测试工具会以「改坏签名回传后中转仍返回 200」识别中转，这一限制正是为此而设。判定依据是请求里历史 thinking 签名的签发账号：luban 转发过的每条回复都记下其中的签名由哪个账号签发，保留 90 天；有签发自其他账号的即重试，全部都有记录且均为当前账号签发则原样返回 400；重试成功后这段历史记为「外来」，之后的续轮照常恢复。有认不出的签名（上线前的历史、超过保留期、非经 luban 发出，或已被改动）时再看该会话：请求流水或绑定事件里出现过其他账号则重试；此前就由当前账号在此会话应答过则视为改坏、返回 400；对该会话一无所知则按可恢复处理、照常重试。没有会话键的请求照常重试。',
-                'content is converted to plain text and retried once with the same account; the original content is not deleted. Tool continuation may still fail. The retry adds the cost of one request, and a failure returns the original 400 response. The retry only happens when this session has actually been served by another account: signatures are verified by the account that issued them, so a failure on a session that never switched accounts means the client itself altered the historical thinking, and the upstream 400 is returned as is, matching an API-key connection. Relay-detection tools flag a relay when a tampered signature still gets a 200, which is what this restriction prevents. The decision is based on which account issued the thinking signatures in the request: every reply luban relays has its signatures recorded against the issuing account for 90 days. Any signature issued by another account triggers the retry; when every signature is on record and all were issued by the current account, the 400 is returned as is. After a successful retry that history is recorded as foreign, so later turns keep recovering. With unknown signatures (history predating the feature, past retention, not relayed by luban, or altered) the session is consulted: another account in its request log or binding events means retry; the current account having already answered this session means the block was altered, so the 400 is returned; a session with no history at all is treated as recoverable and retried. Requests with no session key are retried as before.',
+                '会转为普通文本，并用同一账号重试一次，不会删除原内容。工具续跑仍可能失败；重试会增加一次请求成本，失败时返回原始 400。「拒绝改坏的历史思考块」同时启用时，只在该会话确实经过其他账号时才重试，判定规则见该项说明。',
+                'content is converted to plain text and retried once with the same account; the original content is not deleted. Tool continuation may still fail. The retry adds the cost of one request, and a failure returns the original 400 response. With “Reject tampered thinking history” also on, the retry only happens when this session has actually been served by another account; see that setting for the rules.',
               )}
             </>
           }
@@ -1002,8 +1018,8 @@ export function ForwardingSettingsContent() {
                 Invalid `data` in `redacted_thinking` block
               </code>{' '}
               {t(
-                '时触发。这段密文由上游签发，校验不通过通常是因为会话中途换了账号，或该轮 assistant 消息在转发时被改写过（如工具名混淆）。处理方式与另外两种兜底相同：历史 thinking 降级成普通文本、redacted_thinking 整块删除后重试一次；命中时日志会输出该块在收到与发出的两份请求体中的对照，可据此判断具体成因。与「thinking 签名兜底」相同，只在该会话确实经过其他账号时才重试，否则原样返回上游的 400。',
-                '. The ciphertext is issued by the upstream, so a failure usually means the session switched accounts midway, or that assistant turn was rewritten on forwarding (for example by tool name obfuscation). Handled like the other two fallbacks: historical thinking is downgraded to plain text, redacted_thinking blocks are dropped, and the request is retried once. On a hit, the log compares that block between the received and the forwarded request body so the cause can be told apart. As with the thinking signature fallback, the retry only happens when the session has actually been served by another account; otherwise the upstream 400 is returned as is.',
+                '时触发。这段密文由上游签发，校验不通过通常是因为会话中途换了账号，或该轮 assistant 消息在转发时被改写过（如工具名混淆）。处理方式与另外两种兜底相同：历史 thinking 降级成普通文本、redacted_thinking 整块删除后重试一次；命中时日志会输出该块在收到与发出的两份请求体中的对照，可据此判断具体成因。与「thinking 签名兜底」相同，受「拒绝改坏的历史思考块」约束。',
+                '. The ciphertext is issued by the upstream, so a failure usually means the session switched accounts midway, or that assistant turn was rewritten on forwarding (for example by tool name obfuscation). Handled like the other two fallbacks: historical thinking is downgraded to plain text, redacted_thinking blocks are dropped, and the request is retried once. On a hit, the log compares that block between the received and the forwarded request body so the cause can be told apart. As with the thinking signature fallback, it is subject to “Reject tampered thinking history”.',
               )}
             </>
           }

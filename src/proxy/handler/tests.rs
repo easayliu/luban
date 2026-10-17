@@ -1493,6 +1493,36 @@ async fn recovery_cache_does_not_cover_unrelated_new_signatures(pool: sqlx::PgPo
     assert_eq!(mock.seen().len(), 3, "无关的新签名不借救活之光，原样透传");
 }
 
+/// 「拒绝改坏的历史思考块」关掉：不判换没换号，回到兜底开关自己的老行为——本号在此会话应答过、
+/// 签名认不出，也照样降级重试。
+#[sqlx::test]
+async fn reject_tampered_thinking_off_restores_unconditional_retry(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok("first turn"),
+        Reply::json_error(
+            400,
+            "invalid_request_error",
+            "messages.2.content.0: Invalid `signature` in `thinking` block",
+        ),
+        sse_ok("rescued"),
+    ])
+    .await;
+    let (store, state, _ids) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::REJECT_TAMPERED_THINKING, "0").await.unwrap();
+    let (status, _, _) = send(&state, cc_request(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    usage_logs(&store, 1).await;
+    let req = cc_request(serde_json::json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "let me think", "signature": "TAMPERED"},
+            {"type": "text", "text": "hello"}]},
+        {"role": "user", "content": "again"}]}));
+    let (status, _, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::OK, "开关关着：一律降级重试");
+    assert_eq!(mock.seen().len(), 3);
+}
+
 /// 混合历史：首次救活的请求里既有外来块 A 也有已登记为本号签发的合法块 B。救活时只有 A 进救活
 /// 缓存、只有 A 记成外来；之后客户端丢掉 A、保留 B，再带一个签名改坏的新块 U 来——B 不能给 U
 /// 当重试凭据，本号已在此会话应答过，透传 400。

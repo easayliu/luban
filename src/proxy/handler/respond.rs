@@ -547,10 +547,11 @@ async fn client_error(
         // 下一条请求就改走别的号。这一发已经到了客户端手里，原样透传。
         park_org_oauth_disallowed(&state.store, cred, status.as_u16(), "forward").await;
     }
-    // 历史思考块验不过（签名 / `redacted_thinking` 密文）的两条兜底，只在**这条会话确实经过别的
-    // 号**时才降级重试：签名由签发它的账号校验，历史全是本号签发的还验不过，就是客户端自己改坏
-    // 了，该把上游的 400 原样回去——API Key 直连就是这样，渠道测试工具拿「改坏签名回传、直连
-    // 400、中转 200」识别中转。判据见 [`session_switched_credential`]；只在命中那两类 400 时才查库。
+    // 历史思考块验不过（签名 / `redacted_thinking` 密文）的两条兜底，`reject_tampered_thinking`
+    // 开着时只在**这条会话确实经过别的号**时才降级重试：签名由签发它的账号校验，历史全是本号签发
+    // 的还验不过，就是客户端自己改坏了，该把上游的 400 原样回去——API Key 直连就是这样，渠道测试
+    // 工具拿「改坏签名回传、直连 400、中转 200」识别中转。判据见 [`thinking_history_check`]；只在
+    // 命中那两类 400 时才查库。
     let thinking_block_rejected = status == StatusCode::BAD_REQUEST
         && !compressed
         && (is_thinking_signature_error(&err_bytes) || is_redacted_thinking_data_error(&err_bytes));
@@ -563,7 +564,8 @@ async fn client_error(
     } else {
         None
     };
-    let switched = history.as_ref().is_some_and(|h| h.retry);
+    // `reject_tampered_thinking` 关着：不判换没换号，回到兜底开关自己的老行为（开着就一律重试）。
+    let switched = history.as_ref().is_some_and(|h| h.retry || !flags.reject_tampered_thinking);
     // thinking 签名降级重试。
     if status == StatusCode::BAD_REQUEST && !compressed && is_thinking_signature_error(&err_bytes) {
         if !flags.thinking_signature_retry {

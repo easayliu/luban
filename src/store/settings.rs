@@ -200,6 +200,10 @@ pub const SIM_BILLING_RELOCATE: &str = "sim_billing_relocate";
 /// 见 [`ForwardFlags::reject_enabled_thinking`]。
 pub const REJECT_ENABLED_THINKING: &str = "reject_enabled_thinking";
 
+/// 历史思考块验不过时按签发者判换没换号、没换的透传 400 的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::reject_tampered_thinking`]。
+pub const REJECT_TAMPERED_THINKING: &str = "reject_tampered_thinking";
+
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。
 pub const SIM_MESSAGE_THREADS: &str = "sim_message_threads";
@@ -763,6 +767,9 @@ impl CredentialStore {
         if let Some(v) = on(REJECT_ENABLED_THINKING) {
             flags.reject_enabled_thinking = v;
         }
+        if let Some(v) = on(REJECT_TAMPERED_THINKING) {
+            flags.reject_tampered_thinking = v;
+        }
         if let Some(v) = on(SIM_BILLING_RELOCATE) {
             flags.sim_billing_relocate = v;
         }
@@ -1135,6 +1142,7 @@ mod tests {
             (RELOCATE_CLIENT_SYSTEM, "0"),
             (REJECT_KNOWN_THIRD_PARTY, "0"),
             (REJECT_ENABLED_THINKING, "0"),
+            (REJECT_TAMPERED_THINKING, "0"),
             (SIM_BILLING_RELOCATE, "0"),
             (SIM_MESSAGE_THREADS, "0"),
             (FILL_METADATA, "0"),
@@ -1189,6 +1197,7 @@ mod tests {
                 relocate_client_system: false,
                 reject_known_third_party: false,
                 reject_enabled_thinking: false,
+                reject_tampered_thinking: false,
                 sim_billing_relocate: false,
                 sim_message_threads: false,
                 fill_metadata: false,

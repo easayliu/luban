@@ -511,9 +511,20 @@ async fn forwarding_update_persists_reject_enabled_thinking(pool: sqlx::PgPool) 
         Some("false")
     );
     assert!(!store.forward_flags().reject_enabled_thinking, "关掉后立刻生效");
-    let _ = set_forwarding(State(state), req(true)).await.unwrap();
+    let _ = set_forwarding(State(state.clone()), req(true)).await.unwrap();
     assert_eq!(store.get_setting(store::REJECT_ENABLED_THINKING).unwrap().as_deref(), Some("true"));
     assert!(store.forward_flags().reject_enabled_thinking);
+
+    assert!(store.forward_flags().reject_tampered_thinking, "默认开");
+    let tampered = Json(
+        serde_json::from_value(serde_json::json!({ "reject_tampered_thinking": false })).unwrap(),
+    );
+    let _ = set_forwarding(State(state), tampered).await.unwrap();
+    assert_eq!(
+        store.get_setting(store::REJECT_TAMPERED_THINKING).unwrap().as_deref(),
+        Some("false")
+    );
+    assert!(!store.forward_flags().reject_tampered_thinking, "关掉后立刻生效");
 }
 
 /// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
