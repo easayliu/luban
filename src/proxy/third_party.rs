@@ -9,6 +9,12 @@
 //! - `system` 正文：pi（badlogic/pi-mono 编码代理）提示词里的 `docs/custom-provider.md` 与
 //!   `pi packages (docs/packages.md)` **同时**出现即 400（顺序无关、中间可夹其他文字；各自单独、
 //!   少一个字符、`Pi` 大写、放进用户消息都放行），haiku / sonnet 一致，线上 10-16 四种变体 100% 复现；
+//! - `system` 正文：OpenCode（1.19.3）环境段的三行 `Here is some useful information about the
+//!   environment you are running in:`、`Workspace root folder:`、`Is directory a git repo:` **同时**出现
+//!   即 400（顺序无关、行首空格与冒号后的取值无关、中间可夹 3KB 正文；少任一行、全小写、`some` 去掉
+//!   成官方原句、`Workspace root folder` 换成 `Working directory`、放进用户消息都放行），2026-10-17
+//!   本地 ddmin 38 发 + 10 发变体对拍，sonnet-5-5。这三行由 OpenCode 的环境段模板固定生成，每条主请求
+//!   都带，与提示词变体（anthropic / gemini / beast 等）无关；它的标题生成请求没有环境段，上游也放行；
 //! - 工具名：以 `mcp_`（单下划线）开头的客户端工具名，单独一个就 400
 //!   （[`crate::proxy::is_mcp_underscore_name`]）。
 //!
@@ -26,6 +32,14 @@ not plan limits. Ask your workspace admin to add more and keep going.";
 const SYSTEM_SIGNATURES: &[(&str, &[&str])] = &[
     ("openclaw", &["[[reply_to_current]]", "stripped before rendering"]),
     ("pi", &["docs/custom-provider.md", "pi packages (docs/packages.md)"]),
+    (
+        "opencode",
+        &[
+            "Here is some useful information about the environment you are running in:",
+            "Workspace root folder:",
+            "Is directory a git repo:",
+        ],
+    ),
 ];
 
 /// 工具名命中 [`crate::proxy::is_mcp_underscore_name`] 时的标签。
@@ -119,6 +133,54 @@ mod tests {
         let in_user = serde_json::json!({
             "system": "You are a concise assistant.",
             "messages": [{ "role": "user", "content": "docs/custom-provider.md pi packages (docs/packages.md)" }],
+        });
+        assert_eq!(known_third_party_signature(&in_user), None, "挪进用户消息就不算");
+    }
+
+    /// OpenCode 环境段三行同时在 system 里才触发：顺序、行首空格、取值无关；少一行、改成官方原句、
+    /// 换行名、全小写、放进消息都不算。
+    #[test]
+    fn opencode_env_triplet_must_co_occur_in_system() {
+        let a = "Here is some useful information about the environment you are running in:";
+        let b = "  Workspace root folder: /";
+        let c = "  Is directory a git repo: no";
+        for hit in [
+            format!("{a}\n{b}\n{c}"),
+            format!("{c}\n{b}\n{a}"),
+            format!("{a}\n{}\n{}", b.trim(), c.trim()),
+            format!("{a}\n  Workspace root folder: /Users/me/proj\n  Is directory a git repo: yes"),
+            format!("{a}\n{}\n{b}\n{c}", "x".repeat(3000)),
+        ] {
+            assert_eq!(
+                known_third_party_signature(&body(hit.clone().into(), &[])),
+                Some("opencode"),
+                "{hit}"
+            );
+        }
+        for miss in [
+            format!("{a}\n{b}"),
+            format!("{b}\n{c}"),
+            format!("{a}\n{c}"),
+            format!(
+                "Here is useful information about the environment you are running in:\n{b}\n{c}"
+            ),
+            format!("{a}\n  Working directory: /tmp/x\n{c}"),
+            format!("{a}\n{b}\n{c}").to_lowercase(),
+            // 官方 Claude Code 自己的环境段（cap/2.1.260/00029 原文）：首句没有 `some`、没有
+            // `Workspace root folder`，只命中第三句，不能误伤。
+            "Here is useful information about the environment you are running in:\n<env>\n\
+             Working directory: /tmp/p\nIs directory a git repo: No\nPlatform: darwin\n</env>"
+                .to_string(),
+        ] {
+            assert_eq!(
+                known_third_party_signature(&body(miss.clone().into(), &[])),
+                None,
+                "{miss}"
+            );
+        }
+        let in_user = serde_json::json!({
+            "system": "You are a helpful assistant.",
+            "messages": [{ "role": "user", "content": format!("{a}\n{b}\n{c}") }],
         });
         assert_eq!(known_third_party_signature(&in_user), None, "挪进用户消息就不算");
     }
