@@ -358,6 +358,12 @@ function rewriteLabel(tag: string, t: (zh: string, en: string) => string): strin
       return t('账号 token 刷新失败，未转发', 'Account token refresh failed, not forwarded')
     case 'rejected_locally:third-party':
       return t('命中已知第三方特征，本地返回 400，未转发', 'Known third-party signature, rejected locally with a 400, not forwarded')
+    case 'rejected_locally:anthropic-version':
+      return t('缺少 anthropic-version 头，本地返回 400，未转发', 'Missing anthropic-version header, rejected locally with a 400, not forwarded')
+    case 'rejected_locally:thinking-display':
+      return t('thinking.display 取值不被 API Key 直连接受，本地返回 400，未转发', 'thinking.display value not accepted over an API-key connection, rejected locally with a 400, not forwarded')
+    case 'rejected_locally:thinking-budget':
+      return t('思考预算不小于 max_tokens，本地返回 400，未转发', 'Thinking budget not below max_tokens, rejected locally with a 400, not forwarded')
     case 'rejected_locally:enabled-thinking':
       return t('该模型不接受 enabled thinking，本地返回 400，未转发', 'Model does not accept enabled thinking, rejected locally with a 400, not forwarded')
     case 'refusal_replay':

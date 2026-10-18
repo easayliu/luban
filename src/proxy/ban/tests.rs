@@ -46,6 +46,17 @@ fn bans_on_real_account_errors() {
     }
 }
 
+/// 订阅号调 batches 之类要别的 scope 的接口：403「OAuth token does not meet scope requirement」
+/// 是接口不匹配，不是封号（2026-10-18 实测：此前被 `oauth` 特征词命中，调一次就停用了号）。
+#[test]
+fn scope_requirement_403_is_not_a_ban() {
+    let body = err_body(
+        "permission_error",
+        "OAuth token does not meet scope requirement any_of(user:batch, user:developer, workspace:developer, workspace:inference)",
+    );
+    assert_eq!(detect_account_ban(StatusCode::FORBIDDEN, &body), None);
+}
+
 /// 豁免有没有改写结论要分得清：改写了的（没有豁免就会停用）记日志，没改写的（普通
 /// 参数错误回显字段名）不记；「主语 + 状态词」共现不受豁免影响。
 #[test]

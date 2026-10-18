@@ -527,6 +527,23 @@ async fn forwarding_update_persists_reject_enabled_thinking(pool: sqlx::PgPool) 
     assert!(!store.forward_flags().reject_tampered_thinking, "关掉后立刻生效");
 }
 
+/// 转发开关的保存接口认得 `api_key_parity`：拨关落库为 `false`、立刻生效；再拨回开。
+#[sqlx::test]
+async fn forwarding_update_persists_api_key_parity(pool: sqlx::PgPool) {
+    let store = std::sync::Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let state = AppState::for_test(store.clone());
+    assert!(store.forward_flags().api_key_parity, "默认开");
+    let req = |on: bool| {
+        Json(serde_json::from_value(serde_json::json!({ "api_key_parity": on })).unwrap())
+    };
+    let _ = set_forwarding(State(state.clone()), req(false)).await.unwrap();
+    assert_eq!(store.get_setting(store::API_KEY_PARITY).unwrap().as_deref(), Some("false"));
+    assert!(!store.forward_flags().api_key_parity, "关掉后立刻生效");
+    let _ = set_forwarding(State(state), req(true)).await.unwrap();
+    assert_eq!(store.get_setting(store::API_KEY_PARITY).unwrap().as_deref(), Some("true"));
+    assert!(store.forward_flags().api_key_parity);
+}
+
 /// 趋势接口响应里声明的桶宽就是实际用的那个：请求 60 秒，数据是 15 分钟一格，回 900。
 #[sqlx::test]
 async fn series_endpoints_report_the_bucket_width_actually_used(pool: sqlx::PgPool) {

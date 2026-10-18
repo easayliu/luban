@@ -644,6 +644,17 @@ async fn client_error(
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
     }
+    // billing-only 在 `system[0]` 前插了一块 billing header（还可能剥掉了客户端自带的）：上游报错
+    // 里的 `system.N` 按块对应还原成客户端那份的下标，与 API Key 直连一致（[`billing_system_index_map`]）。
+    let system_map =
+        (!compressed && flags.billing_only() && err_bytes.windows(7).any(|w| w == b"system."))
+            .then(|| serde_json::from_slice::<serde_json::Value>(sent).ok())
+            .flatten()
+            .and_then(|out| billing_system_index_map(body_json.as_ref(), &out));
+    let err_bytes = match system_map {
+        Some(map) => unshift_system_index(&err_bytes, &map).unwrap_or(err_bytes),
+        None => err_bytes,
+    };
     let err_bytes = match &tool_names {
         Some(map) => Bytes::from(map.restore(&err_bytes)),
         None => err_bytes,

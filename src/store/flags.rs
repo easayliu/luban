@@ -344,6 +344,27 @@ pub struct ForwardFlags {
     /// - **开**（默认）：没换过号的改坏历史透传 400。
     /// - **关**：不判，由兜底开关决定。
     pub reject_tampered_thinking: bool,
+    /// 订阅通道放行、API Key 直连却 400 的几种请求形态，按直连那句原文本地回给客户端
+    /// （`rejected_locally:<类别>`），不出门。判的是来访原件与来访自己那串 `anthropic-beta`——
+    /// 两边结果分叉恰恰因为 luban 出站补了 beta 与头。完整模拟与 billing-only 都生效，
+    /// thinking 那两条与 [`Self::reject_enabled_thinking`] 排在探针判定**之前**（改写成预热的探针
+    /// 不过形态闸）；缺版本头那条排在探针之后——探活脚本常不带这个头，不能把就地作答的探活回成 400。
+    ///
+    /// 2026-10-18 对 api.anthropic.com 实测，三类：
+    /// - 缺 `anthropic-version` 头 → `anthropic-version: header is required`（上游最先校验它）；
+    /// - 来访没带 `thinking-display-updates` 却写了 `summarized` / `omitted` / `null` 以外的
+    ///   `thinking.display` → `thinking.<type>.display: Input should be 'summarized', 'omitted'`
+    ///   （排在缺 `max_tokens`、未知字段、采样冲突之前）；
+    /// - 收 `enabled` 的模型（4-6 及更早）`budget_tokens` 不小于 `max_tokens` 且来访没带
+    ///   `interleaved-thinking` → `` `max_tokens` must be greater than `thinking.budget_tokens` ``…
+    ///   （让位给预算不足 1024、display 非法与采样冲突）。
+    ///
+    /// 判据见 [`crate::proxy::client_display_rejection`] / [`crate::proxy::client_budget_rejection`]。
+    /// 官方 CC 恒带版本头与这两项 beta，真实客户端不会命中。
+    ///
+    /// - **开**（默认）：命中即本地 400，与 API Key 直连逐字相同。
+    /// - **关**：照发，由订阅通道放行。
+    pub api_key_parity: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
     ///
     /// 官方两处逐字相同，不同值说明来访自己就不自洽——而 luban 拿会话 id 当会话链
@@ -519,6 +540,7 @@ impl Default for ForwardFlags {
             reject_openai_shape: true,
             reject_enabled_thinking: true,
             reject_tampered_thinking: true,
+            api_key_parity: true,
             reject_session_conflict: true,
             reject_probes: true,
             reject_probes_strict: false,

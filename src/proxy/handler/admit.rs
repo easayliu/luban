@@ -143,6 +143,7 @@ pub(super) async fn admit(
     // 自报 CC 的历史里混进了 `call_` id（会话中途切过别的后端）：改写成 `toolu_` 再往下走，
     // 不然这个会话此后每一轮都被 2.3a 拒掉。后面所有闸门与出站改写都看改写后的那份。
     let body = remap_foreign_tool_ids(state, body, &mut facts, &client_ua);
+    api_parity_gates(state, &method, &path_and_query, &client_ua, &headers, &facts, log_state)?;
     let probe = identity_gates(
         state,
         &method,
@@ -733,6 +734,80 @@ async fn identity_gates(
     Ok(None)
 }
 
+/// 2.0′：订阅通道放行、API Key 直连却 400 的 thinking 形态 → 按直连那句原文本地拒，不出门。
+/// 顺序照直连的校验先后：`thinking.display` → 新一代模型的 `enabled` → 预算不小于 `max_tokens`。
+/// 排在探针判定（[`identity_gates`]）**之前**：改写成预热的探针不过 [`shape_gates`]，放在后面就会
+/// 被预热吞掉、回成 200。缺版本头那条不在这里（见 [`shape_gates`]），但缺它时这里一概让路，
+/// 好让非探活请求先拿到版本头那句。只判计费路径。
+///
+/// `enabled` 那条由 `reject_enabled_thinking` 拨（[`client_enabled_thinking_rejection`]），其余两条由
+/// `api_key_parity` 拨（[`store::ForwardFlags::api_key_parity`]）。
+fn api_parity_gates(
+    state: &AppState,
+    method: &Method,
+    path_and_query: &str,
+    client_ua: &str,
+    headers: &HeaderMap,
+    facts: &Facts,
+    log_state: &RequestLogState,
+) -> Result<(), Response> {
+    let Facts { ref body_json, ref req_model, cc_shaped, billable, .. } = *facts;
+    if !billable {
+        return Ok(());
+    }
+    let flags = state.store.forward_flags();
+    let reject = |tag: &'static str, why: &str, message: &str| {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), cc_shaped, %tag,
+            "rejected locally: {why}"
+        );
+        *log_state.local_reject.lock() = Some(tag);
+        Err(error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message))
+    };
+    // 缺版本头：直连先报它，这几条一概不判。不在这里拒（探活脚本常不带这个头，要先让探针判定
+    // 就地作答）；不是探活的到 [`shape_gates`] 开头回版本头那句，与直连的先后一致。
+    if flags.api_key_parity && !headers.contains_key("anthropic-version") {
+        return Ok(());
+    }
+    let betas = inbound_beta_list(headers);
+
+    // `display` 取值直连不收：luban 出站补的 `thinking-display-updates` 让订阅通道放行了 `updates`。
+    if flags.api_key_parity
+        && let Some(message) = client_display_rejection(body_json.as_ref(), &betas)
+    {
+        return reject(
+            "thinking-display",
+            "thinking.display is not accepted on the API-key channel without the display beta",
+            &message,
+        );
+    }
+    // 新一代模型（5 系、opus-4-7 起）配客户端自己写的 `thinking.type:"enabled"`：订阅通道静默
+    // 放行（当成 adaptive，预算与 display 都忽略），上游永远不会回这条 400，学习机制学不到，
+    // 只能写死；判据见 [`client_enabled_thinking_rejection`]。官方 CC 只在 haiku-4-5 上发
+    // `enabled`，真实客户端不会命中。
+    if flags.reject_enabled_thinking
+        && client_enabled_thinking_rejection(body_json.as_ref(), req_model.as_deref())
+    {
+        return reject(
+            "enabled-thinking",
+            "this model only accepts adaptive thinking on the API-key channel; the subscription channel would silently accept it",
+            ENABLED_THINKING_REJECT_MESSAGE,
+        );
+    }
+    // 预算不小于 `max_tokens`：luban 出站补的 `interleaved-thinking` 让订阅通道放行了。
+    if flags.api_key_parity
+        && client_budget_rejection(body_json.as_ref(), req_model.as_deref(), &betas)
+    {
+        return reject(
+            "thinking-budget",
+            "thinking.budget_tokens is not below max_tokens and the client did not send interleaved-thinking",
+            BUDGET_EXCEEDS_MAX_TOKENS_MESSAGE,
+        );
+    }
+    Ok(())
+}
+
 /// 2.3～2.3a5：本地就能判的形态错误与学到的拒答，命中即拒或回放，不往上游送。
 fn shape_gates(
     state: &AppState,
@@ -762,6 +837,22 @@ fn shape_gates(
     // 判据与 [`crate::proxy::handler::attempt`] 同源（[`store::ForwardFlags::billing_only`]），下面
     // 两处「出站带不带 fallback」的例外要跟实际出站计划一致。
     let billing_only = flags.billing_only();
+    // 2.3⁰) 缺 `anthropic-version` 头 → 直连那句 400。上游先于一切校验它，订阅通道收到的是 luban
+    //       补了头的请求，回不出这句。不放进 [`api_parity_gates`]：探活脚本常不带这个头，排在探针
+    //       判定之前会把本该就地作答的探活回成 400、让下游摘掉渠道。`api_key_parity` 拨。
+    if billable && flags.api_key_parity && !headers.contains_key("anthropic-version") {
+        tracing::warn!(
+            %method, path = %path_and_query, ua = %client_ua,
+            model = %req_model.as_deref().unwrap_or("-"), cc_shaped,
+            "rejected locally: the anthropic-version header is missing; the API-key channel requires it"
+        );
+        *log_state.local_reject.lock() = Some("anthropic-version");
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            VERSION_REQUIRED_MESSAGE,
+        ));
+    }
     if flags.reject_learned_shapes
         && let Some((field, value, message)) = known_shape_rejection(
             &state.shape_rejections,
@@ -789,28 +880,6 @@ fn shape_gates(
             "rejected locally: a mid-conversation system message is not followed by an assistant message"
         );
         return Err(error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message));
-    }
-
-    // 2.3'') 新一代模型（5 系、opus-4-7 起）配客户端自己写的 `thinking.type:"enabled"` → 本地回
-    //        API Key 直连那条 400（[`ENABLED_THINKING_REJECT_MESSAGE`]）。订阅通道对这个组合静默放行
-    //        （当成 adaptive，预算与 display 都忽略），上游永远不会回这条 400，学习机制学不到，
-    //        只能写死；判据见 [`client_enabled_thinking_rejection`]。官方 CC 只在 haiku-4-5 上发
-    //        `enabled`，真实客户端不会命中。只判计费路径，`reject_enabled_thinking` 拨。
-    if billable
-        && flags.reject_enabled_thinking
-        && client_enabled_thinking_rejection(body_json.as_ref(), req_model.as_deref())
-    {
-        tracing::warn!(
-            %method, path = %path_and_query, ua = %client_ua,
-            model = %req_model.as_deref().unwrap_or("-"), cc_shaped,
-            "rejected locally: this model only accepts adaptive thinking on the API-key channel; the subscription channel would silently accept it"
-        );
-        *log_state.local_reject.lock() = Some("enabled-thinking");
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            ENABLED_THINKING_REJECT_MESSAGE,
-        ));
     }
 
     // 2.3a) OpenAI 格式转换残留 → 本地直接拒，不修补，见 [`find_openai_marker`]。

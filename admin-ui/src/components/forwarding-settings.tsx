@@ -901,6 +901,22 @@ export function ForwardingSettingsContent() {
             </>
           }
         />
+        <ForwardingToggle
+          k="api_key_parity"
+          label={t('对齐 API Key 直连的请求校验', 'Match API-key request validation')}
+          summary={t(
+            '订阅通道放行、API Key 直连却返回 400 的几种请求形态，于本地返回直连的同一条 400。',
+            'For request shapes the subscription channel accepts but an API-key connection rejects with a 400, return that same 400 locally.',
+          )}
+          description={
+            <>
+              {t(
+                '2026-10-18 对照 API Key 直连实测，三类请求在直连下返回 400，经订阅通道却被放行，渠道测试工具可据此识别中转。其一，缺少 anthropic-version 请求头：直连返回「anthropic-version: header is required」，且先于其他一切校验；luban 出站时补齐了该头。其二，thinking.display 取 summarized、omitted 以外的值（包括 updates）而请求未带 thinking-display-updates beta：直连返回「thinking.<type>.display: Input should be \'summarized\', \'omitted\'」，先于缺 max_tokens、未知字段与采样参数冲突；luban 出站补了这项 beta，订阅通道因而放行 updates，并把非法值报成三选一。其三，接受 enabled 的模型（4-6 及更早）budget_tokens 不小于 max_tokens 而请求未带 interleaved-thinking beta：直连返回「`max_tokens` must be greater than `thinking.budget_tokens`」；luban 出站补了这项 beta，订阅通道因而放行。budget_tokens 不足 1024、display 非法、采样参数冲突排在这条之前，照常发往上游。判定看客户端发来的原始请求与它自带的 anthropic-beta，客户端已带相应 beta 的照常转发。后两类排在探活判定之前，改写为预热的探活同样适用；缺版本头一类排在探活判定之后，以免探活脚本被拒、下游摘除渠道。官方 Claude Code 始终带版本头与这两项 beta，不会命中。启用（默认）：命中即在本地返回与直连逐字相同的 400，请求明细分别标注 rejected_locally:anthropic-version、thinking-display、thinking-budget。停用：照常发往上游，由订阅通道放行。完整对齐与「仅 billing 标识」两种模式下均生效。',
+                'Measured against an API-key connection on 2026-10-18: three kinds of request get a 400 there but are accepted through the subscription channel, which relay-detection tools can use to spot a relay. First, a missing anthropic-version header: a direct connection answers “anthropic-version: header is required” before any other check; luban fills the header in on the way out. Second, a thinking.display other than summarized or omitted (updates included) without the thinking-display-updates beta: a direct connection answers “thinking.<type>.display: Input should be \'summarized\', \'omitted\'”, ahead of a missing max_tokens, unknown fields and sampling conflicts; luban adds that beta on the way out, so the subscription channel accepts updates and lists three allowed values for invalid ones. Third, on models that accept enabled (4-6 and earlier), a budget_tokens not below max_tokens without the interleaved-thinking beta: a direct connection answers “`max_tokens` must be greater than `thinking.budget_tokens`”; luban adds that beta on the way out, so the subscription channel accepts it. A budget_tokens below 1024, an invalid display and sampling conflicts come first and are forwarded as usual. The checks look at the request as the client sent it, with its own anthropic-beta; requests that already carry the relevant beta are forwarded. The latter two run before probe detection, so probes rewritten as prewarms are covered too; the missing-header check runs after it, so probe scripts are not rejected and channels are not dropped downstream. The official Claude Code always sends the header and both betas and never hits these. On (default): a hit returns locally the same 400 a direct connection would, byte for byte, and the request detail is tagged rejected_locally:anthropic-version, thinking-display or thinking-budget. Off: forwarded, and the subscription channel accepts it. Applies in both full-alignment and billing-only modes.',
+              )}
+            </>
+          }
+        />
       </ForwardingGroup>
 
       <ForwardingFilterItem

@@ -98,6 +98,8 @@ export interface Settings {
   reject_enabled_thinking: boolean
   /** 历史 thinking 签名验不过时按签发账号判断会话是否换过号，没换过的原样返回上游 400；默认启用。 */
   reject_tampered_thinking: boolean
+  /** 订阅通道放行、API Key 直连却返回 400 的几种请求形态，按直连原文于本地拒绝；默认启用。 */
+  api_key_parity: boolean
   /** 仅注入 billing 标识时也挪客户端 system；默认停用。 */
   sim_billing_relocate: boolean
   /** 模拟路径的主线程按官方 message threads 形态写 thread：首轮 create，接得上的续轮 continue 只发增量（2.1.291 起四族都写）；并在末尾补官方的 total_tokens 提醒。 */
@@ -178,6 +180,7 @@ export type ForwardingKey =
   | 'reject_known_third_party'
   | 'reject_enabled_thinking'
   | 'reject_tampered_thinking'
+  | 'api_key_parity'
   | 'sim_billing_relocate'
   | 'sim_message_threads'
   | 'fill_metadata'

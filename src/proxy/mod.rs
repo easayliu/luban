@@ -65,6 +65,12 @@ pub(crate) use probe_detect::{
     PROBE_REPLY_TEXT, ProbeKind, message_to_sse, probe_reply, probe_signature,
 };
 
+mod api_parity;
+pub(crate) use api_parity::{
+    BUDGET_EXCEEDS_MAX_TOKENS_MESSAGE, VERSION_REQUIRED_MESSAGE, billing_system_index_map,
+    client_budget_rejection, client_display_rejection, unshift_system_index,
+};
+
 mod thinking;
 #[allow(unused_imports)]
 pub(crate) use thinking::{
@@ -696,12 +702,18 @@ pub(super) fn is_quota_probe_shaped(v: &serde_json::Value) -> bool {
 }
 
 /// 来访自己那串 `anthropic-beta`，切成逐项。给 [`CcRequestKind::of`] 用。
+///
+/// 头可以重复发：官方 API 把每一条都读进来（同一请求里分两条写的 beta 都生效），这里同样合并
+/// 全部条目，不只取第一条。
 pub(super) fn inbound_beta_list(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get("anthropic-beta")
-        .and_then(|x| x.to_str().ok())
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
-        .unwrap_or_default()
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|x| x.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// 末条 `role:"user"` 消息的正文（首个 text 块，或字符串 content）是否以 `prefix` 开头。

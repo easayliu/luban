@@ -37,8 +37,18 @@ const BAN_KEYWORDS: &[&str] = &["invalid_grant", "oauth"];
 ///
 /// 它排在**首项**：[`classify_account_rejection`] 靠「豁免命中的是它」认出订阅未生效，与别的
 /// 豁免短语同句时也得是它先被找到。
-const NOT_ACCOUNT_PHRASES: &[&str] =
-    &[ORG_OAUTH_DISALLOWED, "not supported for this", "does not support", "unsupported model"];
+///
+/// `does not meet scope requirement` 取自 `OAuth token does not meet scope requirement any_of(user:batch,
+/// …)`（2026-10-18，订阅号调 `/v1/messages/batches` 回 403）：token 缺某个接口要的 scope，是接口与
+/// 账号类型不匹配，号本身好好的；它带 `oauth` 一词，不豁免会被 [`BAN_KEYWORDS`] 命中，客户端调一次
+/// batches 就把号永久停用。
+const NOT_ACCOUNT_PHRASES: &[&str] = &[
+    ORG_OAUTH_DISALLOWED,
+    "not supported for this",
+    "does not support",
+    "unsupported model",
+    "does not meet scope requirement",
+];
 
 /// 订阅未生效时上游的原话（去掉结尾主语、转小写），见 [`NOT_ACCOUNT_PHRASES`] 首项。字面是
 /// 「组织不允许 OAuth」，实际含义是付费订阅失效（需续费）或 Free 账号（需订阅）。

@@ -1813,6 +1813,233 @@ async fn client_enabled_thinking_on_adaptive_only_model_is_rejected_locally(pool
     assert_eq!(mock.seen().len(), 2);
 }
 
+/// 非 CC 客户端的一条请求：`patch` 并进基础体，`extra` 追加/覆盖请求头（值为 `None` 即删掉）。
+fn go_request(
+    patch: serde_json::Value,
+    extra: &[(&'static str, Option<&'static str>)],
+) -> (HeaderMap, Bytes) {
+    let mut body = serde_json::json!({
+        "model": "claude-haiku-4-5",
+        "max_tokens": 2048,
+        "metadata": {"user_id": serde_json::json!({
+            "device_id": "b".repeat(64), "account_uuid": "", "session_id": SESSION,
+        }).to_string()},
+        "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+    });
+    for (k, v) in patch.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    for (k, v) in extra {
+        match v {
+            Some(v) => headers.insert(*k, HeaderValue::from_static(v)),
+            None => headers.remove(*k),
+        };
+    }
+    (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+}
+
+/// `api_key_parity` 的三条：缺版本头、没带 beta 的 `display`、预算不小于 `max_tokens`，各自本地回
+/// 直连原文、不打上游、流水标各自的类别；来访带了对应 beta 的照发；关掉照发。
+#[sqlx::test]
+async fn api_key_parity_rejects_what_the_api_key_channel_rejects(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start((0..5).map(|_| sse_ok("ok")).collect()).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let no_version = || go_request(serde_json::json!({}), &[("anthropic-version", None)]);
+    let updates = |beta: Option<&'static str>| {
+        go_request(
+            serde_json::json!({"model": "claude-opus-5-5", "thinking": {"type": "adaptive", "display": "updates"}}),
+            &[("anthropic-beta", beta)],
+        )
+    };
+    let budget = |beta: Option<&'static str>| {
+        go_request(
+            serde_json::json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 2000}}),
+            &[("anthropic-beta", beta)],
+        )
+    };
+    let cases: [(_, &str, &str); 3] = [
+        (no_version(), "anthropic-version: header is required", "anthropic-version"),
+        (
+            updates(None),
+            "thinking.adaptive.display: Input should be 'summarized', 'omitted'",
+            "thinking-display",
+        ),
+        (
+            budget(None),
+            "`max_tokens` must be greater than `thinking.budget_tokens`",
+            "thinking-budget",
+        ),
+    ];
+    for (i, (req, needle, tag)) in cases.into_iter().enumerate() {
+        assert_local_reject(
+            &mock,
+            &state,
+            req,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            needle,
+        )
+        .await;
+        let rows = usage_logs(&store, i + 1).await;
+        assert_eq!(
+            rows[0].forensics.rewrites.as_deref(),
+            Some(&*format!("rejected_locally:{tag}"))
+        );
+    }
+
+    let (status, _, _) = send(&state, updates(Some("thinking-display-updates-2026-08-18"))).await;
+    assert_eq!(status, StatusCode::OK, "带了 beta 的交给上游");
+    let (status, _, _) = send(&state, budget(Some("interleaved-thinking-2025-05-14"))).await;
+    assert_eq!(status, StatusCode::OK, "带了 interleaved 直连也放行");
+    assert_eq!(mock.seen().len(), 2);
+
+    store.set_setting(store::API_KEY_PARITY, "0").await.unwrap();
+    for req in [no_version(), updates(None), budget(None)] {
+        let (status, _, _) = send(&state, req).await;
+        assert_eq!(status, StatusCode::OK, "关掉就照发");
+    }
+    assert_eq!(mock.seen().len(), 5);
+}
+
+/// 改写成预热的探针也绕不过去：探针判定排在这几条之后会被预热吞掉、回成 200，直连却是 400。
+#[sqlx::test]
+async fn api_key_parity_applies_before_probe_prewarm(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::REJECT_PROBES, "0").await.unwrap();
+    store.set_setting(store::PROBE_AS_PREWARM, "1").await.unwrap();
+    let (headers, body) = go_probe(false);
+    let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["model"] = "claude-opus-5-5".into();
+    v["max_tokens"] = 2048.into();
+    v["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": 1024});
+    let req = (headers, Bytes::from(serde_json::to_vec(&v).unwrap()));
+    assert_local_reject(
+        &mock,
+        &state,
+        req,
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "\"thinking.type.enabled\" is not supported for this model",
+    )
+    .await;
+}
+
+/// billing-only 在 `system[0]` 前插了 billing header：上游报 `system.2`，客户端看到的是它自己那份
+/// 的 `system.1`，与直连一致；体的其余部分原样。
+#[sqlx::test]
+async fn billing_only_unshifts_system_index_in_upstream_errors(pool: sqlx::PgPool) {
+    const TTL_400: &str = "system.2.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
+    let mock =
+        MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TTL_400)]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SIM_BILLING_ONLY, "1").await.unwrap();
+    let req = go_request(
+        serde_json::json!({"system": [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b", "cache_control": {"type": "ephemeral", "ttl": "2h"}},
+        ]}),
+        &[],
+    );
+    let (status, _, body) = send(&state, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with("system.1.cache_control.ephemeral.ttl: Input should be '5m' or '1h'"),
+        "{msg}"
+    );
+    let seen = mock.seen();
+    let out: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(out["system"].as_array().unwrap().len(), 3, "出站确实多了一块 billing header");
+}
+
+/// `anthropic-beta` 分两条头发：官方两条都读，第二条里的 interleaved / display-updates 同样算数，
+/// 照发不拦。
+#[sqlx::test]
+async fn api_key_parity_reads_every_anthropic_beta_header(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![sse_ok("ok"), sse_ok("ok")]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let twice = |patch: serde_json::Value, second: &'static str| {
+        let (mut headers, body) =
+            go_request(patch, &[("anthropic-beta", Some("effort-2025-11-24"))]);
+        headers.append("anthropic-beta", HeaderValue::from_static(second));
+        (headers, body)
+    };
+    let (status, _, body) = send(
+        &state,
+        twice(
+            serde_json::json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 2000}}),
+            "interleaved-thinking-2025-05-14",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let (status, _, body) = send(
+        &state,
+        twice(
+            serde_json::json!({"model": "claude-opus-5-5", "thinking": {"type": "adaptive", "display": "updates"}}),
+            "thinking-display-updates-2026-08-18",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(mock.seen().len(), 2);
+}
+
+/// 缺版本头又写了非法 display：直连先报版本头，这里也得先报它，不能让 thinking 那条抢先。
+#[sqlx::test]
+async fn missing_version_is_reported_before_thinking_checks(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let req = go_request(
+        serde_json::json!({"model": "claude-opus-5-5", "thinking": {"type": "adaptive", "display": "updates"}}),
+        &[("anthropic-version", None)],
+    );
+    assert_local_reject(
+        &mock,
+        &state,
+        req,
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "anthropic-version: header is required",
+    )
+    .await;
+}
+
+/// 客户端首块混着旧 billing header 与业务指令：billing-only 行级剥掉那行、块保留，再插新的
+/// billing 首块；上游报 `system.1`，客户端看到的是它自己那份的 `system.0`。
+#[sqlx::test]
+async fn billing_only_maps_system_index_through_a_mixed_first_block(pool: sqlx::PgPool) {
+    const TTL_400: &str = "system.1.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
+    let mock =
+        MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TTL_400)]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SIM_BILLING_ONLY, "1").await.unwrap();
+    let mixed = "x-anthropic-billing-header: cc_version=2.1.300.abc; cc_entrypoint=cli; cch=00000;\nbe brief";
+    let req = go_request(
+        serde_json::json!({"system": [
+            {"type": "text", "text": mixed, "cache_control": {"type": "ephemeral", "ttl": "2h"}},
+        ]}),
+        &[],
+    );
+    let (status, _, body) = send(&state, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with("system.0.cache_control.ephemeral.ttl: Input should be '5m' or '1h'"),
+        "{msg}"
+    );
+    let out: serde_json::Value = serde_json::from_slice(&mock.seen()[0].body).unwrap();
+    assert_eq!(out["system"].as_array().unwrap().len(), 2, "出站：新 billing 首块 + 剥过的业务块");
+    assert_eq!(out["system"][1]["text"], "be brief");
+}
+
 /// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条
 /// 第三方 400、不打上游，流水标 `rejected_locally:third-party`；关掉照发。
 #[sqlx::test]

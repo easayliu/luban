@@ -390,6 +390,8 @@ async fn the_same_probe_goes_on_when_the_switch_is_off(pool: sqlx::PgPool) {
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
     headers.insert("x-api-key", HeaderValue::from_static(crate::web::AppState::TEST_CLIENT_KEY));
+    // 带上版本头：缺它会被 `api_key_parity` 先拒（那是另一回事），这里只看探针开关。
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     let resp = super::handle(
         axum::extract::State(state),
         axum::http::Method::POST,

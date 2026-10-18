@@ -1588,7 +1588,7 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 /// 行级剥掉一段 `system` 文本里可能抄自官方的 billing header 行与身份句，保留其余正文与换行。
 /// [`strip_cc_preamble`] 的子串分支与 billing-only 路径共用：后者按客户端原块透传，只能**行级**剥，
 /// 整块丢会连「billing header 行 + 单换行 + 业务指令」里的指令一起删。文本里没有这两样时原样返回。
-fn strip_cc_preamble_lines(text: &str) -> String {
+pub(in crate::proxy) fn strip_cc_preamble_lines(text: &str) -> String {
     if !text.contains(config::CC_SYSTEM_IDENTITY) && !text.contains("x-anthropic-billing-header:") {
         return text.to_string();
     }

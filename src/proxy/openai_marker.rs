@@ -16,6 +16,9 @@ pub(crate) struct OpenAiMarker {
     /// 而分辨「真是 OpenAI 转换器回填的」还是「某个客户端自己就这么发 id」只能看这个）。
     /// 其余类别留 `None`——那些的 `kind` 已经把形态说尽了。见 [`SAMPLE_CAP`]。
     pub(super) sample: Option<String>,
+    /// `reason` 本身就是上游原文（含路径），原样回给客户端、不加路径前缀与总括。目前只有
+    /// `system_role`：上游对它的 400 写得够清楚，回 API Key 直连那句才与直连一致。
+    verbatim: bool,
 }
 
 /// 摘录进日志的字符数上限。id 不是机密，但没必要整条打；`call_` 之后那几位足够看出
@@ -31,7 +34,13 @@ fn sample_of(v: &str) -> String {
 
 impl OpenAiMarker {
     fn new(location: String, kind: &'static str, reason: impl Into<String>) -> Self {
-        Self { location, kind, reason: reason.into(), sample: None }
+        Self { location, kind, reason: reason.into(), sample: None, verbatim: false }
+    }
+
+    /// 回给客户端的就是 `reason` 原文，见 [`Self::verbatim`]。
+    fn verbatim(mut self) -> Self {
+        self.verbatim = true;
+        self
     }
 
     /// 带上触发值的摘录，见 [`Self::sample`]。
@@ -42,6 +51,9 @@ impl OpenAiMarker {
 
     /// 回给客户端的 `error.message`：路径 + 原因 + 一句总括，让它知道该修客户端而不是换号重试。
     pub(super) fn message(&self) -> String {
+        if self.verbatim {
+            return self.reason.clone();
+        }
         format!(
             "{}: {}. This request looks like it was converted from the OpenAI Chat Completions \
              format; only native Anthropic Messages API requests are accepted here",
@@ -196,14 +208,19 @@ pub(crate) fn find_openai_marker(
             // 指令式 system（`content: []` 带 `output_config`）不是 OpenAI 的开头系统提示词，
             // 上游对它「放在任何位置都收」，见 [`is_system_directive`]。
             if role == "system" && mi < first_turn && !cc_shaped && !is_system_directive(msg) {
-                return Some(OpenAiMarker::new(
-                    format!("messages.{mi}.role"),
-                    "system_role",
-                    "a 'system' message before the first user or assistant message is the \
-                     OpenAI way of \
-                     passing the system prompt; the Anthropic API takes the initial system \
-                     prompt in the top-level 'system' field",
-                ));
+                // 回 API Key 直连那句原文（2026-10-18 实测，新老模型、开头几条 system 都点名首个）。
+                return Some(
+                    OpenAiMarker::new(
+                        format!("messages.{mi}.role"),
+                        "system_role",
+                        format!(
+                            "messages.{mi}: use the top-level 'system' parameter for the initial \
+                             system prompt; the directive-only form (content: [] with \
+                             output_config) is accepted at any position"
+                        ),
+                    )
+                    .verbatim(),
+                );
             }
             if matches!(role, "tool" | "function" | "developer") {
                 let hint = if role == "developer" {
@@ -471,8 +488,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind} not caught"));
             assert_eq!(m.kind, kind);
             assert_eq!(m.location, loc);
-            // 客户端读到的那句话带路径与总括。
+            // 客户端读到的那句话带路径与总括；`system_role` 例外，回的是直连原文。
             let msg = m.message();
+            if kind == "system_role" {
+                assert!(
+                    msg.starts_with("messages.0: use the top-level 'system' parameter"),
+                    "{msg}"
+                );
+                continue;
+            }
             assert!(msg.starts_with(&format!("{loc}: ")), "{msg}");
             assert!(msg.contains("OpenAI Chat Completions"), "{msg}");
         }
@@ -489,6 +513,12 @@ mod tests {
         ]});
         let m = find_openai_marker(Some(&leading), false, true).unwrap();
         assert_eq!((m.kind, m.location.as_str()), ("system_role", "messages.0.role"));
+        // 回给客户端的是 API Key 直连那句原文，逐字（2026-10-18 实测），点名首个。
+        assert_eq!(
+            m.message(),
+            "messages.0: use the top-level 'system' parameter for the initial system prompt; \
+             the directive-only form (content: [] with output_config) is accepted at any position"
+        );
 
         // 指令式那种（`content: []` 带 `output_config`）不是开头系统提示词，上游哪儿都收。
         let directive = serde_json::json!({"messages": [

@@ -496,6 +496,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     'unavailable': t('无可用账号', 'no account available'),
     'third-party': t('已知第三方特征', 'known third-party signature'),
     'enabled-thinking': t('模型不接受 enabled thinking', 'enabled thinking not accepted by model'),
+    'anthropic-version': t('缺少版本头', 'missing version header'),
+    'thinking-display': t('thinking.display 取值不被接受', 'thinking.display value not accepted'),
+    'thinking-budget': t('思考预算不小于 max_tokens', 'thinking budget not below max_tokens'),
   } as Record<string, string>)[kind] ?? t('其他', 'other')
   // 颜色看「现在比平时慢了多少」：慢一半黄、慢一倍红；没有基线时按绝对值（3s / 8s）。
   const ttftTone = (() => {

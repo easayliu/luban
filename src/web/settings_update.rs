@@ -428,6 +428,7 @@ pub(super) struct SetForwardingReq {
     reject_known_third_party: Option<bool>,
     reject_enabled_thinking: Option<bool>,
     reject_tampered_thinking: Option<bool>,
+    api_key_parity: Option<bool>,
     sim_billing_relocate: Option<bool>,
     sim_message_threads: Option<bool>,
     fill_metadata: Option<bool>,
@@ -461,7 +462,7 @@ pub(super) async fn set_forwarding(
     Json(req): Json<SetForwardingReq>,
 ) -> Result<Json<SettingsResp>, ApiError> {
     use crate::store::{
-        API_TELEMETRY, CCH_REAL_RECOMPUTE, CCH_SIM_COMPUTE, EAGER_TOOL_STREAMING,
+        API_KEY_PARITY, API_TELEMETRY, CCH_REAL_RECOMPUTE, CCH_SIM_COMPUTE, EAGER_TOOL_STREAMING,
         FABLE_REFUSAL_FALLBACK, FILL_ABSENT_TOOLS, FILL_CLIENT_HEADERS, FILL_METADATA,
         INJECT_THINKING, KEEPALIVE_TELEMETRY, MERGE_BETA, NONSTREAM_AS_SSE, NORMALIZE_DEVICE_FP,
         OPUS_REFUSAL_FALLBACK, ORIG_HEADER_CASE, PROBE_AS_PREWARM, RATE_LIMIT_RETRY,
@@ -499,6 +500,7 @@ pub(super) async fn set_forwarding(
         (REJECT_KNOWN_THIRD_PARTY, req.reject_known_third_party),
         (REJECT_ENABLED_THINKING, req.reject_enabled_thinking),
         (REJECT_TAMPERED_THINKING, req.reject_tampered_thinking),
+        (API_KEY_PARITY, req.api_key_parity),
         (SIM_BILLING_RELOCATE, req.sim_billing_relocate),
         (SIM_MESSAGE_THREADS, req.sim_message_threads),
         (FILL_METADATA, req.fill_metadata),
