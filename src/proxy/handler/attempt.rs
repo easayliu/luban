@@ -132,10 +132,13 @@ pub(super) async fn prepare<'a>(
         return prepare_probe_prewarm(cx, inb, probe, pick).await;
     }
     // 这条会话在**选中的号**上占的槽位（选号时按会话键写的会话绑定并随选号结果一起返回，
-    // 见 [`store::Select::session_key`]）：模拟路径的会话 id 由它派生，每个账号固定一组、
-    // 对话之间复用。换号重试后 `session_slot` 随新号一起换。没占槽位的（带设备身份的
+    // 见 [`store::Select::session_key`]）：模拟路径的会话 id 由「槽位 + 会话键」派生
+    // （[`crate::credentials::conversation_session_seed`]）——同一对话多轮恒定，新对话换新 id，
+    // 与官方 `/clear` 一致。换号重试后 `session_slot` 随新号一起换。没占槽位的（带设备身份的
     // 模拟请求）退回按缓存前缀派生。
-    let slot_seed = session_slot.map(crate::credentials::slot_session_seed);
+    let slot_seed = session_slot.map(|slot| {
+        crate::credentials::conversation_session_seed(slot, inb.plan.key.as_deref().unwrap_or(""))
+    });
     let seed = match &slot_seed {
         Some(s) => SimSessionSeed::Slot(s),
         None => SimSessionSeed::Prefix(prefix_key.as_deref().unwrap_or_default()),

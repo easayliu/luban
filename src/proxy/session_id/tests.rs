@@ -4,8 +4,9 @@ use crate::proxy::test_support::{
 };
 use crate::proxy::{Bytes, HeaderValue, store};
 
-/// 占了槽位的模拟请求，会话 id 一律是槽位派生的那个（来访自带的也换掉，除非不改身份）；
-/// 与后台列表算出来的同一个值。
+/// 占了槽位的模拟请求，会话 id 一律是「槽位 + 会话键」派生的那个（来访自带的也换掉，除非不改身份）；
+/// 与后台列表算出来的同一个值。同一槽位换了对话（会话键不同）就是另一个 id——官方 `/clear` 开新对话
+/// 同样换会话 id（`cap/auto-2.1.303-20261019-full` 00429 → 00434）。
 #[test]
 fn slotted_simulation_uses_the_slot_session_id() {
     const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
@@ -14,7 +15,7 @@ fn slotted_simulation_uses_the_slot_session_id() {
     );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let h = crate::proxy::HeaderMap::new();
-    let seed = crate::credentials::slot_session_seed(2);
+    let seed = crate::credentials::conversation_session_seed(2, "conv-a");
     let detect = |flags: store::ForwardFlags, slotted: bool| {
         let seed = if slotted {
             crate::proxy::SimSessionSeed::Slot(&seed)
@@ -25,7 +26,8 @@ fn slotted_simulation_uses_the_slot_session_id() {
             .unwrap()
             .session_id
     };
-    let slot2 = crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 2);
+    let slot2 =
+        crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 2, "conv-a");
     assert_eq!(detect(all_on(), true), slot2, "占了槽位就用槽位的 id");
     assert_eq!(detect(all_on(), true), super::session_id_for(&test_cred(), &seed));
     assert_ne!(detect(all_on(), false), slot2, "没占槽位：来访自带的按账号钉住");
@@ -35,8 +37,13 @@ fn slotted_simulation_uses_the_slot_session_id() {
     assert_eq!(detect(off, true), SID, "不改身份时原样");
     assert_ne!(
         slot2,
-        crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 0),
+        crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 0, "conv-a"),
         "槽位之间不同"
+    );
+    assert_ne!(
+        slot2,
+        crate::credentials::sim_slot_session_id(Some(ACCOUNT_UUID), test_cred().id, 2, "conv-b"),
+        "同一槽位换了对话就换 id"
     );
     assert!(super::looks_like_uuid(&slot2));
 }

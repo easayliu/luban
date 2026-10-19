@@ -206,11 +206,13 @@ impl Credential {
 /// [`session_account_key`]：有 `account_uuid` 用它，没有就用凭证 id——两个都没有 uuid 的号
 /// 不能算出同一组会话 id，否则换号后上游会在两个组织下看到同一个会话 uuid。
 ///
-/// seed 正常是**槽位**（[`slot_session_seed`]）：每个账号的模拟会话 id 是一组固定的槽位，
-/// 数量就是会话上限，对话占哪个槽位就用哪个 id，槽位释放后下一个对话**复用**同一个 id——
-/// 上游看到的每个账号只在这几个会话 id 之间轮转，与设备 id 恒定的做法一致，而不是每个对话
-/// 一个新 uuid、时间一长无限增多。没有槽位可占的（按设备占名额、不写会话绑定的模拟请求，或
-/// luban 自己发的探测）退回按缓存前缀或固定 seed 派生。
+/// seed 正常是**槽位 + 对话**（[`conversation_session_seed`]）：同时在跑的会话数受槽位（会话上限）约束，
+/// 每个对话在占到的槽位上有自己的会话 id，同一对话多轮恒定，换了对话就换一个——与官方 `/clear`
+/// 开新对话时换会话 id 一致（`cap/auto-2.1.303-20261019-full` 00429 → 00434：会话 id 换新、首轮
+/// `diagnostics` 为 null、没有 `cc_prev_req`、`cc_prompt_index` 从 1 起）。此前槽位释放后下一个对话
+/// **复用**同一个 id，会话链跟着接过来，新对话首轮便带着上一个无关对话的 `previous_message_id` 与
+/// `cc_prev_req`——官方从不产生的组合。没有槽位可占的（按设备占名额、不写会话绑定的模拟请求，或
+/// luban 自己发的探测）退回按缓存前缀或固定 seed（[`slot_session_seed`]）派生。
 ///
 /// 前缀是为了和 [`Credential::spoof_device_id`] 分开取值——同样的输入派生出两个字段，不加
 /// 区分前缀就会得到「device_id 与 session_id 的高位相同」这种真实客户端不产生的相关性。
@@ -237,15 +239,31 @@ pub fn session_account_key(account_uuid: Option<&str>, cred_id: i64) -> String {
     }
 }
 
-/// 第 `slot` 个会话槽位的 seed（`slot:<n>`），见 [`derive_session_id`]。
+/// 第 `slot` 个会话槽位的固定 seed（`slot:<n>`）：只给不分对话的场合（luban 自己发的探测）用，
+/// 模拟对话用 [`conversation_session_seed`]。
 pub fn slot_session_seed(slot: i64) -> String {
     format!("slot:{slot}")
 }
 
-/// 第 `slot` 个会话槽位的会话 id，见 [`derive_session_id`]。后台列会话时用它算出上游看到的
-/// 那个 uuid，与转发路径同一个函数，两边不会漂开。
-pub fn sim_slot_session_id(account_uuid: Option<&str>, cred_id: i64, slot: i64) -> String {
-    derive_session_id(&session_account_key(account_uuid, cred_id), &slot_session_seed(slot))
+/// 占到第 `slot` 个槽位的那个对话（会话键 `session_key`，即 `session_bindings` 那一列，取法见
+/// `crate::proxy::session_plan`）的 seed，见 [`derive_session_id`]。会话键对同一对话恒定（来访自带的
+/// 会话 id，或缓存前缀 + 首条用户消息的指纹），所以多轮同一个 id、新对话换新 id。
+pub fn conversation_session_seed(slot: i64, session_key: &str) -> String {
+    format!("slot:{slot}:{session_key}")
+}
+
+/// 占到第 `slot` 个槽位的对话 `session_key` 的会话 id，见 [`derive_session_id`]。后台列会话时用它
+/// 算出上游看到的那个 uuid，与转发路径同一个函数，两边不会漂开。
+pub fn sim_slot_session_id(
+    account_uuid: Option<&str>,
+    cred_id: i64,
+    slot: i64,
+    session_key: &str,
+) -> String {
+    derive_session_id(
+        &session_account_key(account_uuid, cred_id),
+        &conversation_session_seed(slot, session_key),
+    )
 }
 
 /// 来访会话 id 在某个账号上**钉住**后的出站会话 id（`crate::proxy::account_session_id` 的本体）：

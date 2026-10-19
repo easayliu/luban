@@ -41,7 +41,13 @@ pub(in crate::proxy) fn insert_env_note(
     cred_id: i64,
     root: u64,
 ) -> EnvNoted {
-    let none = EnvNoted::default();
+    // 能不能写中途 system 消息只看这一轮模型自带的 beta，与补不补环境说明无关：不注工具（来访没带、
+    // `fill_absent_tools` 关着）时环境说明不补，但之后的 `<total_tokens>` 与模型说明照样要按 5 系的
+    // 形态落成 `role: system` 消息（[`insert_total_tokens_reminder`]）。此前这里一律给 `false`，
+    // 无工具的 opus / sonnet / haiku-5-5 于是被写成 haiku-4.5 那种 user 消息里的 `<system-reminder>`
+    // 块——官方 5 系从不产生的形态。
+    let mid_conv_sys = crate::proxy::simulation::sim_has_mid_conversation_system(sim);
+    let none = EnvNoted { mid_conv_sys, ..EnvNoted::default() };
     if !crate::proxy::simulation::sim_is_main_thread(sim) {
         return none;
     }
@@ -59,7 +65,6 @@ pub(in crate::proxy) fn insert_env_note(
     if first.get("role").and_then(|r| r.as_str()) != Some("user") || has_env_note(msgs) {
         return none;
     }
-    let mid_conv_sys = crate::proxy::simulation::sim_has_mid_conversation_system(sim);
     // 换模型记在末条**用户**消息上：来访以 system（指令之类）收尾时末条不是那句话。
     let last_fp = msgs
         .iter()

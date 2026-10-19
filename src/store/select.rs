@@ -1374,13 +1374,18 @@ pub(super) mod tests {
         assert!(store.unbind_session(a, "s3").await.unwrap());
         assert_eq!(store.select_for_device(soft_session("s4")).await.unwrap().id, a);
         assert_eq!(slot("s4").await, Some(0));
-        // 列表带槽位与派生的会话 id：同槽位同 id、不同槽位不同 id、形态是 uuid。
+        // 列表带槽位与派生的会话 id（槽位 + 会话键）：与转发路径同一口径、各会话互不相同、形态是 uuid。
         let list = store.list_sessions(a).await.unwrap();
         let cred = store.get(a).await.unwrap().unwrap();
         for s in &list {
             assert_eq!(
                 s.session_id,
-                crate::credentials::sim_slot_session_id(cred.account_uuid.as_deref(), a, s.slot)
+                crate::credentials::sim_slot_session_id(
+                    cred.account_uuid.as_deref(),
+                    a,
+                    s.slot,
+                    &s.session_key
+                )
             );
             assert_eq!(s.session_id.len(), 36, "{}", s.session_id);
         }
@@ -1389,20 +1394,20 @@ pub(super) mod tests {
         sids.dedup();
         assert_eq!(sids.len(), list.len(), "各槽位的会话 id 互不相同: {list:?}");
         assert_ne!(
-            crate::credentials::sim_slot_session_id(Some("u"), 1, 0),
-            crate::credentials::sim_slot_session_id(Some("v"), 1, 0),
+            crate::credentials::sim_slot_session_id(Some("u"), 1, 0, "k"),
+            crate::credentials::sim_slot_session_id(Some("v"), 1, 0, "k"),
             "换账号另一组"
         );
         // 没有 account_uuid 的两个号（刚登录还没拉到 profile、或旧库）也不能算出同一组：
         // 按凭证 id 分；同一个号有没有拉到 uuid 会是两组，那是 uuid 回填那一刻的一次性切换。
         assert_ne!(
-            crate::credentials::sim_slot_session_id(None, 1, 0),
-            crate::credentials::sim_slot_session_id(None, 2, 0),
+            crate::credentials::sim_slot_session_id(None, 1, 0, "k"),
+            crate::credentials::sim_slot_session_id(None, 2, 0, "k"),
             "两个没有 uuid 的号，同槽位不同 id"
         );
         assert_eq!(
-            crate::credentials::sim_slot_session_id(None, 1, 0),
-            crate::credentials::sim_slot_session_id(Some("  "), 1, 0),
+            crate::credentials::sim_slot_session_id(None, 1, 0, "k"),
+            crate::credentials::sim_slot_session_id(Some("  "), 1, 0, "k"),
             "空白 uuid 当没有"
         );
         // 后台列表对没有 uuid 的号也与转发路径同一口径（换两个新号：先把 a 删掉）。
@@ -1417,8 +1422,14 @@ pub(super) mod tests {
         assert_eq!(store2.select_for_device(soft_session("k")).await.unwrap().id, ids2[0]);
         let listed = store2.list_sessions(ids2[0]).await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].session_id, crate::credentials::sim_slot_session_id(None, ids2[0], 0));
-        assert_ne!(listed[0].session_id, crate::credentials::sim_slot_session_id(None, ids2[1], 0));
+        assert_eq!(
+            listed[0].session_id,
+            crate::credentials::sim_slot_session_id(None, ids2[0], 0, "k")
+        );
+        assert_ne!(
+            listed[0].session_id,
+            crate::credentials::sim_slot_session_id(None, ids2[1], 0, "k")
+        );
     }
 
     /// 绑定行记下最近一轮的模型：**只给后台列**，不参与键也不参与选号——同一条对话换个模型

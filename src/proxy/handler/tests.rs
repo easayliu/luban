@@ -2082,3 +2082,61 @@ async fn known_third_party_signature_is_rejected_locally(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK, "关掉就照发");
     assert_eq!(mock.seen().len(), 1);
 }
+
+/// 第三方客户端的两个对话先后占到号上同一个会话槽位（A 的绑定释放后 B 进来）：B 出站是一个新的
+/// 会话 id，会话链从头开始——首轮 `diagnostics.previous_message_id` 为 null、billing header 里没有
+/// `cc_prev_req`、`cc_prompt_index` 从 1 起，与官方 `/clear` 开新对话一致
+/// （`cap/auto-2.1.303-20261019-full` 00429 → 00434）。此前槽位复用同一个 id，B 首轮带着 A 的
+/// `previous_message_id` 与 `cc_prev_req`（线上 `req_j1uuiSQrvphw6Orz`）。
+#[sqlx::test]
+async fn a_new_conversation_in_a_reused_slot_starts_a_fresh_session(pool: sqlx::PgPool) {
+    let ok = || {
+        sse_ok("done").with_headers(&[("request-id", "req_011CmockAAAAAAAAAAAAAAAA".to_string())])
+    };
+    let mock = MockUpstream::start(vec![ok(), ok()]).await;
+    let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
+    // 线上配置：不要求来访带设备身份（第三方客户端本来就没有）。
+    store.set_setting(store::REQUIRE_DEVICE_ID, "0").await.unwrap();
+    let third_party = |text: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("Go-http-client/1.1"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let body = serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "max_tokens": 1024,
+            "stream": true,
+            "system": "You translate text for a small agency.",
+            "messages": [{"role": "user", "content": text}],
+        });
+        (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+    };
+    let (status, _, body) = send(&state, third_party("Translate: good morning, everyone.")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let logs = usage_logs(&store, 1).await;
+    let key_a = logs[0].forensics.session_key.clone().expect("模拟请求有会话键");
+    // A 的绑定释放（相当于它闲过了 TTL），槽位 0 空出来给 B。
+    assert!(store.unbind_session(ids[0], &key_a).await.unwrap());
+    let (status, ..) = send(&state, third_party("Translate: the meeting is at noon.")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let seen = mock.seen();
+    let main: Vec<serde_json::Value> = seen
+        .iter()
+        .filter(|s| s.path.starts_with("/v1/messages"))
+        .map(|s| serde_json::from_slice(&s.body).unwrap())
+        .collect();
+    assert_eq!(main.len(), 2, "{:?}", seen.iter().map(|s| &s.path).collect::<Vec<_>>());
+    let session_of = |v: &serde_json::Value| {
+        let uid: serde_json::Value =
+            serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        uid["session_id"].as_str().unwrap().to_string()
+    };
+    assert_ne!(session_of(&main[0]), session_of(&main[1]), "新对话换新的会话 id");
+    let b = &main[1];
+    assert_eq!(b["thread"]["type"], "create");
+    assert_eq!(b["diagnostics"]["previous_message_id"], serde_json::Value::Null, "{b}");
+    let billing = b["system"][0]["text"].as_str().unwrap();
+    assert!(!billing.contains("cc_prev_req="), "{billing}");
+    assert!(billing.contains("cc_prompt_index=1;"), "{billing}");
+}

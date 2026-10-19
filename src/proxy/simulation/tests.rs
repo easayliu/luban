@@ -2857,3 +2857,54 @@ fn artifact_edits_paragraph_follows_the_injected_artifact_tool() {
     assert!(!artifact && base == config::CC_SYSTEM_BASE, "不注工具就不接");
     assert!(!artifact && rest.ends_with("</total_tokens>"), "不注工具就不接");
 }
+
+/// 第三方无工具单轮（`fill_absent_tools` 关，线上默认）：不补环境说明，但 `<total_tokens>` 仍按模型的
+/// 中途 system 消息能力落位——5 系（opus-5-5、haiku-5-5）是 user 之后独立一条 `role: system`，末条
+/// 断点随之挪过去（`cap/auto-2.1.285-20260930/00033`）；haiku-4.5 才是 user 消息里的 `<system-reminder>`
+/// 块。线上 `req_j1uuiSQrvphw6Orz`（haiku-5-5）此前被写成了 haiku-4.5 那种。
+#[test]
+fn total_tokens_without_tools_follows_the_model() {
+    let flags = store::ForwardFlags {
+        simulate_full_system: false,
+        fill_absent_tools: false,
+        sim_trim_tools: false,
+        ..all_on()
+    };
+    let run = |model: &str| {
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": model,
+                "system": [{"type": "text", "text": "You translate text for a small agency."}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "Translate this paragraph into French, keep it formal."}]}],
+                "max_tokens": 4096
+            })
+            .to_string(),
+        );
+        let sim = detect_for(&body, flags).unwrap();
+        let out =
+            rewrite_body(&body, &test_cred(), &format!("fp-{model}"), flags, Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("tools").is_none(), "{model}: 不注工具");
+        v["messages"].as_array().unwrap().clone()
+    };
+    for model in ["claude-opus-5-5", "claude-haiku-5-5"] {
+        let msgs = run(model);
+        assert_eq!(msgs.len(), 2, "{model}: {msgs:?}");
+        let user = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(user.len(), 1, "{model}: user 消息里不再塞提醒块: {user:?}");
+        assert!(!user[0]["text"].as_str().unwrap().contains("total_tokens"));
+        assert_eq!(msgs[1]["role"], "system", "{model}");
+        let t = msgs[1]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            t.starts_with("<total_tokens>") && t.ends_with("tokens left</total_tokens>"),
+            "{model}: {t}"
+        );
+    }
+    let msgs = run("claude-haiku-4-5-20251001");
+    assert_eq!(msgs.len(), 1, "haiku-4.5 不能写中途 system 消息: {msgs:?}");
+    let user = msgs[0]["content"].as_array().unwrap();
+    assert!(
+        user[0]["text"].as_str().unwrap().starts_with("<system-reminder>\n<total_tokens>"),
+        "{user:?}"
+    );
+}

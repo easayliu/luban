@@ -328,7 +328,12 @@ fn session_row(r: &PgRow, cred_id: i64) -> Result<SessionBinding> {
             _ => String::new(),
         }
     } else {
-        crate::credentials::sim_slot_session_id(account_uuid.as_deref(), cred_id, slot)
+        crate::credentials::sim_slot_session_id(
+            account_uuid.as_deref(),
+            cred_id,
+            slot,
+            &session_key,
+        )
     };
     Ok(SessionBinding {
         session_key,
