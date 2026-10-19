@@ -8,6 +8,8 @@ use super::*;
 pub(super) struct Prepared {
     pub(super) url: String,
     pub(super) req_speed: Option<String>,
+    /// 请求体 `fallbacks[]` 各项的模型与覆盖的速度档，见 [`request_fallback_speeds`]。
+    pub(super) req_fallback_speeds: Vec<(String, Option<String>)>,
     pub(super) beta_ctx: BetaCtx,
     pub(super) upgrade_stream: bool,
     pub(super) tool_names: Option<std::sync::Arc<crate::proxy::body::ToolNameMap>>,
@@ -48,6 +50,7 @@ impl Prepared {
         // 请求侧的速度档（顶层 `speed` 字段，配套 anthropic-beta: fast-mode-*）。
         // 仅作兜底：以上游 `usage.speed` 为准，那里才反映实际生效的档位。
         let req_speed = request_speed(body_json.as_ref());
+        let req_fallback_speeds = request_fallback_speeds(body_json.as_ref());
         // 这条非流式请求要不要改成流式发、再聚合回整段 JSON（见
         // [`store::ForwardFlags::nonstream_as_sse`]）。
         //
@@ -82,7 +85,7 @@ impl Prepared {
         if let Some(map) = &tool_names {
             tracing::debug!(count = map.forward.len(), "obfuscating tool names");
         }
-        Self { url, req_speed, beta_ctx, upgrade_stream, tool_names }
+        Self { url, req_speed, req_fallback_speeds, beta_ctx, upgrade_stream, tool_names }
     }
 }
 

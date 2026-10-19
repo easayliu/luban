@@ -107,7 +107,9 @@ async fn upstream_client_decodes_gzip_and_keeps_official_accept_encoding() {
 /// 回复里的 `fallback` 块：嗅探器记下作答模型；Drop 时打标签 `served_by_fallback`。
 /// 输出前就被拒的（refusal + 零输出）花费记 0；流到一半被掐的照常计价。
 #[sqlx::test]
-async fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing(pool: sqlx::PgPool) {
+async fn fallback_block_is_noted_and_pre_output_refusals_are_billed_by_category(
+    pool: sqlx::PgPool,
+) {
     let mut s = crate::proxy::UsageSniffer::new(false, false);
     s.feed(br#"{"id":"msg_1","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-opus-5"},"to":{"model":"claude-opus-4-8"}},{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}"#);
     s.finish();
@@ -135,6 +137,7 @@ async fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing(pool: sqlx
             sse_aggregated: false,
             sniffer,
             req_speed: None,
+            req_fallback_speeds: Vec::new(),
             req_model: Some("claude-opus-5".into()),
             ratelimit: rl_headers(&[]),
             stream_broke: None,
@@ -207,6 +210,13 @@ async fn fallback_block_is_noted_and_pre_output_refusals_cost_nothing(pool: sqlx
         logs[3].cost_usd.unwrap() > 0.0,
         "半截拒答、usage 缺 output_tokens：按输入计价，不能记 0"
     );
+    // 8) 输出前被拒，但类别是 bio：官方照常收费（误判率低的几类为遏制规模化绕过照收）。
+    log(br#"{"id":"msg_b","model":"claude-opus-5","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"bio"},"usage":{"input_tokens":1000,"output_tokens":0}}"#);
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    store.drain_writes(std::time::Duration::from_secs(3)).await;
+    let logs = store.list_usage_logs(10).await.unwrap();
+    assert_eq!(logs.len(), 8);
+    assert!((logs[0].cost_usd.unwrap() - 0.005).abs() < 1e-9, "bio 输出前拒答按输入计价");
 }
 
 /// 上游回 200 却零输出：收尾时响应体开头落进流水的 `response_excerpt`、标签 `empty_reply`，
@@ -238,6 +248,7 @@ async fn a_zero_output_reply_is_captured_and_its_request_class_learned_on_drop(p
             sse_aggregated: false,
             sniffer,
             req_speed: None,
+            req_fallback_speeds: Vec::new(),
             req_model: Some("claude-fable-5".into()),
             ratelimit: rl_headers(&[]),
             stream_broke: None,
@@ -514,6 +525,7 @@ async fn client_ua_lands_in_the_usage_log(pool: sqlx::PgPool) {
             sse_aggregated: false,
             sniffer: crate::proxy::UsageSniffer::new(false, false),
             req_speed: None,
+            req_fallback_speeds: Vec::new(),
             req_model: None,
             ratelimit: rl_headers(&[]),
             stream_broke: None,
@@ -585,6 +597,7 @@ async fn a_call_to_an_injected_tool_is_tagged_in_the_flow_log(pool: sqlx::PgPool
         sse_aggregated: false,
         sniffer: crate::proxy::UsageSniffer::new(true, false),
         req_speed: None,
+        req_fallback_speeds: Vec::new(),
         req_model: Some("claude-opus-5".into()),
         ratelimit: rl_headers(&[]),
         stream_broke: None,
@@ -698,6 +711,7 @@ async fn mid_stream_error_is_billed_as_the_mapped_status(pool: sqlx::PgPool) {
         sse_aggregated: false,
         sniffer: crate::proxy::UsageSniffer::new(true, false),
         req_speed: None,
+        req_fallback_speeds: Vec::new(),
         req_model: None,
         ratelimit: rl_headers(&[]),
         stream_broke: None,
@@ -776,6 +790,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
         sse_aggregated: false,
         sniffer: crate::proxy::UsageSniffer::new(false, false),
         req_speed: None,
+        req_fallback_speeds: Vec::new(),
         req_model: None,
         ratelimit: rl_headers(&[]),
         stream_broke: None,
@@ -1257,6 +1272,7 @@ async fn req_log(pool: sqlx::PgPool) -> crate::proxy::ReqLog {
         sse_aggregated: false,
         sniffer: crate::proxy::UsageSniffer::new(true, false),
         req_speed: None,
+        req_fallback_speeds: Vec::new(),
         req_model: None,
         ratelimit: rl_headers(&[]),
         stream_broke: None,
@@ -1280,5 +1296,42 @@ async fn req_log(pool: sqlx::PgPool) -> crate::proxy::ReqLog {
         _session_concurrency: crate::proxy::SessionConcurrencyGuard::dummy(Default::default()),
         _route_load: crate::proxy::note_upstream_send(&Default::default(), 0, "-", 0),
         keepalive: None,
+    }
+}
+
+/// 服务端压缩（`compact_20260112`）的流：压缩块以 `content: null` 开头、正文随 `compaction_delta`
+/// 到，聚合后要拼回 `content`；最终 `message_delta.usage` 里的 `iterations` 原样留在 `usage` 里
+/// （形态取自 `cap/auto-2.1.303-20261019-compact/00172`）。
+#[test]
+fn aggregates_a_compaction_stream() {
+    let sse = concat!(
+        r#"data: {"type":"message_start","message":{"id":"msg_c","type":"message","role":"assistant","model":"claude-opus-4-7","content":[],"stop_reason":null,"usage":{"input_tokens":48,"cache_creation_input_tokens":137152,"cache_read_input_tokens":20084,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":null}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"The user asked "}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"what the proxy does."}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"It is a proxy."}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":6,"cache_creation_input_tokens":1221,"cache_read_input_tokens":25369,"output_tokens":283,"iterations":[{"input_tokens":48,"output_tokens":730,"cache_read_input_tokens":20084,"cache_creation_input_tokens":137152,"type":"compaction"},{"input_tokens":6,"output_tokens":283,"cache_read_input_tokens":25369,"cache_creation_input_tokens":1221,"type":"message"}]}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    for chunk in [1usize, 4096] {
+        let v = aggregated_message(sse, chunk);
+        assert_eq!(v["content"][0]["type"], "compaction", "chunk={chunk}");
+        assert_eq!(v["content"][0]["content"], "The user asked what the proxy does.");
+        assert_eq!(v["content"][1]["text"], "It is a proxy.");
+        assert_eq!(v["usage"]["iterations"].as_array().map(Vec::len), Some(2));
+        assert_eq!(v["usage"]["input_tokens"], 6, "顶层是最后一轮");
     }
 }

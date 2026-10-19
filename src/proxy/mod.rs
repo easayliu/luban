@@ -922,6 +922,23 @@ fn request_speed(body: Option<&serde_json::Value>) -> Option<String> {
     Some(body?.get("speed")?.as_str()?.to_string())
 }
 
+/// 请求体 `fallbacks[]`（服务端 fallback）每一项的模型与它单独覆盖的速度档：官方允许每项为那次尝试
+/// 单独设 `speed`，没写就沿用顶层的。逐轮计价时给 fallback 那几轮取速度档用
+/// （[`UsageSniffer::billed_cost`]）。
+fn request_fallback_speeds(body: Option<&serde_json::Value>) -> Vec<(String, Option<String>)> {
+    body.and_then(|b| b.get("fallbacks"))
+        .and_then(|f| f.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|e| {
+                    let model = e.get("model")?.as_str()?.to_string();
+                    Some((model, e.get("speed").and_then(|s| s.as_str()).map(str::to_string)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 读取请求体声明的输出上限（顶层 `max_tokens`）。解析失败或没有该字段时返回 `None`。
 ///
 /// **我们从不改这个字段**（理由见 [`ensure_context_management`] 文档里的第 1 条：改掉它等于

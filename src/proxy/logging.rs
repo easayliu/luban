@@ -55,6 +55,9 @@ pub(crate) struct ReqLog {
     pub(super) sniffer: UsageSniffer,
     /// 请求体里声明的速度档；仅在响应未回报 `usage.speed` 时兜底。
     pub(super) req_speed: Option<String>,
+    /// 请求体 `fallbacks[]` 各项的模型与覆盖的速度档：服务端 fallback 逐轮计价时，fallback 那几轮
+    /// 按它取速度档（[`UsageSniffer::billed_cost`]）。
+    pub(super) req_fallback_speeds: Vec<(String, Option<String>)>,
     /// 请求体里声明的模型名；仅在响应没带 `usage`（4xx/5xx，尤其是 429）时兜底。
     /// 否则那些记录只留下 `model=-`，排查「哪个模型被拒得多」时等于没有信息。
     pub(super) req_model: Option<String>,
@@ -284,29 +287,16 @@ impl Drop for ReqLog {
         let speed = self.sniffer.speed.clone().or_else(|| self.req_speed.clone());
         // 模型同理以响应为准（上游可能回落到别的模型），没有才用请求侧声明的那个。
         let model = self.sniffer.model.clone().or_else(|| self.req_model.clone());
-        // 输出前就被分类器拒掉的（`stop_reason: "refusal"`、零输出）上游**不计费**：usage 里
-        // 报了 token 数但不扣钱（官方 Refusals and fallback 页）。照 usage 算会把一堆 0 输出的
-        // 拒答算成真金白银。流到一半被掐的按已产出部分正常计费（输入 + 已流出的输出都算），
-        // 走下面那条。「输出前」的判据不只看 `output_tokens`：那个数没解析到（`None`）时不能
-        // 当 0——回复里已经见过任何内容块（[`UsageSniffer::saw_output_block`]，`fallback` 切换
-        // 标记不算）的，就是流到一半被掐的，得计费。
-        let refused_before_output = self.sniffer.refused()
-            && self.sniffer.output_tokens.unwrap_or(0) == 0
-            && !self.sniffer.saw_output_block;
-        let cost_usd = if refused_before_output {
-            Some(0.0)
-        } else {
-            crate::pricing::estimate_usd(crate::pricing::Usage {
-                model: model.as_deref(),
-                speed: speed.as_deref(),
-                input_tokens: self.sniffer.input_tokens,
-                output_tokens: self.sniffer.output_tokens,
-                cache_creation_total: self.sniffer.cache_creation_tokens,
-                cache_5m_tokens: self.sniffer.cache_creation_5m,
-                cache_1h_tokens: self.sniffer.cache_creation_1h,
-                cache_read_tokens: self.sniffer.cache_read_tokens,
-            })
-        };
+        // 计费口径：token 按各轮之和（[`UsageSniffer::billed`]），费用按官方拒答计费规则逐次尝试算
+        // （[`UsageSniffer::billed_cost`]：输出前的拒答按类别决定收不收，服务端 fallback 每次尝试按
+        // 它自己的模型与速度档）。
+        let billed = self.sniffer.billed();
+        let cost_usd = self.sniffer.billed_cost(
+            model.as_deref(),
+            self.req_model.as_deref(),
+            self.req_speed.as_deref(),
+            &self.req_fallback_speeds,
+        );
         let total_ms = self.started.elapsed().as_millis();
         // 伪装设备（见 [`sim_device_id`]）同样只展示前 8 位，但保留 `sim:` 前缀——
         // 截断时把前缀一起截掉，日志里就和真实 device_id 混在一起分不出来了。
@@ -331,10 +321,11 @@ impl Drop for ReqLog {
             model = %model.as_deref().unwrap_or("-"),
             speed = %speed.as_deref().unwrap_or("-"),
             has_usage,
-            input_tokens = self.sniffer.input_tokens.unwrap_or(0),
-            output_tokens = self.sniffer.output_tokens.unwrap_or(0),
-            cache_creation_tokens = self.sniffer.cache_creation_tokens.unwrap_or(0),
-            cache_read_tokens = self.sniffer.cache_read_tokens.unwrap_or(0),
+            input_tokens = billed.input_tokens.unwrap_or(0),
+            output_tokens = billed.output_tokens.unwrap_or(0),
+            cache_creation_tokens = billed.cache_creation_tokens.unwrap_or(0),
+            cache_read_tokens = billed.cache_read_tokens.unwrap_or(0),
+            iterations = self.sniffer.iterations.len(),
             ttft_ms = self.ttft_ms.map(|v| v as u64).unwrap_or(0),
             total_ms,
             sse_aggregated = self.sse_aggregated,
@@ -360,12 +351,12 @@ impl Drop for ReqLog {
             status: self.status,
             sse_aggregated: self.sse_aggregated,
             has_usage,
-            input_tokens: self.sniffer.input_tokens,
-            output_tokens: self.sniffer.output_tokens,
-            cache_creation_tokens: self.sniffer.cache_creation_tokens,
-            cache_5m_tokens: self.sniffer.cache_creation_5m,
-            cache_1h_tokens: self.sniffer.cache_creation_1h,
-            cache_read_tokens: self.sniffer.cache_read_tokens,
+            input_tokens: billed.input_tokens,
+            output_tokens: billed.output_tokens,
+            cache_creation_tokens: billed.cache_creation_tokens,
+            cache_5m_tokens: billed.cache_creation_5m,
+            cache_1h_tokens: billed.cache_creation_1h,
+            cache_read_tokens: billed.cache_read_tokens,
             ttft_ms: ttft,
             total_ms: total,
             unified_status: self.ratelimit.unified_status.clone(),
@@ -1049,6 +1040,115 @@ pub(crate) fn spawn_usage_log(
     store.spawn_write("usage log", async move { s.insert_usage_log(&rec).await });
 }
 
+/// 输出前就拒答也照常收费的类别（官方「How refusals are billed」，2026-09 起）：误判率低的这几类，
+/// 为了遏制规模化绕过照样计费；其余类别（`cyber`、`general_harms`）与 `null` 免费。官方说这张表会变，
+/// 以 Refusals and fallback 页类别表的 **Billed before any output** 一列为准。
+const BILLED_REFUSAL_CATEGORIES: &[&str] = &["bio", "frontier_llm", "reasoning_extraction"];
+
+/// 输出前的拒答收不收钱，见 [`BILLED_REFUSAL_CATEGORIES`]。
+fn refusal_billed_before_output(category: Option<&str>) -> bool {
+    category.is_some_and(|c| BILLED_REFUSAL_CATEGORIES.contains(&c))
+}
+
+/// 请求里写的模型名与 iteration 报的是不是同一个。先比精确相等；再只把末尾的 `-YYYYMMDD` 日期后缀当
+/// 同一个模型的别名（`claude-haiku-4-5` 对 `claude-haiku-4-5-20251001`）。不能按前缀认：
+/// `claude-opus-5` 是 `claude-opus-5-5` 的前缀，却是两个模型。
+fn same_model(a: &str, b: &str) -> bool {
+    fn base(m: &str) -> String {
+        let m = m.trim().to_ascii_lowercase();
+        match m.rsplit_once('-') {
+            Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|c| c.is_ascii_digit()) => {
+                head.to_string()
+            }
+            _ => m,
+        }
+    }
+    base(a) == base(b)
+}
+
+/// 一次请求的计费用量，见 [`UsageSniffer::billed`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BilledUsage {
+    pub(crate) input_tokens: Option<i64>,
+    pub(crate) output_tokens: Option<i64>,
+    pub(crate) cache_creation_tokens: Option<i64>,
+    pub(crate) cache_creation_5m: Option<i64>,
+    pub(crate) cache_creation_1h: Option<i64>,
+    pub(crate) cache_read_tokens: Option<i64>,
+}
+
+impl BilledUsage {
+    /// 一轮 `usage.iterations` 条目（或顶层 `usage`）里的 token 数。
+    fn of(it: &serde_json::Value) -> Self {
+        let top = |k: &str| it.get(k).and_then(|x| x.as_i64());
+        let tier =
+            |k: &str| it.get("cache_creation").and_then(|c| c.get(k)).and_then(|x| x.as_i64());
+        Self {
+            input_tokens: top("input_tokens"),
+            output_tokens: top("output_tokens"),
+            cache_creation_tokens: top("cache_creation_input_tokens"),
+            cache_creation_5m: tier("ephemeral_5m_input_tokens"),
+            cache_creation_1h: tier("ephemeral_1h_input_tokens"),
+            cache_read_tokens: top("cache_read_input_tokens"),
+        }
+    }
+
+    /// 逐轮相加；某轮缺的字段按 0 算，所有轮都没有的字段保持 `None`。
+    fn sum<'a>(parts: impl Iterator<Item = &'a BilledUsage> + Clone) -> Self {
+        let add = |get: fn(&BilledUsage) -> Option<i64>| {
+            parts
+                .clone()
+                .filter_map(get)
+                .fold(None, |acc: Option<i64>, x| Some(acc.unwrap_or(0) + x))
+        };
+        Self {
+            input_tokens: add(|u| u.input_tokens),
+            output_tokens: add(|u| u.output_tokens),
+            cache_creation_tokens: add(|u| u.cache_creation_tokens),
+            cache_creation_5m: add(|u| u.cache_creation_5m),
+            cache_creation_1h: add(|u| u.cache_creation_1h),
+            cache_read_tokens: add(|u| u.cache_read_tokens),
+        }
+    }
+
+    /// 按一个模型计价（[`crate::pricing::estimate_usd`]）。
+    fn cost(&self, model: Option<&str>, speed: Option<&str>) -> Option<f64> {
+        crate::pricing::estimate_usd(crate::pricing::Usage {
+            model,
+            speed,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_total: self.cache_creation_tokens,
+            cache_5m_tokens: self.cache_creation_5m,
+            cache_1h_tokens: self.cache_creation_1h,
+            cache_read_tokens: self.cache_read_tokens,
+        })
+    }
+}
+
+/// `usage.iterations` 的一轮：类型（`compaction` / `message` / `fallback_message`）、这轮自己报的
+/// 模型（服务端 fallback 时与响应模型不同）与用量。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IterationUsage {
+    pub(crate) kind: String,
+    pub(crate) model: Option<String>,
+    pub(crate) usage: BilledUsage,
+}
+
+impl IterationUsage {
+    fn parse(its: &[serde_json::Value]) -> Vec<Self> {
+        its.iter()
+            .filter_map(|it| {
+                Some(Self {
+                    kind: it.get("type")?.as_str()?.to_string(),
+                    model: it.get("model").and_then(|m| m.as_str()).map(str::to_string),
+                    usage: BilledUsage::of(it),
+                })
+            })
+            .collect()
+    }
+}
+
 /// 从上游响应中增量嗅探 token 用量。
 ///
 /// - SSE 流：逐行解析 `data:` 事件——`message_start` 带 input/cache 与 model，
@@ -1070,6 +1170,14 @@ pub(crate) struct UsageSniffer {
     pub(super) cache_creation_5m: Option<i64>,
     pub(super) cache_creation_1h: Option<i64>,
     pub(super) cache_read_tokens: Option<i64>,
+    /// `usage.iterations` 的各轮（服务端压缩 `compact_20260112`、服务端 fallback 这类一次请求跑了多轮
+    /// 采样时才有，否则为空）。
+    ///
+    /// 这时顶层 `usage` 只是**最后一轮**的用量（官方文档与客户端 `MX` 都按最后一轮算上下文），压缩那一轮
+    /// 的输入、缓存写、输出不在里面。所以流水与配额的 token 用各轮之和（[`Self::billed`]），费用逐轮按
+    /// 各自的模型与提示长度算再相加（[`Self::billed_cost`]，客户端 `wNn` 同样逐轮拆开）；遥测与上下文
+    /// 长度仍用顶层那份，与官方客户端一致。
+    pub(super) iterations: Vec<IterationUsage>,
     /// 上游回报的实际速度档（`usage.speed`，如 `"fast"`）。fast 有独立限流，
     /// 被限流时会回落到标准档，故以响应为准、请求体只作兜底。
     pub(super) speed: Option<String>,
@@ -1110,6 +1218,10 @@ pub(crate) struct UsageSniffer {
     /// （`cyber`、`bio`、…）。**为空的拒答是模型自己拒的**（官方：分类器拦截与模型拒绝都走
     /// `stop_reason: "refusal"`，靠这一项区分），带采样、重发可能就答了，不能学。
     refusal_category: Option<String>,
+    /// 回复里各个 `fallback` 内容块的 `trigger.category`，按出现顺序：第 i 个是服务端 fallback 第 i 次
+    /// 换模型时被拒那次尝试的拒答类别（`null` 记 `None`）。逐次计费按类别决定那次收不收钱
+    /// （[`Self::billed_cost`]）。
+    fallback_triggers: Vec<Option<String>>,
     /// `stop_details.recommended_model`：带 `fallbacks` 的请求，fallback 模型限流/过载时
     /// 上游不跑 fallback、把主模型的拒答原样返回并在这里提示「直接重试这个模型可能成功」。
     /// 有它的拒答是没救成，不是救不了，同样不能学。
@@ -1524,6 +1636,13 @@ impl UsageSniffer {
                     self.cache_creation_1h = Some(x);
                 }
             }
+            // 多轮采样（服务端压缩）：逐轮累加，见 [`Self::iterations_total`]。流式里它随最终的
+            // `message_delta.usage` 一起到，非流式在顶层 `usage`；后到的整份覆盖先到的。
+            if let Some(its) = u.get("iterations").and_then(|i| i.as_array())
+                && !its.is_empty()
+            {
+                self.iterations = IterationUsage::parse(its);
+            }
         }
     }
 
@@ -1550,6 +1669,16 @@ impl UsageSniffer {
         let ty = cb.get("type").and_then(|t| t.as_str());
         if ty != Some("fallback") {
             self.saw_output_block = true;
+        } else {
+            // `{"type":"fallback","from":…,"to":…,"trigger":{"type":"refusal","category":"cyber"}}`。
+            let category = cb
+                .get("trigger")
+                .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("refusal"))
+                .and_then(|t| t.get("category"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(str::to_string);
+            self.fallback_triggers.push(category);
         }
         // 签发者登记：非流式的 thinking 块在这里就带着完整签名（流式的 `content_block_start`
         // 里是空串，签名随后由 `signature_delta` 送来）；`redacted_thinking` 两种模式都在这里。
@@ -1817,6 +1946,132 @@ impl UsageSniffer {
             return None;
         }
         self.refusal_category.as_deref().filter(|c| !c.is_empty())
+    }
+
+    /// 计费口径的 token：有 `usage.iterations` 时取各轮之和（[`Self::iterations`]），否则就是顶层
+    /// `usage`。流水与日志都用它；遥测与上下文长度用顶层字段。
+    pub(super) fn billed(&self) -> BilledUsage {
+        if self.iterations.is_empty() {
+            return self.top_level();
+        }
+        BilledUsage::sum(self.iterations.iter().map(|it| &it.usage))
+    }
+
+    fn top_level(&self) -> BilledUsage {
+        BilledUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_creation_5m: self.cache_creation_5m,
+            cache_creation_1h: self.cache_creation_1h,
+            cache_read_tokens: self.cache_read_tokens,
+        }
+    }
+
+    /// 计费口径的费用（美元），按官方「How refusals are billed」逐次尝试算：
+    ///
+    /// - 没被拒的尝试照常计价；
+    /// - 被拒的尝试：产出过输出的（拒答前流出了内容，或服务端工具循环的前几轮已经出过东西）整次照常
+    ///   计价；一点输出都没有的只有 [`BILLED_REFUSAL_CATEGORIES`] 那几类收钱，其余类别与 `null` 免费；
+    /// - 每一轮按它自己的模型（iteration 自带的 `model`，没有就用响应模型 `model`）与这一轮的提示长度
+    ///   计价——Haiku 5.5 的 100K 长提示档按单轮判，压缩前后两轮不能加起来误触。
+    ///
+    /// **一次「尝试」是同一个模型的连续几轮**，按模型切换的边界分组：服务端工具循环里同一个模型会采样
+    /// 好几轮，每轮各记一条 `message`，不能一条算一次。`message` / `fallback_message` 之外的条目
+    /// （`compaction`、`advisor_message` 等）照常计价、不参与分组。除最后一组外，每组都是被拒后换了
+    /// 模型的，类别按顺序取回复里 `fallback` 块的 `trigger.category`（[`Self::fallback_triggers`]）；
+    /// 最后一组只在最终 `stop_reason` 为拒答时算被拒，类别取顶层 `stop_details.category`。没有
+    /// iterations 就是单次尝试。
+    ///
+    /// 速度档按**这一轮实际跑的模型**取，不按位置：是请求的主模型 `req_model` 就用请求顶层 `speed`；
+    /// 是请求 `fallbacks[]` 里的某一项就用那项覆盖的 `speed`，没写沿用顶层的（sticky routing 直接
+    /// 从 fallback 模型开跑时同样如此）；最后一组以响应 `usage.speed` 为准（fast 被限流时会回落），
+    /// 响应没报才按模型取。
+    ///
+    /// 有一轮的模型认不出来就整体返回 `None`（不计入），与单次时未知模型的口径一致。
+    pub(super) fn billed_cost(
+        &self,
+        model: Option<&str>,
+        req_model: Option<&str>,
+        req_speed: Option<&str>,
+        fallback_speeds: &[(String, Option<String>)],
+    ) -> Option<f64> {
+        let final_refused = self.refused();
+        let final_category = self.refusal_category.as_deref().filter(|c| !c.is_empty());
+        if self.iterations.is_empty() {
+            // 单次尝试：输出前拒答看类别；`output_tokens` 没解析到时不能当 0——回复里已经见过内容块
+            // （[`Self::saw_output_block`]，`fallback` 标记不算）就是流到一半被掐的，要计费。
+            let before_output = self.output_tokens.unwrap_or(0) == 0 && !self.saw_output_block;
+            if final_refused && before_output && !refusal_billed_before_output(final_category) {
+                return Some(0.0);
+            }
+            return self.top_level().cost(model, self.speed.as_deref().or(req_speed));
+        }
+        fn it_model<'a>(it: &'a IterationUsage, model: Option<&'a str>) -> Option<&'a str> {
+            it.model.as_deref().or(model)
+        }
+        // 按模型切换的边界给尝试分组：组号 → 这组里各轮的下标。
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut last_model: Option<&str> = None;
+        for (i, it) in self.iterations.iter().enumerate() {
+            if !matches!(it.kind.as_str(), "message" | "fallback_message") {
+                continue;
+            }
+            let m = it_model(it, model);
+            let switched = match (last_model, m, groups.last()) {
+                (_, _, None) => true,
+                (Some(prev), Some(cur), _) => !same_model(prev, cur),
+                _ => false,
+            };
+            if switched {
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("just pushed").push(i);
+            last_model = m;
+        }
+        let group_of = |i: usize| groups.iter().position(|g| g.contains(&i));
+        // 被拒且整组零输出、类别又不收费的组：整组跳过。
+        let free_group = |g: usize| {
+            let last = g + 1 == groups.len();
+            if last && !final_refused {
+                return false;
+            }
+            let silent =
+                groups[g].iter().all(|&i| self.iterations[i].usage.output_tokens.unwrap_or(0) == 0);
+            let category = if last {
+                final_category
+            } else {
+                self.fallback_triggers.get(g).and_then(|c| c.as_deref())
+            };
+            silent && !refusal_billed_before_output(category)
+        };
+        // 一轮的速度档：最后一组（及不参与分组的条目）以响应 `usage.speed` 为准；响应没报或不是最后
+        // 一组，就按这轮的模型对请求里的配置。
+        let speed_for = |g: Option<usize>, m: Option<&str>| -> Option<&str> {
+            if g.is_none_or(|g| g + 1 == groups.len())
+                && let Some(s) = self.speed.as_deref()
+            {
+                return Some(s);
+            }
+            let Some(m) = m else { return req_speed };
+            if req_model.is_some_and(|r| same_model(r, m)) {
+                return req_speed;
+            }
+            fallback_speeds
+                .iter()
+                .find(|(fm, _)| same_model(fm, m))
+                .map_or(req_speed, |(_, s)| s.as_deref().or(req_speed))
+        };
+        let mut total = 0.0;
+        for (i, it) in self.iterations.iter().enumerate() {
+            let g = group_of(i);
+            if g.is_some_and(free_group) {
+                continue;
+            }
+            let m = it_model(it, model);
+            total += it.usage.cost(m, speed_for(g, m))?;
+        }
+        Some(total)
     }
 
     /// 是否解析到任一用量字段。

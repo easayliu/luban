@@ -483,7 +483,7 @@ pub(crate) enum Aggregated {
 /// |---|---|
 /// | `message_start` | 取 `.message` 当骨架（`content` 清空重攒） |
 /// | `content_block_start` | `content[index] = .content_block`（原样收下） |
-/// | `content_block_delta` | 按 `delta.type` 追加到该块的对应字段 |
+/// | `content_block_delta` | 按 `delta.type` 追加到该块的对应字段（含压缩块的 `compaction_delta`） |
 /// | `content_block_stop` | `input_json_delta` 攒的串在这里解析成 `.input` |
 /// | `message_delta` | `.delta` 合进顶层、`.usage` 合进 `usage` |
 /// | `message_stop` | 收尾 |
@@ -618,6 +618,9 @@ impl SseAggregator {
             "text_delta" => self.append_str(idx, "text", text("text")),
             "thinking_delta" => self.append_str(idx, "thinking", text("thinking")),
             "signature_delta" => self.append_str(idx, "signature", text("signature")),
+            // 服务端压缩（`compact_20260112`）的摘要：块开头是 `{"type":"compaction","content":null}`，
+            // 正文随 `compaction_delta.content` 到（`cap/auto-2.1.303-20261019-compact/00172`）。
+            "compaction_delta" => self.append_str(idx, "content", text("content")),
             // tool_use 的入参是分片的 JSON 串，攒到 content_block_stop 再整体解析。
             "input_json_delta" => {
                 self.partial_json.entry(idx).or_default().push_str(text("partial_json"));

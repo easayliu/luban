@@ -84,7 +84,8 @@ async fn relay_ok(
     let session_less = inb.session_less();
     let log_session_key = &inb.plan.log_key;
     let Pick { ref cred, .. } = *pick;
-    let Prepared { ref req_speed, ref tool_names, upgrade_stream, .. } = *prepared;
+    let Prepared { ref req_speed, ref req_fallback_speeds, ref tool_names, upgrade_stream, .. } =
+        *prepared;
     let status = up.status();
     // 是否 SSE 流（决定用量嗅探逐行还是整段 JSON）；以及我们解不开的 content-encoding。
     //
@@ -216,6 +217,7 @@ async fn relay_ok(
         sse_aggregated: false,
         sniffer: UsageSniffer::new(is_stream, compressed),
         req_speed: req_speed.clone(),
+        req_fallback_speeds: req_fallback_speeds.clone(),
         req_model: req_model.clone(),
         ratelimit,
         stream_broke: None,

@@ -609,3 +609,300 @@ fn sniffer_fingerprints_thinking_signatures_and_redacted_data() {
     j.finish();
     assert_eq!(j.thinking_blocks, vec![fp("SIG_C"), fp("DATA_D")]);
 }
+
+/// 服务端压缩一次请求跑两轮采样：顶层 `usage` 只是最后一轮，计费按 `usage.iterations` 逐轮相加
+/// （[`UsageSniffer::billed`]）；顶层字段照旧（遥测与上下文长度用它）。流式在最终的
+/// `message_delta.usage` 里，非流式在顶层；数值取自 `cap/auto-2.1.303-20261019-compact/00172`。
+#[test]
+fn billed_usage_sums_the_compaction_iterations() {
+    let iterations = r#"[{"input_tokens":48,"output_tokens":730,"cache_read_input_tokens":20084,"cache_creation_input_tokens":137152,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":137152},"type":"compaction"},{"input_tokens":6,"output_tokens":283,"cache_read_input_tokens":25369,"cache_creation_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":1221,"ephemeral_1h_input_tokens":0},"type":"message"}]"#;
+    let want = super::BilledUsage {
+        input_tokens: Some(54),
+        output_tokens: Some(1013),
+        cache_creation_tokens: Some(138_373),
+        cache_creation_5m: Some(1221),
+        cache_creation_1h: Some(137_152),
+        cache_read_tokens: Some(45_453),
+    };
+
+    let mut stream = UsageSniffer::new(true, false);
+    stream.feed(
+        br#"data: {"type":"message_start","message":{"model":"claude-opus-4-7","usage":{"input_tokens":48,"cache_creation_input_tokens":137152,"cache_read_input_tokens":20084,"output_tokens":1}}}"#,
+    );
+    stream.feed(b"\n\n");
+    stream.feed(
+        format!(
+            r#"data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn"}},"usage":{{"input_tokens":6,"cache_creation_input_tokens":1221,"cache_read_input_tokens":25369,"output_tokens":283,"iterations":{iterations}}}}}"#
+        )
+        .as_bytes(),
+    );
+    stream.feed(b"\n\n");
+    stream.finish();
+    assert_eq!(stream.billed(), want);
+    assert_eq!((stream.input_tokens, stream.output_tokens), (Some(6), Some(283)), "顶层是最后一轮");
+
+    let mut plain = UsageSniffer::new(false, false);
+    plain.feed(
+        format!(
+            r#"{{"model":"claude-opus-4-7","usage":{{"input_tokens":6,"cache_creation_input_tokens":1221,"cache_read_input_tokens":25369,"output_tokens":283,"iterations":{iterations}}}}}"#
+        )
+        .as_bytes(),
+    );
+    plain.finish();
+    assert_eq!(plain.billed(), want);
+
+    // 没有 `iterations`（普通请求）：计费口径就是顶层。
+    let mut single = UsageSniffer::new(false, false);
+    single.feed(br#"{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":7}}"#);
+    single.finish();
+    let b = single.billed();
+    assert_eq!(
+        (b.input_tokens, b.output_tokens, b.cache_read_tokens),
+        (Some(10), Some(5), Some(7))
+    );
+    assert_eq!(b.cache_creation_tokens, None);
+}
+
+/// 费用逐轮算（[`UsageSniffer::billed_cost`]），不能把各轮 token 加起来再按响应模型算一次。
+#[test]
+fn billed_cost_prices_each_iteration_on_its_own() {
+    let sniff = |body: &str| {
+        let mut s = UsageSniffer::new(false, false);
+        s.feed(body.as_bytes());
+        s.finish();
+        s
+    };
+    let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+
+    // Haiku 5.5 压缩：压缩前 70K、压缩后 40K，两轮各 1K 输出。各轮都在 100K 短提示档内，
+    // 合计 110K 也不能触发长提示价：0.0075 + 0.0045 = 0.012（误按合计算是 0.060）。
+    let haiku = sniff(
+        r#"{"model":"claude-haiku-5-5","usage":{"input_tokens":40000,"output_tokens":1000,"iterations":[
+            {"type":"compaction","input_tokens":70000,"output_tokens":1000},
+            {"type":"message","input_tokens":40000,"output_tokens":1000}]}}"#,
+    );
+    assert!(
+        close(haiku.billed_cost(Some("claude-haiku-5-5"), None, None, &[]), 0.012),
+        "{:?}",
+        haiku.billed_cost(Some("claude-haiku-5-5"), None, None, &[])
+    );
+    assert_eq!(haiku.billed().input_tokens, Some(110_000), "token 照样加总");
+
+    // 服务端 fallback：主模型输出前就拒掉（535 输入、0 输出，回复里没给类别）不收钱，fallback 那轮按它
+    // 自己的模型计价：412 × $5 + 264 × $25 = $0.008660（误把主模型那 535 一起按最终模型算是 $0.011335）。
+    let fallback = sniff(
+        r#"{"model":"claude-opus-5","usage":{"input_tokens":412,"output_tokens":264,"iterations":[
+            {"type":"message","model":"claude-fable-5-1","input_tokens":535,"output_tokens":0},
+            {"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}]}}"#,
+    );
+    assert!(close(fallback.billed_cost(Some("claude-opus-5"), None, None, &[]), 0.008_660));
+    assert_eq!(fallback.billed().input_tokens, Some(947), "被拒那轮的 token 仍计入用量");
+
+    // 主模型拒答前已经流出了内容：那部分照常按主模型计价。
+    let partial = sniff(
+        r#"{"model":"claude-opus-5","usage":{"iterations":[
+            {"type":"message","model":"claude-fable-5-1","input_tokens":1000,"output_tokens":100},
+            {"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}]}}"#,
+    );
+    let fable = 1000.0 * 10.0 / 1e6 + 100.0 * 50.0 / 1e6;
+    assert!(close(partial.billed_cost(Some("claude-opus-5"), None, None, &[]), fable + 0.008_660));
+
+    // 没有 iterations：与原来一样按顶层用量算。
+    let plain =
+        sniff(r#"{"model":"claude-opus-5","usage":{"input_tokens":412,"output_tokens":264}}"#);
+    assert!(close(plain.billed_cost(Some("claude-opus-5"), None, None, &[]), 0.008_660));
+}
+
+/// 拒答按官方「How refusals are billed」逐次判：输出前就拒的只有 bio / frontier_llm /
+/// reasoning_extraction 收钱，其余与 `null` 免费；拒答前已经出了内容的照常计；服务端 fallback 每次
+/// 尝试的类别看回复里 `fallback` 块的 `trigger`，最后一次看顶层 `stop_details`；速度档逐次取。
+#[test]
+fn refusals_are_billed_by_category_and_attempt() {
+    let sniff = |body: &str| {
+        let mut s = UsageSniffer::new(false, false);
+        s.feed(body.as_bytes());
+        s.finish();
+        s
+    };
+    let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+    let est = |model: &str, speed: Option<&str>, input: i64, output: i64| {
+        crate::pricing::estimate_usd(crate::pricing::Usage {
+            model: Some(model),
+            speed,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let fallback_block = |cat: &str| {
+        format!(
+            r#"{{"type":"fallback","from":{{"model":"claude-fable-5-1"}},"to":{{"model":"claude-opus-5"}},"trigger":{{"type":"refusal","category":{cat}}}}}"#
+        )
+    };
+
+    // 1. 主模型输出前以 bio 拒掉、fallback 作答：bio 照收，535 × $10 + 0.008660 = $0.014010。
+    let bio = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"input_tokens":412,"output_tokens":264,"iterations":[
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":535,"output_tokens":0}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        fallback_block(r#""bio""#)
+    ));
+    assert!(close(bio.billed_cost(Some("claude-opus-5"), None, None, &[]), 0.014_010));
+    // 同样的形态换成 cyber：主模型那次免费，只剩 fallback 的 $0.008660。
+    let cyber = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"input_tokens":412,"output_tokens":264,"iterations":[
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":535,"output_tokens":0}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        fallback_block(r#""cyber""#)
+    ));
+    assert!(close(cyber.billed_cost(Some("claude-opus-5"), None, None, &[]), 0.008_660));
+
+    // 2. 主模型出了内容后被拒（照收：1000 × $10 + 100 × $50 = $0.015），fallback 随后以 cyber 输出前
+    //    拒掉、成为最终回复：最后那次免费，合计 $0.015000（误把它也收了是 $0.017060）。
+    let last_refused = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"refusal","stop_details":{{"type":"refusal","category":"cyber"}},
+            "content":[{{"type":"text","text":"part"}},{}],
+            "usage":{{"input_tokens":412,"output_tokens":0,"iterations":[
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":1000,"output_tokens":100}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":0}}]}}}}"#,
+        fallback_block("null")
+    ));
+    assert!(close(last_refused.billed_cost(Some("claude-opus-5"), None, None, &[]), 0.015));
+
+    // 3. 主模型 standard、请求 `fallbacks[]` 给 opus-5 单独开 fast：主模型那次按 standard，
+    //    fallback 那次（也是最终回复，`usage.speed` 报 fast）按 fast。
+    let speeds = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"input_tokens":412,"output_tokens":264,"speed":"fast","iterations":[
+            {{"type":"message","model":"claude-opus-5-5","input_tokens":1000,"output_tokens":100}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        fallback_block(r#""cyber""#)
+    ));
+    let fb = vec![("claude-opus-5".to_string(), Some("fast".to_string()))];
+    let want =
+        est("claude-opus-5-5", None, 1000, 100) + est("claude-opus-5", Some("fast"), 412, 264);
+    assert!(close(
+        speeds.billed_cost(Some("claude-opus-5"), Some("claude-opus-5-5"), Some("standard"), &fb),
+        want
+    ));
+    assert!(
+        est("claude-opus-5", Some("fast"), 412, 264) > est("claude-opus-5", None, 412, 264),
+        "fast 档确有溢价"
+    );
+
+    // 4. 没有 iterations 的单次拒答也按类别：输出前 bio 照收、cyber / null 免费、出了内容的照收。
+    let single = |cat: &str, output: i64, content: &str| {
+        sniff(&format!(
+            r#"{{"model":"claude-opus-5","stop_reason":"refusal","stop_details":{{"type":"refusal","category":{cat}}},
+                "content":{content},"usage":{{"input_tokens":1000,"output_tokens":{output}}}}}"#
+        ))
+        .billed_cost(Some("claude-opus-5"), None, None, &[])
+    };
+    assert!(close(single(r#""bio""#, 0, "[]"), 0.005));
+    assert!(close(single(r#""reasoning_extraction""#, 0, "[]"), 0.005));
+    assert!(close(single(r#""cyber""#, 0, "[]"), 0.0));
+    assert!(close(single("null", 0, "[]"), 0.0));
+    assert!(close(single(r#""cyber""#, 40, r#"[{"type":"text","text":"part"}]"#), 0.006));
+}
+
+/// 服务端工具循环里同一个模型会采样好几轮、各记一条 `message`：一次「尝试」是同一模型的连续几轮，
+/// 按模型切换的边界分组，不能一条算一次；速度档按这一轮实际跑的模型取，模型名只认精确相等与日期后缀。
+#[test]
+fn tool_loop_rounds_belong_to_one_attempt() {
+    assert!(!super::same_model("claude-opus-5", "claude-opus-5-5"), "前缀不是同一个模型");
+    assert!(super::same_model("claude-haiku-4-5", "claude-haiku-4-5-20251001"), "日期后缀是别名");
+    assert!(super::same_model("claude-opus-5-5", "claude-opus-5-5"));
+
+    let sniff = |body: &str| {
+        let mut s = UsageSniffer::new(false, false);
+        s.feed(body.as_bytes());
+        s.finish();
+        s
+    };
+    let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+    let est = |model: &str, speed: Option<&str>, input: i64, output: i64| {
+        crate::pricing::estimate_usd(crate::pricing::Usage {
+            model: Some(model),
+            speed,
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let block = |from: &str, to: &str, cat: &str| {
+        format!(
+            r#"{{"type":"fallback","from":{{"model":"{from}"}},"to":{{"model":"{to}"}},"trigger":{{"type":"refusal","category":{cat}}}}}"#
+        )
+    };
+
+    // 1. fable 先调了一次服务端工具（出了 50 输出）、下一轮以 bio 拒掉，换 opus-5 作答。fable 那两轮
+    //    是同一次尝试、整次照收；`fallback` 块只有一个，类别 bio 属于这整次，不能错位到第二轮上。
+    let tool_then_bio = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"iterations":[
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":500,"output_tokens":50}},
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":600,"output_tokens":0}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        block("claude-fable-5-1", "claude-opus-5", r#""bio""#)
+    ));
+    let want = est("claude-fable-5-1", None, 500, 50)
+        + est("claude-fable-5-1", None, 600, 0)
+        + est("claude-opus-5", None, 412, 264);
+    assert!(close(
+        tool_then_bio.billed_cost(Some("claude-opus-5"), Some("claude-fable-5-1"), None, &[]),
+        want
+    ));
+    // fable 那次一点输出都没有、类别 cyber：整次免费（两轮都不收），只收 opus-5。
+    let silent_cyber = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"iterations":[
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":500,"output_tokens":0}},
+            {{"type":"message","model":"claude-fable-5-1","input_tokens":600,"output_tokens":0}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        block("claude-fable-5-1", "claude-opus-5", r#""cyber""#)
+    ));
+    assert!(close(
+        silent_cyber.billed_cost(Some("claude-opus-5"), Some("claude-fable-5-1"), None, &[]),
+        est("claude-opus-5", None, 412, 264)
+    ));
+
+    // 2. 主模型 opus-5-5（standard）跑了两轮工具循环后被拒，fallback opus-5 在请求里单独开 fast：
+    //    opus-5-5 那两轮按 standard（不能因为 `opus-5` 是 `opus-5-5` 的前缀拿到 fast），opus-5 按 fast。
+    let fb = vec![("claude-opus-5".to_string(), Some("fast".to_string()))];
+    let prefix = sniff(&format!(
+        r#"{{"model":"claude-opus-5","stop_reason":"end_turn","content":[{},{{"type":"text","text":"ok"}}],
+            "usage":{{"speed":"fast","iterations":[
+            {{"type":"message","model":"claude-opus-5-5","input_tokens":800,"output_tokens":60}},
+            {{"type":"message","model":"claude-opus-5-5","input_tokens":900,"output_tokens":40}},
+            {{"type":"fallback_message","model":"claude-opus-5","input_tokens":412,"output_tokens":264}}]}}}}"#,
+        block("claude-opus-5-5", "claude-opus-5", r#""cyber""#)
+    ));
+    let want = est("claude-opus-5-5", Some("standard"), 800, 60)
+        + est("claude-opus-5-5", Some("standard"), 900, 40)
+        + est("claude-opus-5", Some("fast"), 412, 264);
+    assert!(close(
+        prefix.billed_cost(Some("claude-opus-5"), Some("claude-opus-5-5"), Some("standard"), &fb),
+        want
+    ));
+
+    // 3. sticky routing：请求 opus-5-5（standard），直接由 fallback opus-5 跑，且跑了工具循环（先一条
+    //    `message` 再 `fallback_message`）。两轮都是 opus-5、按它在 `fallbacks[]` 里的 fast；响应没报
+    //    `usage.speed` 时也一样。
+    let sticky = sniff(
+        r#"{"model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],
+            "usage":{"iterations":[
+            {"type":"message","model":"claude-opus-5","input_tokens":1000,"output_tokens":100},
+            {"type":"fallback_message","model":"claude-opus-5","input_tokens":1200,"output_tokens":200}]}}"#,
+    );
+    let want = est("claude-opus-5", Some("fast"), 1000, 100)
+        + est("claude-opus-5", Some("fast"), 1200, 200);
+    assert!(close(
+        sticky.billed_cost(Some("claude-opus-5"), Some("claude-opus-5-5"), Some("standard"), &fb),
+        want
+    ));
+    assert!(want > est("claude-opus-5", None, 1000, 100) + est("claude-opus-5", None, 1200, 200));
+}
