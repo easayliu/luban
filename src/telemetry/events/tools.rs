@@ -313,7 +313,15 @@ impl EventBuilder<'_> {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
         let TurnFacts {
-            is_main, ref chain_id, shell_snapshot_first, v285, v291, v293, v299, ..
+            is_main,
+            ref chain_id,
+            shell_snapshot_first,
+            v285,
+            v291,
+            v293,
+            v299,
+            v303,
+            ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
         let ToolStep {
@@ -457,6 +465,10 @@ impl EventBuilder<'_> {
             "toolName": &tu.name,
             "isMcp": false
         });
+        // 2.1.303 起 `messageID` 之后多一项 `toolUseID`（失败那条 `tool_use_error` 早就有）。
+        if v303 {
+            insert_after(&mut success, "messageID", vec![("toolUseID", json!(&tu.id))]);
+        }
         // 子代理里跑的工具多报是哪类子代理（`cap/2.1.280`：`subagent_type: Explore`、
         // `is_built_in_agent: true`，紧跟 `isMcp`）。
         if is_sub {
@@ -547,8 +559,15 @@ impl EventBuilder<'_> {
             // 栈的摘要与顶帧随每个版本的打包产物变：2.1.285 那份取自 `cap/auto-2.1.285-20260930`，
             // 2.1.291 取自 `cap/auto-2.1.291-20261006-full`（B4 那条失败的 Bash），后者还多了异常的
             // 构造器名（压缩后的类名）；2.1.293（`cap/auto-2.1.293-20261008-full` 的两条失败 Bash）
-            // 又没有构造器名了。
-            if v293 {
+            // 又没有构造器名了。2.1.299（`cap/auto-2.1.299-20261014-full` 两条）、2.1.303
+            // （`cap/auto-2.1.303-20261019-full` 两条）各换一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299。
+            if v303 {
+                err["error_stack_hash"] = json!("99830f66ede0");
+                err["error_top_frame"] = json!("chunk-jh3cvmqy.js:3614:6109");
+            } else if v299 {
+                err["error_stack_hash"] = json!("1dada4b9379c");
+                err["error_top_frame"] = json!("chunk-4xx9trad.js:3588:6085");
+            } else if v293 {
                 err["error_stack_hash"] = json!("2e671ed03fc0");
                 err["error_top_frame"] = json!("chunk-nwqfvmza.js:3493:5989");
             } else if v291 {

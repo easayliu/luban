@@ -364,6 +364,9 @@ impl EventBuilder<'_> {
                 "subagent_type": call.agent.agent_type.as_deref().unwrap_or("general-purpose"),
                 "is_built_in_agent": builtin_agent.is_some()
             });
+            if env.f.v303 {
+                insert_after(&mut ok, "messageID", vec![("toolUseID", json!(&tu.id))]);
+            }
             if let Some(e) = &effort {
                 ok["effort_level"] = json!(e);
             }
@@ -417,42 +420,94 @@ impl EventBuilder<'_> {
             // 30 秒才可能分叉一次；抓包里的子代理都不到 30 秒，三项恒 0，大于 0 的情形没有样本）。
             // `config_flag` 按子代理拉起时会话主模型的族挑（可执行文件 `nd`：fable / opus 各一个，其余一个；
             // 摘要器启动时读当前主模型，中途 `/model` 换过的以那时为准）。
-            // `config_source` 抓包六条都是 `fallback`——那三个开关这个号的 eval 里都没有；号若下发了，官方
-            // 报什么没有样本，luban 也不读这三个开关，照报 `fallback`。
+            // `config_source`、等待与（2.1.303 起的）模式、输入上限取这个号 eval 里那个开关
+            // （[`crate::proxy::agent_summary_config`]）；抓包那个号三个开关都没下发，六条都是 `fallback`、
+            // `[30]` 秒、`full`、2000。
             let summary_ms = elapsed + 10;
             if env.f.v300 {
-                let family = |m: &str| {
-                    let m = m.to_ascii_lowercase();
-                    ["fable", "opus", "sonnet", "haiku"]
-                        .into_iter()
-                        .find(|f| m.contains(f))
-                        .unwrap_or("other")
-                };
-                let session_family = family(&done.session_model);
-                let calls = done.summaries;
-                self.push(
-                    t2,
-                    "tengu_agent_summary_stopped",
-                    json!({
-                        "config_flag": match session_family {
-                            "fable" => "tengu_starry_wall",
-                            "opus" => "tengu_groovy_ember",
-                            _ => "tengu_composed_plum",
-                        },
-                        "config_source": "fallback",
-                        "session_model_family": session_family,
-                        "agent_model_family": family(display_model),
-                        "agent_model": &display_model,
-                        "is_sdk_host": false,
-                        "is_resume": false,
-                        "duration_ms": summary_ms,
-                        "calls": calls,
-                        "calls_failed": done.summaries_failed,
-                        "lines_accepted": done.summaries_accepted,
-                        "first_wait_ms": 30_000,
-                        "next_wait_ms": 30_000
-                    }),
+                let session_family = model_family(&done.session_model);
+                let agent_family = model_family(display_model);
+                // 收尾报的是摘要器**最后一次读到**的配置，不是此刻号的最新 eval：它启动时读一次，之后每次
+                // 计时器触发都重读；触发时刻按官方的排法从最后一条摘要结束（没发过就是起跑）往后推，摘要
+                // 请求的耗时也算进去（[`crate::proxy::agent_summary_config::last_read_at`]）。
+                let spawn = done.started.unwrap_or(call.started_at);
+                let stop = spawn + std::time::Duration::from_millis(summary_ms.max(0) as u64);
+                let read_at = crate::proxy::agent_summary_config::last_read_at(
+                    call.cred_id,
+                    session_family,
+                    done.summary_last_end.unwrap_or(spawn),
+                    done.summary_last_sent.unwrap_or(spawn),
+                    done.summaries,
+                    stop,
                 );
+                let cfg = crate::proxy::agent_summary_config::config_at(
+                    call.cred_id,
+                    session_family,
+                    read_at,
+                );
+                let calls = done.summaries;
+                let mut stopped = json!({
+                    "config_flag": crate::proxy::agent_summary_config::flag_for_family(session_family),
+                    "config_source": &cfg.source,
+                    "session_model_family": session_family,
+                    "agent_model_family": agent_family,
+                    "agent_model": &display_model,
+                    "is_sdk_host": false,
+                    "is_resume": false,
+                    "duration_ms": summary_ms,
+                    "calls": calls,
+                    "calls_failed": done.summaries_failed,
+                    "lines_accepted": done.summaries_accepted,
+                    "first_wait_ms": cfg.wait_ms(0),
+                    "next_wait_ms": cfg.wait_ms(calls)
+                });
+                // 2.1.303 多六项（`cap/auto-2.1.303-20261019-full` 六条：`full` / `full` / `false` / 2000 /
+                // `false` / 0）。官方（`z` / `te` / `he`）：计时器每次触发先 `J = te()`（配置是 short 且子代理
+                // 是 opus / fable 即 short，否则 full），**再**看到没到期——没到期、内容没变而不发也照样改了
+                // `J`；收尾 `mode` 报 `J`（一次没触发就现算 `te()`），`config_mode` 报那时的配置，`mode_changed`
+                // 看发过的摘要里有没有不同于 `mode` 的，`calls_kept_on_full` 是逐条按发出时配置累计的（见
+                // [`AgentState::summaries_kept_on_full`]）。所以：最后一次读配置正是最后一条摘要发出那一刻时，
+                // `mode` 就是那条的模式，且那条是 short 即证明当时配置是 short（eval 没见过或没更新也按
+                // short）；之后的触发若没赶上新的 eval，读到的还是同一份配置，同样按那条算；赶上了新 eval
+                // 的，按那次读到的配置现算。子代理模型中途被换（`agent_model_swapped`）代理看不到，报 false。
+                if env.f.v303 {
+                    let full_calls = calls - done.summaries_short;
+                    let same_as_last_send = done.summary_last_sent.is_some_and(|sent| {
+                        !crate::proxy::agent_summary_config::changed_between(
+                            call.cred_id,
+                            sent,
+                            read_at,
+                        )
+                    });
+                    let last_short = done.summary_last_short.filter(|_| same_as_last_send);
+                    let config_short = cfg.short || last_short == Some(true);
+                    let mode_short = last_short
+                        .unwrap_or(config_short && matches!(agent_family, "opus" | "fable"));
+                    let mode_changed =
+                        if mode_short { full_calls > 0 } else { done.summaries_short > 0 };
+                    let mode_name = |short: bool| if short { "short" } else { "full" };
+                    insert_before(
+                        &mut stopped,
+                        "config_flag",
+                        vec![
+                            ("mode", json!(mode_name(mode_short))),
+                            ("config_mode", json!(mode_name(config_short))),
+                            ("mode_changed", json!(mode_changed)),
+                            ("max_input_tokens", json!(cfg.max_input_tokens)),
+                        ],
+                    );
+                    insert_after(
+                        &mut stopped,
+                        "agent_model",
+                        vec![("agent_model_swapped", json!(false))],
+                    );
+                    insert_after(
+                        &mut stopped,
+                        "calls",
+                        vec![("calls_kept_on_full", json!(done.summaries_kept_on_full))],
+                    );
+                }
+                self.push(t2, "tengu_agent_summary_stopped", stopped);
             }
             if handback.is_some() {
                 self.push_dd(t2, "tengu_feature_ok", feature("agent_handback_pointer_notice"));

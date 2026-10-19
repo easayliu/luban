@@ -26,6 +26,13 @@ pub(super) enum Kind {
     /// **没有工具**、`thinking: disabled`、不带断点。事件形态与标题那类侧查询相同：没有链、
     /// `previousRequestId`、`effort`、`turn_origin`、`queryOverheadMs`，也没有收尾那串。
     WebFetchApply,
+    /// 2.1.303 子代理摘要的 short 模式：服务端配置（`tengu_groovy_ember` 那几个开关）给 `mode: short`、
+    /// 子代理是 opus / fable 时，客户端不再从子代理上下文分叉，改发一条无工具的侧查询——system 是固定的
+    /// 「You write a 3-5 word progress label for a background agent…」，用户消息是整理过的 `<task>` /
+    /// `<recent_steps>` 笔记，`querySource: agent_summary`、effort low、不开缓存（可执行文件 `Vd`）。
+    /// 请求头同样带子代理的 `agent-id` 与 `request-class: auxiliary`、`tools: []`，形态与 WebFetch 页面
+    /// 处理同属侧查询（没有链与收尾那串），只是 `querySource` 不同，且记进那条支线的摘要统计。
+    AgentSummaryShort,
     /// 离开一阵再回来时客户端从主线程分叉出来的回顾：带主线程那套工具与上下文，末条用户消息
     /// 是固定的「The user stepped away and is coming back. Recap…」（`querySource: away_summary`，
     /// `cap/2.1.280/00048`、`00088`，`cap/2.1.285/00097`、`00158`）。事件形态同猜下一句：链另起、
@@ -62,6 +69,7 @@ impl Kind {
             Kind::Title
                 | Kind::Helper
                 | Kind::WebFetchApply
+                | Kind::AgentSummaryShort
                 | Kind::RenameName
                 | Kind::ModelValidation
                 | Kind::SideQuestion
@@ -76,7 +84,7 @@ impl Kind {
             Kind::Suggestion => "prompt_suggestion",
             Kind::Title => "generate_session_title",
             Kind::Helper => "compact",
-            Kind::AgentSummary => "agent_summary",
+            Kind::AgentSummary | Kind::AgentSummaryShort => "agent_summary",
             Kind::WebFetchApply => "web_fetch_apply",
             Kind::AwaySummary => "away_summary",
             Kind::WebSearchTool => "web_search_tool",
@@ -137,6 +145,7 @@ impl Kind {
             Kind::Title
                 | Kind::Helper
                 | Kind::WebFetchApply
+                | Kind::AgentSummaryShort
                 | Kind::WebSearchTool
                 | Kind::RenameName
         )
@@ -145,6 +154,13 @@ impl Kind {
     pub(super) fn is_agent(self) -> bool {
         matches!(self, Kind::Subagent | Kind::AgentSummary)
     }
+}
+
+/// 模型名归到族（摘要器挑开关、报 `*_model_family` 用，官方 `Kn`）：fable / opus / sonnet / haiku，
+/// 其余 `other`。
+pub(super) fn model_family(model: &str) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    ["fable", "opus", "sonnet", "haiku"].into_iter().find(|f| m.contains(f)).unwrap_or("other")
 }
 
 /// 子代理请求的 `querySource`：内置的是 `agent:builtin:<类型>`（`cap/2.1.280` Explore），
@@ -283,6 +299,15 @@ pub(super) fn insert_after(v: &mut Value, after: &str, pairs: Vec<(&str, Value)>
     }
 }
 
+/// 在 `before` 那个键前面依次插入 `pairs`，见 [`insert_after`]；`before` 不在就追加到末尾。
+pub(super) fn insert_before(v: &mut Value, before: &str, pairs: Vec<(&str, Value)>) {
+    let Some(obj) = v.as_object_mut() else { return };
+    let at = obj.keys().position(|k| k == before).unwrap_or(obj.len());
+    for (i, (k, val)) in pairs.into_iter().enumerate() {
+        obj.shift_insert(at + i, k.to_string(), val);
+    }
+}
+
 /// billing header 的 `cc_turn_origin` 换成事件里的写法：下划线换连字符
 /// （`task_notification` → `task-notification`，`cap/2.1.280/00180` 与同批事件），
 /// `human` / `peer` 原样。
@@ -379,9 +404,16 @@ pub(super) fn classify_kind(call: &ApiCall, shape: &RequestShape, is_agent: bool
         // 子代理的摘要请求（「这个子代理刚才在干什么」）：`request-class: auxiliary`、
         // 带同一个 `agent-id`（`cap/2.1.280/00174`），事件报 `querySource: agent_summary`。
         // 同样带着子代理 `agent-id` 的 WebFetch 页面处理没有工具（`cap/2.1.285/00125`），
-        // 摘要请求带着子代理那套工具（`00135`）。
+        // 摘要请求带着子代理那套工具（`00135`）。2.1.303 short 模式的摘要也没有工具，按它固定的
+        // system 认（见 [`Kind::AgentSummaryShort`]）。
         if call.agent.request_class.as_deref() == Some("auxiliary") {
-            if shape.tools_count == 0 { Kind::WebFetchApply } else { Kind::AgentSummary }
+            if shape.agent_summary_short {
+                Kind::AgentSummaryShort
+            } else if shape.tools_count == 0 {
+                Kind::WebFetchApply
+            } else {
+                Kind::AgentSummary
+            }
         } else {
             Kind::Subagent
         }

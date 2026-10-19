@@ -92,6 +92,7 @@ pub(crate) use rate_limit::{
     rate_limit_scope_for,
 };
 pub(crate) use usage_grace::note_eval_features;
+pub(crate) mod agent_summary_config;
 pub(crate) mod cache_keepalive;
 mod lucky_cerf;
 pub(crate) use lucky_cerf::{

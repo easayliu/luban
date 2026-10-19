@@ -186,11 +186,32 @@ pub(super) static TEMPLATE_2_1_300_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_300_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.300 起用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 2.1.303 的两份模板：以 2.1.300 那两份为底，按 `cap/auto-2.1.303-20261019-full` 生成
+/// （`_driver/build_tpl_303.py`）。相对 2.1.300：`tengu_init` 在 `mcpClientCount` 之后多
+/// `repoMcpAllowList` / `repoMcpDenyList` / `mcpConfigBlockedCount`（抓包 `false` / `false` / `0`）；
+/// `-p` 那份另多一条 `tengu_fork_subagent_enabled`（这一版起 `-p` 默认开 fork，位置同交互式）。
+/// 2.1.301 用的仍是 2.1.300 那两份（两版构造逐一相同）。
+pub(super) static TEMPLATE_2_1_303: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_303.json"))
+            .expect("assets/cc_telemetry_template_2_1_303.json must parse")
+    });
+
+/// 2.1.303 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_303`]。
+pub(super) static TEMPLATE_2_1_303_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_303_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_303_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.303 起用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
     let at = |v: &str| version_at_least(version, v);
+    if at("2.1.303") {
+        return if sdk { &TEMPLATE_2_1_303_SDK } else { &TEMPLATE_2_1_303 };
+    }
     if at("2.1.300") {
         return if sdk { &TEMPLATE_2_1_300_SDK } else { &TEMPLATE_2_1_300 };
     }
@@ -366,6 +387,29 @@ impl ToolFamily {
 /// 对 2.1.293 的 13942、13912、14413、6490）。`Agent` 按模型换的那段说明（`tengu_lucky_cerf`）不进这个
 /// 估算：sonnet-5-5、haiku-5-5 与 opus 多出来的都只是这 83。
 const READ_ALLOW_LARGE_TOKENS: u64 = 83;
+
+/// 2.1.300 起 `Artifact` 的 schema 按版本变，交互式各族（`-p` 没有 Artifact）的 token 跟着变、工具数不变；
+/// 关掉 Artifact 时连这部分一起减。逐版对抓包里 `Artifact.input_schema` 的 `round(长度 / 4)` 差：
+/// 2.1.300 加 `edits` 参数 +274（`cap/auto-2.1.300-20261015-full`：opus 等 14299、haiku-5-5 14269、
+/// haiku-4.5 14770），2.1.301 那句去掉 `root` −2（`cap/auto-2.1.301-20261016-full`：14297 / 14267 /
+/// 14768），2.1.303 `intent` 加 dashboard 那句 +8。
+fn artifact_schema_delta(version: &str) -> u64 {
+    match () {
+        _ if version_at_least(version, "2.1.303") => 274 - 2 + 8,
+        _ if version_at_least(version, "2.1.301") => 274 - 2,
+        _ if version_at_least(version, "2.1.300") => 274,
+        _ => 0,
+    }
+}
+
+/// 2.1.303 起 `-p` 的 `Agent` 默认开 fork，`effort` 等参数说明随之变长：`-p` 多 17（`cap/auto-2.1.303-20261019-full`
+/// D1 是 27 / 7742，减去下面那个 PublishPlugin 的 1152 后比 2.1.301 的 6573 多 17）。交互式的 Agent
+/// 本来就带 fork 说明，不变。
+///
+/// **不跟的**：2.1.303 抓包各族工具数都多 1、token 多 1152，是 `PublishPlugin`（schema 1152）——它在 2.1.301
+/// 里就有，是否启用看 GrowthBook `tengu_copper_gazette`（301 / 303 判据相同），这次抓包那个号恰好开了，
+/// 不随版本，所以计数照旧、不算它（交互式抓包 15457 − 1152 = 14305，正好是 2.1.301 的 14297 加 Artifact 的 8）。
+const SDK_AGENT_FORK_TOKENS_2_1_303: u64 = 17;
 
 fn context_tool_counts(v293: bool, sdk: bool, family: ToolFamily, off: ToolsOff) -> (u64, u64) {
     use ToolFamily::*;
@@ -605,6 +649,13 @@ where
                     context_tool_counts(v293, subst.sdk, subst.tool_family, off);
                 if version_at_least(subst.version, "2.1.296") {
                     tokens += READ_ALLOW_LARGE_TOKENS;
+                }
+                if subst.sdk {
+                    if version_at_least(subst.version, "2.1.303") {
+                        tokens += SDK_AGENT_FORK_TOKENS_2_1_303;
+                    }
+                } else if !off.artifact {
+                    tokens += artifact_schema_delta(subst.version);
                 }
                 o.insert("non_mcp_tools_count".into(), json!(count));
                 o.insert("non_mcp_tools_tokens".into(), json!(tokens));

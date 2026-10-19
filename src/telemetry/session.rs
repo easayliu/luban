@@ -222,6 +222,18 @@ pub(super) struct AgentState {
     pub(super) summaries: u32,
     pub(super) summaries_failed: u32,
     pub(super) summaries_accepted: u32,
+    /// 其中按 2.1.303 short 模式发的条数（[`Kind::AgentSummaryShort`]），与最后一条是不是 short（`None`
+    /// 即一条都没发）：收尾那条的 `mode` / `mode_changed` 从这里推。
+    pub(super) summaries_short: u32,
+    pub(super) summary_last_short: Option<bool>,
+    /// 配置给 short、这一条却按 full 发的条数（官方 `callsKeptOnFull`）：逐条按**发那一刻**的配置判，
+    /// 运行中配置切换过也不回算。
+    pub(super) summaries_kept_on_full: u32,
+    /// 最后一条摘要请求发出的时刻：摘要器在那一刻读过配置，收尾报的配置不早于它（见
+    /// [`crate::proxy::agent_summary_config`]）。
+    pub(super) summary_last_sent: Option<SystemTime>,
+    /// 最后一条摘要请求结束的时刻：摘要器的下一次计时从这里起算（`finally` 里才 `ee()`）。
+    pub(super) summary_last_end: Option<SystemTime>,
     /// 子代理拉起时会话的主模型（展示名）：摘要器启动那一刻读的当前主模型，收尾那条摘要器统计按它的族
     /// 挑开关。按子代理首条请求的发出时刻查（[`Session::main_model_at`]），之后主线程换模型不影响它。
     pub(super) session_model: String,
@@ -552,6 +564,7 @@ pub(super) struct TurnFacts {
     pub(super) v296: bool,
     pub(super) v299: bool,
     pub(super) v300: bool,
+    pub(super) v303: bool,
     /// 这一轮要发的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text` 实验曝光。客户端头一次给精简提示词
     /// 的模型拼 `Agent` 说明时读这两个开关、各记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词
     /// 模型开头、中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮；从 opus-5-5（不在

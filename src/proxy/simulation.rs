@@ -1462,18 +1462,22 @@ pub(crate) fn simulate_system(
     // 就 400，见 [`MAX_CLIENT_SYSTEM_BYTES`]），同样文本进了用户消息就不触发。所以超过那条线的
     // 仍由 [`relocate_long_client_system`] 在 [`rewrite_body`](crate::proxy::rewrite_body) 里挪进
     // 首条用户消息（开关 `relocate_client_system`，默认开），这里先整段放在末块。
-    let rest = sim.rest.clone().map(|mut rest| {
-        // 2.1.300 起工具里同时有 Artifact 与 Edit 时，第四块末尾接 `edits` 说明（见
-        // [`config::CC_SYSTEM_ARTIFACT_EDITS`]）。system 拼在注工具之前（cch 随后按整份体算），
-        // 只能照注工具那一步的判据预判：会注官方工具（[`super::body::injects_cc_tools`]），且没精简
-        // 掉 Artifact——注了就是 14 条全在、Edit 恒在其中。不注工具（开关关着、来访强制调某个工具）
-        // 或精简了，出站就没有 Artifact，这段也不接。
-        if super::body::injects_cc_tools(v, sim.fill_absent_tools) && !sim.trim_tools {
-            rest.push_str("\n\n");
-            rest.push_str(config::CC_SYSTEM_ARTIFACT_EDITS);
+    // 2.1.300 起工具里同时有 Artifact 与 Edit 时，接一段 `edits` 说明（见
+    // [`config::CC_SYSTEM_ARTIFACT_EDITS`]）：2.1.300 / 2.1.301 接在第四块末尾，2.1.303 挪到基座
+    // （global 缓存那块）末尾。system 拼在注工具之前（cch 随后按整份体算），只能照注工具那一步的判据
+    // 预判：会注官方工具（[`super::body::injects_cc_tools`]），且没精简掉 Artifact——注了就是 14 条
+    // 全在、Edit 恒在其中。不注工具（开关关着、来访强制调某个工具）或精简了，出站就没有 Artifact，
+    // 这段也不接。
+    let artifact_edits = super::body::injects_cc_tools(v, sim.fill_absent_tools) && !sim.trim_tools;
+    let base = sim.base.map(|base| {
+        let mut base = base.to_string();
+        if artifact_edits {
+            base.push_str("\n\n");
+            base.push_str(config::CC_SYSTEM_ARTIFACT_EDITS);
         }
-        rest
+        base
     });
+    let rest = sim.rest.clone();
     // system 之外的断点（tools、messages）+ 合并后的客户端断点，才是本条请求已占的数目。
     let outside = cache_slots(v).iter().filter(|s| !matches!(s, CacheSlot::System(_))).count();
     let used = outside + client.iter().filter(|b| b.get("cache_control").is_some()).count();
@@ -1486,12 +1490,12 @@ pub(crate) fn simulate_system(
     if sim.profile.system == config::CcSystemShape::IdentityReporting {
         blocks.push(text_block_bare(config::CC_SYSTEM_REPORTING));
     }
-    if let Some(base) = sim.base {
+    if let Some(base) = base {
         if budget > 0 {
             budget -= 1;
-            blocks.push(text_block(base, cache_control(cache)));
+            blocks.push(text_block(&base, cache_control(cache)));
         } else {
-            blocks.push(text_block_bare(base));
+            blocks.push(text_block_bare(&base));
         }
     }
     // 第四块：官方在它上面标末尾断点（`{ttl:1h}`，不带 `scope`，`cap/2.1.260-2/00013`）。

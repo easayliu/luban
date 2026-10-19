@@ -312,6 +312,9 @@ impl Telemetry {
         // 2.1.300：auto 模式判决多 `coworkWebAllowOverride`、`-p` 收尾多两个 debug 丢弃计数
         // （`cap/auto-2.1.300-20261015-full`）。
         let v300 = version_at_least(&version, "2.1.300");
+        // 2.1.303：`tengu_tool_use_success` 在 `messageID` 之后多 `toolUseID`
+        // （`cap/auto-2.1.303-20261019-full` 55 条全有）。
+        let v303 = version_at_least(&version, "2.1.303");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -494,6 +497,7 @@ impl Telemetry {
             v296,
             v299,
             v300,
+            v303,
             lucky_cerf,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
@@ -992,6 +996,7 @@ impl Session {
             Kind::Title
             | Kind::Helper
             | Kind::WebFetchApply
+            | Kind::AgentSummaryShort
             | Kind::WebSearchTool
             | Kind::RenameName
             | Kind::ModelValidation => (String::new(), 0),
@@ -1189,11 +1194,31 @@ impl Session {
         // 摘要请求不推进支线，只记数（收尾那条摘要器统计要它）。收没收下照客户端的过滤（`ad`）：
         // 一行、去掉首尾空白后不超过 100 个字、不是标题或代码块才收。代理看不到正文的行数与开头，
         // 只按字数判——多行或以 `#`、``` 开头的短回复会被多算成收下。
-        if kind == Kind::AgentSummary
+        if matches!(kind, Kind::AgentSummary | Kind::AgentSummaryShort)
             && !aborted
             && let Some(a) = self.agents.get_mut(agent_key)
         {
             a.summaries += 1;
+            // 摘要器每次按当时的模式发：short 走侧查询，full 从子代理分叉。官方 `calls_kept_on_full`
+            // 数的是「发这一条时配置是 short、却按 full 发」的次数（每次计时器触发都重读配置），所以逐条
+            // 按**发出那一刻**号的 eval（[`crate::proxy::agent_summary_config::config_at`]）判——遥测在
+            // 回复完成后才处理，那时的配置可能已经换过；也不在收尾时拿最后的配置回算。这一条本身是
+            // short 就说明那一刻配置必是 short，不必再看。
+            let short = kind == Kind::AgentSummaryShort;
+            if short {
+                a.summaries_short += 1;
+            } else if crate::proxy::agent_summary_config::config_at(
+                call.cred_id,
+                model_family(&a.session_model),
+                call.started_at,
+            )
+            .short
+            {
+                a.summaries_kept_on_full += 1;
+            }
+            a.summary_last_short = Some(short);
+            a.summary_last_sent = Some(call.started_at);
+            a.summary_last_end = Some(this_end_wall(call));
             if failed {
                 a.summaries_failed += 1;
             } else if (1..=100).contains(&call.text_chars) {

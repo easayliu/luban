@@ -1,9 +1,9 @@
-//! 2.1.301 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.301 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.301 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.301 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.301 的 profile 表：2.1.301 ~ 2.1.302 来访的 beta 参照（[`cc_profile_at`]）。2.1.303 的表
+/// （[`CC_PROFILES`]）逐行同这张，只换版本号。
 ///
 /// **各行除版本号外与 2.1.300（[`CC_PROFILES_2_1_300`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.301-20261016-full`（场景同 2.1.300-full）：可执行文件里的 beta 注册表
@@ -13,7 +13,7 @@ use super::*;
 /// 这一版在请求上只改了 `Artifact` 工具 `edits` 参数说明里的一句（去掉 `` `root` ``），见
 /// [`crate::proxy::cc_tools_core_for`]。可执行文件新加的 leanRewrite 提示词（模型能力 / 开关
 /// `temporal_hare`）默认不开，服务端也没给这个号下发，模拟路径不跟。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_301: &[CcProfile] = &[
     at_301(CC_PROFILES_2_1_300[0]),
     at_301(CC_PROFILES_2_1_300[1]),
     at_301(CC_PROFILES_2_1_300[2]),

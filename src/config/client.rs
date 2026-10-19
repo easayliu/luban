@@ -4,15 +4,15 @@
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（`cap/auto-2.1.301-20261016-full`）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（`cap/auto-2.1.303-20261019-full`）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
 ///
 /// 动这里必须同时动 [`CC_VERSION_BASE`]（billing header 里的 `cc_version`）、
 /// [`KEEPALIVE_USER_AGENT`](super::KEEPALIVE_USER_AGENT) 与 [`CC_BUILD_TIMES`]（遥测里的构建时间），还有
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
-/// 同一个客户端不会一边自称 2.1.301、一边报另一个版本的 cc_version、构建时间、上一版的
+/// 同一个客户端不会一边自称 2.1.303、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.301 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.303 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -124,7 +124,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.301";
+pub const CC_VERSION_BASE: &str = "2.1.303";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -137,10 +137,10 @@ pub const CC_VERSION_BASE: &str = "2.1.301";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.301-20261016-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
-/// UA `claude-cli/2.1.301`）。
+/// 依据：`cap/auto-2.1.303-20261019-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
+/// UA `claude-cli/2.1.303`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.301";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.303";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -256,12 +256,12 @@ pub const CC_SYSTEM_REST_HAIKU: &str = include_str!("../assets/cc_system_rest_ha
 /// [`CC_SYSTEM_REST`]。
 pub const CC_SYSTEM_REST_HAIKU_5_5: &str = include_str!("../assets/cc_system_rest_haiku_5_5.txt");
 
-/// 2.1.300 起第四块末尾的 Artifact `edits` 说明（965 字节）：工具里同时有 `Artifact` 与 `Edit` 时
-/// 客户端接在第四块最后、前面空一行（`CLAUDE_CODE_ARTIFACT_PUBLISH_EDITS` 默认开时是这一版，与
-/// `Artifact` 的 `edits` 参数同开同关）。`cap/auto-2.1.300-20261015-full` 四族主线程、`/btw`、压缩
-/// 共 62 条都是这一段、都在末尾；`-p` 不注 Artifact，没有它。模拟路径按「注了 Artifact」接上
-/// （精简工具时不接），位置在 `<total_tokens>` 之后——官方两者之间那段 WebSearch 说明模拟路径不收，
-/// 见 [`CC_SYSTEM_REST`]。
+/// 2.1.300 起的 Artifact `edits` 说明（965 字节）：工具里同时有 `Artifact` 与 `Edit` 时客户端接上、
+/// 前面空一行（`CLAUDE_CODE_ARTIFACT_PUBLISH_EDITS` 默认开时是这一版，与 `Artifact` 的 `edits` 参数
+/// 同开同关）。2.1.300 / 2.1.301 接在第四块最后（`cap/auto-2.1.300-20261015-full` 四族主线程、`/btw`、
+/// 压缩共 62 条），**2.1.303 挪到基座（带 `scope: global` 断点那块）最后**：`cap/auto-2.1.303-20261019-full`
+/// 四族主线程、haiku-4.5 长基座、`/btw`、压缩都是基座 +967、第四块 −967，其余逐字不变。`-p` 不注
+/// Artifact，没有它。模拟路径按「注了 Artifact」接在基座末尾（精简工具时不接）。
 pub const CC_SYSTEM_ARTIFACT_EDITS: &str = include_str!("../assets/cc_system_artifact_edits.txt");
 
 // ---------- 首轮环境说明（`# Environment` 那条） ----------
@@ -466,6 +466,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.301-20261016-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致。
     ("2.1.301", "2026-10-15T12:58:20Z"),
+    // `cap/auto-2.1.303-20261019-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.303", "2026-10-18T20:20:57Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

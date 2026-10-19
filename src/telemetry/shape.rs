@@ -138,6 +138,8 @@ pub(super) struct RequestShape {
     pub(super) web_search_tool: bool,
     /// 无工具、唯一一条用户消息以 `Web page content:` 开头：WebFetch 取回网页后的页面处理。
     pub(super) web_fetch_page: bool,
+    /// system 是 2.1.303 子代理摘要 short 模式那句固定指令，见 [`Kind::AgentSummaryShort`]。
+    pub(super) agent_summary_short: bool,
     /// 有 `system`、无工具、`max_tokens: 1`：`/model` 选完模型后的「Hi」探测，见
     /// [`Kind::ModelValidation`]。额度探测没有 `system`，另见 `quota_probe`。
     pub(super) model_validation: bool,
@@ -767,6 +769,9 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         }
         shape.title = texts.iter().any(|t| t.contains("You are naming a coding session"));
         shape.rename = texts.iter().any(|t| t.contains("Generate a short kebab-case name"));
+        shape.agent_summary_short = texts
+            .iter()
+            .any(|t| t.contains("You write a 3-5 word progress label for a background agent"));
     }
 
     // tools：数量、JSON 长度、逐个长度表（整个工具对象的紧凑 JSON 长度：抓包里 Agent 3078 /

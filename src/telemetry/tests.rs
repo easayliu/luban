@@ -3607,6 +3607,44 @@ fn version_2_1_293_telemetry_shape() {
     assert!(catalog(&opus)["picker_old"].as_str().unwrap().ends_with("claude-haiku-5-5"));
 }
 
+/// `context_size` 的内建工具 token 随 Artifact / `-p` Agent 的 schema 逐版变（工具数不变），对齐各版抓包：
+/// 2.1.300 Artifact +274、2.1.301 −2、2.1.303 +8，2.1.303 的 `-p` Agent +17。2.1.303 抓包里多出来的
+/// PublishPlugin（GrowthBook `tengu_copper_gazette`，不随版本）不算，所以 2.1.303 的值是抓包减 1152。
+#[test]
+fn context_size_tool_tokens_follow_the_schema_per_version() {
+    let ctx = |ver: &str, model: &str, sdk: bool| {
+        let t = Telemetry::default();
+        let mut body = String::from_utf8(body_for(model, Some("high"), true)).unwrap();
+        if sdk {
+            body = body.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+        }
+        let mut c = call(body.into_bytes(), "req_ctx", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let m = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        (m["non_mcp_tools_count"].as_u64().unwrap(), m["non_mcp_tools_tokens"].as_u64().unwrap())
+    };
+    let (opus, h55, h45) = ("claude-opus-5-5", "claude-haiku-5-5", "claude-haiku-4-5-20251001");
+    for (ver, o, h, l) in [
+        ("2.1.299", 14025, 13995, 14496),
+        ("2.1.300", 14299, 14269, 14770),
+        ("2.1.301", 14297, 14267, 14768),
+        ("2.1.303", 15457 - 1152, 15427 - 1152, 15928 - 1152),
+    ] {
+        assert_eq!(ctx(ver, opus, false), (34, o), "{ver} opus");
+        assert_eq!(ctx(ver, h55, false), (33, h), "{ver} haiku-5-5");
+        assert_eq!(ctx(ver, h45, false), (37, l), "{ver} haiku-4.5");
+    }
+    assert_eq!(ctx("2.1.301", opus, true), (26, 6573));
+    assert_eq!(ctx("2.1.303", opus, true), (26, 7742 - 1152));
+}
+
 /// 开关 `sim_trim_tools` 的遥测侧：正文里有官方工具却没有 Artifact / ListAgents / SendFeedback
 /// 时，按官方用户用环境变量关掉这三项的样子报（`cap/auto-2.1.291-20261006` 关前 / 关后对照）。
 #[test]
@@ -4831,6 +4869,91 @@ fn version_2_1_300_telemetry_shape() {
     );
 }
 
+/// 2.1.303 的遥测（`cap/auto-2.1.303-20261019-full`）：`tengu_init` 在 `mcpClientCount` 之后多
+/// `repoMcpAllowList` / `repoMcpDenyList` / `mcpConfigBlockedCount`，`tengu_tool_use_success` 在
+/// `messageID` 之后多 `toolUseID`；`-p` 模板多一条 `tengu_fork_subagent_enabled`。2.1.301 都没有。
+#[test]
+fn version_2_1_303_telemetry_shape() {
+    let run = |ua: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_303","name":"Read","input":{"file_path":"/tmp/a.txt"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_303","content":"hello"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let find = |n: &str| {
+            p.events.iter().find(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).unwrap()
+        };
+        (find("tengu_init"), find("tengu_tool_use_success"))
+    };
+    let keys = |m: &Value| m.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+
+    let (init, ok) = run("claude-cli/2.1.303 (external, cli)");
+    let k = keys(&init);
+    let at = k.iter().position(|k| k == "mcpClientCount").unwrap();
+    assert_eq!(k[at + 1..at + 4], ["repoMcpAllowList", "repoMcpDenyList", "mcpConfigBlockedCount"]);
+    assert_eq!(
+        (&init["repoMcpAllowList"], &init["mcpConfigBlockedCount"]),
+        (&json!(false), &json!(0))
+    );
+    let k = keys(&ok);
+    let at = k.iter().position(|k| k == "messageID").unwrap();
+    assert_eq!(k[at..at + 3], ["messageID", "toolUseID", "toolName"], "{ok}");
+    assert_eq!(ok["toolUseID"], "toolu_303");
+
+    let (init, ok) = run("claude-cli/2.1.301 (external, cli)");
+    assert!(init.get("repoMcpAllowList").is_none() && ok.get("toolUseID").is_none(), "{init} {ok}");
+
+    // 失败的 Bash：`tool_use_error` 的栈摘要与顶帧随打包产物变，按版本取各自抓包里的值。
+    let failed = |ua: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"false","description":"fail"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_tool_use_error")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    for (ua, hash, frame) in [
+        ("claude-cli/2.1.303 (external, cli)", "99830f66ede0", "chunk-jh3cvmqy.js:3614:6109"),
+        ("claude-cli/2.1.299 (external, cli)", "1dada4b9379c", "chunk-4xx9trad.js:3588:6085"),
+        ("claude-cli/2.1.293 (external, cli)", "2e671ed03fc0", "chunk-nwqfvmza.js:3493:5989"),
+    ] {
+        let err = failed(ua);
+        assert_eq!(
+            (&err["error_stack_hash"], &err["error_top_frame"]),
+            (&json!(hash), &json!(frame)),
+            "{ua}"
+        );
+    }
+
+    let fork = |v: &str, sdk: bool| {
+        super::template::template_for(v, sdk)
+            .startup
+            .iter()
+            .filter(|t| t.name == "tengu_fork_subagent_enabled")
+            .count()
+    };
+    assert_eq!((fork("2.1.303", true), fork("2.1.303", false)), (1, 1));
+    assert_eq!((fork("2.1.301", true), fork("2.1.301", false)), (0, 1));
+}
+
 /// 缓存保活：这条主线程回复接替了一条续命成功过的记录（[`ApiCall::cache_keepalive_ok`]）时，收尾补一条
 /// `tengu_feature_ok{api_cache_keepalive}`，夹在 `tether_live_outcome` 与 `api_success` 之间、同一刻，
 /// Datadog 也有（`cap/auto-2.1.300-20261015-full` A0）；没接替的不报。
@@ -4870,9 +4993,263 @@ fn cache_keepalive_feature_follows_the_successor_reply() {
 /// 会话首轮那个 opus。
 #[test]
 fn agent_summary_stopped_uses_the_main_model_at_spawn() {
+    let stopped = summary_stopped_for("claude-cli/2.1.300 (external, cli)");
+    assert_eq!(stopped["session_model_family"], "fable", "{stopped}");
+    assert_eq!(stopped["config_flag"], "tengu_starry_wall");
+    assert_eq!(stopped["agent_model_family"], "opus");
+    assert_eq!((&stopped["calls"], &stopped["config_source"]), (&json!(0), &json!("fallback")));
+    assert!(stopped.get("mode").is_none(), "2.1.303 之前没有那六项: {stopped}");
+}
+
+/// 2.1.303 的 `tengu_agent_summary_stopped` 多六项，键序与取值逐个对 `cap/auto-2.1.303-20261019-full`
+/// （六条都是 `full` / `full` / `false` / `2000` / `false` / `0`）。
+#[test]
+fn agent_summary_stopped_2_1_303_shape() {
+    let stopped = summary_stopped_for("claude-cli/2.1.303 (external, cli)");
+    let keys: Vec<&str> = stopped
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .skip_while(|k| *k != "mode")
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "mode",
+            "config_mode",
+            "mode_changed",
+            "max_input_tokens",
+            "config_flag",
+            "config_source",
+            "session_model_family",
+            "agent_model_family",
+            "agent_model",
+            "agent_model_swapped",
+            "is_sdk_host",
+            "is_resume",
+            "duration_ms",
+            "calls",
+            "calls_kept_on_full",
+            "calls_failed",
+            "lines_accepted",
+            "first_wait_ms",
+            "next_wait_ms"
+        ],
+        "{stopped}"
+    );
+    for (k, v) in [
+        ("mode", json!("full")),
+        ("config_mode", json!("full")),
+        ("mode_changed", json!(false)),
+        ("max_input_tokens", json!(2000)),
+        ("agent_model_swapped", json!(false)),
+        ("calls_kept_on_full", json!(0)),
+    ] {
+        assert_eq!(stopped[k], v, "{k}");
+    }
+}
+
+/// 2.1.303 short 模式的子代理摘要：无工具、system 是那句固定指令的侧查询，带子代理的 `agent-id` 与
+/// `request-class: auxiliary`。按 `agent_summary` 报（不当成 WebFetch 页面处理），记进支线的摘要统计；
+/// 收尾那条的模式按发过的请求与号的配置推。
+#[test]
+fn short_agent_summaries_are_reported_and_counted() {
+    // 主线程 opus 在 0 秒拉起一个子代理：子代理 5 秒起跑、一步工具，第 i 条摘要在 40 + 30i 秒发
+    // （`summaries` 里 true 即 short），150 秒子代理发最后一条、约 156.2 秒收尾。摘要器每次计时器触发都
+    // 重读配置：没发摘要时起跑后每 30 秒一次；发过的从最后一条摘要结束（发出 + 6.1 秒）起再每 30 秒一次。
+    let base = frozen_now() - Duration::from_secs(200);
+    let run = |cred: i64, agent_model: &str, summaries: &[bool]| {
+        let t = Telemetry::default();
+        let ua = "claude-cli/2.1.303 (external, cli)";
+        let at = |c: &mut ApiCall, secs: u64| {
+            c.ua_out = ua.into();
+            c.cred_id = cred;
+            c.started_at = base + Duration::from_secs(secs);
+        };
+        let agent = |class: &str| AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("general-purpose".into()),
+            request_class: Some(class.into()),
+        };
+        let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_m", "tool_use");
+        at(&mut main, 0);
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input: json!({}),
+            verdict: None,
+        }];
+        t.ingest(main);
+        let mut s1 = call(body_for(agent_model, Some("high"), true), "req_s1", "tool_use");
+        at(&mut s1, 5);
+        s1.agent = agent("subagent");
+        s1.tool_calls = vec![ToolCall {
+            id: "t2".into(),
+            name: "Read".into(),
+            input: json!({}),
+            verdict: None,
+        }];
+        t.ingest(s1);
+        for (i, short) in summaries.iter().enumerate() {
+            let body = if *short {
+                let meta: Value =
+                    serde_json::from_slice::<Value>(&cc_body(true)).unwrap()["metadata"].clone();
+                json!({
+                    "metadata": meta,
+                    "model": agent_model,
+                    "max_tokens": 2108,
+                    "system": [
+                        {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=00000;"},
+                        {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                        {"type":"text","text":"You write a 3-5 word progress label for a background agent, from short notes about what it is doing."}
+                    ],
+                    "messages": [{"role":"user","content":"<recent_steps>\ndid: Read - a.rs\n</recent_steps>\n\nDescribe the agent's most recent action in 3-5 words using present tense (-ing)."}],
+                    "tools": []
+                })
+                .to_string()
+                .into_bytes()
+            } else {
+                body_for(agent_model, Some("high"), true)
+            };
+            let mut c = call(body, &format!("req_sum{i}"), "end_turn");
+            at(&mut c, 40 + 30 * i as u64);
+            c.agent = agent("auxiliary");
+            c.text_chars = 18;
+            t.ingest(c);
+        }
+        let mut s2 = call(body_for(agent_model, Some("high"), false), "req_s2", "end_turn");
+        at(&mut s2, 150);
+        s2.agent = agent("subagent");
+        t.ingest(s2);
+        let st = t.0.state.lock();
+        let events = &st.pending[&(cred, SESSION.to_string())].events;
+        let sources: Vec<Value> = events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e)["querySource"].clone())
+            .collect();
+        let stopped = events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
+            .map(|(_, e)| meta_of(e))
+            .expect("子代理收尾报一条");
+        (sources, stopped)
+    };
+    let pick = |m: &Value| {
+        ["mode", "config_mode", "mode_changed", "calls", "calls_kept_on_full", "lines_accepted"]
+            .map(|k| m[k].clone())
+    };
+
+    // 两条 short：都报 agent_summary、不报 web_fetch_apply，记两次、都收下；配置由此推成 short。
+    // 两条 short：都报 agent_summary、不报 web_fetch_apply，记两次、都收下；配置由此推成 short。
+    let (sources, stopped) = run(9_303, "claude-opus-5-5", &[true, true]);
+    assert_eq!(sources.iter().filter(|s| *s == "agent_summary").count(), 2, "{sources:?}");
+    assert!(!sources.contains(&json!("web_fetch_apply")), "{sources:?}");
+    assert_eq!(
+        pick(&stopped),
+        [json!("short"), json!("short"), json!(false), json!(2), json!(0), json!(2)]
+    );
+
+    // 没见过 eval、先 full 后 short：模式换过；发那条 full 时没有配置是 short 的依据，不记 kept_on_full。
+    let (_, stopped) = run(9_304, "claude-opus-5-5", &[false, true]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("short"), json!("short"), json!(true), json!(2), json!(0), json!(2)]
+    );
+
+    // 号的 eval 按时刻生效：每条摘要按它发出那一刻的配置算，收尾按摘要器最后一次读到的那份报。
+    let short_cfg =
+        json!({"tengu_groovy_ember": {"value": {"mode": "short"}, "source": "experiment"}});
+    let full_cfg = json!({});
+    let set_ms = |cred: i64, f: &Value, ms: u64| {
+        crate::proxy::agent_summary_config::note_eval_at(
+            cred,
+            f.as_object().unwrap(),
+            base + Duration::from_millis(ms),
+        )
+    };
+    let set = |cred: i64, f: &Value, at: u64| set_ms(cred, f, at * 1_000);
+    // full → short（55 秒切）：40 秒那条 full 时配置还是 full，kept_on_full 为 0。
+    set(9_306, &full_cfg, 0);
+    set(9_306, &short_cfg, 55);
+    let (_, stopped) = run(9_306, "claude-opus-5-5", &[false, true]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("short"), json!("short"), json!(true), json!(2), json!(0), json!(2)]
+    );
+    // short → full：收尾时配置已是 full，早先那条 short 不把 config_mode 拉回 short。
+    set(9_307, &short_cfg, 0);
+    set(9_307, &full_cfg, 55);
+    let (_, stopped) = run(9_307, "claude-opus-5-5", &[true, false]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("full"), json!("full"), json!(true), json!(2), json!(0), json!(2)]
+    );
+    // full 摘要 40 秒发出、41 秒（回复还没回来）配置切成 short：那条按发出时的 full 算，不记 kept_on_full；
+    // 之后的触发（46.1 秒结束后每 30 秒）读到 short，opus 子代理的 `J` 随之变 short，虽然没再发也报
+    // short，发过的那条 full 算模式变过。
+    set(9_308, &full_cfg, 0);
+    set(9_308, &short_cfg, 41);
+    let (_, stopped) = run(9_308, "claude-opus-5-5", &[false]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("short"), json!("short"), json!(true), json!(1), json!(0), json!(1)]
+    );
+    // 反过来：short 摘要 40 秒发出，80 秒配置切回 full，106.1 秒的触发读到 full 但没到期不发：
+    // 收尾报 full / full、模式变过（审查的例子），不让最后那条 short 盖过去。
+    set(9_311, &short_cfg, 0);
+    set(9_311, &full_cfg, 80);
+    let (_, stopped) = run(9_311, "claude-opus-5-5", &[true]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("full"), json!("full"), json!(true), json!(1), json!(0), json!(1)]
+    );
+    // 最后一次读配置之后、收尾之前才切，收尾仍报摘要器读到的 full：没发摘要的支线最后一次在 155 秒，
+    // 155.5 秒切；发过一条摘要（40 秒发、46.1 秒结束）的支线计时从结束起算，最后一次在 136.1 秒，140 秒
+    // 切也不算（按起跑后 30 秒整点推会误读成 155 秒）。
+    set(9_309, &full_cfg, 0);
+    set_ms(9_309, &short_cfg, 155_500);
+    let (_, stopped) = run(9_309, "claude-opus-5-5", &[]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("full"), json!("full"), json!(false), json!(0), json!(0), json!(0)]
+    );
+    set(9_310, &full_cfg, 0);
+    set(9_310, &short_cfg, 140);
+    let (_, stopped) = run(9_310, "claude-opus-5-5", &[false]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("full"), json!("full"), json!(false), json!(1), json!(0), json!(1)]
+    );
+
+    // 号的 eval 给 short（opus 那个开关，带输入上限与等待）：haiku 子代理照 full 发，全算 kept_on_full；
+    // 一次没发的 opus 子代理按配置报 short。来源、上限、等待都取 eval 里那份。
+    let features = json!({"tengu_groovy_ember": {"value": {"mode": "short", "maxInputTokens": 4000,
+        "refreshSeconds": [30, 60]}, "source": "experiment"}});
+    set(9_305, &features, 0);
+    let (_, stopped) = run(9_305, "claude-haiku-5-5", &[false]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("full"), json!("short"), json!(false), json!(1), json!(1), json!(1)]
+    );
+    assert_eq!(stopped["config_source"], "experiment");
+    assert_eq!(stopped["max_input_tokens"], 4000);
+    assert_eq!(
+        (&stopped["first_wait_ms"], &stopped["next_wait_ms"]),
+        (&json!(30_000), &json!(60_000))
+    );
+    let (_, stopped) = run(9_305, "claude-opus-5-5", &[]);
+    assert_eq!(
+        pick(&stopped),
+        [json!("short"), json!("short"), json!(false), json!(0), json!(0), json!(0)]
+    );
+}
+
+/// opus 起头、换到 fable 后拉起一个 opus 的 Explore 子代理，返回它收尾那条 `tengu_agent_summary_stopped`。
+fn summary_stopped_for(ua: &str) -> Value {
     let t = Telemetry::default();
     let base = frozen_now() - Duration::from_secs(120);
-    let ua = "claude-cli/2.1.300 (external, cli)";
     let main = |model: &str, rid: &str, at: u64, tools: bool| {
         let mut c = call(body_for(model, Some("high"), true), rid, "tool_use");
         c.ua_out = ua.into();
@@ -4901,16 +5278,12 @@ fn agent_summary_stopped_uses_the_main_model_at_spawn() {
     };
     t.ingest(sub);
     let st = t.0.state.lock();
-    let stopped = st.pending[&key()]
+    st.pending[&key()]
         .events
         .iter()
         .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
         .map(|(_, e)| meta_of(e))
-        .expect("子代理收尾报一条");
-    assert_eq!(stopped["session_model_family"], "fable", "{stopped}");
-    assert_eq!(stopped["config_flag"], "tengu_starry_wall");
-    assert_eq!(stopped["agent_model_family"], "opus");
-    assert_eq!((&stopped["calls"], &stopped["config_source"]), (&json!(0), &json!("fallback")));
+        .expect("子代理收尾报一条")
 }
 
 /// 后台子代理在 opus 下拉起，它的首条回复处理之前主线程已经换到 fable：摘要器照拉起那一刻的 opus 报

@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.301.eca; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.303.914; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -478,7 +478,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.301.eca; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.303.914; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1627,22 +1627,23 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.301-20261016-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.303-20261019-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
 /// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00440`、`00261`、`00386`、`00348`）；
-/// fable 只有 auto 模式的（`00549`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式的首轮（`00434`、`00261`、`00380`、`00345`）；
+/// fable 只有 auto 模式的（`00539`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
-/// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`）；第四块末尾那段 Artifact `edits` 说明随注入的工具一起出现。
+/// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
+/// 从第四块挪到基座）。
 ///
 /// `effort` 与官方逐值相同（opus / sonnet / haiku-5-5 是 medium、fable 是 high、haiku-4.5 不带）。
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_301_captures() {
-    let dir = format!("{}/cap/auto-2.1.301-20261016-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_303_captures() {
+    let dir = format!("{}/cap/auto-2.1.303-20261019-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.301-20261016-full not present");
+        eprintln!("skipped: cap/auto-2.1.303-20261019-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
@@ -1660,7 +1661,7 @@ fn simulated_main_threads_match_the_2_1_301_captures() {
             "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
     crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00440", false), ("00261", false), ("00386", false), ("00348", false), ("00549", true)]
+        [("00434", false), ("00261", false), ("00380", false), ("00345", false), ("00539", true)]
     {
         let path = files
             .iter()
@@ -1715,7 +1716,7 @@ fn simulated_main_threads_match_the_2_1_301_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：2.1.301 五个主线程首轮都是 `create`，模拟出站与之一致。
+        // `thread`：2.1.303 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1747,7 +1748,7 @@ fn simulated_main_threads_match_the_2_1_301_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.301."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.303."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1756,26 +1757,26 @@ fn simulated_main_threads_match_the_2_1_301_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/f2acbdd2-ad62-4a78-becd-81a53d2469df/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/ac59fde7-ed1a-410c-a6c5-b252adb0724d/scratchpad/calc",
         );
-        // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段；
-        // 末尾那段 Artifact `edits` 说明留着。
+        // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
+        // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
         let mut official_rest = osys[3]["text"].as_str().unwrap().to_string();
         if let Some(end) = official_rest.find("EndConversation (deferred tool)") {
             let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
             official_rest.replace_range(end..end_to, "");
         }
         let ws = official_rest.find("\n\nWebSearch takes a `mode`").unwrap();
-        let ws_end = ws + 2 + official_rest[ws + 2..].find("\n\n").unwrap();
+        let ws_end =
+            ws + 2 + official_rest[ws + 2..].find("\n\n").unwrap_or(official_rest.len() - ws - 2);
         official_rest.replace_range(ws..ws_end, "");
-        assert!(official_rest.ends_with(config::CC_SYSTEM_ARTIFACT_EDITS), "{model}");
+        assert!(
+            osys[2]["text"].as_str().unwrap().ends_with(config::CC_SYSTEM_ARTIFACT_EDITS),
+            "{model}"
+        );
         let template = super::cc_system_rest(model).unwrap();
         assert_eq!(
-            format!(
-                "{}\n\n{}",
-                crate::proxy::render_system_rest(template, &cap_env),
-                config::CC_SYSTEM_ARTIFACT_EDITS
-            ),
+            crate::proxy::render_system_rest(template, &cap_env),
             official_rest,
             "{model}: 第四块按抓包机的环境回填后逐字节相同"
         );
@@ -2827,27 +2828,32 @@ fn cache_keepalive_beta_lands_before_message_threads() {
     );
 }
 
-/// 第四块末尾的 Artifact `edits` 说明只跟着真注进去的 Artifact 走：精简工具（默认）、不注工具（来访
-/// 没带工具且 `fill_absent_tools` 关着）都不接；注了完整 14 条才接，且是最后一段。
+/// Artifact `edits` 说明只跟着真注进去的 Artifact 走：精简工具（默认）、不注工具（来访没带工具且
+/// `fill_absent_tools` 关着）都不接；注了完整 14 条才接。2.1.303 起接在基座（global 那块）末尾，
+/// 第四块照旧以 `</total_tokens>` 收尾。
 #[test]
 fn artifact_edits_paragraph_follows_the_injected_artifact_tool() {
-    let rest_of = |flags: store::ForwardFlags, body: &str| {
+    let sys_of = |flags: store::ForwardFlags, body: &str| {
         let body = Bytes::from(body.to_string());
         let sim = detect_for(&body, flags).unwrap();
         let out = rewrite_body(&body, &test_cred(), "fp", flags, Some(&sim), None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let has_artifact =
             v["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "Artifact"));
-        (v["system"][3]["text"].as_str().unwrap().to_string(), has_artifact)
+        let text = |i: usize| v["system"][i]["text"].as_str().unwrap().to_string();
+        (text(2), text(3), has_artifact)
     };
     let plain = r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}],"system":"你是助手","max_tokens":1024}"#;
     let full = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
-    let (rest, artifact) = rest_of(full, plain);
+    let (base, rest, artifact) = sys_of(full, plain);
     assert!(artifact);
-    assert!(rest.ends_with(&format!("</total_tokens>\n\n{}", config::CC_SYSTEM_ARTIFACT_EDITS)));
-    let (rest, artifact) = rest_of(all_on(), plain);
-    assert!(!artifact && rest.ends_with("</total_tokens>"), "精简了 Artifact 就不接");
+    assert_eq!(base, format!("{}\n\n{}", config::CC_SYSTEM_BASE, config::CC_SYSTEM_ARTIFACT_EDITS));
+    assert!(rest.ends_with("</total_tokens>"), "第四块不再接这段");
+    let (base, rest, artifact) = sys_of(all_on(), plain);
+    assert!(!artifact && base == config::CC_SYSTEM_BASE, "精简了 Artifact 就不接");
+    assert!(rest.ends_with("</total_tokens>"));
     let no_fill = store::ForwardFlags { fill_absent_tools: false, ..full };
-    let (rest, artifact) = rest_of(no_fill, plain);
+    let (base, rest, artifact) = sys_of(no_fill, plain);
+    assert!(!artifact && base == config::CC_SYSTEM_BASE, "不注工具就不接");
     assert!(!artifact && rest.ends_with("</total_tokens>"), "不注工具就不接");
 }

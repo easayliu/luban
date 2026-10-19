@@ -55,6 +55,8 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::lucky_cerf::note_eval(cred_id, features);
     // 缓存保活开没开（`tengu_sequential_cloud`），模拟路径的主线程据此带不带那项 beta。
     super::cache_keepalive::note_eval(cred_id, features);
+    // 子代理进度摘要器的配置（`full` / `short`、输入上限、等待），收尾那条摘要器统计要报。
+    super::agent_summary_config::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)
     };
