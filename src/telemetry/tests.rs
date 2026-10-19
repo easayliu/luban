@@ -5349,3 +5349,71 @@ fn seed_org_uuid_only_fills_a_missing_one() {
     t.seed_org_uuid(3, Some("from-profile"));
     assert_eq!(t.org_uuid(3).as_deref(), Some("from-header"));
 }
+
+/// 模拟路径不补工具（`fill_absent_tools` 关，线上默认）时，第三方单轮请求出站是 `request-class: main`、
+/// 零个工具。官方只有辅助调用才不带工具（它们的 `request-class` 是 `auxiliary`）；头上明说 `main`
+/// 的就是主线程（`claude -p --tools ""` 之类同样如此），不能因为零工具判成无工具 helper、报成
+/// `querySource: compact`——那与同一条请求的出站头、billing header 里的 `cc_prompt_id` 自相矛盾。
+#[test]
+fn a_main_class_request_without_tools_is_reported_as_main() {
+    let t = Telemetry::default();
+    let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+    v.as_object_mut().unwrap().remove("tools");
+    let mut c = call(v.to_string().into_bytes(), "req_notools", "end_turn");
+    c.ua_out = "claude-cli/2.1.303 (external, cli)".into();
+    c.agent = AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let ok = p
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_api_success")
+        .map(|(_, e)| meta_of(e))
+        .expect("主线程那条 api_success");
+    assert_eq!(ok["querySource"], "repl_main_thread", "{ok}");
+}
+
+/// 无工具的主线程对话（模拟路径不补工具时的第三方多轮）：首轮 `create` 是全量，要记成线程底本，
+/// 第二轮 `continue` 的增量（只有 billing header 一块 system、只发新增消息）才补得回全量——
+/// 底本此前只在「工具数 > 0」时记，零工具的对话续轮报出来的 system 长度、消息数都是增量那份。
+#[test]
+fn a_tool_less_main_thread_continue_is_filled_from_its_create() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let mut first: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+    first.as_object_mut().unwrap().remove("tools");
+    first["thread"] = json!({"type": "create"});
+    let mut c1 = call(first.to_string().into_bytes(), "req_c1", "end_turn");
+    c1.ua_out = "claude-cli/2.1.303 (external, cli)".into();
+    c1.started_at = base;
+    c1.agent =
+        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    let msg_id = c1.message_id.clone();
+    t.ingest(c1);
+    // 续轮：system 只剩 billing header，messages 只有新增那条。
+    let billing = first["system"][0].clone();
+    let second = json!({
+        "model": first["model"], "max_tokens": first["max_tokens"], "thinking": first["thinking"],
+        "output_config": first["output_config"], "metadata": first["metadata"], "stream": true,
+        "system": [billing],
+        "thread": {"type": "continue", "previous_message_id": msg_id},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "and now in German"}]}],
+    });
+    let mut c2 = call(second.to_string().into_bytes(), "req_c2", "end_turn");
+    c2.ua_out = "claude-cli/2.1.303 (external, cli)".into();
+    c2.started_at = base + Duration::from_secs(20);
+    c2.agent =
+        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    t.ingest(c2);
+    let st = t.0.state.lock();
+    let ok: Vec<Value> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_api_success")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    assert_eq!(ok.len(), 2);
+    assert_eq!(ok[1]["querySource"], "repl_main_thread", "{}", ok[1]);
+    assert_eq!(ok[1]["systemCharLength"], ok[0]["systemCharLength"], "续轮按底本补回完整 system");
+}

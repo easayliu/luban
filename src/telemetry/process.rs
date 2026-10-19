@@ -68,7 +68,9 @@ impl Telemetry {
         let agent_key = call.agent.agent_id.clone().unwrap_or_default();
         let thread_key = if is_agent { format!("agent:{agent_key}") } else { "main".to_string() };
         // 线程增量请求先补成客户端视角的全量，再往下判类别（见 [`ThreadBase`]）。
-        if shape.thread_type.as_deref() == Some("continue")
+        let is_delta = shape.thread_type.as_deref() == Some("continue");
+        let mut filled_from_base = false;
+        if is_delta
             && let Some(base) = st
                 .sessions
                 .get(&(call.cred_id, session_id.clone()))
@@ -76,6 +78,7 @@ impl Telemetry {
         {
             let auto_in_delta = shape.auto_marker || shape.permission_declared;
             base.fill(&mut shape, auto_in_delta);
+            filled_from_base = true;
         }
         // 会话还没有：标题生成先扣住，等这个会话的主线程请求来建会话（见 [`State::presession`]）。
         // 必须在判会话来历（`resolve_lineage`）之前扣：那一步会把 `/clear` 的旧会话标成已清、把
@@ -367,7 +370,10 @@ impl Telemetry {
         let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent))
             .then(|| sess.tether_for(&call, &shape, &display_model, is_main, &agent_key));
         // 这条线程的全量形态记下来，给下一条增量请求补（见 [`ThreadBase`]）。
-        if matches!(kind, Kind::Main | Kind::Subagent) && shape.tools_count > 0 {
+        // 只记全量视角：不是增量（`create` 或没开线程），或增量已经按底本补全了。没补上的增量（底本
+        // 丢了）不能拿来当底本。此前用「工具数 > 0」近似「是全量」，无工具的主线程对话（模拟路径不补
+        // 工具时的第三方多轮）首轮就记不下，续轮报出的 system 长度、消息数都是增量那份。
+        if matches!(kind, Kind::Main | Kind::Subagent) && (!is_delta || filled_from_base) {
             sess.thread_bases.insert(
                 thread_key.clone(),
                 ThreadBase::of(&shape, call.reply_input_chars, call.tool_use_lens.clone()),

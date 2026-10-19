@@ -440,9 +440,12 @@ pub(super) fn classify_kind(call: &ApiCall, shape: &RequestShape, is_agent: bool
             Kind::WebSearchTool
         } else if shape.web_fetch_page {
             Kind::WebFetchApply
-        } else if tools == 0 || class == Some("auxiliary") {
+        } else if class == Some("auxiliary") || (tools == 0 && class != Some("main")) {
             // 认不出的辅助调用：宁可当无链的侧查询，也不能当主线程——那会换一轮输入、顶掉
-            // 主线程的线程底本。
+            // 主线程的线程底本。零工具只在头上没说是 `main` 时才算辅助：官方不带工具的只有辅助调用
+            // （`request-class: auxiliary`），头上明说 `main` 的就是主线程（`claude -p --tools ""`；
+            // 模拟路径不补工具时第三方单轮也是这个形态），判成 helper 会报 `querySource: compact`，
+            // 与同一条请求的出站头、billing header 的 `cc_prompt_id` 自相矛盾。
             Kind::Helper
         } else {
             Kind::Main
