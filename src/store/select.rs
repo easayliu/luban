@@ -127,7 +127,8 @@ pub struct Select<'a> {
     /// 名额。非模拟路径只有 `per_session` 时才有值（真实客户端自带的会话 id，没带时按前缀指纹）。
     ///
     /// 绑定行还记着这条会话在该号上占的**槽位**（[`free_session_slot`]）：出站会话 id 由
-    /// 「账号 + 槽位」派生，槽位释放后下一个对话复用同一个 id，见 `CredentialStore::session_slot`。
+    /// 「账号 + 槽位 + 会话键」派生，同一对话恒定、槽位上换了对话就换 id，见 `CredentialStore::session_slot`
+    /// 与 `crate::credentials::conversation_session_seed`。
     pub session_key: Option<&'a str>,
     /// 带设备身份的来访也**按会话**占名额（[`Self::session_key`] 那张表与 `session_limit`），
     /// 设备上限不再生效。代理在「上游看到的设备身份已经收敛」时置真：设备指纹归一化开着、

@@ -273,10 +273,10 @@ pub(crate) fn bare_session_id(
 
 /// 模拟用的 session_id：按「账号 + seed」派生，见 [`crate::credentials::derive_session_id`]。
 ///
-/// seed 正常是**槽位**（[`crate::credentials::slot_session_seed`]）：这条会话在选中的号上占的
-/// 那个槽位，由选号时的会话绑定分配（`session_bindings.slot`），槽位释放后下一个对话复用同一个
-/// 会话 id，上游看到的每个账号只在会话上限那么多个 id 之间轮转。没有槽位的（带设备身份、不写
-/// 会话绑定的模拟请求）退回按缓存前缀（[`sim_session_key`]）派生，与 v0.3.126 相同。
+/// seed 正常是**槽位 + 对话**（[`crate::credentials::conversation_session_seed`]）：槽位是这条会话
+/// 在选中的号上占的那个，由选号时的会话绑定分配（`session_bindings.slot`），对话取会话键——同一
+/// 对话多轮恒定，槽位释放后进来的新对话换新 id（与官方 `/clear` 一致）。没有槽位的（带设备身份、
+/// 不写会话绑定的模拟请求）退回按缓存前缀（[`sim_session_key`]）派生，与 v0.3.126 相同。
 pub(crate) fn session_id_for(cred: &crate::credentials::Credential, seed: &str) -> String {
     crate::credentials::derive_session_id(
         &crate::credentials::session_account_key(cred.account_uuid.as_deref(), cred.id),
