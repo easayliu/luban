@@ -103,15 +103,18 @@ fn index_map_for_plain_prepend() {
     assert_eq!(map, Some(vec![0, 1]));
 }
 
-/// 首块混着旧 billing header 与业务指令：行级剥掉那行、块保留，块数仍从 1 变 2，出站 1 对应来访 0。
-/// 纯 billing header 那块被剥空丢掉：出站 1 对应来访 1。
+/// 客户端后面的块里抄了 billing header：出站那行被改写成 luban 的，两边归一后照样对得上。
+/// 客户端首块就是 billing header（luban 没前插、下标没偏）：不给表。
 #[test]
-fn index_map_follows_line_stripping() {
-    let mixed = format!("{BILLING}\nbe brief");
-    let map = billing_system_index_map(Some(&sys(&[&mixed])), &sys(&[BILLING, "be brief"]));
-    assert_eq!(map, Some(vec![0]));
-    let map = billing_system_index_map(Some(&sys(&[BILLING, "b"])), &sys(&[BILLING, "b"]));
-    assert_eq!(map, Some(vec![1]));
+fn index_map_tolerates_rewritten_billing_lines() {
+    let copied =
+        "x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;\nbe brief";
+    let rewritten = format!("{BILLING}\nbe brief");
+    let map =
+        billing_system_index_map(Some(&sys(&["a", copied])), &sys(&[BILLING, "a", &rewritten]));
+    assert_eq!(map, Some(vec![0, 1]));
+    let map = billing_system_index_map(Some(&sys(&[copied, "b"])), &sys(&[&rewritten, "b"]));
+    assert_eq!(map, None);
 }
 
 /// 对不上就不给表：字符串 system、整段挪走、正文不一致、出站首块不是 billing header。

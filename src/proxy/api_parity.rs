@@ -8,7 +8,7 @@
 use axum::body::Bytes;
 
 use super::has_beta;
-use super::simulation::strip_cc_preamble_lines;
+use super::simulation::rewrite_billing_lines;
 use super::thinking::adaptive_only_model;
 
 /// 缺 `anthropic-version` 头时直连的 400 原文。上游最先校验它（体再错也先报这条）；订阅通道
@@ -87,39 +87,33 @@ pub(crate) fn client_budget_rejection(
 /// 来访下标（出站 `system[0]` 是 luban 那块 billing header，不在表里）。上游报错里的 `system.N`
 /// 按它还原成客户端那份的下标（[`unshift_system_index`]）。
 ///
-/// 按 billing-only 的同一套规则重算（[`strip_cc_preamble_lines`] 行级剥 billing header 与身份句，
-/// 剥空的块丢掉），再逐块核对出站正文与剥后的一致，对得上才给表：客户端首块混着旧 billing
-/// header 与业务指令时块数照样对得上；system 是字符串（直连那边没有块下标）、整段挪进了首条
-/// 用户消息、或出站不是这套改写的结果时返回 `None`，不改。
+/// billing-only 下客户端各块原样跟在 luban 前插的那块后面（[`simulate_system`] 与
+/// [`ensure_cc_system_prefix`] 两条路都是；前者还把客户端抄来的 billing header 行原位改写），故出站
+/// 比来访多一块、且逐块正文一致（billing header 行两边先归一，见 [`rewrite_billing_lines`]）时
+/// `map[k] = k`。客户端首块就是 billing header（luban 没前插、下标没偏）、system 是字符串（直连那边
+/// 没有块下标）、整段挪进了首条用户消息、或出站不是这套改写的结果时返回 `None`，不改。
+///
+/// [`simulate_system`]: super::simulation::simulate_system
+/// [`ensure_cc_system_prefix`]: super::ensure_cc_system_prefix
 pub(crate) fn billing_system_index_map(
     inbound: Option<&serde_json::Value>,
     outbound: &serde_json::Value,
 ) -> Option<Vec<usize>> {
-    let text = |b: &serde_json::Value| b.get("text").and_then(|t| t.as_str()).map(str::to_owned);
+    let text = |b: &serde_json::Value| {
+        b.get("text").and_then(|t| t.as_str()).map(|t| {
+            rewrite_billing_lines(t, "x-anthropic-billing-header:").unwrap_or_else(|| t.to_owned())
+        })
+    };
     let out = outbound.get("system")?.as_array()?;
     let inb = inbound?.get("system")?.as_array()?;
     if !out.first().and_then(text).is_some_and(|t| t.starts_with("x-anthropic-billing-header:")) {
         return None;
     }
-    let kept: Vec<(usize, Option<String>)> = inb
-        .iter()
-        .enumerate()
-        .filter_map(|(i, b)| match text(b) {
-            Some(t) => {
-                let stripped = strip_cc_preamble_lines(&t);
-                (!stripped.trim().is_empty()).then_some((i, Some(stripped)))
-            }
-            None => Some((i, None)),
-        })
-        .collect();
-    if kept.len() + 1 != out.len() {
+    if inb.len() + 1 != out.len() {
         return None;
     }
-    let consistent = kept
-        .iter()
-        .zip(&out[1..])
-        .all(|((_, want), got)| want.as_ref().is_none_or(|w| text(got).as_deref() == Some(w)));
-    consistent.then(|| kept.into_iter().map(|(i, _)| i).collect())
+    let consistent = inb.iter().zip(&out[1..]).all(|(want, got)| text(want) == text(got));
+    consistent.then(|| (0..inb.len()).collect())
 }
 
 /// 把上游报错 `error.message` 里的 `system.N`（N ≥ 1）按 [`billing_system_index_map`] 改回客户端

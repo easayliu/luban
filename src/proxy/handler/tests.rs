@@ -2011,11 +2011,11 @@ async fn missing_version_is_reported_before_thinking_checks(pool: sqlx::PgPool) 
     .await;
 }
 
-/// 客户端首块混着旧 billing header 与业务指令：billing-only 行级剥掉那行、块保留，再插新的
-/// billing 首块；上游报 `system.1`，客户端看到的是它自己那份的 `system.0`。
+/// 客户端首块混着抄来的 billing header 与业务指令：那行原位改写成 luban 的、块保留，不再前插，
+/// 出站与来访逐块对应，上游报的 `system.0` 原样就是客户端那份的下标。
 #[sqlx::test]
-async fn billing_only_maps_system_index_through_a_mixed_first_block(pool: sqlx::PgPool) {
-    const TTL_400: &str = "system.1.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
+async fn billing_only_rewrites_a_copied_billing_header_in_place(pool: sqlx::PgPool) {
+    const TTL_400: &str = "system.0.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
     let mock =
         MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TTL_400)]).await;
     let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
@@ -2031,13 +2031,14 @@ async fn billing_only_maps_system_index_through_a_mixed_first_block(pool: sqlx::
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let msg = v["error"]["message"].as_str().unwrap();
-    assert!(
-        msg.starts_with("system.0.cache_control.ephemeral.ttl: Input should be '5m' or '1h'"),
-        "{msg}"
-    );
+    assert!(msg.starts_with(TTL_400), "{msg}");
     let out: serde_json::Value = serde_json::from_slice(&mock.seen()[0].body).unwrap();
-    assert_eq!(out["system"].as_array().unwrap().len(), 2, "出站：新 billing 首块 + 剥过的业务块");
-    assert_eq!(out["system"][1]["text"], "be brief");
+    let sys = out["system"].as_array().unwrap();
+    assert_eq!(sys.len(), 1, "不前插，客户端那块就是 system[0]: {out}");
+    let text = sys[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("x-anthropic-billing-header:"), "{text}");
+    assert!(!text.contains("cc_version=2.1.300.abc"), "抄来的那行已改写: {text}");
+    assert!(text.ends_with("\nbe brief"), "业务指令保留: {text}");
 }
 
 /// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条

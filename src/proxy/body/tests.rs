@@ -2820,18 +2820,20 @@ mod billing_only {
         assert_eq!(texts, ["B1", "B2", "B3", "B4", "B5", "B6"], "六块原样保留、不合并封顶");
     }
 
-    /// 修复 1：客户端把旧 billing header 与业务指令写在同一块（单换行分隔）时，billing-only **行级**
-    /// 剥——只去掉 header 那一行，保留业务指令；且全局只剩 system[0] 一条 billing header。
+    /// 客户端把旧 billing header 与业务指令写在同一块（单换行分隔）时，billing-only 把那行**原位改写**
+    /// 成 luban 的（版本 / 入口 / cch 都换掉），业务指令保留；首块已以 billing header 开头，不再前插。
+    /// 客户端的身份句与其余块原样保留。
     #[test]
-    fn strips_old_billing_line_but_keeps_business_instructions_in_the_same_block() {
-        let raw = Bytes::from_static(
+    fn rewrites_copied_billing_line_and_keeps_the_rest_of_the_client_system() {
+        let raw = Bytes::from(format!(
             concat!(
-                r#"{"model":"claude-opus-5-5","max_tokens":64,"#,
-                r#""system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;\n保留我的业务指令"}],"#,
-                r#""messages":[{"role":"user","content":"hi"}]}"#
-            )
-            .as_bytes(),
-        );
+                r#"{{"model":"claude-opus-5-5","max_tokens":64,"#,
+                r#""system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=sdk-ts; cch=12345;\n保留我的业务指令"}},"#,
+                r#"{{"type":"text","text":"{identity}"}}],"#,
+                r#""messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            identity = config::CC_SYSTEM_IDENTITY
+        ));
         let sim = detect_for(&raw, on_flags()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&rewrite_body(
             &raw,
@@ -2843,16 +2845,13 @@ mod billing_only {
         ))
         .unwrap();
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 2, "只剩注入的 billing header + 客户端那块（指令保留）: {v}");
-        assert!(sys[0]["text"].as_str().unwrap().starts_with("x-anthropic-billing-header:"));
-        assert_eq!(sys[1]["text"], "保留我的业务指令", "业务指令未被整块删掉");
-        let billing_headers = sys
-            .iter()
-            .filter(|b| {
-                b["text"].as_str().is_some_and(|t| t.contains("x-anthropic-billing-header:"))
-            })
-            .count();
-        assert_eq!(billing_headers, 1, "全局只剩一条 billing header，客户端抄的那行已剥");
+        assert_eq!(sys.len(), 2, "不前插、不删块: {v}");
+        let first = sys[0]["text"].as_str().unwrap();
+        assert!(first.starts_with("x-anthropic-billing-header:"), "{first}");
+        assert!(first.contains("cc_entrypoint=cli;"), "改写成 luban 的入口: {first}");
+        assert!(!first.contains("9.9.9.aaa") && !first.contains("cch=12345"), "旧值已换: {first}");
+        assert!(first.ends_with("\n保留我的业务指令"), "业务指令保留: {first}");
+        assert_eq!(sys[1]["text"], config::CC_SYSTEM_IDENTITY, "客户端的身份句原样保留");
     }
 
     /// billing-only 保留客户端 metadata 时，会话 id 照常派生（不照抄客户端 uuid），body 里的会话段
