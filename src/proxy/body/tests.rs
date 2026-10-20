@@ -2917,6 +2917,42 @@ mod billing_only {
         assert_eq!(billing_header_count(&v), 1, "{v}");
     }
 
+    /// 客户端指令里的示例不动：代码围栏里的 header 行、以及不带 `cc_version=` 的示例值都原样保留，
+    /// 只去掉块首那条真正抄来的 header。
+    #[test]
+    fn keeps_billing_header_examples_in_code_fences() {
+        let text = concat!(
+            "x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=12345;\n",
+            "输出以下 HTTP 头的示例值：\n",
+            "```text\n",
+            "x-anthropic-billing-header: cc_version=9.9.9; cch=00000;\n",
+            "```\n",
+            "x-anthropic-billing-header: sample-value",
+        );
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-opus-5-5", "max_tokens": 64,
+                "system": [{"type": "text", "text": text}],
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        );
+        let v = billing_only_out(&raw);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2, "{v}");
+        assert_eq!(
+            sys[1]["text"],
+            concat!(
+                "输出以下 HTTP 头的示例值：\n",
+                "```text\n",
+                "x-anthropic-billing-header: cc_version=9.9.9; cch=00000;\n",
+                "```\n",
+                "x-anthropic-billing-header: sample-value",
+            ),
+            "围栏里与不带 cc_version 的示例原样保留"
+        );
+    }
+
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {
         let sim = detect_for(raw, on_flags()).unwrap();
         serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", on_flags(), Some(&sim), None))
