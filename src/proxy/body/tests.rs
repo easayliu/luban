@@ -2953,6 +2953,34 @@ mod billing_only {
         );
     }
 
+    /// 围栏按 CommonMark 配对：四反引号里的三反引号、反引号里的 `~~~`、后面带字的「关闭行」都关
+    /// 不上外层，里面的 header 示例照留；缩进 4 格的代码示例同样不动。只去块首那条真 header。
+    #[test]
+    fn fence_pairing_and_indented_code_protect_examples() {
+        const HDR: &str =
+            "x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=12345;\n";
+        const EX: &str = "x-anthropic-billing-header: cc_version=9.9.9; cch=00000;\n";
+        let cases = [
+            format!("请保留以下 Markdown 示例：\n````markdown\n```text\n{EX}```\n````"),
+            format!("示例：\n```\n~~~\n{EX}~~~\n```"),
+            format!("示例：\n```\n``` not-a-close\n{EX}```"),
+            format!("输出以下 HTTP 头的示例值：\n\n    {EX}"),
+            format!("Tab 缩进：\n\n\t{EX}"),
+        ];
+        for rest in cases {
+            let raw = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-opus-5-5", "max_tokens": 64,
+                    "system": [{"type": "text", "text": format!("{HDR}{rest}")}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            );
+            let v = billing_only_out(&raw);
+            assert_eq!(v["system"][1]["text"], rest.as_str(), "示例原样保留: {v}");
+        }
+    }
+
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {
         let sim = detect_for(raw, on_flags()).unwrap();
         serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", on_flags(), Some(&sim), None))

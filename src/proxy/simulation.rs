@@ -1595,20 +1595,33 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 
 const BILLING_KEY: &str = "x-anthropic-billing-header:";
 
-/// 这一行是不是一条抄来的 billing header：行首（容许前导空白与 BOM）就是
+/// 这一行是不是一条抄来的 billing header：行首（容许 BOM 与至多 3 个空格）就是
 /// `x-anthropic-billing-header:`，且带 `cc_version=`（官方 header 恒带，上游放行也认它）。只出现在
-/// 行中间的（客户端指令里提到这个词、或引用成 `> x-anthropic-...`）、或没有 `cc_version=` 的示例值
-/// 都不算，免得把客户端的指令与示例一起吞掉。代码围栏里的行由调用方另外保护
-/// （[`billing_only_block_fates`]）。
+/// 行中间的（客户端指令里提到这个词、或引用成 `> x-anthropic-...`）、缩进 4 格或 Tab 起头的
+/// （Markdown 缩进代码块）、没有 `cc_version=` 的示例值都不算，免得把客户端的指令与示例一起吞掉。
+/// 围栏代码块里的行由调用方另外保护（[`billing_only_block_fates`]）。
 fn is_billing_line(line: &str) -> bool {
-    let line = line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
-    line.starts_with(BILLING_KEY) && line.contains("cc_version=")
+    let line = line.trim_start_matches('\u{feff}');
+    let body = line.trim_start_matches(' ');
+    line.len() - body.len() <= 3
+        && body.starts_with(BILLING_KEY)
+        && body.trim_end().contains("cc_version=")
 }
 
-/// 这一行是不是 Markdown 代码围栏的开或关（``` 或 ~~~ 起头）。
-fn is_code_fence(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("```") || line.starts_with("~~~")
+/// 一行若是 Markdown 围栏（CommonMark：至多 3 格缩进，3 个以上同一字符 `` ` `` 或 `~`），返回
+/// `(字符, 长度, 其后是否只有空白)`。反引号围栏的信息串里不许再有反引号，有就不是围栏。
+fn code_fence(line: &str) -> Option<(char, usize, bool)> {
+    let body = line.trim_start_matches(' ');
+    if line.len() - body.len() > 3 {
+        return None;
+    }
+    let ch = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = body.len() - body.trim_start_matches(ch).len();
+    let rest = &body[len..];
+    if len < 3 || (ch == '`' && rest.contains('`')) {
+        return None;
+    }
+    Some((ch, len, rest.trim().is_empty()))
 }
 
 /// billing-only 下客户端一个 `system` 块的去留，见 [`billing_only_block_fates`]。
@@ -1625,7 +1638,7 @@ pub(in crate::proxy) enum BlockFate {
 /// billing-only 下客户端各 `system` 块的去留，与来访逐块对应；出站时依次跟在 luban 前插的
 /// billing header 之后（[`simulate_system`]）。
 /// - 抄来的 billing header 行（[`is_billing_line`]）去掉，改写成 [`BlockFate::Rewrite`]；代码围栏
-///   （[`is_code_fence`]）里的行是客户端的示例，一律不动。块开头的
+///   （[`code_fence`]）与缩进代码块里的行是客户端的示例，一律不动。块开头的
 ///   header 行后面紧跟的空行一并去掉，不留开头换行；段落中间的 header 行只去它自己，段落间的
 ///   空行照留。原文不以换行收尾的，去掉末行后留下的尾随换行也收掉。
 /// - 正文只剩空白的块（原本就空、或去掉 header 后变空）是 [`BlockFate::Drop`]：上游不收空文本块。
@@ -1644,14 +1657,18 @@ pub(in crate::proxy) fn billing_only_block_fates(blocks: &[serde_json::Value]) -
                 return BlockFate::Drop;
             }
             let mut kept = String::with_capacity(text.len());
-            let mut in_fence = false;
+            // 开着的围栏：开启时的字符与长度。只有同字符、不短于它、其后只有空白的围栏行才关得上。
+            let mut fence: Option<(char, usize)> = None;
             let mut removed = false;
             for line in text.split_inclusive('\n') {
-                if is_code_fence(line) {
-                    in_fence = !in_fence;
-                } else if !in_fence && is_billing_line(line) {
-                    removed = true;
-                    continue;
+                match (fence, code_fence(line)) {
+                    (None, Some((ch, len, _))) => fence = Some((ch, len)),
+                    (Some((ch, len)), Some((c, l, true))) if c == ch && l >= len => fence = None,
+                    (None, None) if is_billing_line(line) => {
+                        removed = true;
+                        continue;
+                    }
+                    _ => {}
                 }
                 // 块开头 header 行后面紧跟的空行（去掉过 header、还没留下任何正文）不留。
                 if removed && kept.is_empty() && line.trim().is_empty() {
