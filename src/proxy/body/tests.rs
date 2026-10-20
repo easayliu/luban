@@ -3042,6 +3042,19 @@ mod billing_only {
         }
     }
 
+    /// 代码块很多、块外与块内的 header 交错时，代码块范围的游标查找结果与逐个比对一致：块内的
+    /// 示例全留，块外不缩进的真 header 全去。
+    #[test]
+    fn code_range_cursor_handles_many_blocks() {
+        use crate::proxy::simulation::{BlockFate, billing_only_block_fates};
+        const UNIT: &str =
+            "```text\nx-anthropic-billing-header: cc_version=9.9.9; cch=00000;\n```\n\n";
+        const HDR: &str = "x-anthropic-billing-header: cc_version=1; cch=12345;\n";
+        let text = format!("{HDR}{}", format!("{UNIT}{HDR}").repeat(2_000));
+        let blocks = vec![serde_json::json!({"type": "text", "text": text})];
+        assert_eq!(billing_only_block_fates(&blocks), vec![BlockFate::Rewrite(UNIT.repeat(2_000))]);
+    }
+
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {
         let sim = detect_for(raw, on_flags()).unwrap();
         serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", on_flags(), Some(&sim), None))

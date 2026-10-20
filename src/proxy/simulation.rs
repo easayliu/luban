@@ -1656,10 +1656,16 @@ pub(in crate::proxy) fn billing_only_block_fates(blocks: &[serde_json::Value]) -
             let mut kept = String::with_capacity(text.len());
             let mut removed = false;
             let mut at = 0;
+            // 代码块范围与行都按原文顺序排列、互不重叠：游标只往前走，整体线性，不必每行从头找。
+            let mut ci = 0;
             for line in text.split_inclusive('\n') {
                 let start = at;
                 at += line.len();
-                if is_billing_line(line) && !code.iter().any(|r| r.contains(&start)) {
+                while code.get(ci).is_some_and(|r| r.end <= start) {
+                    ci += 1;
+                }
+                let in_code = code.get(ci).is_some_and(|r| r.start <= start);
+                if !in_code && is_billing_line(line) {
                     removed = true;
                     continue;
                 }
