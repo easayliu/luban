@@ -99,7 +99,10 @@ fn sys(texts: &[&str]) -> serde_json::Value {
 /// 出站开头多一块 billing header、客户端块原样顺延：出站 1、2 对应来访 0、1。
 #[test]
 fn index_map_for_plain_prepend() {
-    let map = billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING, "a", "b"]));
+    let map = billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING, "a", "b"]), true);
+    assert_eq!(map, Some(vec![0, 1]));
+    // 真实 CC 缺 header、前插了一块：同样顺延一位。
+    let map = billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING, "a", "b"]), false);
     assert_eq!(map, Some(vec![0, 1]));
 }
 
@@ -108,13 +111,16 @@ fn index_map_for_plain_prepend() {
 #[test]
 fn index_map_follows_dropped_billing_lines() {
     let mixed = format!("{BILLING}\nbe brief");
-    let map = billing_system_index_map(Some(&sys(&[&mixed])), &sys(&[BILLING, "be brief"]));
+    let map = billing_system_index_map(Some(&sys(&[&mixed])), &sys(&[BILLING, "be brief"]), true);
     assert_eq!(map, Some(vec![0]));
-    let map = billing_system_index_map(Some(&sys(&[BILLING, "b"])), &sys(&[BILLING, "b"]));
+    let map = billing_system_index_map(Some(&sys(&[BILLING, "b"])), &sys(&[BILLING, "b"]), true);
     assert_eq!(map, Some(vec![1]));
     // 空白块同样不出站：出站 1、2 对应来访 1、3。
-    let map =
-        billing_system_index_map(Some(&sys(&["", "a", " ", "b"])), &sys(&[BILLING, "a", "b"]));
+    let map = billing_system_index_map(
+        Some(&sys(&["", "a", " ", "b"])),
+        &sys(&[BILLING, "a", "b"]),
+        true,
+    );
     assert_eq!(map, Some(vec![1, 3]));
 }
 
@@ -122,10 +128,28 @@ fn index_map_follows_dropped_billing_lines() {
 #[test]
 fn index_map_refuses_when_blocks_do_not_line_up() {
     let out = sys(&[BILLING, "a", "b"]);
-    assert_eq!(billing_system_index_map(Some(&json!({"system": "a"})), &out), None);
-    assert_eq!(billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING])), None);
-    assert_eq!(billing_system_index_map(Some(&sys(&["a", "x"])), &out), None);
-    assert_eq!(billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&["z", "a", "b"])), None);
+    for simulated in [true, false] {
+        let map = |inb: &serde_json::Value, out: &serde_json::Value| {
+            billing_system_index_map(Some(inb), out, simulated)
+        };
+        assert_eq!(map(&json!({"system": "a"}), &out), None);
+        assert_eq!(map(&sys(&["a", "b"]), &sys(&[BILLING])), None);
+        assert_eq!(map(&sys(&["a", "x"]), &out), None);
+        assert_eq!(map(&sys(&["a", "b"]), &sys(&["z", "a", "b"])), None);
+    }
+}
+
+/// 真实 CC 来访已带 billing header：luban 没前插、没删块，一律不改下标——哪怕首块去掉首行后恰好
+/// 等于第二块（按模拟那套规则就会误判成「前插一块、删一块」）。
+#[test]
+fn index_map_leaves_real_cc_with_its_own_header_alone() {
+    let both = format!("{BILLING}\n{BILLING}\n");
+    let one = format!("{BILLING}\n");
+    let inb = sys(&[&both, &one]);
+    assert_eq!(billing_system_index_map(Some(&inb), &inb, false), None);
+    // 真实 CC 不删块：来访的空白块出站照在，按模拟那套跳过它就对不上。
+    let map = billing_system_index_map(Some(&sys(&["", "a"])), &sys(&[BILLING, "", "a"]), false);
+    assert_eq!(map, Some(vec![0, 1]));
 }
 
 /// `system.N` 按表还原，`system.0`、别的名字、无下标的不动；体的其余部分原样。

@@ -2043,6 +2043,45 @@ async fn billing_only_maps_system_index_through_a_mixed_first_block(pool: sqlx::
     assert_eq!(sys[1]["cache_control"]["ttl"], "2h", "业务块保留自己的断点");
 }
 
+/// 真实 CC（不走模拟）来访已带 billing header：luban 不前插也不删块，上游报的 `system.1` 原样回给
+/// 客户端，不因「首块去掉首行后恰好等于第二块」被改成 `system.0`。缺 header 时前插一块，`system.1`
+/// 还原成客户端的 `system.0`。
+#[sqlx::test]
+async fn billing_only_real_cc_maps_system_index_only_when_a_block_was_prepended(
+    pool: sqlx::PgPool,
+) {
+    const TTL_1: &str = "system.1.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
+    let mock = MockUpstream::start(
+        (0..2).map(|_| Reply::json_error(400, "invalid_request_error", TTL_1)).collect(),
+    )
+    .await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SIM_BILLING_ONLY, "1").await.unwrap();
+    let h = "x-anthropic-billing-header: cc_version=2.1.301.abc; cc_entrypoint=cli; cch=00000;";
+    let ttl = serde_json::json!({"type": "ephemeral", "ttl": "2h"});
+    let with_header = cc_request(serde_json::json!({
+        "max_tokens": 1,
+        "system": [
+            {"type": "text", "text": format!("{h}\n{h}\n")},
+            {"type": "text", "text": format!("{h}\n"), "cache_control": ttl},
+        ],
+    }));
+    let without_header = cc_request(serde_json::json!({
+        "max_tokens": 1,
+        "system": [{"type": "text", "text": "be brief", "cache_control": ttl}],
+    }));
+    for (req, want, blocks) in [(with_header, "system.1.", 2), (without_header, "system.0.", 2)] {
+        let (status, _, body) = send(&state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with(want), "{msg}");
+        let seen = mock.seen();
+        let out: serde_json::Value = serde_json::from_slice(&seen.last().unwrap().body).unwrap();
+        assert_eq!(out["system"].as_array().unwrap().len(), blocks, "{out}");
+    }
+}
+
 /// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条
 /// 第三方 400、不打上游，流水标 `rejected_locally:third-party`；关掉照发。
 #[sqlx::test]

@@ -89,32 +89,48 @@ pub(crate) fn client_budget_rejection(
 /// 来访下标（出站 `system[0]` 是 luban 那块 billing header，不在表里）。上游报错里的 `system.N`
 /// 按它还原成客户端那份的下标（[`unshift_system_index`]）。
 ///
-/// 按 billing-only 的同一套规则重算（[`billing_only_block_fates`]：块首抄来的 billing header 行去掉、
-/// 只剩空白的块不出站），再逐块核对出站正文与之一致，对得上才给表：客户端首块混着旧 billing
-/// header 与业务指令时块数照样对得上；system 是字符串（直连那边没有块下标）、整段挪进了首条
-/// 用户消息、或出站不是这套改写的结果时返回 `None`，不改。
+/// 按这条请求**实际走的那条路**的改写规则算，不凭正文相等反推（`simulated` 即这条请求走没走模拟）：
+/// - 模拟：[`simulate_system`] 恒前插一块，客户端各块的去留按 [`billing_only_block_fates`]（块首抄来
+///   的 billing header 行去掉、只剩空白的块不出站）。
+/// - 真实 CC：[`ensure_cc_system_prefix`] 只在来访**一条 billing header 都没有**时前插一块、不删块。
+///   来访已带 header 就没插过，一律不改下标——哪怕某块去掉首行后恰好等于下一块。
+///
+/// 末了再逐块核对出站正文与预期一致，对得上才给表：system 是字符串（直连那边没有块下标）、整段
+/// 挪进了首条用户消息、或出站不是这套改写的结果时返回 `None`，不改。
+///
+/// [`simulate_system`]: super::simulation::simulate_system
+/// [`ensure_cc_system_prefix`]: super::ensure_cc_system_prefix
 pub(crate) fn billing_system_index_map(
     inbound: Option<&serde_json::Value>,
     outbound: &serde_json::Value,
+    simulated: bool,
 ) -> Option<Vec<usize>> {
     fn text(b: &serde_json::Value) -> Option<&str> {
         b.get("text").and_then(|t| t.as_str())
     }
+    let is_header = |b: &serde_json::Value| {
+        text(b).is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
+    };
     let out = outbound.get("system")?.as_array()?;
     let inb = inbound?.get("system")?.as_array()?;
-    if !out.first().and_then(text).is_some_and(|t| t.starts_with("x-anthropic-billing-header:")) {
+    if !out.first().is_some_and(is_header) {
         return None;
     }
-    let kept: Vec<(usize, Option<Cow<'_, str>>)> = inb
-        .iter()
-        .zip(billing_only_block_fates(inb))
-        .enumerate()
-        .filter_map(|(i, (b, fate))| match fate {
-            BlockFate::Drop => None,
-            BlockFate::Keep => Some((i, text(b).map(Cow::Borrowed))),
-            BlockFate::Rewrite(t) => Some((i, Some(Cow::Owned(t)))),
-        })
-        .collect();
+    let kept: Vec<(usize, Option<Cow<'_, str>>)> = if simulated {
+        inb.iter()
+            .zip(billing_only_block_fates(inb))
+            .enumerate()
+            .filter_map(|(i, (b, fate))| match fate {
+                BlockFate::Drop => None,
+                BlockFate::Keep => Some((i, text(b).map(Cow::Borrowed))),
+                BlockFate::Rewrite(t) => Some((i, Some(Cow::Owned(t)))),
+            })
+            .collect()
+    } else if inb.iter().any(is_header) {
+        return None;
+    } else {
+        inb.iter().enumerate().map(|(i, b)| (i, text(b).map(Cow::Borrowed))).collect()
+    };
     if kept.len() + 1 != out.len() {
         return None;
     }

@@ -646,13 +646,15 @@ async fn client_error(
             return relay_upstream(up, rl, upgrade_stream, tool_names.clone()).await;
         }
     }
-    // billing-only 在 `system[0]` 前插了一块 billing header（还可能剥掉了客户端自带的）：上游报错
-    // 里的 `system.N` 按块对应还原成客户端那份的下标，与 API Key 直连一致（[`billing_system_index_map`]）。
-    let system_map =
-        (!compressed && flags.billing_only() && err_bytes.windows(7).any(|w| w == b"system."))
-            .then(|| serde_json::from_slice::<serde_json::Value>(sent).ok())
-            .flatten()
-            .and_then(|out| billing_system_index_map(body_json.as_ref(), &out));
+    // billing-only 在 `system[0]` 前插了一块 billing header（模拟那条还可能去掉了客户端抄来的）：上游
+    // 报错里的 `system.N` 按块对应还原成客户端那份的下标，与 API Key 直连一致；按这条请求实际走的
+    // 那条路（模拟 / 真实 CC）的改写规则算（[`billing_system_index_map`]）。
+    let system_map = (!compressed
+        && flags.billing_only()
+        && err_bytes.windows(7).any(|w| w == b"system."))
+    .then(|| serde_json::from_slice::<serde_json::Value>(sent).ok())
+    .flatten()
+    .and_then(|out| billing_system_index_map(body_json.as_ref(), &out, upstream.sim.is_some()));
     let err_bytes = match system_map {
         Some(map) => unshift_system_index(&err_bytes, &map).unwrap_or(err_bytes),
         None => err_bytes,
