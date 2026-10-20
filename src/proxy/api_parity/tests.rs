@@ -112,6 +112,10 @@ fn index_map_follows_dropped_billing_lines() {
     assert_eq!(map, Some(vec![0]));
     let map = billing_system_index_map(Some(&sys(&[BILLING, "b"])), &sys(&[BILLING, "b"]));
     assert_eq!(map, Some(vec![1]));
+    // 空白块同样不出站：出站 1、2 对应来访 1、3。
+    let map =
+        billing_system_index_map(Some(&sys(&["", "a", " ", "b"])), &sys(&[BILLING, "a", "b"]));
+    assert_eq!(map, Some(vec![1, 3]));
 }
 
 /// 对不上就不给表：字符串 system、整段挪走、正文不一致、出站首块不是 billing header。

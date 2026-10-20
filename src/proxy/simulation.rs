@@ -1403,24 +1403,37 @@ pub(crate) fn simulate_system(
             cc_version_suffix(v, sim.profile.version),
             cch_value(),
         );
-        // 客户端自己的 system 按**原块**透传：不合并、不剥身份句，正文原样。唯二的改动：
+        // 客户端自己的 system 按**原块**透传：不合并、不剥身份句，正文原样。只做三处改动：
         // - 它自己抄来的 billing header 行（[`is_billing_line`]）由 luban 前插的这块顶替、原行去掉，
         //   全局只留 `system[0]` 一条（`cch` 也只回填那一条）；只剩 header 的块随之去掉。首块
         //   「header 行 + 业务指令」就拆成 `[luban header, 业务指令]`，不混成一块。
+        // - 正文只有空白的块去掉：上游回 400 `text content blocks must be non-empty`。
         // - 去掉 `citations`：上游不收在 system 里（见下方多块路径同样处理），留着是一发稳定 400。
         // 出站块与来访块的对应见 [`billing_only_client_texts`]，上游报错的下标按它还原。
-        let client = match v.get("system") {
-            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![text_block_bare(s)],
-            Some(serde_json::Value::Array(a)) => a.clone(),
+        // 整个取出来按值组装：客户端 system 可能几十 KB，不必为改几个字段整份拷贝。
+        let client = match v.get_mut("system").map(serde_json::Value::take) {
+            Some(serde_json::Value::String(s)) => vec![text_block_bare(&s)],
+            Some(serde_json::Value::Array(a)) => a,
             _ => Vec::new(),
         };
-        let texts = billing_only_client_texts(&client);
-        let mut blocks = vec![text_block_bare(&header)];
-        for (i, text) in texts {
-            let mut b = client[i].clone();
+        // 只留改过的正文（`Owned`），借用随之结束，下面才能按值拿走客户端的块。
+        let mut changed: std::collections::VecDeque<(usize, Option<String>)> =
+            billing_only_client_texts(&client)
+                .into_iter()
+                .map(|(i, t)| match t {
+                    Some(std::borrow::Cow::Owned(t)) => (i, Some(t)),
+                    _ => (i, None),
+                })
+                .collect();
+        let mut blocks = Vec::with_capacity(changed.len() + 1);
+        blocks.push(text_block_bare(&header));
+        for (i, mut b) in client.into_iter().enumerate() {
+            let Some((_, text)) = changed.pop_front_if(|(k, _)| *k == i) else {
+                continue;
+            };
             if let Some(o) = b.as_object_mut() {
                 o.shift_remove("citations");
-                if let Some(std::borrow::Cow::Owned(t)) = text {
+                if let Some(t) = text {
                     o.insert("text".into(), serde_json::Value::String(t));
                 }
             }
@@ -1589,17 +1602,19 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 
 const BILLING_KEY: &str = "x-anthropic-billing-header:";
 
-/// 这一行是不是一条 billing header：行首（容许前导空白）就是 `x-anthropic-billing-header:`。
-/// 只出现在行中间的（客户端指令里提到这个词）不算，免得把同一行的指令一起吞掉。
+/// 这一行是不是一条 billing header：行首（容许前导空白与 BOM）就是 `x-anthropic-billing-header:`。
+/// 只出现在行中间的（客户端指令里提到这个词、或引用成 `> x-anthropic-...`）不算，免得把同一行的
+/// 指令一起吞掉。
 fn is_billing_line(line: &str) -> bool {
-    line.trim_start().starts_with(BILLING_KEY)
+    line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}').starts_with(BILLING_KEY)
 }
 
 /// billing-only 下客户端各 `system` 块出站的样子：`(来访下标, 正文)`，按来访顺序，出站时依次跟在
 /// luban 前插的 billing header 之后（[`simulate_system`]）。正文 `None` 是没有 `text` 的块（原样
 /// 带上）；`Borrowed` 是原文不动；`Owned` 是去掉了抄来的 billing header 行（[`is_billing_line`]）
-/// 之后的正文。去掉之后只剩空白的块整块不出站、不在表里；客户端原本就是空文本的块照带（上游
-/// 回什么由它自己负责，与直连一致）。报错下标还原用同一张表（[`billing_system_index_map`]）。
+/// 之后的正文，紧跟在去掉那行后面的空行一并去掉，不留多余的换行。正文只剩空白的块（原本就空、
+/// 或去掉 header 后变空）整块不出站、不在表里：上游不收空文本块。报错下标还原用同一张表
+/// （[`billing_system_index_map`]）。
 ///
 /// [`billing_system_index_map`]: crate::proxy::billing_system_index_map
 pub(in crate::proxy) fn billing_only_client_texts(
@@ -1613,11 +1628,22 @@ pub(in crate::proxy) fn billing_only_client_texts(
             let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
                 return Some((i, None));
             };
+            if text.trim().is_empty() {
+                return None;
+            }
             if !text.split('\n').any(is_billing_line) {
                 return Some((i, Some(Cow::Borrowed(text))));
             }
-            let mut kept: String =
-                text.split_inclusive('\n').filter(|l| !is_billing_line(l)).collect();
+            let mut kept = String::with_capacity(text.len());
+            let mut after_header = false;
+            for line in text.split_inclusive('\n') {
+                if is_billing_line(line) {
+                    after_header = true;
+                } else if !(after_header && line.trim().is_empty()) {
+                    after_header = false;
+                    kept.push_str(line);
+                }
+            }
             // 去掉的是末行时，前一行的换行成了多余的尾巴；原文本不以换行收尾就把它去掉。
             if !text.ends_with('\n') && kept.ends_with('\n') {
                 kept.pop();

@@ -2867,6 +2867,31 @@ mod billing_only {
         assert_eq!(sys.len(), 3, "luban header + 提及那块 + 去掉 header 行的那块: {v}");
         assert_eq!(sys[1]["text"], mention, "行中间提到的不算 header，原样保留");
         assert_eq!(sys[2]["text"], "a\r\nb");
+        assert_eq!(billing_header_count(&v), 2, "luban 那条 + 提及那句，没有别的: {v}");
+    }
+
+    /// 去掉 header 行时紧跟的空行一并去掉、不留开头换行；BOM 开头的 header 行也认；正文只有空白的
+    /// 块不出站（上游不收空文本块）。
+    #[test]
+    fn drops_blank_lines_after_header_bom_headers_and_blank_blocks() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-opus-5-5", "max_tokens": 64,
+                "system": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cc_version=1; cch=12345;\n\n保留我的业务指令"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "\u{feff}x-anthropic-billing-header: cc_version=1; cch=12345;\nb"},
+                    {"type": "text", "text": " \n"},
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        );
+        let v = billing_only_out(&raw);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3, "luban header + 两块业务正文，空白块不出站: {v}");
+        assert_eq!(sys[1]["text"], "保留我的业务指令", "不留开头空行");
+        assert_eq!(sys[2]["text"], "b");
         assert_eq!(billing_header_count(&v), 1, "{v}");
     }
 
@@ -2881,7 +2906,9 @@ mod billing_only {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|b| b["text"].as_str().is_some_and(|t| t.contains("cc_version=")))
+            .filter(|b| {
+                b["text"].as_str().is_some_and(|t| t.contains("x-anthropic-billing-header:"))
+            })
             .count()
     }
 
