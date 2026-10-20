@@ -101,6 +101,8 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/api-keys/{id}/reveal", get(reveal_api_key))
         .route("/provision-keys", get(list_provision_keys).post(create_provision_key))
         .route("/provision-keys/{id}", post(update_provision_key).delete(delete_provision_key))
+        .route("/mcp-keys", get(list_mcp_keys).post(create_mcp_key))
+        .route("/mcp-keys/{id}", post(update_mcp_key).delete(delete_mcp_key))
         .route("/users", get(list_users).post(create_user))
         .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/password", post(set_user_password))
@@ -131,5 +133,7 @@ pub(super) fn router(state: AppState) -> Router {
         // 转发收原始体流、由 handler 鉴权之后自己按上限读（见 `proxy::MAX_BODY_BYTES`），
         // 不走 `Bytes` 提取器：那个会在鉴权之前把体整个读进内存。管理接口维持默认 2MB。
         .route("/v1/{*path}", any(proxy::handle))
+        // 排查用的 MCP 端点：自己认 MCP Key，不走控制台会话，见 [`mcp`]。
+        .route("/mcp", any(mcp::handle))
         .with_state(state)
 }

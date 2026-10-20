@@ -1174,3 +1174,130 @@ async fn proxy_probe_bounds_and_hides_the_response() {
     assert!(r.error.unwrap().contains("timed out"));
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
+
+/// `/mcp`：只认 MCP Key（会话 token、上号 Key、乱填的都 401），MCP Key 也进不了 `/api/*`；
+/// 查流水按身份收窄——用户只查得到本人名下的号，且字段按号主口径抹掉；跨站来的 403。
+#[sqlx::test]
+async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
+    use store::KeyKind;
+    use tower::ServiceExt;
+    let store = Arc::new(CredentialStore::for_test(pool).await);
+    let admin = store.admin_user().await.unwrap();
+    store.set_user_password_hash(admin.id, "h-admin", None).await.unwrap();
+    let user =
+        store.create_user("u", "h-user", store::UserRole::User, admin.id).await.unwrap().unwrap();
+    let state = AppState::for_test(store.clone());
+    let new_key = async |u: &store::User, kind: KeyKind| {
+        let key = store::generate_key(kind);
+        let tag = auth::password_tag(
+            &state,
+            u.role,
+            &format!("h-{}", if u.id == admin.id { "admin" } else { "user" }),
+        );
+        store.create_provision_key(kind, u.id, "", &key, &tag).await.unwrap();
+        key
+    };
+    let admin_key = new_key(&admin, KeyKind::Mcp).await;
+    let user_key = new_key(&user, KeyKind::Mcp).await;
+    let provision_key = new_key(&admin, KeyKind::Provision).await;
+
+    let mine =
+        store.insert("c-user", None, "t", "r-user", 0, None, None, user.id).await.unwrap().id;
+    let theirs =
+        store.insert("c-admin", None, "t", "r-admin", 0, None, None, admin.id).await.unwrap().id;
+    // 同一来访会话，模拟会话各不相同（辅助请求与主请求就是这样）：上下文仍要连得上。
+    for (cred, rid, key) in [(mine, "req_mine", "lb:v2:a"), (theirs, "req_theirs", "lb:v2:b")] {
+        store
+            .insert_usage_log(&store::UsageRecord {
+                cred_id: Some(cred),
+                status: 400,
+                request_id: Some(rid.into()),
+                forensics: store::Forensics {
+                    simulated: true,
+                    error_message: Some("boom".into()),
+                    shape: Some(r#"{"tools":3}"#.into()),
+                    session_id_in: Some("sess-1".into()),
+                    session_key: Some(key.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let app = router(state);
+    let rpc = |key: &str, body: serde_json::Value, origin: Option<&str>| {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "luban.test")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        app.clone().oneshot(b.body(axum::body::Body::from(body.to_string())).unwrap())
+    };
+    let json_of = async |resp: axum::response::Response| {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let get = |key: &str, rid: &str| {
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_request", "arguments": {"request_id": rid}}});
+        rpc(key, call, None)
+    };
+    let text =
+        |v: &serde_json::Value| v["result"]["content"][0]["text"].as_str().unwrap().to_owned();
+
+    let init = serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}});
+    let resp = json_of(rpc(&admin_key, init.clone(), None).await.unwrap()).await;
+    assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+    let note = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    assert_eq!(rpc(&admin_key, note, None).await.unwrap().status(), StatusCode::ACCEPTED);
+
+    for bad in [provision_key.as_str(), "lbm-nope", "garbage"] {
+        assert_eq!(rpc(bad, init.clone(), None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        rpc(&admin_key, init.clone(), Some("https://evil.test")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let api = axum::http::Request::builder()
+        .uri("/api/usage")
+        .header(header::AUTHORIZATION, format!("Bearer {admin_key}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(api).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // admin 看得到别人的号与取证字段，存成 JSON 文本的字段展开成对象。
+    let v = json_of(get(&admin_key, "req_mine").await.unwrap()).await;
+    let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
+    let f = &found["requests"][0];
+    assert_eq!((f["simulated"].as_bool(), f["shape"]["tools"].as_i64()), (Some(true), Some(3)));
+    assert_eq!(found["earlier_in_session"].as_array().unwrap().len(), 0);
+    let v = json_of(get(&admin_key, "req_theirs").await.unwrap()).await;
+    let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
+    assert_eq!(found["earlier_in_session"][0]["request_id"], "req_mine", "同一会话之前的那条");
+
+    // 用户只查得到自己的号，取证字段按号主口径抹掉；别人的号当查不到。
+    let v = json_of(get(&user_key, "req_mine").await.unwrap()).await;
+    let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
+    let f = &found["requests"][0];
+    assert!(
+        f.get("shape").is_none()
+            && f.get("error_message").is_none()
+            && f.get("session_id_in").is_none()
+    );
+    let v = json_of(get(&user_key, "req_theirs").await.unwrap()).await;
+    assert_eq!(v["result"]["isError"], true);
+
+    let search = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "search_requests", "arguments": {"session_id": "sess-1", "limit": 1}}});
+    let v = json_of(rpc(&admin_key, search, None).await.unwrap()).await;
+    let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
+    assert_eq!(found["requests"][0]["request_id"], "req_theirs");
+    assert!(found["next_before_id"].is_i64(), "满一页给下一页的锚点");
+}

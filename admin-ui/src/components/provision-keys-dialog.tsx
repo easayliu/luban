@@ -6,6 +6,7 @@ import {
   deleteProvisionKey,
   listProvisionKeys,
   updateProvisionKey,
+  type ConsoleKeyKind,
   type ProvisionKey,
 } from '@/api/groups'
 import { useI18n } from '@/lib/i18n'
@@ -45,16 +46,34 @@ function scriptSnippet(key: string): string {
   ].join('\n')
 }
 
+/** 将 MCP Key 接入 Claude Code 的命令。装在用户级（`--scope user`），在任何目录下都能用。 */
+function mcpSnippet(key: string): string {
+  return `claude mcp add --scope user --transport http luban ${window.location.origin}/mcp --header "Authorization: Bearer ${key}"`
+}
+
 /**
- * 上号 Key（账号菜单 → 上号 Key）：给自动化脚本添加账号用。Key 只能调用取授权链接、交授权码
- * 与列出分组这几个接口，上的号落在建 Key 的人名下。明文只在新建时显示一次。
- * admin 能看到并管理所有人的 Key；代理和用户只看到自己的。
+ * 控制台 Key（账号菜单 → 上号 Key / MCP Key），明文仅在新建时显示一次。
+ * - 上号 Key：供自动化脚本添加账号，只能调用取授权链接、交授权码、列出分组与代理池几个接口，
+ *   添加的账号归创建者所有；
+ * - MCP Key：供 Claude Code 等 MCP 客户端按请求 ID 或会话查阅请求记录，只读，范围同创建者。
+ * admin 可查看并管理所有人的 Key；代理和用户只见自己的。
  */
-export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+export function ProvisionKeysDialog({
+  kind,
+  open,
+  onOpenChange,
+}: {
+  kind: ConsoleKeyKind
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const { t, language } = useI18n()
   const isAdmin = useIsAdmin()
   const qc = useQueryClient()
-  const keysQuery = useQuery({ queryKey: ['provision-keys'], queryFn: listProvisionKeys, enabled: open })
+  const mcp = kind === 'mcp'
+  const queryKey = [mcp ? 'mcp-keys' : 'provision-keys']
+  const snippet = mcp ? mcpSnippet : scriptSnippet
+  const keysQuery = useQuery({ queryKey, queryFn: () => listProvisionKeys(kind), enabled: open })
   const keys = keysQuery.data ?? []
   const [label, setLabel] = useState('')
   const [created, setCreated] = useState<string | null>(null)
@@ -63,9 +82,9 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
   const failed = (error: unknown) => {
     toastManager.add({ title: t('操作失败', 'Operation failed'), description: extractError(error, language), type: 'error' })
   }
-  const refresh = () => void qc.invalidateQueries({ queryKey: ['provision-keys'] })
+  const refresh = () => void qc.invalidateQueries({ queryKey })
   const create = useMutation({
-    mutationFn: (name: string) => createProvisionKey(name),
+    mutationFn: (name: string) => createProvisionKey(kind, name),
     onSuccess: (res) => {
       refresh()
       setLabel('')
@@ -74,7 +93,7 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
     onError: failed,
   })
   const toggle = useMutation({
-    mutationFn: (k: ProvisionKey) => updateProvisionKey(k.id, { label: k.label, disabled: !k.disabled }),
+    mutationFn: (k: ProvisionKey) => updateProvisionKey(kind, k.id, { label: k.label, disabled: !k.disabled }),
     onSuccess: (_r, k) => {
       refresh()
       toastManager.add({ title: k.disabled ? t('Key 已启用', 'Key enabled') : t('Key 已停用', 'Key disabled'), type: 'success' })
@@ -82,7 +101,7 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
     onError: failed,
   })
   const remove = useMutation({
-    mutationFn: (k: ProvisionKey) => deleteProvisionKey(k.id),
+    mutationFn: (k: ProvisionKey) => deleteProvisionKey(kind, k.id),
     onSuccess: () => {
       refresh()
       setDeleting(null)
@@ -102,9 +121,12 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
     <Dialog open={open} onOpenChange={close}>
       <DialogPopup className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>{t('上号 Key', 'Provision keys')}</DialogTitle>
+          <DialogTitle>{mcp ? t('MCP Key', 'MCP keys') : t('上号 Key', 'Provision keys')}</DialogTitle>
           <DialogDescription>
-            {t(
+            {mcp ? t(
+              '供 Claude Code 等 MCP 客户端按请求 ID 或会话查阅请求记录。修改密码后，名下的 MCP Key 全部失效。',
+              'Lets MCP clients such as Claude Code look up requests by request ID or session. Changing your password revokes all your MCP keys.',
+            ) : t(
               '供自动化脚本添加账号使用。Key 仅能调用获取授权链接、提交授权码、查询分组与代理池的接口，添加的账号归属于 Key 的创建者。未指定代理时，按挂载账号从少到多测试创建者代理池中的代理，使用第一条测试通过的；代理池为空时直连，均不通时报错。修改密码后，名下的上号 Key 全部失效。',
               'For scripts that add accounts. A key can only get authorization links, submit authorization codes, and list groups and proxies; accounts it adds belong to the key’s creator. Without a specified proxy, proxies in the creator’s pool are tested from least to most used and the first that passes is used; an empty pool connects directly, and the request fails if none pass. Changing your password revokes all your provision keys.',
             )}
@@ -122,10 +144,13 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
               </div>
               <div className="relative">
                 <pre className="max-w-full overflow-x-auto rounded-lg border bg-muted/72 p-3 pe-10 font-mono text-xs leading-5">
-                  {scriptSnippet(created)}
+                  {snippet(created)}
                 </pre>
                 <span className="absolute end-1.5 top-1.5">
-                  <CopyButton label={t('复制调用示例', 'Copy example')} text={scriptSnippet(created)} />
+                  <CopyButton
+                    label={mcp ? t('复制接入命令', 'Copy command') : t('复制调用示例', 'Copy example')}
+                    text={snippet(created)}
+                  />
                 </span>
               </div>
               <Button size="sm" variant="outline" onClick={() => setCreated(null)}>
@@ -146,7 +171,7 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
                   className="flex-1"
                   maxLength={64}
                   onChange={(event) => setLabel(event.target.value)}
-                  placeholder={t('名称，例如：批量上号脚本', 'Name, e.g. bulk add script')}
+                  placeholder={mcp ? t('名称，例如：本机 Claude Code', 'Name, e.g. my Claude Code') : t('名称，例如：批量上号脚本', 'Name, e.g. bulk add script')}
                   value={label}
                 />
                 <Button loading={create.isPending} type="submit">
@@ -155,16 +180,16 @@ export function ProvisionKeysDialog({ open, onOpenChange }: { open: boolean; onO
               </Form>
               <div className="divide-y rounded-lg border">
                 {keysQuery.isPending ? (
-                  <LoadingState className="min-h-24" label={t('正在加载上号 Key', 'Loading provision keys')} />
+                  <LoadingState className="min-h-24" label={mcp ? t('正在加载 MCP Key', 'Loading MCP keys') : t('正在加载上号 Key', 'Loading provision keys')} />
                 ) : keysQuery.isError ? (
                   <ErrorState
                     error={keysQuery.error}
-                    title={t('无法读取上号 Key', 'Unable to load provision keys')}
+                    title={mcp ? t('无法读取 MCP Key', 'Unable to load MCP keys') : t('无法读取上号 Key', 'Unable to load provision keys')}
                     onRetry={() => keysQuery.refetch()}
                     retrying={keysQuery.isFetching}
                   />
                 ) : keys.length === 0 ? (
-                  <div className="px-3 py-3 text-xs text-muted-foreground">{t('尚未创建上号 Key。', 'No provision keys yet.')}</div>
+                  <div className="px-3 py-3 text-xs text-muted-foreground">{mcp ? t('尚未创建 MCP Key。', 'No MCP keys yet.') : t('尚未创建上号 Key。', 'No provision keys yet.')}</div>
                 ) : keys.map((k) => (
                   <div className={cn('flex items-center gap-3 px-3 py-2.5 text-sm', k.disabled && 'opacity-64')} key={k.id}>
                     <KeyRoundIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />

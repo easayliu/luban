@@ -581,10 +581,17 @@ async fn provision_keys_only_reach_the_add_account_routes(pool: sqlx::PgPool) {
     let agent = create(&state, "agent1", UserRole::Agent, admin_id).await;
     let user = create(&state, "user1", UserRole::User, agent).await;
     let new_key = async |owner: i64| {
-        let key = crate::store::generate_provision_key();
+        let key = crate::store::generate_key(crate::store::KeyKind::Provision);
         let hash = state.store.user_password_hash(owner).await.unwrap().unwrap_or_default();
         let tag = super::password_tag(&state, UserRole::User, &hash);
-        (state.store.create_provision_key(owner, "script", &key, &tag).await.unwrap(), key)
+        (
+            state
+                .store
+                .create_provision_key(crate::store::KeyKind::Provision, owner, "script", &key, &tag)
+                .await
+                .unwrap(),
+            key,
+        )
     };
     let (id, key) = new_key(user).await;
 
@@ -620,17 +627,43 @@ async fn provision_keys_only_reach_the_add_account_routes(pool: sqlx::PgPool) {
     state.store.set_user_disabled(agent, false, None).await.unwrap();
 
     // 别人改不了、删不了；本人停用后失效。
-    assert!(!state.store.update_provision_key(id, Some(agent), "x", true).await.unwrap());
-    assert!(!state.store.delete_provision_key(id, Some(agent)).await.unwrap());
-    assert!(state.store.update_provision_key(id, Some(user), "script", true).await.unwrap());
+    assert!(
+        !state
+            .store
+            .update_provision_key(crate::store::KeyKind::Provision, id, Some(agent), "x", true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !state
+            .store
+            .delete_provision_key(Some(crate::store::KeyKind::Provision), id, Some(agent))
+            .await
+            .unwrap()
+    );
+    assert!(
+        state
+            .store
+            .update_provision_key(crate::store::KeyKind::Provision, id, Some(user), "script", true)
+            .await
+            .unwrap()
+    );
     assert_eq!(
         call(&app, Method::GET, "/api/authorize", Some(&key), "").await,
         StatusCode::UNAUTHORIZED
     );
-    let keys = state.store.list_provision_keys(None).await.unwrap();
+    let keys =
+        state.store.list_provision_keys(crate::store::KeyKind::Provision, None).await.unwrap();
     assert_eq!((keys.len(), keys[0].username.as_str()), (1, "user1"));
     assert!(keys[0].last_used_at.is_some());
-    assert!(state.store.list_provision_keys(Some(agent)).await.unwrap().is_empty());
+    assert!(
+        state
+            .store
+            .list_provision_keys(crate::store::KeyKind::Provision, Some(agent))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // 改密码（含被重置）：建 Key 时的指纹对不上，Key 作废并被删掉。
     let (id2, key2) = new_key(user).await;
@@ -642,13 +675,26 @@ async fn provision_keys_only_reach_the_add_account_routes(pool: sqlx::PgPool) {
         StatusCode::UNAUTHORIZED
     );
     assert!(
-        !state.store.list_provision_keys(None).await.unwrap().iter().any(|k| k.id == id2),
+        !state
+            .store
+            .list_provision_keys(crate::store::KeyKind::Provision, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k.id == id2),
         "作废的 Key 认证时就删掉"
     );
 
     // 删掉账号连带删 Key。
     state.store.delete_user(user, None).await.unwrap().unwrap();
-    assert!(state.store.list_provision_keys(None).await.unwrap().is_empty());
+    assert!(
+        state
+            .store
+            .list_provision_keys(crate::store::KeyKind::Provision, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// 代理和用户能打的路由快照：与真实路由表逐条对上。新加一条对他们开放的路由、或某条下线了，
@@ -712,6 +758,8 @@ fn member_routes_match_the_router() {
         "/credentials/{id}/usage",
         "/exchange",
         "/groups",
+        "/mcp-keys",
+        "/mcp-keys/{id}",
         "/metrics",
         "/models",
         "/provision-keys",

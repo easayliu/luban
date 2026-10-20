@@ -91,7 +91,12 @@ export async function revealApiKey(id: number): Promise<string> {
   return data.key
 }
 
-/** 一把上号 Key（不含明文）：脚本拿它只能走「添加账号」，上的号落在所属账号名下。 */
+/** 控制台 Key 的种类：上号 Key 供脚本添加账号，MCP Key 供 MCP 客户端查阅请求记录。 */
+export type ConsoleKeyKind = 'provision' | 'mcp'
+
+const KEY_PATHS: Record<ConsoleKeyKind, string> = { provision: '/provision-keys', mcp: '/mcp-keys' }
+
+/** 一把控制台 Key（不含明文），归创建它的成员所有，以其身份生效。 */
 export interface ProvisionKey {
   id: number
   user_id: number
@@ -106,21 +111,25 @@ export interface ProvisionKey {
   last_used_at: number | null
 }
 
-export async function listProvisionKeys(): Promise<ProvisionKey[]> {
-  const { data } = await api.get<ProvisionKey[]>('/provision-keys')
+export async function listProvisionKeys(kind: ConsoleKeyKind): Promise<ProvisionKey[]> {
+  const { data } = await api.get<ProvisionKey[]>(KEY_PATHS[kind])
   return data
 }
 
-/** 给自己新建一把上号 Key，回明文——只回这一次。 */
-export async function createProvisionKey(label: string): Promise<{ id: number; key: string }> {
-  const { data } = await api.post<{ id: number; key: string }>('/provision-keys', { label })
+/** 给自己新建一把 Key，回明文——只回这一次。 */
+export async function createProvisionKey(kind: ConsoleKeyKind, label: string): Promise<{ id: number; key: string }> {
+  const { data } = await api.post<{ id: number; key: string }>(KEY_PATHS[kind], { label })
   return data
 }
 
-export async function updateProvisionKey(id: number, input: { label: string; disabled: boolean }): Promise<void> {
-  await api.post(`/provision-keys/${id}`, input)
+export async function updateProvisionKey(
+  kind: ConsoleKeyKind,
+  id: number,
+  input: { label: string; disabled: boolean },
+): Promise<void> {
+  await api.post(`${KEY_PATHS[kind]}/${id}`, input)
 }
 
-export async function deleteProvisionKey(id: number): Promise<void> {
-  await api.delete(`/provision-keys/${id}`)
+export async function deleteProvisionKey(kind: ConsoleKeyKind, id: number): Promise<void> {
+  await api.delete(`${KEY_PATHS[kind]}/${id}`)
 }

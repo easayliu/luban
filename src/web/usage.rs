@@ -130,7 +130,7 @@ pub(super) async fn get_credential_stats(
 /// 设备 / 会话 id；二是 **luban 的改写细节**——走没走模拟、为什么走、请求体结构摘要、改写
 /// 标签。上游错误原文与零输出的回复片段也抹掉：前者个别会把请求体回显进来，后者就是模型
 /// 输出，都是下游的内容。号主是外部的人，这些看到了既泄露下游，也泄露手法。
-fn for_owner(mut log: store::UsageLog) -> store::UsageLog {
+pub(super) fn for_owner(mut log: store::UsageLog) -> store::UsageLog {
     log.device_id = None;
     log.ua = None;
     log.ua_out = None;

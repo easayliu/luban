@@ -29,6 +29,7 @@ mod groups;
 mod keepalive;
 mod learned;
 mod login;
+mod mcp;
 mod metrics;
 mod migrate;
 mod pricing;

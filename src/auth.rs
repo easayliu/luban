@@ -30,7 +30,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::store::{self, LEGACY_SHA256_PREFIX, Scope, User, UserRole};
+use crate::store::{self, KeyKind, LEGACY_SHA256_PREFIX, Scope, User, UserRole};
 use crate::web::AppState;
 
 type ApiError = (StatusCode, String);
@@ -485,6 +485,9 @@ const MEMBER_ROUTES: &[(&str, Owned)] = &[
     // 上号 Key：handler 按身份收窄到本人名下的（admin 看全部）。
     ("/provision-keys", Owned::Nothing),
     ("/provision-keys/{id}", Owned::Nothing),
+    // MCP Key：同上。
+    ("/mcp-keys", Owned::Nothing),
+    ("/mcp-keys/{id}", Owned::Nothing),
 ];
 
 /// 路由的访问级别，默认只给 admin。
@@ -506,7 +509,7 @@ fn access_of(path: &str) -> Access {
 ///   地址里的密码由 [`redact_url_credentials`] 遮掉；
 /// - `/users`：访客是来看号池的，用不着控制台账号名单；
 /// - `/api-keys`：带着查看明文的接口，看到就等于能用。
-/// - `/provision-keys`：访客建不了 Key，列表也没必要看。
+/// - `/provision-keys`、`/mcp-keys`：访客建不了 Key，列表也没必要看。
 const VIEWER_DENIED: &[&str] = &[
     "/authorize",
     "/export",
@@ -515,6 +518,7 @@ const VIEWER_DENIED: &[&str] = &[
     "/users",
     "/api-keys",
     "/provision-keys",
+    "/mcp-keys",
 ];
 
 /// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
@@ -734,14 +738,14 @@ async fn provision_key_request(
     next: Next,
 ) -> Response {
     let invalid = || (StatusCode::UNAUTHORIZED, "invalid provision key").into_response();
-    let hit = match state.store.provision_key_lookup(&token).await {
+    let hit = match state.store.provision_key_lookup(KeyKind::Provision, &token).await {
         Ok(Some(hit)) => hit,
         Ok(None) => return invalid(),
         Err(e) => return internal(e).into_response(),
     };
     // 密码指纹对不上（改过密码、被重置、环境变量里的密码换了或撤了）：这把 Key 作废、删掉。
     if !provision_key_current(state, hit.user.role, &hit.password_hash, &hit.pw_tag) {
-        if let Err(e) = state.store.delete_provision_key(hit.id, None).await {
+        if let Err(e) = state.store.delete_provision_key(None, hit.id, None).await {
             tracing::warn!(error = %e, key_id = hit.id, "failed to delete a revoked provision key");
         }
         return invalid();
@@ -765,6 +769,40 @@ async fn provision_key_request(
     req.extensions_mut().insert(Actor::from(user));
     req.extensions_mut().insert(ViaProvisionKey);
     redact_for_viewer(next.run(req).await).await
+}
+
+/// `/mcp` 的鉴权：认 MCP Key（[`KeyKind::Mcp`]），回所属成员与 Key 的 id。
+///
+/// 判据与上号 Key 同一套：Key 已停用、所属成员已停用或改过密码的都不认（改过密码的顺手删掉），
+/// 访客名下的也不认。只认 `Authorization: Bearer` 里的 MCP Key，会话 token 与上号 Key 一概不认：
+/// 任何一种控制台凭据泄露，都不该顺带多出一条读取流水的门路。形态不符的在查库之前即拒。
+// Err 就是要原样回给客户端的响应，每个请求只走一次，没必要装箱（同 `check_owned`）。
+#[allow(clippy::result_large_err)]
+pub(crate) async fn mcp_actor(
+    state: &AppState,
+    headers: &header::HeaderMap,
+) -> Result<(Actor, i64), Response> {
+    let invalid = || (StatusCode::UNAUTHORIZED, "invalid MCP key").into_response();
+    let token = bearer(headers).filter(|t| store::looks_like_key(t, KeyKind::Mcp));
+    let Some(token) = token else { return Err(invalid()) };
+    let hit = match state.store.provision_key_lookup(KeyKind::Mcp, token).await {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return Err(invalid()),
+        Err(e) => return Err(internal(e).into_response()),
+    };
+    if !provision_key_current(state, hit.user.role, &hit.password_hash, &hit.pw_tag) {
+        if let Err(e) = state.store.delete_provision_key(None, hit.id, None).await {
+            tracing::warn!(error = %e, key_id = hit.id, "failed to delete a revoked MCP key");
+        }
+        return Err(invalid());
+    }
+    if hit.user.effectively_disabled() || hit.user.role == UserRole::Viewer {
+        return Err(invalid());
+    }
+    if let Err(e) = state.store.touch_provision_key(hit.id).await {
+        tracing::warn!(error = %e, "failed to record MCP key use");
+    }
+    Ok((Actor::from(hit.user), hit.id))
 }
 
 // ---------- 接口 ----------

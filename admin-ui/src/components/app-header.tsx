@@ -6,6 +6,7 @@ import {
   KeyRoundIcon,
   LayersIcon,
   ReceiptIcon,
+  SearchCodeIcon,
   SettingsIcon,
   LogOutIcon,
   UsersIcon,
@@ -257,6 +258,7 @@ export function AccountMenu({
   const manage = onNavigate && (canManageUsers || isAdmin)
   const [passwordOpen, setPasswordOpen] = useState(false)
   const [provisionOpen, setProvisionOpen] = useState(false)
+  const [mcpOpen, setMcpOpen] = useState(false)
   const canChangePassword = role === 'agent' || role === 'user'
   // 访客只读，不能上号，也就用不着上号 Key。
   const canProvision = !!role && role !== 'viewer'
@@ -279,6 +281,11 @@ export function AccountMenu({
             <KeySquareIcon />{t('上号 Key', 'Provision keys')}
           </MenuItem>
         )}
+        {canProvision && (
+          <MenuItem onClick={() => setMcpOpen(true)}>
+            <SearchCodeIcon />{t('MCP Key', 'MCP keys')}
+          </MenuItem>
+        )}
         {canChangePassword && (
           <MenuItem onClick={() => setPasswordOpen(true)}>
             <KeyRoundIcon />{t('修改密码', 'Change password')}
@@ -286,7 +293,8 @@ export function AccountMenu({
         )}
       </PreferencesMenu>
       {canChangePassword && <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />}
-      {canProvision && <ProvisionKeysDialog open={provisionOpen} onOpenChange={setProvisionOpen} />}
+      {canProvision && <ProvisionKeysDialog kind="provision" open={provisionOpen} onOpenChange={setProvisionOpen} />}
+      {canProvision && <ProvisionKeysDialog kind="mcp" open={mcpOpen} onOpenChange={setMcpOpen} />}
     </>
   )
 }

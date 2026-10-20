@@ -268,7 +268,7 @@ pub(super) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// 它要进日志、进库、进错误体，还要原样回给下游，所以只认这套最保守的字符集——UUID、
 /// ULID、Stripe/Anthropic 那种 `req_…`、nginx 的 32 位 hex 都在内；带空格、引号、控制字符或
 /// 长得离谱的一律当没带，重新生成。
-fn acceptable_request_id(v: &str) -> bool {
+pub(crate) fn acceptable_request_id(v: &str) -> bool {
     (1..=128).contains(&v.len())
         && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
