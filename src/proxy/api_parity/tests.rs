@@ -99,10 +99,18 @@ fn sys(texts: &[&str]) -> serde_json::Value {
 /// 出站开头多一块 billing header、客户端块原样顺延：出站 1、2 对应来访 0、1。
 #[test]
 fn index_map_for_plain_prepend() {
-    let map = billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING, "a", "b"]), true);
+    let map = billing_system_index_map(
+        Some(&sys(&["a", "b"])),
+        &sys(&[BILLING, "a", "b"]),
+        SystemRewrite::Simulated,
+    );
     assert_eq!(map, Some(vec![0, 1]));
     // 真实 CC 缺 header、前插了一块：同样顺延一位。
-    let map = billing_system_index_map(Some(&sys(&["a", "b"])), &sys(&[BILLING, "a", "b"]), false);
+    let map = billing_system_index_map(
+        Some(&sys(&["a", "b"])),
+        &sys(&[BILLING, "a", "b"]),
+        SystemRewrite::RealCc,
+    );
     assert_eq!(map, Some(vec![0, 1]));
 }
 
@@ -111,15 +119,25 @@ fn index_map_for_plain_prepend() {
 #[test]
 fn index_map_follows_dropped_billing_lines() {
     let mixed = format!("{BILLING}\nbe brief");
-    let map = billing_system_index_map(Some(&sys(&[&mixed])), &sys(&[BILLING, "be brief"]), true);
+    let map = billing_system_index_map(
+        Some(&sys(&[&mixed])),
+        &sys(&[BILLING, "be brief"]),
+        SystemRewrite::Simulated,
+    );
     assert_eq!(map, Some(vec![0]));
-    let map = billing_system_index_map(Some(&sys(&[BILLING, "b"])), &sys(&[BILLING, "b"]), true);
+    // 客户端抄的那条与 luban 的不同（版本、cch 都换了）；逐字相同时出站就等于来访，下标本就不偏。
+    let copied = "x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;";
+    let map = billing_system_index_map(
+        Some(&sys(&[copied, "b"])),
+        &sys(&[BILLING, "b"]),
+        SystemRewrite::Simulated,
+    );
     assert_eq!(map, Some(vec![1]));
     // 空白块同样不出站：出站 1、2 对应来访 1、3。
     let map = billing_system_index_map(
         Some(&sys(&["", "a", " ", "b"])),
         &sys(&[BILLING, "a", "b"]),
-        true,
+        SystemRewrite::Simulated,
     );
     assert_eq!(map, Some(vec![1, 3]));
 }
@@ -128,9 +146,9 @@ fn index_map_follows_dropped_billing_lines() {
 #[test]
 fn index_map_refuses_when_blocks_do_not_line_up() {
     let out = sys(&[BILLING, "a", "b"]);
-    for simulated in [true, false] {
+    for rewrite in [SystemRewrite::Simulated, SystemRewrite::RealCc] {
         let map = |inb: &serde_json::Value, out: &serde_json::Value| {
-            billing_system_index_map(Some(inb), out, simulated)
+            billing_system_index_map(Some(inb), out, rewrite)
         };
         assert_eq!(map(&json!({"system": "a"}), &out), None);
         assert_eq!(map(&sys(&["a", "b"]), &sys(&[BILLING])), None);
@@ -146,9 +164,15 @@ fn index_map_leaves_real_cc_with_its_own_header_alone() {
     let both = format!("{BILLING}\n{BILLING}\n");
     let one = format!("{BILLING}\n");
     let inb = sys(&[&both, &one]);
-    assert_eq!(billing_system_index_map(Some(&inb), &inb, false), None);
+    assert_eq!(billing_system_index_map(Some(&inb), &inb, SystemRewrite::RealCc), None);
+    // 出站与来访逐字相同就是没改写过，按模拟规则也不改。
+    assert_eq!(billing_system_index_map(Some(&inb), &inb, SystemRewrite::Simulated), None);
     // 真实 CC 不删块：来访的空白块出站照在，按模拟那套跳过它就对不上。
-    let map = billing_system_index_map(Some(&sys(&["", "a"])), &sys(&[BILLING, "", "a"]), false);
+    let map = billing_system_index_map(
+        Some(&sys(&["", "a"])),
+        &sys(&[BILLING, "", "a"]),
+        SystemRewrite::RealCc,
+    );
     assert_eq!(map, Some(vec![0, 1]));
 }
 

@@ -72,8 +72,9 @@ use super::upstream::{
     upstream_error_kind, upstream_load_snapshot,
 };
 use super::{
-    BUDGET_EXCEEDS_MAX_TOKENS_MESSAGE, VERSION_REQUIRED_MESSAGE, billing_system_index_map,
-    client_budget_rejection, client_display_rejection, unshift_system_index,
+    BUDGET_EXCEEDS_MAX_TOKENS_MESSAGE, SystemRewrite, VERSION_REQUIRED_MESSAGE,
+    billing_system_index_map, client_budget_rejection, client_display_rejection,
+    unshift_system_index,
 };
 use super::{
     EarlyUpstreamFailure, MAX_BODY_BYTES, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY,

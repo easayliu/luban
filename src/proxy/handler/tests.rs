@@ -2082,6 +2082,36 @@ async fn billing_only_real_cc_maps_system_index_only_when_a_block_was_prepended(
     }
 }
 
+/// count_tokens 不计费、出站体原样透传：即便来访会被识别成模拟（非 CC UA），也没有前插或删块，
+/// 上游报的 `system.1` 原样回给客户端，不按模拟规则被改成 `system.0`。
+#[sqlx::test]
+async fn billing_only_count_tokens_keeps_upstream_system_index(pool: sqlx::PgPool) {
+    const TTL_1: &str = "system.1.cache_control.ephemeral.ttl: Input should be '5m' or '1h'";
+    let mock =
+        MockUpstream::start(vec![Reply::json_error(400, "invalid_request_error", TTL_1)]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::SIM_BILLING_ONLY, "1").await.unwrap();
+    let h = "x-anthropic-billing-header: cc_version=2.1.301.abc; cc_entrypoint=cli; cch=00000;";
+    let req = go_request(
+        serde_json::json!({
+            "model": "claude-sonnet-5",
+            "system": [
+                {"type": "text", "text": format!("{h}\n{h}\n")},
+                {"type": "text", "text": format!("{h}\n"),
+                 "cache_control": {"type": "ephemeral", "ttl": "2h"}},
+            ],
+        }),
+        &[],
+    );
+    let sent_body = req.1.clone();
+    let (status, _, body) = send_to(&state, "/v1/messages/count_tokens", req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.starts_with(TTL_1), "{msg}");
+    assert_eq!(mock.seen()[0].body, sent_body, "count_tokens 出站体原样透传");
+}
+
 /// 非 CC 客户端带 OpenClaw 那两个原文片段（不到 1900 字节、不会被挪走）：开关开着时本地回上游那条
 /// 第三方 400、不打上游，流水标 `rejected_locally:third-party`；关掉照发。
 #[sqlx::test]

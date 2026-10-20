@@ -647,14 +647,20 @@ async fn client_error(
         }
     }
     // billing-only 在 `system[0]` 前插了一块 billing header（模拟那条还可能去掉了客户端抄来的）：上游
-    // 报错里的 `system.N` 按块对应还原成客户端那份的下标，与 API Key 直连一致；按这条请求实际走的
-    // 那条路（模拟 / 真实 CC）的改写规则算（[`billing_system_index_map`]）。
-    let system_map = (!compressed
-        && flags.billing_only()
-        && err_bytes.windows(7).any(|w| w == b"system."))
-    .then(|| serde_json::from_slice::<serde_json::Value>(sent).ok())
-    .flatten()
-    .and_then(|out| billing_system_index_map(body_json.as_ref(), &out, upstream.sim.is_some()));
+    // 报错里的 `system.N` 按块对应还原成客户端那份的下标，与 API Key 直连一致；按这条请求**实际**
+    // 走的那条改写算（[`billing_system_index_map`]）。非计费路径（count_tokens 等）出站体原样透传，
+    // 没有改写可还原；模拟那条按它自己出站时的 `billing_only`，不读此刻的开关。
+    let rewrite = match &upstream.sim {
+        _ if !upstream.billable => None,
+        Some(s) => s.billing_only.then_some(SystemRewrite::Simulated),
+        None => flags.billing_only().then_some(SystemRewrite::RealCc),
+    };
+    let system_map = rewrite
+        .filter(|_| !compressed && err_bytes.windows(7).any(|w| w == b"system."))
+        .and_then(|rw| {
+            let out = serde_json::from_slice::<serde_json::Value>(sent).ok()?;
+            billing_system_index_map(body_json.as_ref(), &out, rw)
+        });
     let err_bytes = match system_map {
         Some(map) => unshift_system_index(&err_bytes, &map).unwrap_or(err_bytes),
         None => err_bytes,
