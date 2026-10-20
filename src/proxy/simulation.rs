@@ -1403,37 +1403,29 @@ pub(crate) fn simulate_system(
             cc_version_suffix(v, sim.profile.version),
             cch_value(),
         );
-        // 客户端自己的 system 按**原块**原样透传：不合并、不剥身份句、空块也不丢。它自己抄来的
-        // billing header 行原位改写成 luban 这份（[`rewrite_billing_lines`]），不删；首块本就以
-        // billing header 开头时改写后它就是 `system[0]`，不再前插，免得两条——否则前插一块，出站
-        // `system[k + 1]` 对应来访 `system[k]`，上游报错的下标按此还原（见
-        // [`billing_system_index_map`](crate::proxy::billing_system_index_map)）。唯一删的是
-        // `citations`：上游不收在 system 里（见下方多块路径同样处理），留着是一发稳定 400。
-        let mut client = match v.get("system") {
+        // 客户端自己的 system 按**原块**透传：不合并、不剥身份句，正文原样。唯二的改动：
+        // - 它自己抄来的 billing header 行（[`is_billing_line`]）由 luban 前插的这块顶替、原行去掉，
+        //   全局只留 `system[0]` 一条（`cch` 也只回填那一条）；只剩 header 的块随之去掉。首块
+        //   「header 行 + 业务指令」就拆成 `[luban header, 业务指令]`，不混成一块。
+        // - 去掉 `citations`：上游不收在 system 里（见下方多块路径同样处理），留着是一发稳定 400。
+        // 出站块与来访块的对应见 [`billing_only_client_texts`]，上游报错的下标按它还原。
+        let client = match v.get("system") {
             Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![text_block_bare(s)],
             Some(serde_json::Value::Array(a)) => a.clone(),
             _ => Vec::new(),
         };
-        for b in &mut client {
+        let texts = billing_only_client_texts(&client);
+        let mut blocks = vec![text_block_bare(&header)];
+        for (i, text) in texts {
+            let mut b = client[i].clone();
             if let Some(o) = b.as_object_mut() {
                 o.shift_remove("citations");
-                if let Some(text) = o.get("text").and_then(|t| t.as_str())
-                    && let Some(rewritten) = rewrite_billing_lines(text, &header)
-                {
-                    o.insert("text".into(), serde_json::Value::String(rewritten));
+                if let Some(std::borrow::Cow::Owned(t)) = text {
+                    o.insert("text".into(), serde_json::Value::String(t));
                 }
             }
+            blocks.push(b);
         }
-        let leads_with_header = client.first().is_some_and(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.starts_with("x-anthropic-billing-header:"))
-        });
-        let mut blocks = Vec::with_capacity(client.len() + 1);
-        if !leads_with_header {
-            blocks.push(text_block_bare(&header));
-        }
-        blocks.extend(client);
         insert_top_level(v, "system", serde_json::Value::Array(blocks), &["messages", "model"]);
         return true;
     }
@@ -1582,7 +1574,7 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
         }
         true
     });
-    // 处理合并后嵌在一大段文本里的情况：子串级剥（与 billing-only 路径共用 [`strip_cc_preamble_lines`]）。
+    // 处理合并后嵌在一大段文本里的情况：子串级剥（[`strip_cc_preamble_lines`]）。
     for b in &mut blocks {
         let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
             continue;
@@ -1595,35 +1587,53 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
     blocks
 }
 
-/// 行级剥掉一段 `system` 文本里可能抄自官方的 billing header 行与身份句，保留其余正文与换行。
-/// 把 `text` 里每一行 billing header（从 `x-anthropic-billing-header:` 起到行尾）换成 `header`，
-/// 同一行里它前面的内容与其余各行原样不动。一行都没有返回 `None`。billing-only 下客户端抄来的
-/// 那条按 luban 的版本 / 入口 / cch 改写，而不是删掉（[`simulate_system`]）；报错下标还原也拿它
-/// 把两边归一后再逐块比对（[`billing_system_index_map`](crate::proxy::billing_system_index_map)）。
-pub(in crate::proxy) fn rewrite_billing_lines(text: &str, header: &str) -> Option<String> {
-    const KEY: &str = "x-anthropic-billing-header:";
-    if !text.contains(KEY) {
-        return None;
-    }
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        match line.find(KEY) {
-            Some(at) => {
-                out.push_str(&line[..at]);
-                out.push_str(header);
-            }
-            None => out.push_str(line),
-        }
-    }
-    Some(out)
+const BILLING_KEY: &str = "x-anthropic-billing-header:";
+
+/// 这一行是不是一条 billing header：行首（容许前导空白）就是 `x-anthropic-billing-header:`。
+/// 只出现在行中间的（客户端指令里提到这个词）不算，免得把同一行的指令一起吞掉。
+fn is_billing_line(line: &str) -> bool {
+    line.trim_start().starts_with(BILLING_KEY)
 }
 
-/// [`strip_cc_preamble`] 的子串分支与 billing-only 路径共用：后者按客户端原块透传，只能**行级**剥，
-/// 整块丢会连「billing header 行 + 单换行 + 业务指令」里的指令一起删。文本里没有这两样时原样返回。
-pub(in crate::proxy) fn strip_cc_preamble_lines(text: &str) -> String {
+/// billing-only 下客户端各 `system` 块出站的样子：`(来访下标, 正文)`，按来访顺序，出站时依次跟在
+/// luban 前插的 billing header 之后（[`simulate_system`]）。正文 `None` 是没有 `text` 的块（原样
+/// 带上）；`Borrowed` 是原文不动；`Owned` 是去掉了抄来的 billing header 行（[`is_billing_line`]）
+/// 之后的正文。去掉之后只剩空白的块整块不出站、不在表里；客户端原本就是空文本的块照带（上游
+/// 回什么由它自己负责，与直连一致）。报错下标还原用同一张表（[`billing_system_index_map`]）。
+///
+/// [`billing_system_index_map`]: crate::proxy::billing_system_index_map
+pub(in crate::proxy) fn billing_only_client_texts(
+    blocks: &[serde_json::Value],
+) -> Vec<(usize, Option<std::borrow::Cow<'_, str>>)> {
+    use std::borrow::Cow;
+    blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
+                return Some((i, None));
+            };
+            if !text.split('\n').any(is_billing_line) {
+                return Some((i, Some(Cow::Borrowed(text))));
+            }
+            let mut kept: String =
+                text.split_inclusive('\n').filter(|l| !is_billing_line(l)).collect();
+            // 去掉的是末行时，前一行的换行成了多余的尾巴；原文本不以换行收尾就把它去掉。
+            if !text.ends_with('\n') && kept.ends_with('\n') {
+                kept.pop();
+                if kept.ends_with('\r') {
+                    kept.pop();
+                }
+            }
+            (!kept.trim().is_empty()).then_some((i, Some(Cow::Owned(kept))))
+        })
+        .collect()
+}
+
+/// 行级剥掉一段 `system` 文本里可能抄自官方的 billing header 行与身份句，保留其余正文与换行。
+/// [`strip_cc_preamble`] 的子串分支用：合并块里两样嵌在一大段文本中，整块丢会连「billing header
+/// 行 + 单换行 + 业务指令」里的指令一起删。文本里没有这两样时原样返回。
+fn strip_cc_preamble_lines(text: &str) -> String {
     if !text.contains(config::CC_SYSTEM_IDENTITY) && !text.contains("x-anthropic-billing-header:") {
         return text.to_string();
     }
