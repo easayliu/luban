@@ -2895,6 +2895,28 @@ mod billing_only {
         assert_eq!(billing_header_count(&v), 1, "{v}");
     }
 
+    /// 段落中间的 header 行只去它自己，段落间的空行照留；原文不以换行收尾、header 在末行时，
+    /// 前面留下的尾随空行一并收掉。
+    #[test]
+    fn keeps_paragraph_breaks_around_a_removed_header() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-opus-5-5", "max_tokens": 64,
+                "system": [
+                    {"type": "text", "text": "Rules A\nx-anthropic-billing-header: cc_version=1; cch=12345;\n\nRules B"},
+                    {"type": "text", "text": "a\n\nx-anthropic-billing-header: cc_version=1; cch=12345;"},
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        );
+        let v = billing_only_out(&raw);
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys[1]["text"], "Rules A\n\nRules B", "段落间空行照留");
+        assert_eq!(sys[2]["text"], "a", "不留尾随换行");
+        assert_eq!(billing_header_count(&v), 1, "{v}");
+    }
+
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {
         let sim = detect_for(raw, on_flags()).unwrap();
         serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", on_flags(), Some(&sim), None))

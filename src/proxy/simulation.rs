@@ -1409,33 +1409,26 @@ pub(crate) fn simulate_system(
         //   「header 行 + 业务指令」就拆成 `[luban header, 业务指令]`，不混成一块。
         // - 正文只有空白的块去掉：上游回 400 `text content blocks must be non-empty`。
         // - 去掉 `citations`：上游不收在 system 里（见下方多块路径同样处理），留着是一发稳定 400。
-        // 出站块与来访块的对应见 [`billing_only_client_texts`]，上游报错的下标按它还原。
+        // 每块的去留见 [`billing_only_block_fates`]，上游报错的下标按同一份还原。
         // 整个取出来按值组装：客户端 system 可能几十 KB，不必为改几个字段整份拷贝。
         let client = match v.get_mut("system").map(serde_json::Value::take) {
             Some(serde_json::Value::String(s)) => vec![text_block_bare(&s)],
             Some(serde_json::Value::Array(a)) => a,
             _ => Vec::new(),
         };
-        // 只留改过的正文（`Owned`），借用随之结束，下面才能按值拿走客户端的块。
-        let mut changed: std::collections::VecDeque<(usize, Option<String>)> =
-            billing_only_client_texts(&client)
-                .into_iter()
-                .map(|(i, t)| match t {
-                    Some(std::borrow::Cow::Owned(t)) => (i, Some(t)),
-                    _ => (i, None),
-                })
-                .collect();
-        let mut blocks = Vec::with_capacity(changed.len() + 1);
+        let fates = billing_only_block_fates(&client);
+        let mut blocks = Vec::with_capacity(client.len() + 1);
         blocks.push(text_block_bare(&header));
-        for (i, mut b) in client.into_iter().enumerate() {
-            let Some((_, text)) = changed.pop_front_if(|(k, _)| *k == i) else {
-                continue;
-            };
+        for (mut b, fate) in client.into_iter().zip(fates) {
             if let Some(o) = b.as_object_mut() {
-                o.shift_remove("citations");
-                if let Some(t) = text {
-                    o.insert("text".into(), serde_json::Value::String(t));
+                match fate {
+                    BlockFate::Drop => continue,
+                    BlockFate::Rewrite(t) => {
+                        o.insert("text".into(), serde_json::Value::String(t));
+                    }
+                    BlockFate::Keep => {}
                 }
+                o.shift_remove("citations");
             }
             blocks.push(b);
         }
@@ -1609,49 +1602,51 @@ fn is_billing_line(line: &str) -> bool {
     line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}').starts_with(BILLING_KEY)
 }
 
-/// billing-only 下客户端各 `system` 块出站的样子：`(来访下标, 正文)`，按来访顺序，出站时依次跟在
-/// luban 前插的 billing header 之后（[`simulate_system`]）。正文 `None` 是没有 `text` 的块（原样
-/// 带上）；`Borrowed` 是原文不动；`Owned` 是去掉了抄来的 billing header 行（[`is_billing_line`]）
-/// 之后的正文，紧跟在去掉那行后面的空行一并去掉，不留多余的换行。正文只剩空白的块（原本就空、
-/// 或去掉 header 后变空）整块不出站、不在表里：上游不收空文本块。报错下标还原用同一张表
-/// （[`billing_system_index_map`]）。
+/// billing-only 下客户端一个 `system` 块的去留，见 [`billing_only_block_fates`]。
+#[derive(Debug, PartialEq)]
+pub(in crate::proxy) enum BlockFate {
+    /// 原样出站（没有 `text` 的块也是这样）。
+    Keep,
+    /// 去掉抄来的 billing header 行之后的正文。
+    Rewrite(String),
+    /// 不出站。
+    Drop,
+}
+
+/// billing-only 下客户端各 `system` 块的去留，与来访逐块对应；出站时依次跟在 luban 前插的
+/// billing header 之后（[`simulate_system`]）。
+/// - 抄来的 billing header 行（[`is_billing_line`]）去掉，改写成 [`BlockFate::Rewrite`]。块开头的
+///   header 行后面紧跟的空行一并去掉，不留开头换行；段落中间的 header 行只去它自己，段落间的
+///   空行照留。原文不以换行收尾的，去掉末行后留下的尾随换行也收掉。
+/// - 正文只剩空白的块（原本就空、或去掉 header 后变空）是 [`BlockFate::Drop`]：上游不收空文本块。
+///
+/// 报错下标还原用同一份（[`billing_system_index_map`]）。
 ///
 /// [`billing_system_index_map`]: crate::proxy::billing_system_index_map
-pub(in crate::proxy) fn billing_only_client_texts(
-    blocks: &[serde_json::Value],
-) -> Vec<(usize, Option<std::borrow::Cow<'_, str>>)> {
-    use std::borrow::Cow;
+pub(in crate::proxy) fn billing_only_block_fates(blocks: &[serde_json::Value]) -> Vec<BlockFate> {
     blocks
         .iter()
-        .enumerate()
-        .filter_map(|(i, b)| {
+        .map(|b| {
             let Some(text) = b.get("text").and_then(|t| t.as_str()) else {
-                return Some((i, None));
+                return BlockFate::Keep;
             };
             if text.trim().is_empty() {
-                return None;
+                return BlockFate::Drop;
             }
             if !text.split('\n').any(is_billing_line) {
-                return Some((i, Some(Cow::Borrowed(text))));
+                return BlockFate::Keep;
             }
             let mut kept = String::with_capacity(text.len());
-            let mut after_header = false;
             for line in text.split_inclusive('\n') {
-                if is_billing_line(line) {
-                    after_header = true;
-                } else if !(after_header && line.trim().is_empty()) {
-                    after_header = false;
+                // 还没留下任何正文时的空行，是块开头 header 行后面的那些。
+                if !is_billing_line(line) && !(kept.is_empty() && line.trim().is_empty()) {
                     kept.push_str(line);
                 }
             }
-            // 去掉的是末行时，前一行的换行成了多余的尾巴；原文本不以换行收尾就把它去掉。
-            if !text.ends_with('\n') && kept.ends_with('\n') {
-                kept.pop();
-                if kept.ends_with('\r') {
-                    kept.pop();
-                }
+            if !text.ends_with('\n') {
+                kept.truncate(kept.trim_end_matches(['\n', '\r']).len());
             }
-            (!kept.trim().is_empty()).then_some((i, Some(Cow::Owned(kept))))
+            if kept.trim().is_empty() { BlockFate::Drop } else { BlockFate::Rewrite(kept) }
         })
         .collect()
 }
