@@ -1595,38 +1595,25 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 
 const BILLING_KEY: &str = "x-anthropic-billing-header:";
 
-/// 这一行是不是一条抄来的 billing header：行首（容许 BOM 与至多 3 个空格）就是
-/// `x-anthropic-billing-header:`，且带 `cc_version` 字段（按字段名精确比对；官方 header 恒带，上游放行也认它）。只出现在
-/// 行中间的（客户端指令里提到这个词、或引用成 `> x-anthropic-...`）、缩进 4 格或 Tab 起头的
-/// （Markdown 缩进代码块）、没有 `cc_version=` 的示例值都不算，免得把客户端的指令与示例一起吞掉。
-/// 围栏代码块里的行由调用方另外保护（[`billing_only_block_fates`]）。
+/// 这一行是不是一条抄来的 billing header：行首（只容许 BOM，不容许缩进）就是
+/// `x-anthropic-billing-header:`，且带 `cc_version` 字段（按 `;` 拆字段、按第一个 `=` 拆名与值，
+/// 名字精确比对；官方 header 恒带，上游放行也认它）。只出现在行中间的（客户端指令里提到这个词、
+/// 或引用成 `> x-anthropic-...`）、带缩进的（列表项里的内容等）、没有 `cc_version` 字段的示例值
+/// 都不算，免得把客户端的指令与示例一起吞掉。代码块里的行由调用方另外保护
+/// （[`markdown_code_ranges`]）。
 fn is_billing_line(line: &str) -> bool {
-    let line = line.trim_start_matches('\u{feff}');
-    let body = line.trim_start_matches(' ');
-    if line.len() - body.len() > 3 {
-        return false;
-    }
-    // 按 `;` 拆字段、按第一个 `=` 拆名与值，字段名精确等于 `cc_version` 才算，
-    // `not_cc_version=` 之类不算。
-    body.strip_prefix(BILLING_KEY).is_some_and(|fields| {
+    line.trim_start_matches('\u{feff}').strip_prefix(BILLING_KEY).is_some_and(|fields| {
         fields.split(';').any(|f| f.split_once('=').is_some_and(|(k, _)| k.trim() == "cc_version"))
     })
 }
 
-/// 一行若是 Markdown 围栏（CommonMark：至多 3 格缩进，3 个以上同一字符 `` ` `` 或 `~`），返回
-/// `(字符, 长度, 其后是否只有空白)`。反引号围栏的信息串里不许再有反引号，有就不是围栏。
-fn code_fence(line: &str) -> Option<(char, usize, bool)> {
-    let body = line.trim_start_matches(' ');
-    if line.len() - body.len() > 3 {
-        return None;
-    }
-    let ch = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = body.len() - body.trim_start_matches(ch).len();
-    let rest = &body[len..];
-    if len < 3 || (ch == '`' && rest.contains('`')) {
-        return None;
-    }
-    Some((ch, len, rest.trim().is_empty()))
+/// `text` 按 Markdown 解析出的代码块（围栏与缩进，含列表、引用等容器里的）的字节范围。
+fn markdown_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    Parser::new(text)
+        .into_offset_iter()
+        .filter_map(|(ev, r)| matches!(ev, Event::Start(Tag::CodeBlock(_))).then_some(r))
+        .collect()
 }
 
 /// billing-only 下客户端一个 `system` 块的去留，见 [`billing_only_block_fates`]。
@@ -1643,7 +1630,7 @@ pub(in crate::proxy) enum BlockFate {
 /// billing-only 下客户端各 `system` 块的去留，与来访逐块对应；出站时依次跟在 luban 前插的
 /// billing header 之后（[`simulate_system`]）。
 /// - 抄来的 billing header 行（[`is_billing_line`]）去掉，改写成 [`BlockFate::Rewrite`]；代码围栏
-///   （[`code_fence`]）与缩进代码块里的行是客户端的示例，一律不动。块开头的
+///   与缩进代码块（[`markdown_code_ranges`]）里的行是客户端的示例，一律不动。块开头的
 ///   header 行后面紧跟的空行一并去掉，不留开头换行；段落中间的 header 行只去它自己，段落间的
 ///   空行照留。原文不以换行收尾的，去掉末行后留下的尾随换行也收掉。
 /// - 正文只剩空白的块（原本就空、或去掉 header 后变空）是 [`BlockFate::Drop`]：上游不收空文本块。
@@ -1661,19 +1648,20 @@ pub(in crate::proxy) fn billing_only_block_fates(blocks: &[serde_json::Value]) -
             if text.trim().is_empty() {
                 return BlockFate::Drop;
             }
+            if !text.split('\n').any(is_billing_line) {
+                return BlockFate::Keep;
+            }
+            // 有候选行才解析：代码块里的行是客户端的示例，一律不动。
+            let code = markdown_code_ranges(text);
             let mut kept = String::with_capacity(text.len());
-            // 开着的围栏：开启时的字符与长度。只有同字符、不短于它、其后只有空白的围栏行才关得上。
-            let mut fence: Option<(char, usize)> = None;
             let mut removed = false;
+            let mut at = 0;
             for line in text.split_inclusive('\n') {
-                match (fence, code_fence(line)) {
-                    (None, Some((ch, len, _))) => fence = Some((ch, len)),
-                    (Some((ch, len)), Some((c, l, true))) if c == ch && l >= len => fence = None,
-                    (None, None) if is_billing_line(line) => {
-                        removed = true;
-                        continue;
-                    }
-                    _ => {}
+                let start = at;
+                at += line.len();
+                if is_billing_line(line) && !code.iter().any(|r| r.contains(&start)) {
+                    removed = true;
+                    continue;
                 }
                 // 块开头 header 行后面紧跟的空行（去掉过 header、还没留下任何正文）不留。
                 if removed && kept.is_empty() && line.trim().is_empty() {

@@ -2856,7 +2856,7 @@ mod billing_only {
                 "system": [
                     {"type": "text", "text": mention},
                     {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;"},
-                    {"type": "text", "text": "a\r\n  x-anthropic-billing-header: cc_version=1; cch=00000;\r\nb"},
+                    {"type": "text", "text": "a\r\nx-anthropic-billing-header: cc_version=1; cch=00000;\r\nb"},
                 ],
                 "messages": [{"role": "user", "content": "hi"}],
             }))
@@ -3011,6 +3011,34 @@ mod billing_only {
             );
             let v = billing_only_out(&raw);
             assert_eq!(v["system"][1]["text"], want, "{v}");
+        }
+    }
+
+    /// 列表里的代码示例（无序、有序、嵌套列表，按 Markdown 解析出的代码块范围）原样保留；列表项里
+    /// 带缩进的 header 行也不算抄来的。只去块首那条真 header。
+    #[test]
+    fn list_code_blocks_and_indented_list_items_keep_examples() {
+        const HDR: &str =
+            "x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=12345;\n";
+        const EX: &str = "x-anthropic-billing-header: cc_version=9.9.9; cch=00000;";
+        let cases = [
+            format!("请输出列表中的 HTTP 示例：\n\n- ```http\n  {EX}\n  ```"),
+            format!("请输出列表中的 HTTP 示例：\n\n1. ```http\n   {EX}\n   ```"),
+            format!("嵌套：\n\n- 外层\n  - ```http\n    {EX}\n    ```"),
+            format!("> ```http\n> {EX}\n> ```"),
+            format!("- 示例值：\n  {EX}"),
+        ];
+        for rest in cases {
+            let raw = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-opus-5-5", "max_tokens": 64,
+                    "system": [{"type": "text", "text": format!("{HDR}{rest}")}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            );
+            let v = billing_only_out(&raw);
+            assert_eq!(v["system"][1]["text"], rest.as_str(), "示例原样保留: {v}");
         }
     }
 
