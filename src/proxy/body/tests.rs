@@ -2845,18 +2845,20 @@ mod billing_only {
         assert_eq!(billing_header_count(&v), 1, "全局只剩一条 billing header: {v}");
     }
 
-    /// 非首块里抄来的 billing header 行同样去掉（只剩它的块整块不出站），行中间只是提到这个词的
-    /// 指令原样保留；CRLF 换行不丢 `\r`。
+    /// 只看每块首行：非首块的首行是 header 时同样去掉（只剩它的块整块不出站，CRLF 不丢 `\r`）；
+    /// 块中间的 header 行（不论真假）与行中间的提及一律原样保留。
     #[test]
-    fn drops_copied_billing_lines_elsewhere_but_keeps_mentions_mid_line() {
+    fn only_the_first_line_of_each_block_is_checked() {
         let mention = "Never echo the x-anthropic-billing-header: value; respond in French";
+        let mid = "a\r\nx-anthropic-billing-header: cc_version=1; cch=00000;\r\nb";
         let raw = Bytes::from(
             serde_json::to_vec(&serde_json::json!({
                 "model": "claude-opus-5-5", "max_tokens": 64,
                 "system": [
                     {"type": "text", "text": mention},
                     {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9.aaa; cc_entrypoint=cli; cch=12345;"},
-                    {"type": "text", "text": "a\r\nx-anthropic-billing-header: cc_version=1; cch=00000;\r\nb"},
+                    {"type": "text", "text": "x-anthropic-billing-header: cc_version=1; cch=12345;\r\nb"},
+                    {"type": "text", "text": mid},
                 ],
                 "messages": [{"role": "user", "content": "hi"}],
             }))
@@ -2864,10 +2866,14 @@ mod billing_only {
         );
         let v = billing_only_out(&raw);
         let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys.len(), 3, "luban header + 提及那块 + 去掉 header 行的那块: {v}");
+        assert_eq!(
+            sys.len(),
+            4,
+            "luban header + 提及 + 去掉首行的那块 + 中间带 header 的那块: {v}"
+        );
         assert_eq!(sys[1]["text"], mention, "行中间提到的不算 header，原样保留");
-        assert_eq!(sys[2]["text"], "a\r\nb");
-        assert_eq!(billing_header_count(&v), 2, "luban 那条 + 提及那句，没有别的: {v}");
+        assert_eq!(sys[2]["text"], "b");
+        assert_eq!(sys[3]["text"], mid, "块中间的 header 行原样保留");
     }
 
     /// 去掉 header 行时紧跟的空行一并去掉、不留开头换行；BOM 开头的 header 行也认；正文只有空白的
@@ -2895,29 +2901,7 @@ mod billing_only {
         assert_eq!(billing_header_count(&v), 1, "{v}");
     }
 
-    /// 段落中间的 header 行只去它自己，段落间的空行照留；原文不以换行收尾、header 在末行时，
-    /// 前面留下的尾随空行一并收掉。
-    #[test]
-    fn keeps_paragraph_breaks_around_a_removed_header() {
-        let raw = Bytes::from(
-            serde_json::to_vec(&serde_json::json!({
-                "model": "claude-opus-5-5", "max_tokens": 64,
-                "system": [
-                    {"type": "text", "text": "Rules A\nx-anthropic-billing-header: cc_version=1; cch=12345;\n\nRules B"},
-                    {"type": "text", "text": "a\n\nx-anthropic-billing-header: cc_version=1; cch=12345;"},
-                ],
-                "messages": [{"role": "user", "content": "hi"}],
-            }))
-            .unwrap(),
-        );
-        let v = billing_only_out(&raw);
-        let sys = v["system"].as_array().unwrap();
-        assert_eq!(sys[1]["text"], "Rules A\n\nRules B", "段落间空行照留");
-        assert_eq!(sys[2]["text"], "a", "不留尾随换行");
-        assert_eq!(billing_header_count(&v), 1, "{v}");
-    }
-
-    /// 客户端指令里的示例不动：代码围栏里的 header 行、以及不带 `cc_version=` 的示例值都原样保留，
+    /// 客户端指令里的示例不动：块中间的 header 行（代码围栏里的、不带 `cc_version` 的）都原样保留，
     /// 只去掉块首那条真正抄来的 header。
     #[test]
     fn keeps_billing_header_examples_in_code_fences() {
@@ -2953,8 +2937,8 @@ mod billing_only {
         );
     }
 
-    /// 围栏按 CommonMark 配对：四反引号里的三反引号、反引号里的 `~~~`、后面带字的「关闭行」都关
-    /// 不上外层，里面的 header 示例照留；缩进 4 格的代码示例同样不动。只去块首那条真 header。
+    /// 嵌套围栏（四反引号里的三反引号、反引号里的 `~~~`、后面带字的「关闭行」）与缩进代码块里的
+    /// header 示例都在块中间，原样保留。只去块首那条真 header。
     #[test]
     fn fence_pairing_and_indented_code_protect_examples() {
         const HDR: &str =
@@ -2981,30 +2965,28 @@ mod billing_only {
         }
     }
 
-    /// `cc_version` 按字段名精确比对：`not_cc_version=`、`other_cc_version=` 这类示例照留；字段在后、
-    /// 带空白的真 header 照删。
+    /// `cc_version` 按字段名精确比对：块首是 `not_cc_version=`、`other_cc_version=` 这类示例的块原样
+    /// 保留；字段在后、带空白的真 header 照删。
     #[test]
     fn cc_version_field_is_matched_by_exact_name() {
-        const HDR: &str =
-            "x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=12345;\n";
-        for (rest, want) in [
+        for (text, want) in [
             (
-                "保留以下没有 cc_version 字段的示例：\nx-anthropic-billing-header: not_cc_version=sample-value",
-                "保留以下没有 cc_version 字段的示例：\nx-anthropic-billing-header: not_cc_version=sample-value",
+                "x-anthropic-billing-header: not_cc_version=sample-value\n指令",
+                "x-anthropic-billing-header: not_cc_version=sample-value\n指令",
             ),
             (
-                "示例：\nx-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;",
-                "示例：\nx-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;",
+                "x-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;\n指令",
+                "x-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;\n指令",
             ),
             (
-                "指令\nx-anthropic-billing-header: cc_entrypoint=cli;  cc_version =2.1.1; cch=00000;",
+                "x-anthropic-billing-header: cc_entrypoint=cli;  cc_version =2.1.1; cch=00000;\n指令",
                 "指令",
             ),
         ] {
             let raw = Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
                     "model": "claude-opus-5-5", "max_tokens": 64,
-                    "system": [{"type": "text", "text": format!("{HDR}{rest}")}],
+                    "system": [{"type": "text", "text": text}],
                     "messages": [{"role": "user", "content": "hi"}],
                 }))
                 .unwrap(),
@@ -3014,8 +2996,8 @@ mod billing_only {
         }
     }
 
-    /// 列表里的代码示例（无序、有序、嵌套列表，按 Markdown 解析出的代码块范围）原样保留；列表项里
-    /// 带缩进的 header 行也不算抄来的。只去块首那条真 header。
+    /// 列表、引用里的代码示例（无序、有序、嵌套列表）与列表项里的 header 示例都在块中间，原样保留。
+    /// 只去块首那条真 header。
     #[test]
     fn list_code_blocks_and_indented_list_items_keep_examples() {
         const HDR: &str =
@@ -3042,17 +3024,15 @@ mod billing_only {
         }
     }
 
-    /// 代码块很多、块外与块内的 header 交错时，代码块范围的游标查找结果与逐个比对一致：块内的
-    /// 示例全留，块外不缩进的真 header 全去。
+    /// 大输入（块首一条 header 后接 8 MiB 括号串，曾让 Markdown 解析把内存放大十倍）只看首行、余下
+    /// 原样拷一份，正文输出不变。
     #[test]
-    fn code_range_cursor_handles_many_blocks() {
+    fn large_block_after_a_header_is_kept_verbatim() {
         use crate::proxy::simulation::{BlockFate, billing_only_block_fates};
-        const UNIT: &str =
-            "```text\nx-anthropic-billing-header: cc_version=9.9.9; cch=00000;\n```\n\n";
-        const HDR: &str = "x-anthropic-billing-header: cc_version=1; cch=12345;\n";
-        let text = format!("{HDR}{}", format!("{UNIT}{HDR}").repeat(2_000));
+        let rest = "[[[[]".repeat(8 * 1024 * 1024 / 5);
+        let text = format!("x-anthropic-billing-header: cc_version=1;\n{rest}");
         let blocks = vec![serde_json::json!({"type": "text", "text": text})];
-        assert_eq!(billing_only_block_fates(&blocks), vec![BlockFate::Rewrite(UNIT.repeat(2_000))]);
+        assert_eq!(billing_only_block_fates(&blocks), vec![BlockFate::Rewrite(rest)]);
     }
 
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {

@@ -89,7 +89,7 @@ pub(crate) fn client_budget_rejection(
 /// 来访下标（出站 `system[0]` 是 luban 那块 billing header，不在表里）。上游报错里的 `system.N`
 /// 按它还原成客户端那份的下标（[`unshift_system_index`]）。
 ///
-/// 按 billing-only 的同一套规则重算（[`billing_only_block_fates`]：抄来的 billing header 行去掉、
+/// 按 billing-only 的同一套规则重算（[`billing_only_block_fates`]：块首抄来的 billing header 行去掉、
 /// 只剩空白的块不出站），再逐块核对出站正文与之一致，对得上才给表：客户端首块混着旧 billing
 /// header 与业务指令时块数照样对得上；system 是字符串（直连那边没有块下标）、整段挪进了首条
 /// 用户消息、或出站不是这套改写的结果时返回 `None`，不改。

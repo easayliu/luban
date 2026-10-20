@@ -63,8 +63,6 @@ xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
-# billing-only 认客户端 system 里的代码块范围（示例里的 billing header 不删），只用解析器、不渲染 HTML。
-pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [dev-dependencies]
 # 仅测试用：构造 gzip 响应，验证上游客户端确实会透明解码（见 proxy 的 decodes_gzip_* 测试）。

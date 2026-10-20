@@ -1404,8 +1404,8 @@ pub(crate) fn simulate_system(
             cch_value(),
         );
         // 客户端自己的 system 按**原块**透传：不合并、不剥身份句，正文原样。只做三处改动：
-        // - 它自己抄来的 billing header 行（[`is_billing_line`]）由 luban 前插的这块顶替、原行去掉，
-        //   全局只留 `system[0]` 一条（`cch` 也只回填那一条）；只剩 header 的块随之去掉。首块
+        // - 它自己抄来的 billing header（只认每块首行，[`billing_only_block_fates`]）由 luban 前插的
+        //   这块顶替、原行去掉（`cch` 只回填 `system[0]` 那一条）；只剩 header 的块随之去掉。首块
         //   「header 行 + 业务指令」就拆成 `[luban header, 业务指令]`，不混成一块。
         // - 正文只有空白的块去掉：上游回 400 `text content blocks must be non-empty`。
         // - 去掉 `citations`：上游不收在 system 里（见下方多块路径同样处理），留着是一发稳定 400。
@@ -1597,23 +1597,12 @@ const BILLING_KEY: &str = "x-anthropic-billing-header:";
 
 /// 这一行是不是一条抄来的 billing header：行首（只容许 BOM，不容许缩进）就是
 /// `x-anthropic-billing-header:`，且带 `cc_version` 字段（按 `;` 拆字段、按第一个 `=` 拆名与值，
-/// 名字精确比对；官方 header 恒带，上游放行也认它）。只出现在行中间的（客户端指令里提到这个词、
-/// 或引用成 `> x-anthropic-...`）、带缩进的（列表项里的内容等）、没有 `cc_version` 字段的示例值
-/// 都不算，免得把客户端的指令与示例一起吞掉。代码块里的行由调用方另外保护
-/// （[`markdown_code_ranges`]）。
+/// 名字精确比对；官方 header 恒带，上游放行也认它）。`not_cc_version=` 这类示例值不算。
+/// 只拿来判每块的首行，见 [`billing_only_block_fates`]。
 fn is_billing_line(line: &str) -> bool {
     line.trim_start_matches('\u{feff}').strip_prefix(BILLING_KEY).is_some_and(|fields| {
         fields.split(';').any(|f| f.split_once('=').is_some_and(|(k, _)| k.trim() == "cc_version"))
     })
-}
-
-/// `text` 按 Markdown 解析出的代码块（围栏与缩进，含列表、引用等容器里的）的字节范围。
-fn markdown_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    use pulldown_cmark::{Event, Parser, Tag};
-    Parser::new(text)
-        .into_offset_iter()
-        .filter_map(|(ev, r)| matches!(ev, Event::Start(Tag::CodeBlock(_))).then_some(r))
-        .collect()
 }
 
 /// billing-only 下客户端一个 `system` 块的去留，见 [`billing_only_block_fates`]。
@@ -1629,10 +1618,10 @@ pub(in crate::proxy) enum BlockFate {
 
 /// billing-only 下客户端各 `system` 块的去留，与来访逐块对应；出站时依次跟在 luban 前插的
 /// billing header 之后（[`simulate_system`]）。
-/// - 抄来的 billing header 行（[`is_billing_line`]）去掉，改写成 [`BlockFate::Rewrite`]；代码围栏
-///   与缩进代码块（[`markdown_code_ranges`]）里的行是客户端的示例，一律不动。块开头的
-///   header 行后面紧跟的空行一并去掉，不留开头换行；段落中间的 header 行只去它自己，段落间的
-///   空行照留。原文不以换行收尾的，去掉末行后留下的尾随换行也收掉。
+/// - **只看每块的首行**：客户端照抄官方 header 时它必在某块开头（整块就是 header，或「header 行 +
+///   业务指令」），首行是 header（[`is_billing_line`]）就去掉它和紧跟的空行，余下原样，改写成
+///   [`BlockFate::Rewrite`]。块中间出现的一律当正文原样保留——指令里的示例（代码块、列表、引用
+///   里的都一样）不会被误删，也不必为认代码块去解析 Markdown，耗时线性、不额外占内存。
 /// - 正文只剩空白的块（原本就空、或去掉 header 后变空）是 [`BlockFate::Drop`]：上游不收空文本块。
 ///
 /// 报错下标还原用同一份（[`billing_system_index_map`]）。
@@ -1648,40 +1637,21 @@ pub(in crate::proxy) fn billing_only_block_fates(blocks: &[serde_json::Value]) -
             if text.trim().is_empty() {
                 return BlockFate::Drop;
             }
-            if !text.split('\n').any(is_billing_line) {
+            let first = text.split_inclusive('\n').next().unwrap_or(text);
+            if !is_billing_line(first) {
                 return BlockFate::Keep;
             }
-            // 有候选行才解析：代码块里的行是客户端的示例，一律不动。
-            let code = markdown_code_ranges(text);
-            let mut kept = String::with_capacity(text.len());
-            let mut removed = false;
-            let mut at = 0;
-            // 代码块范围与行都按原文顺序排列、互不重叠：游标只往前走，整体线性，不必每行从头找。
-            let mut ci = 0;
-            for line in text.split_inclusive('\n') {
-                let start = at;
-                at += line.len();
-                while code.get(ci).is_some_and(|r| r.end <= start) {
-                    ci += 1;
-                }
-                let in_code = code.get(ci).is_some_and(|r| r.start <= start);
-                if !in_code && is_billing_line(line) {
-                    removed = true;
-                    continue;
-                }
-                // 块开头 header 行后面紧跟的空行（去掉过 header、还没留下任何正文）不留。
-                if removed && kept.is_empty() && line.trim().is_empty() {
-                    continue;
-                }
-                kept.push_str(line);
+            let mut rest = &text[first.len()..];
+            while let Some(line) = rest.split_inclusive('\n').next()
+                && line.trim().is_empty()
+            {
+                rest = &rest[line.len()..];
             }
-            if !removed {
-                return BlockFate::Keep;
+            if rest.trim().is_empty() {
+                BlockFate::Drop
+            } else {
+                BlockFate::Rewrite(rest.to_owned())
             }
-            if !text.ends_with('\n') {
-                kept.truncate(kept.trim_end_matches(['\n', '\r']).len());
-            }
-            if kept.trim().is_empty() { BlockFate::Drop } else { BlockFate::Rewrite(kept) }
         })
         .collect()
 }
