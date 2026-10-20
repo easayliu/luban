@@ -1596,16 +1596,21 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 const BILLING_KEY: &str = "x-anthropic-billing-header:";
 
 /// 这一行是不是一条抄来的 billing header：行首（容许 BOM 与至多 3 个空格）就是
-/// `x-anthropic-billing-header:`，且带 `cc_version=`（官方 header 恒带，上游放行也认它）。只出现在
+/// `x-anthropic-billing-header:`，且带 `cc_version` 字段（按字段名精确比对；官方 header 恒带，上游放行也认它）。只出现在
 /// 行中间的（客户端指令里提到这个词、或引用成 `> x-anthropic-...`）、缩进 4 格或 Tab 起头的
 /// （Markdown 缩进代码块）、没有 `cc_version=` 的示例值都不算，免得把客户端的指令与示例一起吞掉。
 /// 围栏代码块里的行由调用方另外保护（[`billing_only_block_fates`]）。
 fn is_billing_line(line: &str) -> bool {
     let line = line.trim_start_matches('\u{feff}');
     let body = line.trim_start_matches(' ');
-    line.len() - body.len() <= 3
-        && body.starts_with(BILLING_KEY)
-        && body.trim_end().contains("cc_version=")
+    if line.len() - body.len() > 3 {
+        return false;
+    }
+    // 按 `;` 拆字段、按第一个 `=` 拆名与值，字段名精确等于 `cc_version` 才算，
+    // `not_cc_version=` 之类不算。
+    body.strip_prefix(BILLING_KEY).is_some_and(|fields| {
+        fields.split(';').any(|f| f.split_once('=').is_some_and(|(k, _)| k.trim() == "cc_version"))
+    })
 }
 
 /// 一行若是 Markdown 围栏（CommonMark：至多 3 格缩进，3 个以上同一字符 `` ` `` 或 `~`），返回

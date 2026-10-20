@@ -2981,6 +2981,39 @@ mod billing_only {
         }
     }
 
+    /// `cc_version` 按字段名精确比对：`not_cc_version=`、`other_cc_version=` 这类示例照留；字段在后、
+    /// 带空白的真 header 照删。
+    #[test]
+    fn cc_version_field_is_matched_by_exact_name() {
+        const HDR: &str =
+            "x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=12345;\n";
+        for (rest, want) in [
+            (
+                "保留以下没有 cc_version 字段的示例：\nx-anthropic-billing-header: not_cc_version=sample-value",
+                "保留以下没有 cc_version 字段的示例：\nx-anthropic-billing-header: not_cc_version=sample-value",
+            ),
+            (
+                "示例：\nx-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;",
+                "示例：\nx-anthropic-billing-header: cc_entrypoint=cli; other_cc_version=1;",
+            ),
+            (
+                "指令\nx-anthropic-billing-header: cc_entrypoint=cli;  cc_version =2.1.1; cch=00000;",
+                "指令",
+            ),
+        ] {
+            let raw = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-opus-5-5", "max_tokens": 64,
+                    "system": [{"type": "text", "text": format!("{HDR}{rest}")}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .unwrap(),
+            );
+            let v = billing_only_out(&raw);
+            assert_eq!(v["system"][1]["text"], want, "{v}");
+        }
+    }
+
     fn billing_only_out(raw: &Bytes) -> serde_json::Value {
         let sim = detect_for(raw, on_flags()).unwrap();
         serde_json::from_slice(&rewrite_body(raw, &test_cred(), "fp", on_flags(), Some(&sim), None))
