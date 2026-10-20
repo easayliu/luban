@@ -331,23 +331,24 @@ export const CredentialRow = memo(function CredentialRow({
                     <a href={credentialDetailHref(cred.id)} className="rounded-sm underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">{credentialLabel}</a>
                   </h3>
                 </Hint>
-                <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
+                {/* 一行排完、不折行：放不下时先截「添加于…」，账号与代理的 #id 始终完整。 */}
+                <p className="mt-1 flex min-w-0 items-center gap-x-1 whitespace-nowrap text-xs text-muted-foreground">
                   <CalendarDaysIcon className="size-3 shrink-0" />
-                  <span className="min-w-0 break-all tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 text-xs" />
-                  <span aria-hidden="true">·</span>
+                  <span className="shrink-0 tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 max-w-24 text-xs" />
+                  <span aria-hidden="true" className="shrink-0">·</span>
                   <Tooltip>
-                    <TooltipTrigger render={<span />} className="min-w-0">
+                    <TooltipTrigger render={<span />} className="min-w-0 truncate">
                       {t(`添加于 ${added}`, `Added ${added}`)}
                     </TooltipTrigger>
                     <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
                   </Tooltip>
                   {cred.proxy && (
                     <>
-                      <span aria-hidden="true">·</span>
+                      <span aria-hidden="true" className="shrink-0">·</span>
                       <Tooltip>
                         <TooltipTrigger
                           render={<button type="button" />}
-                          className="inline-flex min-w-0 items-center gap-0.5 text-info-foreground"
+                          className="inline-flex min-w-0 max-w-[55%] shrink-0 items-center gap-0.5 text-info-foreground"
                           onClick={() => setProxyOpen(true)}
                         >
                           <GlobeIcon className="size-3 shrink-0" />
@@ -497,22 +498,23 @@ export const CredentialRow = memo(function CredentialRow({
                   {credentialLabel}
                 </a>
               </Hint>
-              <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-                <span className="min-w-0 break-all tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 text-xs" />
-                <span aria-hidden="true">·</span>
+              {/* 一行排完、不折行：放不下时先截「添加于…」，账号与代理的 #id 始终完整。 */}
+              <span className="mt-1 flex min-w-0 items-center gap-x-1 whitespace-nowrap text-xs text-muted-foreground">
+                <span className="shrink-0 tabular-nums">#{cred.id}</span><CredentialOwner cred={cred} className="ms-1.5 max-w-24 text-xs" />
+                <span aria-hidden="true" className="shrink-0">·</span>
                 <Tooltip>
-                  <TooltipTrigger render={<span />} className="min-w-0">
+                  <TooltipTrigger render={<span />} className="min-w-0 truncate">
                     {t(`添加于 ${added}`, `Added ${added}`)}
                   </TooltipTrigger>
                   <TooltipPopup>{formatFullTime(cred.created_at, language)}</TooltipPopup>
                 </Tooltip>
                 {cred.proxy && (
                   <>
-                    <span aria-hidden="true">·</span>
+                    <span aria-hidden="true" className="shrink-0">·</span>
                     <Tooltip>
                       <TooltipTrigger
                         render={<button type="button" />}
-                        className="inline-flex min-w-0 items-center gap-0.5 text-info-foreground hover:underline"
+                        className="inline-flex min-w-0 max-w-[55%] shrink-0 items-center gap-0.5 text-info-foreground hover:underline"
                         onClick={() => setProxyOpen(true)}
                       >
                         <GlobeIcon className="size-3 shrink-0" />

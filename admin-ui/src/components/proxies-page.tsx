@@ -532,7 +532,11 @@ function ProxyRow({
   return (
     <TableRow>
       <TableCell className={COL.name}>
-        <p className="truncate font-medium">{proxy.label}</p>
+        {/* id 打在名称前面（上号脚本按它指定代理），灰色等宽、不随名称截断。 */}
+        <p className="flex min-w-0 items-baseline gap-1.5">
+          <span className="shrink-0 text-muted-foreground tabular-nums">#{proxy.id}</span>
+          <span className="truncate font-medium">{proxy.label}</span>
+        </p>
         {/* 窄屏没有地址列，地址收到名称底下。 */}
         <p className="mt-1 truncate text-xs text-muted-foreground md:hidden">{host}</p>
       </TableCell>

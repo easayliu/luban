@@ -1188,7 +1188,7 @@ function CredentialActionSheet({
     `${count.toLocaleString(locale)}/${effective > 0 ? effective.toLocaleString(locale) : '∞'}`
   const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('停用', 'off'))
   /** 设置行右侧的当前值：与详情页读数、调度配置同一口径。 */
-  const valueOf: Record<string, string> = {
+  const valueOf: Record<string, ReactNode> = {
     device: `${limit(cred.device_count, cred.device_limit_effective)} · ${limit(cred.session_count, cred.session_limit_effective)}`,
     session: limit(cred.session_count, cred.session_limit_effective),
     rpm: cred.rpm_limit_effective > 0 ? String(cred.rpm_limit_effective) : t('不限', 'Unlimited'),
@@ -2274,15 +2274,17 @@ export function proxyLabelParts(proxy: string): { scheme: string | null; host: s
 }
 
 /**
- * 账号绑定的代理 → 代理池里的名称。按后端给的 `proxy_id` 查，不按 URL：访客拿到的 URL 已去掉
- * 密码，只差密码的两条代理打码后一模一样，按 URL 建表后一条会盖掉前一条，名称就串了位。
- * 卡片与列表只显示名称，不铺 IP 与端口：
- * - 池里有且起过名的 → 名称；
- * - 池里有但名称就是自动生成的 `host:port`（添加时留空）→ 「代理 #id」；
+ * 账号绑定的代理 → 以代理池 id 为主的称呼（上号脚本按 id 指定代理）。前面的地球图标已经说明这是
+ * 代理，id 就不加 `#`，免得与同一行里账号自己的 `#id` 混淆：id 加粗等宽在前，名称隔一道细竖线、
+ * 颜色放浅在后。按后端给的 `proxy_id` 查，不按 URL：访客拿到的 URL 已去掉密码，只差密码的两条
+ * 代理打码后一模一样，按 URL 建表后一条会盖掉前一条，名称就串了位。卡片与列表不铺 IP 与端口：
+ * - 池里有且起过名的 → 「id | 名称」；
+ * - 池里有但名称就是自动生成的 `host:port`（添加时留空）→ 「id」；
  * - 不在池里的自定义地址 → 「自定义代理」。
- * 完整地址（脱敏）仍在 Tooltip 与出站代理对话框里。与代理池共用 `['proxies']` 缓存。
+ * 完整地址（脱敏）仍在 Tooltip 与出站代理对话框里。与代理池共用 `['proxies']` 缓存。返回的节点
+ * 是行内的，外层的 `truncate` 照常截名称、不截 id。
  */
-export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id' | 'proxy_label'>) => string | null {
+export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id' | 'proxy_label'>) => ReactNode {
   const { t } = useI18n()
   const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
   const byId = useMemo(() => new Map((data ?? []).map((p) => [p.id, p])), [data])
@@ -2295,8 +2297,17 @@ export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id' | '
     if (!saved) return t('自定义代理', 'Custom proxy')
     const name = saved.label.trim()
     const hostPort = proxyLabelParts(proxy).host
-    if (!name || name === hostPort) return t(`代理 #${saved.id}`, `Proxy #${saved.id}`)
-    return name
+    return (
+      <>
+        <span className="font-medium tabular-nums">{saved.id}</span>
+        {name && name !== hostPort && (
+          <>
+            <span aria-hidden="true" className="mx-1 inline-block h-2.5 w-px bg-current align-middle opacity-30" />
+            <span className="opacity-80">{name}</span>
+          </>
+        )}
+      </>
+    )
   }
 }
 

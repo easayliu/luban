@@ -116,7 +116,7 @@ const normal: Credential = {
   id: 4,
   label: 'robertsbeth812904@yahoo.com',
   owner_id: 1,
-  owner: null,
+  owner: 'operator-team-east',
   editable: true,
   groups: [1],
   tier: 'Max 5x',
@@ -148,7 +148,9 @@ const normal: Credential = {
   session_limit_effective: 10,
   session_count: 3,
   ban_reason: null,
-  proxy: null,
+  // 代理池里名称就是 host:port 的那条：账号池里只显示代理 id。
+  proxy: 'socks5h://rgyIjJ7S:AAHHpBYGWw@165.254.95.89:35593',
+  proxy_id: 4,
   token_hint: 'sk-ant-ort01-…igAA',
   last_used: now - 5,
   cost_total: 6.85,
@@ -217,7 +219,9 @@ const overage: Credential = {
   session_limit_effective: 10,
   session_count: 12,
   ban_reason: null,
-  proxy: null,
+  // 起过名的代理：账号池里显示「id | 名称」，放不下时截名称、id 不截。
+  proxy: 'socks5h://sub2:sofjnwaeognw@13.57.24.38:16901',
+  proxy_id: 1,
   token_hint: 'sk-ant-ort01-…oVAA',
   last_used: now - 18,
   cost_total: 122.48,
@@ -1154,7 +1158,7 @@ queryClient.setQueryData(['groups'], [
 ])
 // 代理池：覆盖「无人使用」「被多个账号共用」两种排版。
 queryClient.setQueryData(['proxies'], [
-  { id: 1, label: '香港 · 主力', url: 'socks5h://sub2:sofjnwaeognw@13.57.24.38:16901', created_at: now - 12 * 86400, credential_count: 2, credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'] },
+  { id: 1, label: '香港 · 主力 · 二号备用线路', url: 'socks5h://sub2:sofjnwaeognw@13.57.24.38:16901', created_at: now - 12 * 86400, credential_count: 2, credential_labels: ['robertsbeth812904@yahoo.com', 'single-window-no-7d@example.com'] },
   { id: 2, label: '1', url: 'socks5h://sub2:sofjnwaeognw@54.176.188.201:16901', created_at: now - 9 * 86400, credential_count: 0, credential_labels: [] },
   { id: 3, label: '2', url: 'socks5h://sub2:sofjnwaeognw@57.183.8.180:16901', created_at: now - 8 * 86400, credential_count: 1, credential_labels: ['mizuno@nakanekougyou.com'] },
   { id: 4, label: '165.254.95.89:35593', url: 'socks5h://rgyIjJ7S:AAHHpBYGWw@165.254.95.89:35593', created_at: now - 5 * 86400, credential_count: 0, credential_labels: [] },

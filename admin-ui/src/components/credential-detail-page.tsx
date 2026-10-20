@@ -1333,7 +1333,7 @@ function ScheduleSection({
     // 面板「设置」组同一副面孔：名称在左、当前值在右、末尾一枚 ›，整行可点。
     const pause = (pct: number) => (pct > 0 ? `${pct}%` : t('停用', 'off'))
     // ghost 按钮铺满整行：去掉圆角、边框与按钮自身的高度，行高由 min-h-12 定，与面板里的行一致。
-    const row = (label: string, value: string, onClick: () => void) => (
+    const row = (label: string, value: ReactNode, onClick: () => void) => (
       <Button
         variant="ghost"
         className="h-auto min-h-12 w-full justify-start gap-3 rounded-none border-0 px-4 text-left font-normal before:rounded-none active:bg-accent focus-visible:bg-accent focus-visible:ring-inset focus-visible:ring-offset-0 sm:h-auto [&_svg]:mx-0"

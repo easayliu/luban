@@ -183,7 +183,7 @@ export function ProxyPickerCombobox({
     for (const p of proxies) {
       map.set(p.id, {
         proxy: p,
-        haystack: `${p.label} ${p.url} ${p.credential_labels.join(' ')}`.toLowerCase(),
+        haystack: `#${p.id} ${p.label} ${p.url} ${p.credential_labels.join(' ')}`.toLowerCase(),
       })
     }
     return { byIdMap: map, ids: proxies.map((p) => p.id) }
@@ -198,10 +198,13 @@ export function ProxyPickerCombobox({
         const found = byId(id as number)
         if (found) onPick(found.url)
       }}
-      itemToStringLabel={(id) => byId(id as number)?.label ?? ''}
+      itemToStringLabel={(id) => {
+        const p = byId(id as number)
+        return p ? `#${p.id} ${p.label}` : ''
+      }}
       // 必须自定义 filter：Base UI 默认只拿 itemToStringLabel 去匹配，而这里的 label
       // 常是「1」「2」这种用户随手起的名字。把地址与使用账号一并纳入匹配面，
-      // 占位符承诺的「搜索标签、地址或使用账号」才真的成立。
+      // 占位符承诺的「搜索 id、标签、地址或使用账号」才真的成立（id 按 `#12` 写进匹配面）。
       // 匹配用**原始** URL 而非脱敏后的：用户是照着自己配的地址找的，*** 搜不到。
       filter={(id, query) => {
         const q = query.trim().toLowerCase()
@@ -214,7 +217,7 @@ export function ProxyPickerCombobox({
       </ComboboxTrigger>
       <ComboboxPopup
         className="max-h-80"
-        inputPlaceholder={t('搜索标签、地址或使用账号…', 'Search label, URL, or account…')}
+        inputPlaceholder={t('搜索 #id、标签、地址或使用账号…', 'Search #id, label, URL, or account…')}
         emptyText={t('无匹配结果', 'No matches')}
       >
         {(id: number) => {
@@ -229,6 +232,7 @@ export function ProxyPickerCombobox({
               >
                 <div className="min-w-0">
                   <div className="flex items-baseline gap-2">
+                    <span className="shrink-0 text-xs text-muted-foreground tabular-nums">#{p.id}</span>
                     <span className="truncate font-medium">{p.label}</span>
                     {p.credential_count > 0 && (
                       <span className="shrink-0 text-xs text-muted-foreground">
