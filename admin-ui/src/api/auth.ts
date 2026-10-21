@@ -55,6 +55,8 @@ export interface Me {
   viewer_env_managed: boolean
   /** 代理和用户改自己号的调度参数时能到的边；管理员与访客为 null。见 [MemberCaps]。 */
   member_caps?: MemberCaps | null
+  /** 实例名称，多个 luban 之间区分用；未命名为 null。 */
+  instance_name?: string | null
 }
 
 /**

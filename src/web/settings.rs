@@ -39,6 +39,8 @@ pub(super) struct SettingsResp {
     session_concurrency_limit: i64,
     /// 是否要求请求携带有效设备身份（`metadata.user_id`）；关闭后放行裸客户端。
     require_device_id: bool,
+    /// 实例名称（见 [`crate::store::INSTANCE_NAME`]）；空串表示未命名。
+    instance_name: String,
     /// 允许接入的最低 Claude Code 客户端版本；空串表示不限。只卡 UA 自报 `claude-cli/<版本>`
     /// 的请求，见 [`crate::store::MIN_CLIENT_VERSION`]。
     min_client_version: String,
@@ -278,6 +280,7 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
     let session_concurrency_limit = state.store.session_concurrency_limit();
     let require_device_id = state.store.require_device_id();
     let min_client_version = state.store.min_client_version().unwrap_or_default();
+    let instance_name = state.store.instance_name().unwrap_or_default();
     let latest_cc_release =
         oauth::LATEST_RELEASE.get().map(oauth::release_string).unwrap_or_default();
     let cc_version_base = crate::config::CC_LATEST_KNOWN_RELEASE.to_string();
@@ -305,6 +308,7 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
             session_concurrency_limit,
             require_device_id,
             min_client_version,
+            instance_name: instance_name.clone(),
             latest_cc_release: latest_cc_release.clone(),
             cc_version_base: cc_version_base.clone(),
             oauth_scopes,
@@ -344,6 +348,7 @@ pub(super) async fn settings_resp(state: &AppState) -> SettingsResp {
         session_concurrency_limit,
         require_device_id,
         min_client_version,
+        instance_name,
         latest_cc_release,
         cc_version_base,
         oauth_scopes,

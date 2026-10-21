@@ -47,6 +47,8 @@ import { Button } from '@/components/ui/button'
 import { Hint } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useI18n } from '@/lib/i18n'
+import { useInstanceName } from '@/lib/instance'
+import { withInstance } from '@/lib/use-document-title'
 import {
   rememberRole,
   useCanManageUsers,
@@ -163,6 +165,7 @@ function readAccountRoute(): number | null {
 
 function App() {
   const { t } = useI18n()
+  const instanceName = useInstanceName()
   const queryClient = useQueryClient()
   const [adding, setAdding] = useState(false)
   const [lookupOpen, setLookupOpen] = useState(false)
@@ -409,11 +412,13 @@ function App() {
     enabled: !needAuth && !authLoading, // 未登录时不请求受保护接口
   })
 
+  // 只在账号池列表上设：费用、代理池等一级页面各自设标题。漏掉 `mainRoute` 的话，实例名称
+  // 晚于子页面加载回来时，这里随依赖变化后执行，会把子页面刚设好的标题盖成账号池的。
   useEffect(() => {
-    if (!needAuth && !settingsRoute && accountRoute == null) {
-      document.title = t('luban · 授权代理', 'luban · Authorization Proxy')
+    if (!needAuth && !settingsRoute && !mainRoute && accountRoute == null) {
+      document.title = withInstance(t('luban · 授权代理', 'luban · Authorization Proxy'), instanceName)
     }
-  }, [needAuth, settingsRoute, accountRoute, t])
+  }, [needAuth, settingsRoute, mainRoute, accountRoute, t, instanceName])
 
   // 鉴权状态拿不到（后端重启、网络抖动）时不再干等骨架屏：放行到列表，让账号请求的报错与重试按钮接手。
   const isBootstrapping = authLoading || (!authState && !authFailed)

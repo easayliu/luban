@@ -31,6 +31,8 @@ export interface Settings {
   require_device_id: boolean
   /** 允许接入的最低 Claude Code 版本；空串表示不限。只卡 UA 里自报 claude-cli/<版本> 的请求。 */
   min_client_version: string
+  /** 实例名称，多个 luban 之间区分用；空串表示未命名。 */
+  instance_name: string
   /** 已知的官方最新 Claude Code 版本（主.次.修）；空串 = 还没学到也没手动填。自动从 downloads.claude.ai 学（只升不降），可手动填/删。 */
   latest_cc_release: string
   /** Luban 模拟路径对齐的客户端版本，也是版本上限的兜底值。 */
@@ -337,6 +339,12 @@ export async function setQuotaPausePct(pct: number, pct7d?: number): Promise<Set
 /** 开关设备身份校验（关闭后放行无 metadata.user_id 的请求）。 */
 export async function setRequireDeviceId(required: boolean): Promise<Settings> {
   const { data } = await api.post<Settings>('/settings/require-device-id', { required })
+  return data
+}
+
+/** 设置实例名称（至多 32 个字符；空串清除）。 */
+export async function setInstanceName(name: string): Promise<Settings> {
+  const { data } = await api.post<Settings>('/settings/instance-name', { instance_name: name })
   return data
 }
 

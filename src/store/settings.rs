@@ -347,6 +347,17 @@ pub const REQUIRE_DEVICE_ID: &str = "require_device_id";
 /// 浏览器、自写脚本）UA 里根本没有版本可比，拿它们跟一个 CC 版本号比毫无意义，故一律放行。
 pub const MIN_CLIENT_VERSION: &str = "min_client_version";
 
+/// 实例名称的 settings 键名；未设置或空串表示未命名。
+///
+/// 同时部署多个 luban 时用来区分，`billingonly`、`香港生产` 这类都行：控制台标签页与顶栏显示它，
+/// MCP 端点在初始化时向客户端自报，MCP Key 弹窗据此拟定接入命令里的服务名——名称只含英文字母、
+/// 数字、空格、`-`、`_` 时以名称为底，否则以站点域名为底，须改写方能合规时末尾附短码
+/// （见前端 `mcpServerName`）。只是标识，不参与任何判定。
+pub const INSTANCE_NAME: &str = "instance_name";
+
+/// 实例名称最多多少个字符。
+pub const INSTANCE_NAME_MAX_CHARS: usize = 32;
+
 /// 登录时申请哪些 OAuth scope 的 settings 键名；未设置或空串表示用默认的
 /// [`crate::config::SCOPES`]（官方 Claude Code 那一整套）。
 ///
@@ -871,6 +882,15 @@ impl CredentialStore {
     /// [`crate::proxy::below_min_client_version`]。
     pub fn min_client_version(&self) -> Option<String> {
         self.get_setting(MIN_CLIENT_VERSION)
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// 实例名称（见 [`INSTANCE_NAME`]）；未设置或空串为 None。
+    pub fn instance_name(&self) -> Option<String> {
+        self.get_setting(INSTANCE_NAME)
             .ok()
             .flatten()
             .map(|v| v.trim().to_string())

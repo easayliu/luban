@@ -10,6 +10,7 @@ import {
   SaveIcon,
   Settings2Icon,
   ShieldCheckIcon,
+  TagIcon,
   TerminalIcon,
   TimerIcon,
   Trash2Icon,
@@ -22,6 +23,7 @@ import {
   setDeviceRetention,
   setDeviceRpmLimit,
   setDeviceTtl,
+  setInstanceName,
   setLatestCcRelease,
   setMinClientVersion,
   setRequireDeviceId,
@@ -34,6 +36,7 @@ import {
 import { changePassword, getAuthState, setViewerPassword } from '@/api/auth'
 import { clearToken } from '@/api/client'
 import { useI18n } from '@/lib/i18n'
+import { mcpServerName } from '@/lib/instance'
 import { useMe } from '@/lib/role'
 import { ApiKeysSettings, setupSnippet, SnippetBlock } from '@/components/api-keys-settings'
 import { CopyButton } from '@/components/copy-button'
@@ -143,6 +146,16 @@ export function AccessSettingsContent() {
 
   return (
     <div className="space-y-4">
+      <SettingsGroup
+        icon={TagIcon}
+        title={t('实例标识', 'Instance identity')}
+        description={t(
+          '同时部署多个 Luban 时，用于区分当前实例。',
+          'Tells this instance apart when several Luban deployments are in use.',
+        )}
+      >
+        <InstanceName />
+      </SettingsGroup>
       <SettingsGroup
         icon={CableIcon}
         title={t('连接与认证', 'Connection & authentication')}
@@ -917,6 +930,83 @@ function LatestCcRelease() {
       >
         <Trash2Icon />
         {t('清除', 'Clear')}
+      </Button>
+    </SettingsRow>
+  )
+}
+
+/** 实例名称至多几个字符（按字符计），与后端 `INSTANCE_NAME_MAX_CHARS` 一致。 */
+const INSTANCE_NAME_MAX = 32
+
+/**
+ * 实例名称：`billingonly`、`香港生产` 皆可。显示在顶栏与标签页标题上，MCP 端点向客户端自报，
+ * MCP Key 的接入命令据此拟定服务名。保存后刷新当前身份，顶栏与标题随即更新。
+ */
+function InstanceName() {
+  const { t } = useI18n()
+  const qc = useQueryClient()
+  const { data } = useSettingsQuery()
+  const [draft, setDraft] = useState('')
+
+  useEffect(() => {
+    if (data) setDraft(data.instance_name)
+  }, [data?.instance_name])
+
+  const save = useSettingsSave((name: string) => setInstanceName(name), {
+    success: (settings) => ({
+      title: settings.instance_name
+        ? t('实例名称已更新', 'Instance name updated')
+        : t('实例名称已清除', 'Instance name cleared'),
+    }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['auth-me'] }),
+  })
+
+  const value = draft.trim()
+  const current = data?.instance_name ?? ''
+  const malformed = [...value].length > INSTANCE_NAME_MAX
+
+  return (
+    <SettingsRow
+      htmlFor="instance-name"
+      label={t('实例名称', 'Instance name')}
+      description={t(
+        '显示于顶栏与标签页标题，并据此拟定 MCP 接入时的服务名；留空表示不命名。',
+        'Shown in the header and tab title, and used to derive the MCP server name; leave empty for none.',
+      )}
+      details={t(
+        '至多 32 个字符，中英文皆可。MCP 服务名只收小写字母、数字与连字符：名称仅含英文字母、数字、空格、- 与 _ 时以名称为底，如 billingonly 对应 luban-billingonly；含中文等其他字符或未命名时，以站点域名为底。底稿须改写方能合规时（大写、空格、域名中的点等），末尾另附一段由原文算出的短码，以免不同实例撞名。',
+        'Up to 32 characters, any language. MCP server names allow only lowercase letters, digits and hyphens: a name made of English letters, digits, spaces, - and _ is used as the base (billingonly becomes luban-billingonly); a name with other characters, or no name, uses the site’s domain instead. When the base has to be rewritten to fit (capitals, spaces, dots in a domain), a short code derived from the original is appended so that different instances never collide.',
+      )}
+      note={
+        malformed ? (
+          <Badge variant="warning" size="sm">
+            {t('至多 32 个字符', 'Up to 32 characters')}
+          </Badge>
+        ) : value ? (
+          <Badge variant="secondary" size="sm">
+            {t(
+              `MCP 服务名：${mcpServerName(value, window.location.host)}`,
+              `MCP server name: ${mcpServerName(value, window.location.host)}`,
+            )}
+          </Badge>
+        ) : undefined
+      }
+    >
+      <Input
+        id="instance-name"
+        className="min-w-0 flex-1 sm:w-48 sm:flex-none"
+        maxLength={INSTANCE_NAME_MAX}
+        placeholder="billingonly"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+      />
+      <Button
+        loading={save.isPending}
+        disabled={malformed || value === current}
+        onClick={() => save.mutate(value)}
+      >
+        <SaveIcon />
+        {t('保存', 'Save')}
       </Button>
     </SettingsRow>
   )

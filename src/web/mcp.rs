@@ -105,6 +105,7 @@ pub(super) async fn handle(State(state): State<AppState>, req: axum::extract::Re
     if !same_origin(req.headers()) {
         return (StatusCode::FORBIDDEN, "cross-origin requests are not allowed").into_response();
     }
+    let host = request_host(req.headers());
     let (actor, key_id) = match auth::mcp_actor(&state, req.headers()).await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -131,7 +132,7 @@ pub(super) async fn handle(State(state): State<AppState>, req: axum::extract::Re
     let id = id.clone();
     let params = obj.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        "initialize" => rpc_result(id, initialize(&params)),
+        "initialize" => rpc_result(id, initialize(&params, &state, &host)),
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({ "tools": tool_specs() })),
         "tools/call" => {
@@ -162,17 +163,45 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Response {
         .into_response()
 }
 
-fn initialize(params: &Value) -> Value {
+/// 这次请求打到的站点：先认反代给的 `X-Forwarded-Host`，再认 `Host`；都没有为空串。
+fn request_host(headers: &header::HeaderMap) -> String {
+    ["x-forwarded-host", header::HOST.as_str()]
+        .iter()
+        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
+        .map(|v| v.split(',').next().unwrap_or("").trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// 初始化应答。同时接入多个 luban 时，客户端与模型要分得清在跟哪一个说话：`serverInfo.title`
+/// 与说明开头都写明实例名称（未命名时写站点），说明里再提醒请求 id 只在经手的那个实例上查得到。
+fn initialize(params: &Value, state: &AppState, host: &str) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or_default();
     let version = PROTOCOL_VERSIONS.iter().find(|v| **v == asked).unwrap_or(&PROTOCOL_VERSIONS[0]);
+    let name = state.store.instance_name();
+    let identity = match (&name, host) {
+        (Some(n), "") => format!("the luban instance \"{n}\""),
+        (Some(n), h) => format!("the luban instance \"{n}\" at {h}"),
+        (None, "") => "a luban instance".to_owned(),
+        (None, h) => format!("the luban instance at {h}"),
+    };
+    let title = match &name {
+        Some(n) => format!("luban · {n}"),
+        None if !host.is_empty() => format!("luban · {host}"),
+        None => "luban".to_owned(),
+    };
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "luban", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "Read-only access to luban's request log, which keeps the last 30 days. \
-            Request ids look like `req_…`; luban returns them in the `X-Oneapi-Request-Id` header \
-            and in error bodies, and New API records them as `upstream_request_id`. \
-            Start with get_request; use search_requests to browse a conversation, an account or a model.",
+        "serverInfo": { "name": "luban", "title": title, "version": env!("CARGO_PKG_VERSION") },
+        "instructions": format!(
+            "This server is {identity}. It gives read-only access to that instance's request log, \
+             which keeps the last 30 days. Request ids look like `req_…`; luban returns them in the \
+             `X-Oneapi-Request-Id` header and in error bodies, and New API records them as \
+             `upstream_request_id`. A request is only found on the instance that served it, so if \
+             several luban servers are connected and an id is not found here, try the others. \
+             Name the instance when reporting results. Start with get_request; use search_requests \
+             to browse a conversation, an account or a model."
+        ),
     })
 }
 

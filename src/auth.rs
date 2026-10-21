@@ -1096,6 +1096,9 @@ pub struct MeResp {
     /// 代理和用户改自己号的调度参数时能到的边（admin 与访客为 null），前端据此收窄可选项。
     /// 见 [`crate::web::MemberCaps`]。
     member_caps: Option<crate::web::MemberCaps>,
+    /// 实例名称（见 [`store::INSTANCE_NAME`]），未命名为 null。人人可见：标签页标题与 MCP Key
+    /// 的接入命令都要用，而 `/settings` 只对 admin 开放。
+    instance_name: Option<String>,
 }
 
 /// 当前登录身份（已鉴权）。前端据此决定显示哪些页面、藏掉哪些按钮。
@@ -1110,6 +1113,7 @@ pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor
         viewer_env_managed: admin && state.viewer_env.is_some(),
         member_caps: matches!(actor.role, UserRole::Agent | UserRole::User)
             .then(|| crate::web::MemberCaps::of(&state.store)),
+        instance_name: state.store.instance_name(),
     })
 }
 

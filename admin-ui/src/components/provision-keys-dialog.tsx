@@ -10,6 +10,7 @@ import {
   type ProvisionKey,
 } from '@/api/groups'
 import { useI18n } from '@/lib/i18n'
+import { mcpServerName, useInstanceName } from '@/lib/instance'
 import { useIsAdmin } from '@/lib/role'
 import { cn, extractError, formatFullTime } from '@/lib/utils'
 import { CopyButton } from '@/components/copy-button'
@@ -46,9 +47,13 @@ function scriptSnippet(key: string): string {
   ].join('\n')
 }
 
-/** 将 MCP Key 接入 Claude Code 的命令。装在用户级（`--scope user`），在任何目录下都能用。 */
-function mcpSnippet(key: string): string {
-  return `claude mcp add --scope user --transport http luban ${window.location.origin}/mcp --header "Authorization: Bearer ${key}"`
+/**
+ * 将 MCP Key 接入 Claude Code 的命令。装在用户级（`--scope user`），在任何目录下都能用；服务名按
+ * 实例名称拟定（见 [mcpServerName]），接入多个 luban 时互不覆盖。
+ */
+function mcpSnippet(key: string, instanceName: string | null): string {
+  const name = mcpServerName(instanceName, window.location.host)
+  return `claude mcp add --scope user --transport http ${name} ${window.location.origin}/mcp --header "Authorization: Bearer ${key}"`
 }
 
 /**
@@ -72,7 +77,8 @@ export function ProvisionKeysDialog({
   const qc = useQueryClient()
   const mcp = kind === 'mcp'
   const queryKey = [mcp ? 'mcp-keys' : 'provision-keys']
-  const snippet = mcp ? mcpSnippet : scriptSnippet
+  const instanceName = useInstanceName()
+  const snippet = (key: string) => (mcp ? mcpSnippet(key, instanceName) : scriptSnippet(key))
   const keysQuery = useQuery({ queryKey, queryFn: () => listProvisionKeys(kind), enabled: open })
   const keys = keysQuery.data ?? []
   const [label, setLabel] = useState('')

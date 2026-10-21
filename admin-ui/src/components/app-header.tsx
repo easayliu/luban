@@ -12,6 +12,7 @@ import {
   UsersIcon,
 } from 'lucide-react'
 import { LogoMark } from '@/components/logo-mark'
+import { useInstanceName } from '@/lib/instance'
 import { LanguageMenuItem } from '@/components/language-switcher'
 import { ThemeMenuItem } from '@/components/theme-switcher'
 import { Badge } from '@/components/ui/badge'
@@ -73,6 +74,7 @@ export function AppHeader({
   const { t } = useI18n()
   const readOnly = useReadOnly()
   const me = useMe().data
+  const instanceName = useInstanceName()
   const label = homeLabel ?? t('返回账号池', 'Back to the account pool')
   const brand = (
     <>
@@ -81,6 +83,11 @@ export function AppHeader({
         <LogoMark className="size-[1.125rem] opacity-100" />
       </span>
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight">Luban</span>
+      {instanceName && (
+        <Badge className="min-w-0 shrink truncate" variant="outline">
+          {instanceName}
+        </Badge>
+      )}
     </>
   )
   // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。代理和用户常驻身份与

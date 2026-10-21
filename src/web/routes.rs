@@ -81,6 +81,7 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/settings/quota-pause-pct", post(set_quota_pause_pct))
         .route("/settings/require-device-id", post(set_require_device_id))
         .route("/settings/min-client-version", post(set_min_client_version))
+        .route("/settings/instance-name", post(set_instance_name))
         .route("/settings/latest-cc-release", post(set_latest_cc_release))
         .route("/settings/oauth-scopes", post(set_oauth_scopes))
         .route("/settings/forwarding", post(set_forwarding))

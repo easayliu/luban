@@ -1255,6 +1255,12 @@ async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
         "params": {"protocolVersion": "2025-06-18"}});
     let resp = json_of(rpc(&admin_key, init.clone(), None).await.unwrap()).await;
     assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(resp["result"]["serverInfo"]["title"], "luban · luban.test", "未命名时报站点");
+    store.set_setting(store::INSTANCE_NAME, "billingonly").await.unwrap();
+    let resp = json_of(rpc(&admin_key, init.clone(), None).await.unwrap()).await;
+    assert_eq!(resp["result"]["serverInfo"]["title"], "luban · billingonly");
+    let instructions = resp["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains(r#""billingonly" at luban.test"#), "{instructions}");
     let note = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     assert_eq!(rpc(&admin_key, note, None).await.unwrap().status(), StatusCode::ACCEPTED);
 
@@ -1300,4 +1306,30 @@ async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
     let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
     assert_eq!(found["requests"][0]["request_id"], "req_theirs");
     assert!(found["next_before_id"].is_i64(), "满一页给下一页的锚点");
+}
+
+/// 实例名称：中英文都收，去掉首尾空白后保存，空串即清除；超长或带控制字符的回 400。
+#[sqlx::test]
+async fn instance_name_is_trimmed_bounded_and_clearable(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool).await);
+    let state = AppState::for_test(store.clone());
+    let set = |name: &str| {
+        set_instance_name(
+            State(state.clone()),
+            Json(SetInstanceNameReq { instance_name: name.to_owned() }),
+        )
+    };
+    for ok in ["billingonly", "香港生产", "HK billing-only 2"] {
+        assert!(set(&format!("  {ok} ")).await.is_ok(), "{ok}");
+        assert_eq!(store.instance_name().as_deref(), Some(ok));
+    }
+    let max = "名".repeat(store::INSTANCE_NAME_MAX_CHARS);
+    assert!(set(&max).await.is_ok(), "按字符计，中文 32 个也收");
+    let long = format!("{max}名");
+    for bad in [long.as_str(), "a\nb", "a\u{7}b"] {
+        assert_eq!(set(bad).await.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST), "{bad}");
+    }
+    assert_eq!(store.instance_name().as_deref(), Some(max.as_str()), "被拒的不落库");
+    assert!(set("  ").await.is_ok());
+    assert_eq!(store.instance_name(), None);
 }

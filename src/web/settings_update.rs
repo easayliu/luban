@@ -295,6 +295,37 @@ pub(super) async fn set_require_device_id(
 }
 
 #[derive(Deserialize)]
+pub(super) struct SetInstanceNameReq {
+    /// 实例名称；空串表示清除。
+    pub(super) instance_name: String,
+}
+
+/// 设置（或清除）实例名称，见 [`crate::store::INSTANCE_NAME`]。
+///
+/// 名称会进标签页标题与 MCP 初始化说明，故拒收控制字符；长度按字符计，中文也算一个。
+pub(super) async fn set_instance_name(
+    State(state): State<AppState>,
+    Json(req): Json<SetInstanceNameReq>,
+) -> Result<Json<SettingsResp>, ApiError> {
+    let name = req.instance_name.trim();
+    if name.is_empty() {
+        state.store.delete_setting(crate::store::INSTANCE_NAME).await.map_err(internal)?;
+        tracing::info!("instance name cleared");
+        return Ok(Json(settings_resp(&state).await));
+    }
+    let max = crate::store::INSTANCE_NAME_MAX_CHARS;
+    if name.chars().count() > max {
+        return Err(bad_request(format!("the instance name must be at most {max} characters")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(bad_request("the instance name must not contain control characters"));
+    }
+    state.store.set_setting(crate::store::INSTANCE_NAME, name).await.map_err(internal)?;
+    tracing::info!(name, "instance name changed");
+    Ok(Json(settings_resp(&state).await))
+}
+
+#[derive(Deserialize)]
 pub(super) struct SetMinClientVersionReq {
     /// 最低 Claude Code 客户端版本（`2.1.220`、`2.1`、`2` 都收）；空串表示不限。
     min_client_version: String,
