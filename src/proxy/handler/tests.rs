@@ -1050,7 +1050,7 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     static MB: [u8; 1024 * 1024] = [b' '; 1024 * 1024];
     let mock = MockUpstream::start(vec![]).await;
     let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
-    let chunks = crate::proxy::MAX_MESSAGES_BODY_BYTES / MB.len() + 1;
+    let chunks = crate::proxy::MAX_BODY_BYTES / MB.len() + 1;
     let stream = futures_util::stream::iter(
         (0..chunks).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&MB))),
     );
@@ -1066,16 +1066,32 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     assert!(mock.seen().is_empty());
 }
 
-/// 开关开着：messages 与 count_tokens 按上游 32MB，batches 等其余接口仍是 64MB；关着一律 64MB。
+/// 出站 32MB 只管 messages 与 count_tokens、开关开着时；batches 等其余接口不判。
 #[test]
-fn body_limit_by_path() {
-    use crate::proxy::{MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, body_limit};
-    assert_eq!(body_limit("/v1/messages", true), MAX_MESSAGES_BODY_BYTES);
-    assert_eq!(body_limit("/v1/messages?beta=true", true), MAX_MESSAGES_BODY_BYTES);
-    assert_eq!(body_limit("/v1/messages/count_tokens?beta=true", true), MAX_MESSAGES_BODY_BYTES);
-    assert_eq!(body_limit("/v1/messages/batches", true), MAX_BODY_BYTES);
-    assert_eq!(body_limit("/v1/files", true), MAX_BODY_BYTES);
-    assert_eq!(body_limit("/v1/messages?beta=true", false), MAX_BODY_BYTES);
+fn outbound_too_large_by_path() {
+    use crate::proxy::{MAX_MESSAGES_BODY_BYTES, outbound_too_large};
+    let over = MAX_MESSAGES_BODY_BYTES + 1;
+    assert!(outbound_too_large("/v1/messages?beta=true", over, true));
+    assert!(outbound_too_large("/v1/messages/count_tokens?beta=true", over, true));
+    assert!(!outbound_too_large("/v1/messages?beta=true", MAX_MESSAGES_BODY_BYTES, true));
+    assert!(!outbound_too_large("/v1/messages/batches", over, true));
+    assert!(!outbound_too_large("/v1/files", over, true));
+    assert!(!outbound_too_large("/v1/messages?beta=true", over, false));
+}
+
+/// 入站没过 64MB、出站超 32MB 的 messages 请求：读得进来，改写后就地回 413，不打上游。
+#[sqlx::test]
+async fn oversized_outbound_gets_413(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let pad = "a".repeat(crate::proxy::MAX_MESSAGES_BODY_BYTES);
+    let (headers, body) =
+        cc_request(serde_json::json!({ "messages": [{"role": "user", "content": pad}] }));
+    let (status, _, body) = send_body(&state, headers, axum::body::Body::from(body)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["type"], "request_too_large");
+    assert!(mock.seen().is_empty());
 }
 
 /// 一条下游中转的探活：`Go-http-client`、不带身份、无 tools、一句话、`max_tokens` 8（判据 ping）。

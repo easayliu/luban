@@ -137,7 +137,7 @@ struct ForwardingResp {
     reject_tampered_thinking: bool,
     /// 订阅通道放行、直连 400 的几种形态按 API Key 直连原文本地拒绝。
     api_key_parity: bool,
-    /// messages 请求体超上游 32MB 时本地回 413。
+    /// messages 出站体超上游 32MB 时本地回 413。
     cap_messages_body: bool,
     /// billing-only 下也挪客户端 system；默认关。
     sim_billing_relocate: bool,

@@ -259,29 +259,31 @@ pub async fn handle(
     resp
 }
 
-/// 转发请求体的上限（[`MAX_MESSAGES_BODY_BYTES`] 管不到的那些接口）。batches、files 之类
-/// 上游收得比 32MB 大，这里给 64MB，再大的交给上游判。
+/// 入站请求体的上限，所有接口一个数。batches、files 之类上游收得比 32MB 大；messages 的
+/// 入站体也可能比出站大得多（完整模拟续 message thread 时，已提交的历史整段剪掉、只发增量），
+/// 所以入站只按 64MB 挡内存，messages 的 32MB 看出站，见 [`outbound_too_large`]。
 ///
 /// 体在 Key、最低版本、头上的会话闸都过了之后才读（`handler::admit`）：先读后验的话，
 /// 不带 Key 的人并发灌 64MB 的体就能把内存吃满。
 pub(super) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// `/v1/messages` 与 `count_tokens` 的请求体上限，与上游一致的 32MB（2.1.306 客户端
-/// `mtt=33554432`，超了上游回 413 `request_too_large`）。超出的体转过去也是 413，不如就地回，
-/// 省得多读多转一份。
+/// `/v1/messages` 与 `count_tokens` 的出站体上限，与上游一致的 32MB（2.1.306 客户端
+/// `mtt=33554432`，超了上游回 413 `request_too_large`）。
 pub(super) const MAX_MESSAGES_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// 按路径取请求体上限：`cap_messages_body` 开着时 messages 那组用 [`MAX_MESSAGES_BODY_BYTES`]，
-/// 其余（及开关关着时）用 [`MAX_BODY_BYTES`]。见 [`crate::store::ForwardFlags::cap_messages_body`]。
-pub(super) fn body_limit(path_and_query: &str, cap_messages_body: bool) -> usize {
-    if !cap_messages_body {
-        return MAX_BODY_BYTES;
+/// 改写后的出站体是否超过上游的 32MB：`cap_messages_body` 开着、路径是 messages 那组才判。
+/// 判的是**最终出站**那份——入站超了不算数，续 thread 剪完历史可能只剩几 KB。超了发出去
+/// 上游也是 413，就地回同一个，省一次往返。见 [`crate::store::ForwardFlags::cap_messages_body`]。
+pub(super) fn outbound_too_large(
+    path_and_query: &str,
+    len: usize,
+    cap_messages_body: bool,
+) -> bool {
+    if !cap_messages_body || len <= MAX_MESSAGES_BODY_BYTES {
+        return false;
     }
     let path = path_and_query.split('?').next().unwrap_or_default();
-    match path.trim_end_matches('/') {
-        "/v1/messages" | "/v1/messages/count_tokens" => MAX_MESSAGES_BODY_BYTES,
-        _ => MAX_BODY_BYTES,
-    }
+    matches!(path.trim_end_matches('/'), "/v1/messages" | "/v1/messages/count_tokens")
 }
 
 /// 来访 `X-Request-Id` 能沿用的形态：`[A-Za-z0-9._-]`，1 到 128 位。

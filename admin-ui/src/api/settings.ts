@@ -102,7 +102,7 @@ export interface Settings {
   reject_tampered_thinking: boolean
   /** 订阅通道放行、API Key 直连却返回 400 的几种请求形态，按直连原文于本地拒绝；默认启用。 */
   api_key_parity: boolean
-  /** /v1/messages 与 count_tokens 的请求体超过上游 32MB 时于本地返回 413；停用后按 64MB；默认启用。 */
+  /** /v1/messages 与 count_tokens 改写后的出站体超过上游 32MB 时于本地返回 413；停用后照发由上游判；默认启用。 */
   cap_messages_body: boolean
   /** 仅注入 billing 标识时也挪客户端 system；默认停用。 */
   sim_billing_relocate: boolean

@@ -137,9 +137,8 @@ pub(super) async fn admit(
     *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
-    // 只看头的闸都过了才读体，上限见 [`body_limit`]。
-    let limit = body_limit(&path_and_query, state.store.forward_flags().cap_messages_body);
-    let body = read_body(body, limit, &method, &path_and_query, &client_ua).await?;
+    // 只看头的闸都过了才读体，见 [`MAX_BODY_BYTES`]。
+    let body = read_body(body, &method, &path_and_query, &client_ua).await?;
     let mut facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
     // 自报 CC 的历史里混进了 `call_` id（会话中途切过别的后端）：改写成 `toolu_` 再往下走，
     // 不然这个会话此后每一轮都被 2.3a 拒掉。后面所有闸门与出站改写都看改写后的那份。
@@ -305,11 +304,10 @@ pub(super) async fn admit(
     ))
 }
 
-/// 按 `limit`（[`body_limit`]）读完请求体：边读边数，超限立刻停、回 413（与上游同一个
+/// 按 [`MAX_BODY_BYTES`] 读完请求体：边读边数，超限立刻停、回 413（与上游同一个
 /// `request_too_large`），不会先攒满再判；读到一半断开等读失败回 400。
 async fn read_body(
     body: axum::body::Body,
-    limit: usize,
     method: &Method,
     path_and_query: &str,
     client_ua: &str,
@@ -326,12 +324,12 @@ async fn read_body(
                 "failed to read the request body",
             )
         })?;
-        if buf.len() + chunk.len() > limit {
+        if buf.len() + chunk.len() > MAX_BODY_BYTES {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request body too large");
             return Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_large",
-                format!("request body exceeds {} MB", limit / (1024 * 1024)),
+                format!("request body exceeds {} MB", MAX_BODY_BYTES / (1024 * 1024)),
             ));
         }
         buf.extend_from_slice(&chunk);

@@ -77,10 +77,11 @@ use super::{
     unshift_system_index,
 };
 use super::{
-    EarlyUpstreamFailure, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_PREWARM,
-    REWRITE_PROBE_REPLY, REWRITE_PROBE_REPLY_FILLED, REWRITE_REFUSAL_REPLAY, RequestLogState,
-    body_limit, client_access, client_request_id, error_response, header_opt, inbound_beta_list,
-    log_early_upstream_failure, rate_limit_response, request_fallback_speeds, request_max_tokens,
+    EarlyUpstreamFailure, MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, ParsedRequestBits,
+    REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_PREWARM, REWRITE_PROBE_REPLY,
+    REWRITE_PROBE_REPLY_FILLED, REWRITE_REFUSAL_REPLAY, RequestLogState, client_access,
+    client_request_id, error_response, header_opt, inbound_beta_list, log_early_upstream_failure,
+    outbound_too_large, rate_limit_response, request_fallback_speeds, request_max_tokens,
     request_model, request_speed,
 };
 
@@ -161,6 +162,16 @@ pub(crate) async fn handle_inner(
             Ok(a) => a,
             Err(resp) => return resp,
         };
+        // 出站体超过上游 32MB：发出去也是 413，就地回同一个。判改写后那份，见 [`outbound_too_large`]。
+        if outbound_too_large(&inb.path_and_query, attempt.sent.len(), inb.flags.cap_messages_body)
+        {
+            tracing::warn!(method = %inb.method, path = %inb.path_and_query, ua = %inb.client_ua, bytes = attempt.sent.len(), "rejected: outbound request body too large");
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                format!("request body exceeds {} MB", MAX_MESSAGES_BODY_BYTES / (1024 * 1024)),
+            );
+        }
         let resp = attempt.upstream.send(attempt.sent.clone()).await;
         match retry::on_response(&cx, &inb, &mut pick, &mut swaps, &attempt, &prepared, resp).await
         {
