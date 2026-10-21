@@ -234,7 +234,7 @@ async fn relay_ok(
             .as_ref()
             .map(|s| (s.session_id.clone(), &s.link))
             .or_else(|| upstream.client_link.as_ref().map(|(sid, l)| (sid.clone(), l)))
-            .and_then(|(sid, l)| Some((sid, l.lane.clone()?, l.turn_fp))),
+            .and_then(|(sid, l)| Some((sid, l.lane.clone()?, l.turn.clone()))),
         // 按 message thread 改写过的，回程据回复提交或作废线程状态，见 [`ReqLog::cc_thread`]。
         cc_thread: upstream.sim.as_ref().and_then(|s| s.take_thread()),
         // 只给计费路径分类：count_tokens 之流没有「回复」可言。三把键各自跟着拦截开关走：

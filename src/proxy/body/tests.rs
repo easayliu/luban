@@ -5111,6 +5111,30 @@ fn sim_threads_do_not_continue_onto_another_conversations_text_reply() {
     assert_eq!(v["thread"]["previous_message_id"], "msg_r2", "第二段照常接上: {v}");
 }
 
+/// 同轮并发的两发：后发的 B 先成功、先发的 A 后成功。A 迟到的提交不能顶掉 B 的线程状态，
+/// 带着 B 那条回复的下一轮照常 `continue(msg_B)`。
+#[test]
+fn sim_threads_ignore_a_late_commit_from_an_earlier_request() {
+    use crate::proxy::session_link::CcSessionLink;
+    let user1 = serde_json::json!({ "role": "user", "content": "线程测试·迟到 hi" });
+    let first = thread_body("claude-opus-5-5", serde_json::json!([user1]));
+    let (_, pa) = thread_turn(&first, all_on());
+    let (_, pb) = thread_turn(&first, all_on());
+    CcSessionLink::record_thread(&pb.unwrap(), "msg_B", Vec::new(), reply_of("B".into()), 100);
+    CcSessionLink::record_thread(&pa.unwrap(), "msg_A", Vec::new(), reply_of("A".into()), 900);
+
+    let follow = thread_body(
+        "claude-opus-5-5",
+        serde_json::json!([
+            user1,
+            { "role": "assistant", "content": "B" },
+            { "role": "user", "content": "继续" },
+        ]),
+    );
+    let (v, _) = thread_turn(&follow, all_on());
+    assert_eq!(v["thread"]["previous_message_id"], "msg_B", "{v}");
+}
+
 /// 客户端把上一条回复改了再发下一条：正文 A 改成 B、工具入参改了（id 不变）、thinking 改了，
 /// 都得 `create`——`continue` 会让上游沿用存档里的 A，改动被静默丢掉。原样带回照常
 /// `continue`；把 thinking 整块丢掉也算原样（上游线程里那份本来就在）。

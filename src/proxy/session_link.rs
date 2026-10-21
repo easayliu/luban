@@ -58,19 +58,40 @@ pub(crate) struct CcSessionLink {
     pub(super) prompt_index: u32,
     /// 回程把这条的 `request-id` / `message.id` 记到哪条链上，`None` 即不记。见 [`ChainLane`]。
     pub(super) lane: Option<ChainLane>,
-    /// 这条主线程新输入的指纹（[`turn_fp`]），失败时记进会话（[`Self::mark_failed`]），用来认出
-    /// 紧接着原样重发的那一条。不是新输入的为 `None`。
-    pub(super) turn_fp: Option<u64>,
+    /// 这条请求属于会话的哪一轮、新输入的指纹是什么，回程据此记失败或清失败（[`Self::mark_failed`] /
+    /// [`Self::record_main`]），用来认出紧接着原样重发的那一条。见 [`TurnMark`]。
+    pub(super) turn: Option<TurnMark>,
 }
 
-/// 一条新输入的指纹：消息条数 + 末条消息。失败后原样重发两样都不变；用户重新输入时历史里多了
-/// 一条（官方把报错前那句留在历史里），条数就不同。只取末条，不为大上下文整段再序列化一遍。
+/// 一条主线程请求在 [`CcSessionLink::load_retryable`] 那一刻的位置：所属的一轮（会话当时的
+/// prompt id）、新输入的指纹（[`turn_fp`]，不是新输入为 `None`）与发出的先后（`seq`）。回程据此
+/// 挡掉迟到的旧响应：成功只在比已写进链的那条更新时才写（[`CcSessionLink::record_main`]），失败
+/// 只记在仍未成功的当前这一轮上（[`CcSessionLink::mark_failed`]）。
+#[derive(Debug, Clone)]
+pub(crate) struct TurnMark {
+    prompt_id: String,
+    fp: Option<u64>,
+    pub(super) seq: u64,
+}
+
+/// 一条新输入的指纹：消息条数 + 从最后一条 user 消息起到末尾的几条。失败后原样重发两样都不变；
+/// 用户重新输入时官方不加新消息，而是把报错前那句（末尾补一个换行）与新的一句并成同一条 user
+/// 消息的两个文本块（`cap/auto-2.1.306-20261021-retry/00125`：`"reply with just: ok\n"` +
+/// `"reply with just: fine"`），条数不变、末条 user 消息变了——原样再敲同一句也因多出那一块而
+/// 不同。从 user 消息起算而非只看物理末条：第三方客户端会在末尾挂一条固定的 system 提醒，只看它
+/// 就认不出换了问题。只取这一段，不为大上下文整段再序列化一遍。
 pub(super) fn turn_fp(v: &serde_json::Value) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let msgs = v.get("messages")?.as_array()?;
+    let from = msgs
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .unwrap_or(msgs.len().checked_sub(1)?);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     msgs.len().hash(&mut h);
-    serde_json::to_string(msgs.last()?).ok()?.hash(&mut h);
+    for m in &msgs[from..] {
+        serde_json::to_string(m).ok()?.hash(&mut h);
+    }
     Some(h.finish())
 }
 
@@ -113,9 +134,15 @@ pub(crate) struct CcSessionEntry {
     threads: Vec<ThreadState>,
     /// 子代理各自那条链（[`ChainLane::Agent`]），按最近使用排在后面。
     agents: Vec<AgentChain>,
-    /// 主线程上一条请求失败了：它那条新输入的指纹（[`CcSessionLink::turn_fp`]）。下一条新输入
-    /// 指纹相同即是重发，不换轮；主线程成功一条就清掉。
+    /// 当前这一轮的主线程新输入失败了：它的指纹（[`turn_fp`]）。下一条新输入指纹相同即是重发，
+    /// 不换轮；换了轮、或这一轮成功一条就清掉。只存当前这一轮的（[`TurnMark`]）。
     failed_turn: Option<u64>,
+    /// 当前这一轮已经有主线程请求成功了：之后迟到的同轮失败（并行的另一次重发）不再把它标回待重试。
+    turn_done: bool,
+    /// 发给 [`TurnMark::seq`] 的计数，每加载一条加一。
+    issued_seq: u64,
+    /// 主链上最近写进去的那条成功请求的 [`TurnMark::seq`]：更早发出、迟到的成功不再覆盖它。
+    recorded_seq: u64,
     last_seen: std::time::Instant,
 }
 
@@ -130,6 +157,28 @@ struct AgentChain {
 }
 
 impl CcSessionEntry {
+    /// 把一条成功回复的 `request-id` / `message.id` 记到 `lane` 那条链上，见 [`CcSessionLink::record`]。
+    /// 两个都没有时什么也不做。
+    fn write_link(&mut self, lane: &ChainLane, req_id: Option<&str>, message_id: Option<&str>) {
+        if req_id.is_none() && message_id.is_none() {
+            return;
+        }
+        self.last_seen = std::time::Instant::now();
+        let (prev_req, prev_message_id) = match lane {
+            ChainLane::Main => (&mut self.prev_req, &mut self.prev_message_id),
+            ChainLane::Agent(id) => {
+                let a = self.agent_mut(id);
+                (&mut a.prev_req, &mut a.prev_message_id)
+            }
+        };
+        if let Some(r) = req_id {
+            *prev_req = Some(r.to_string());
+        }
+        if let Some(m) = message_id {
+            *prev_message_id = Some(m.to_string());
+        }
+    }
+
     /// 子代理 `agent_id` 那条链，没有就以主线程当前这一轮新建；用过的挪到末尾，满了先丢最久未用的。
     fn agent_mut(&mut self, agent_id: &str) -> &mut AgentChain {
         let chain = match self.agents.iter().position(|a| a.agent_id == agent_id) {
@@ -186,6 +235,8 @@ pub(crate) struct ThreadState {
     /// 同一会话槽里两段开场相同的对话会互相接上对方的回复；客户端改了正文或工具入参（id 不变）
     /// 也照样接上，改动被静默丢掉。
     reply_fp: ReplyFp,
+    /// 提交它的那条请求的发出序号（[`TurnMark::seq`]），见 [`CcSessionLink::record_thread`]。
+    seq: u64,
     /// 那条回复 usage 的总量（input + cache 写 + cache 读 + output）：官方 `<total_tokens>` 倒数
     /// 里的「当前上下文」（可执行文件里的 `xz(messages)`），见 [`TotalTokens`]。
     ctx_tokens: u64,
@@ -421,6 +472,8 @@ pub(crate) struct ThreadPending {
     budget: TotalTokens,
     /// 历史各轮补过、这一轮仍成立的提醒（[`history_reminders`]），这一轮补了就再追加一条。
     reminders: Vec<TurnReminder>,
+    /// 这条请求的发出序号（[`TurnMark::seq`]），提交时挡掉迟到的旧回复。
+    seq: u64,
 }
 
 impl ThreadPending {
@@ -532,12 +585,13 @@ fn total_tokens_for(lineage: Option<&ThreadState>, regular_prompt: bool) -> (Tot
 /// 回程提交时也就找不到条目、什么都不记。
 ///
 /// 第三个返回值是这一轮 `<total_tokens>` 提醒该写的数（[`TotalTokens`]）；`regular_prompt` 即末条
-/// 是一次新的用户输入（而非工具结果）。
+/// 是一次新的用户输入（而非工具结果）。`seq` 是这条请求的发出序号（[`TurnMark::seq`]）。
 pub(super) fn thread_decision(
     key: CcSessionKey<'_>,
     shape: u64,
     msgs: &[ThreadMsg],
     regular_prompt: bool,
+    seq: u64,
 ) -> (ThreadDecision, ThreadPending, u64) {
     let root = msgs.first().map_or(0, |m| m.fp);
     let (found, (budget, left), reminders) = {
@@ -560,6 +614,7 @@ pub(super) fn thread_decision(
         continued_from: found.as_ref().map(|(_, id)| id.clone()),
         budget,
         reminders,
+        seq,
     };
     let decision = match found {
         Some((from, previous_message_id)) => ThreadDecision::Continue { from, previous_message_id },
@@ -963,6 +1018,9 @@ impl CcSessionLink {
             threads: Vec::new(),
             agents: Vec::new(),
             failed_turn: None,
+            turn_done: false,
+            issued_seq: 0,
+            recorded_seq: 0,
             last_seen: now,
         });
         // 新建的那份 id 就是这一轮的，别再换一次；客户端报的还是这一轮、或与刚失败那条指纹相同，
@@ -976,6 +1034,12 @@ impl CcSessionLink {
             entry.prompt_id = uuid_v4();
             entry.prompt_index = entry.prompt_index.saturating_add(1);
         }
+        // 开了新一轮，上一轮的失败标记作废：它的重发再来就是一句新输入。
+        if new_prompt {
+            entry.failed_turn = None;
+            entry.turn_done = false;
+        }
+        entry.issued_seq += 1;
         if new_prompt || !known {
             entry.local_turn = new_prompt && local_turn;
         }
@@ -994,16 +1058,43 @@ impl CcSessionLink {
             prompt_index: entry.prompt_index,
             // 缺省记主线程：模拟路径只造主线程。真实 CC 那条路由 [`client_session_link`] 按类别覆写。
             lane: Some(ChainLane::Main),
-            turn_fp: fp,
+            turn: Some(TurnMark { prompt_id: entry.prompt_id.clone(), fp, seq: entry.issued_seq }),
         }
     }
 
     /// 主线程这条失败了（上游报错，或连上游都没到）：记下它的新输入指纹，供
-    /// [`Self::load_retryable`] 认出紧接着的原样重发。
-    pub(super) fn mark_failed(key: CcSessionKey<'_>, fp: u64) {
-        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+    /// [`Self::load_retryable`] 认出紧接着的原样重发。会话已经换到别的轮、或这一轮已经有一条成功了
+    /// （迟到的旧响应、并行的另一次重发）就不记。
+    pub(super) fn mark_failed(key: CcSessionKey<'_>, turn: &TurnMark) {
+        let Some(fp) = turn.fp else { return };
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned())
+            && entry.prompt_id == turn.prompt_id
+            && !entry.turn_done
+        {
             entry.failed_turn = Some(fp);
         }
+    }
+
+    /// 主线程这条成功了：[`Self::record`] 记进主链，只是比已写进链的那条**更早发出**的（迟到的
+    /// 旧响应）不写，免得把链倒拨回去。属于当前这一轮的，这一轮记为已成功、失败标记清掉，之后
+    /// 同样的输入是新的一轮。
+    pub(super) fn record_main(
+        key: CcSessionKey<'_>,
+        turn: &TurnMark,
+        req_id: Option<&str>,
+        message_id: Option<&str>,
+    ) {
+        let mut map = CC_SESSIONS.lock();
+        let Some(entry) = map.get_mut(&key.owned()) else { return };
+        if entry.prompt_id == turn.prompt_id {
+            entry.turn_done = true;
+            entry.failed_turn = None;
+        }
+        if turn.seq <= entry.recorded_seq {
+            return;
+        }
+        entry.recorded_seq = turn.seq;
+        entry.write_link(&ChainLane::Main, req_id, message_id);
     }
 
     /// 改接到子代理 `agent_id` 自己那条链上：`cc_prev_req` 与 `previous_message_id` 换成它
@@ -1045,24 +1136,8 @@ impl CcSessionLink {
         if req_id.is_none() && message_id.is_none() {
             return;
         }
-        let mut map = CC_SESSIONS.lock();
-        let Some(entry) = map.get_mut(&key.owned()) else { return };
-        entry.last_seen = std::time::Instant::now();
-        let (prev_req, prev_message_id) = match lane {
-            ChainLane::Main => {
-                entry.failed_turn = None;
-                (&mut entry.prev_req, &mut entry.prev_message_id)
-            }
-            ChainLane::Agent(id) => {
-                let a = entry.agent_mut(id);
-                (&mut a.prev_req, &mut a.prev_message_id)
-            }
-        };
-        if let Some(r) = req_id {
-            *prev_req = Some(r.to_string());
-        }
-        if let Some(m) = message_id {
-            *prev_message_id = Some(m.to_string());
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.write_link(lane, req_id, message_id);
         }
     }
 
@@ -1084,6 +1159,15 @@ impl CcSessionLink {
         let Some(entry) = map.get_mut(&(pending.cred_id, pending.session_id.clone())) else {
             return;
         };
+        // 迟到的旧回复：这段对话（同 root、两边消息互为前缀）已有更晚发出的那条提交过，不再拿旧的
+        // 覆盖它——同轮并发重发 B 先成功、A 后成功时，留着 B 才能接着 `continue(msg_B)`。
+        let related = |t: &ThreadState| {
+            let n = t.msgs.len().min(pending.msgs.len());
+            t.root == pending.root && t.msgs[..n] == pending.msgs[..n]
+        };
+        if entry.threads.iter().any(|t| related(t) && t.seq > pending.seq) {
+            return;
+        }
         entry.threads.retain(|t| {
             !(t.root == pending.root
                 && t.msgs.len() <= pending.msgs.len()
@@ -1104,6 +1188,7 @@ impl CcSessionLink {
             last_message_id: message_id.to_string(),
             tool_use_ids,
             reply_fp,
+            seq: pending.seq,
             ctx_tokens,
             budget: pending.budget,
             reminders: pending.reminders.clone(),
@@ -1461,7 +1546,8 @@ pub(crate) fn client_session_link(
         starts_local_turn(v),
         kind.wants_prompt_id(),
         client_prompt_id.filter(|_| main),
-        new_prompt.then(|| turn_fp(v)).flatten(),
+        // 主线程带了 prompt 头就按头认重发（[`CcSessionLink::load_retryable`]），指纹用不上，不必算。
+        (new_prompt && !(main && client_prompt_id.is_some())).then(|| turn_fp(v)).flatten(),
     );
     // 只有主线程与子代理的回复推进链条，各推各的（[`ChainLane`]）；其余几类只读主线程那一环。
     // 子代理认不出支线号（2.1.277 之前不发 `x-claude-code-agent-id`）就不接任何链。

@@ -24,6 +24,11 @@ const CONTENT_HASH_MAX: usize = 102_400;
 /// 账本最多记多少个文件：超了先忘掉最久没碰的。
 const MAX_FILES: usize = 64;
 
+/// 一个会话账本里全文加起来最多留这么多字节：超了从最久没碰的文件起丢全文（大小、跟踪这些照留，
+/// 之后它的改动按只比两段算，与内容不知道时一样）。单文件上限是 [`CONTENT_HASH_MAX`] 的四倍，64 个
+/// 全满会到 25MB，按会话数一乘就太多了。
+const CONTENT_BUDGET: usize = 4 * 1024 * 1024;
+
 /// Read 读到空文件时的结果。
 pub(super) const EMPTY_FILE_WARNING: &str =
     "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>";
@@ -176,6 +181,7 @@ impl Files {
         let seq = r.touched;
         r.reader(agent, seq).last_op = LastOp::Read;
         r.reader(agent, seq).partial = partial;
+        self.fit_budget(path);
         prior
     }
 
@@ -242,7 +248,9 @@ impl Files {
             let before = std::mem::take(c);
             *c = if replace_all { before.replace(old, new) } else { before.replacen(old, new, 1) };
             r.size = Some(c.len());
-            return line_diff(&before, c);
+            let diff = line_diff(&before, c);
+            self.fit_budget(path);
+            return diff;
         }
         if let Some(s) = r.size {
             r.size = Some((s + new.len() * hits).saturating_sub(old.len() * hits));
@@ -276,7 +284,30 @@ impl Files {
         r.content = (content.len() <= CONTENT_HASH_MAX * 4).then(|| content.to_string());
         r.size = Some(content.len());
         r.dirty = true;
+        self.fit_budget(path);
         diff
+    }
+
+    /// 全文加起来超了 [`CONTENT_BUDGET`]：除刚碰过的 `keep` 外，从最久没碰的起丢全文，直到回到预算内。
+    fn fit_budget(&mut self, keep: &str) {
+        let mut total: usize =
+            self.map.values().filter_map(|r| r.content.as_ref()).map(String::len).sum();
+        if total <= CONTENT_BUDGET {
+            return;
+        }
+        let mut held: Vec<(u64, &mut FileRec)> = self
+            .map
+            .iter_mut()
+            .filter(|(p, r)| p.as_str() != keep && r.content.is_some())
+            .map(|(_, r)| (r.touched, r))
+            .collect();
+        held.sort_by_key(|(t, _)| *t);
+        for (_, r) in held {
+            if total <= CONTENT_BUDGET {
+                break;
+            }
+            total -= r.content.take().map_or(0, |c| c.len());
+        }
     }
 
     /// 快照张数，见 [`Self::snapshots`] 字段。
@@ -563,6 +594,23 @@ mod tests {
         f.note_read(m, "/p/a.txt", Some("a\nb\n".into()), 4, false, false);
         assert_eq!(f.apply_edit(m, "/p/a.txt", "a", "", false), (0, 1));
         assert_eq!(f.map["/p/a.txt"].content.as_deref(), Some("b\n"));
+    }
+
+    /// 全文超了会话预算：从最久没碰的起丢全文，刚读的留着，大小照记。
+    #[test]
+    fn content_over_budget_drops_oldest_text() {
+        let mut f = Files::default();
+        let m = MAIN_READER;
+        let big = "x".repeat(CONTENT_HASH_MAX * 4);
+        let n = CONTENT_BUDGET / big.len() + 2;
+        for i in 0..n {
+            f.note_read(m, &format!("/p/{i}"), Some(big.clone()), big.len(), false, false);
+        }
+        let total: usize = f.map.values().filter_map(|r| r.content.as_ref()).map(String::len).sum();
+        assert!(total <= CONTENT_BUDGET);
+        assert!(f.map["/p/0"].content.is_none(), "最久的丢了全文");
+        assert_eq!(f.map["/p/0"].size, Some(big.len()), "大小还在");
+        assert!(f.map[&format!("/p/{}", n - 1)].content.is_some(), "刚读的留着");
     }
 
     #[test]

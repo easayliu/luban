@@ -60,6 +60,10 @@ pub const TELEMETRY_SIDE_QUERY_HOLD_SECS: u64 = 10;
 /// 失败补报。每来一次重发重新计时。
 pub const TELEMETRY_RETRY_HOLD_SECS: u64 = 120;
 
+/// 一串扣住的重试最多接多少次：官方客户端默认重试 10 次，超过这么多的（不封顶重发的来访）就把扣着的那串当最终
+/// 失败先报掉，这一次另起一串，免得一直接下去。
+pub const TELEMETRY_RETRY_CHAIN_MAX: usize = 32;
+
 /// 「已按退出收尾」的会话 id 记多久：期间同一个 id 再来按 `--resume` 处理（指标
 /// `start_type: resume`），过了就当全新会话。真实用户 resume 几天前的对话很常见，取 7 天。
 pub const TELEMETRY_ENDED_SESSION_MEMORY_SECS: u64 = 7 * 24 * 60 * 60;

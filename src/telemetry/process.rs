@@ -107,12 +107,13 @@ impl Telemetry {
         let mut call = call;
         if allow_defer && classify_kind(&call, &shape, is_agent) == Kind::Main {
             let sig: RetrySig = (shape.cc_prompt_id.clone(), shape.messages_len, shape.tools_count);
-            let mut prior: Vec<ApiCall> = Vec::new();
+            let mut prior: Vec<PriorAttempt> = Vec::new();
             if let Some(held) = st.held_retries.remove(&key) {
-                if held.sig == sig {
-                    prior = held.calls;
+                if held.sig == sig && held.prior.len() < config::TELEMETRY_RETRY_CHAIN_MAX {
+                    prior = held.prior;
+                    prior.push(PriorAttempt::of(&held.last));
                 } else {
-                    Self::finish_retry_chain(st, held.calls);
+                    Self::finish_retry_chain(st, held);
                 }
             }
             let retryable =
@@ -121,14 +122,13 @@ impl Telemetry {
                 if let Some(sess) = st.sessions.get_mut(&key) {
                     sess.last_seen = now;
                 }
-                prior.push(call);
                 st.held_retries.insert(
                     key,
-                    HeldRetry { calls: prior, sig, at: now, device_id: device_id.clone() },
+                    HeldRetry { prior, last: call, sig, at: now, device_id: device_id.clone() },
                 );
                 return;
             }
-            call.prior_attempts = prior.iter().map(PriorAttempt::of).collect();
+            call.prior_attempts = prior;
         }
         let call = call;
         let Lineage { continued_from, cleared_from, cleared_prev, parent_session_id } =
@@ -739,9 +739,9 @@ impl Telemetry {
     }
 
     /// 一串扣住的失败到头了（换了请求或扣太久）：最后一次就是最终失败，带着前面几次照常处理（不再扣）。
-    pub(super) fn finish_retry_chain(st: &mut State, mut calls: Vec<ApiCall>) {
-        let Some(mut last) = calls.pop() else { return };
-        last.prior_attempts = calls.iter().map(PriorAttempt::of).collect();
+    pub(super) fn finish_retry_chain(st: &mut State, held: HeldRetry) {
+        let mut last = held.last;
+        last.prior_attempts = held.prior;
         Self::process(st, last, false, None);
     }
 

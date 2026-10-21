@@ -754,8 +754,14 @@ pub(super) struct State {
 /// 重试途中只报重发事件，最终成功或失败才收尾（`cap/auto-2.1.306-20261021-retry`），所以先扣着，等下一次
 /// 尝试来了再定：还是同一请求就接上，换了别的请求或扣太久（[`config::TELEMETRY_RETRY_HOLD_SECS`]）就把
 /// 最后一次当最终失败报。
+///
+/// 只有最后一次留整份 [`ApiCall`]（收尾要用它的请求体），前面几次只留重发事件要的那几样（[`super::call::PriorAttempt`]）：
+/// 上游一出故障，每个会话都扣着一串，每次都留整份请求体会按「重试次数 × 请求体」涨。
 pub(super) struct HeldRetry {
-    pub(super) calls: Vec<ApiCall>,
+    /// 前面几次，按先后。
+    pub(super) prior: Vec<super::call::PriorAttempt>,
+    /// 最近这一次。
+    pub(super) last: ApiCall,
     /// 发它的设备：同一台设备上的会话在扣着期间都不算闲置（`/clear` 后新会话的头一条扣着时，补处理时还要靠
     /// 旧会话认来历，见 [`Telemetry::gc`]）。
     pub(super) device_id: String,

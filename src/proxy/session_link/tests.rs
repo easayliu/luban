@@ -332,23 +332,86 @@ fn session_link_retry_with_same_prompt_id_keeps_the_turn() {
     assert_eq!((next.prompt_id.as_deref(), next.prompt_index), (Some("p2"), 2), "新输入换轮");
 }
 
-/// 没有 prompt 头（模拟路径）：主线程失败后指纹相同的那条是重发，不换轮；成功一条之后、或指纹
-/// 不同（用户重新输入，历史多了一条），照常换轮。
+/// 没有 prompt 头（模拟路径）：主线程失败后指纹相同的那条是重发，不换轮；这一轮成功一条之后、
+/// 或指纹不同（用户重新输入，官方把报错前那句与新的一句并进同一条 user 消息），照常换轮。
 #[test]
 fn session_link_retry_without_prompt_header_keeps_the_turn() {
-    use super::{CcSessionLink, ChainLane};
+    use super::CcSessionLink;
     let sid = format!("test-{}", crate::proxy::uuid_v4());
     let turn = |fp| CcSessionLink::load_retryable(key(&sid), true, false, true, None, Some(fp));
+    let fail = |l: &CcSessionLink| CcSessionLink::mark_failed(key(&sid), l.turn.as_ref().unwrap());
     let first = turn(1);
-    CcSessionLink::mark_failed(key(&sid), 1);
+    fail(&first);
     let retry = turn(1);
     assert_eq!((retry.prompt_id.clone(), retry.prompt_index), (first.prompt_id.clone(), 1), "重发");
 
-    CcSessionLink::record(key(&sid), &ChainLane::Main, Some("req_1"), Some("msg_1"));
+    CcSessionLink::record_main(key(&sid), retry.turn.as_ref().unwrap(), Some("req_r"), None);
     let again = turn(1);
     assert_eq!(again.prompt_index, 2, "成功之后同样的输入是新的一轮");
-    CcSessionLink::mark_failed(key(&sid), 1);
+    fail(&again);
     assert_eq!(turn(2).prompt_index, 3, "指纹不同即是新输入");
+}
+
+/// 失败标记绑着它那一轮：A 失败 → B 开了新一轮 → A 再来，是新的一轮，不沿用 B 的；A 的失败迟到
+/// （会话已在 B）也不回写。
+#[test]
+fn session_link_failure_mark_is_bound_to_its_turn() {
+    use super::CcSessionLink;
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let turn = |fp| CcSessionLink::load_retryable(key(&sid), true, false, true, None, Some(fp));
+    let a = turn(1);
+    CcSessionLink::mark_failed(key(&sid), a.turn.as_ref().unwrap());
+    let b = turn(2);
+    assert_eq!(b.prompt_index, 2);
+    let a_again = turn(1);
+    assert_eq!(a_again.prompt_index, 3, "旧轮的失败标记在开 B 时已作废");
+    assert_ne!(a_again.prompt_id, b.prompt_id);
+
+    // A 的失败迟到：会话已在 a_again 那一轮，按 A 那一轮记的失败不该生效。
+    CcSessionLink::mark_failed(key(&sid), a.turn.as_ref().unwrap());
+    assert_eq!(turn(1).prompt_index, 4, "迟到的旧失败没回写当前这一轮");
+}
+
+/// 迟到的旧响应：更早发出的成功不覆盖主链；这一轮已有一条成功后，并行的另一次重发迟到失败也不再
+/// 把它标回待重试。
+#[test]
+fn session_link_late_responses_do_not_rewind_the_turn() {
+    use super::CcSessionLink;
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let turn = |fp| CcSessionLink::load_retryable(key(&sid), true, false, true, None, Some(fp));
+    let mark = |l: &CcSessionLink| l.turn.clone().unwrap();
+    let a = turn(1);
+    let b = turn(2);
+    CcSessionLink::record_main(key(&sid), &mark(&b), Some("req_b"), Some("msg_b"));
+    CcSessionLink::record_main(key(&sid), &mark(&a), Some("req_a"), Some("msg_a"));
+    let next = CcSessionLink::load(key(&sid), false, true);
+    assert_eq!(next.prev_req.as_deref(), Some("req_b"), "A 迟到的成功没覆盖 B");
+    assert_eq!(next.prev_message_id.as_deref(), Some("msg_b"));
+
+    // 同一轮两次并行重发：R0 失败，R1、R2 都是它的重发；R1 成功后 R2 迟到失败，这一轮仍算完成，
+    // 同样的输入是新的一轮。
+    let r0 = turn(3);
+    CcSessionLink::mark_failed(key(&sid), &mark(&r0));
+    let r1 = turn(3);
+    let r2 = turn(3);
+    assert_eq!((r1.prompt_index, r2.prompt_index), (r0.prompt_index, r0.prompt_index), "都是重发");
+    CcSessionLink::record_main(key(&sid), &mark(&r1), Some("req_r1"), None);
+    CcSessionLink::mark_failed(key(&sid), &mark(&r2));
+    assert_eq!(turn(3).prompt_index, r0.prompt_index + 1, "已成功的那一轮不会被迟到的失败重新打开");
+}
+
+/// 指纹从最后一条 user 消息算起：末尾挂着同一条 system 提醒时，换了问题也认得出。
+#[test]
+fn turn_fp_sees_past_a_trailing_system_message() {
+    let body = |q: &str| {
+        serde_json::json!({"messages": [
+            {"role": "user", "content": q},
+            {"role": "system", "content": "reminder"},
+        ]})
+    };
+    let fp = |q| super::turn_fp(&body(q)).unwrap();
+    assert_ne!(fp("A"), fp("B"));
+    assert_eq!(fp("A"), fp("A"));
 }
 
 /// 后台子代理属于派生它的那一轮：主线程换了轮它不跟着变，迟到的子代理也不把主线程拨回去。

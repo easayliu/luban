@@ -59,7 +59,9 @@ pub(super) fn apply_sim_thread(
     let regular_prompt = crate::telemetry::last_is_new_prompt_body(v);
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
     let shape = thread_shape_of(v, raw_sys_shape);
-    let (mut decision, pending, tokens_left) = thread_decision(key, shape, fps, regular_prompt);
+    let seq = sim.link.turn.as_ref().map_or(0, |t| t.seq);
+    let (mut decision, pending, tokens_left) =
+        thread_decision(key, shape, fps, regular_prompt, seq);
     let has_tool_choice = v.get("tool_choice").is_some_and(|c| !c.is_null());
     if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
         decision = ThreadDecision::Create;

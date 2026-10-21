@@ -617,6 +617,30 @@ fn a_session_waiting_for_a_retry_is_not_idle() {
     assert!(st.held_retries.contains_key(&key()), "还在等重发");
 }
 
+/// 扣着的重试链只留最后一次的整份请求，前面几次只留概况。
+#[test]
+fn held_retry_keeps_only_the_last_body() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.306 (external, cli)";
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    first.ua_out = ua.into();
+    t.ingest(first);
+    for i in 0..3 {
+        let mut f = failed(
+            call(with_prompt(cc_body(true), PROMPT_2), &format!("req_f{i}"), "end_turn"),
+            Some(529),
+            "overloaded_error",
+            "Overloaded",
+        );
+        f.ua_out = ua.into();
+        t.ingest(f);
+    }
+    let st = t.0.state.lock();
+    let held = &st.held_retries[&key()];
+    assert_eq!(held.prior.len(), 2);
+    assert_eq!(held.last.request_id.as_deref(), Some("req_f2"));
+}
+
 /// 可重试的失败会先扣着等客户端重发（[`config::TELEMETRY_RETRY_HOLD_SECS`]）：让它超时，按最终失败补报。
 fn give_up_retries(t: &Telemetry) {
     t.gc(Instant::now() + Duration::from_secs(config::TELEMETRY_RETRY_HOLD_SECS + 1));

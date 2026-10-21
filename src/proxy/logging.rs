@@ -11,7 +11,7 @@ use super::learned_rules::{
 };
 use super::rate_limit::RateLimitInfo;
 use super::session_link::{
-    CcSessionKey, CcSessionLink, ChainLane, REPLY_TEXT_FP_INIT, ReplyFp, ThreadPending,
+    CcSessionKey, CcSessionLink, ChainLane, REPLY_TEXT_FP_INIT, ReplyFp, ThreadPending, TurnMark,
     reply_text_fp,
 };
 use super::upstream::{
@@ -97,8 +97,8 @@ pub(crate) struct ReqLog {
     /// 模拟路径恒为主线程；真实 CC 只在 luban 替它补关联字段时才有（[`super::client_session_link`]），
     /// 且只有主线程与子代理有——「猜下一句」、分叉这些只读链、不推进。其余为 `None`。
     ///
-    /// 第三项是主线程新输入的指纹（[`CcSessionLink::turn_fp`]）：失败时记进会话，认紧接着的重发。
-    pub(super) cc_session: Option<(String, ChainLane, Option<u64>)>,
+    /// 第三项是这条所属的一轮与新输入指纹（[`TurnMark`]）：失败记进会话、成功清掉，认紧接着的重发。
+    pub(super) cc_session: Option<(String, ChainLane, Option<TurnMark>)>,
     /// 模拟路径这条请求按 message thread 改写后等回程提交的那份（[`ThreadPending`]）：完整成功
     /// 才记成线程状态，失败把它接的那条线程作废。取自 [`super::Simulation::take_thread`]；
     /// 非模拟路径与没写 `thread` 的为 `None`。
@@ -445,17 +445,19 @@ impl Drop for ReqLog {
         // 链上跳过报错的请求（`cap/auto-2.1.306-20261021-retry` R4，见 [`CcSessionLink::record`]），
         // 也跳过被客户端取消的（`cap/auto-2.1.285-20260930/00264` 指回 `00252`，跳过了按 Esc
         // 打断的 `00261`）。
-        if let Some((sid, lane, fp)) = &self.cc_session {
+        if let Some((sid, lane, turn)) = &self.cc_session {
             let key = CcSessionKey { cred_id: self.cred_id, session_id: sid };
+            let main_turn = turn.as_ref().filter(|_| *lane == ChainLane::Main);
+            let (req_id, message_id) =
+                (self.upstream_request_id.as_deref(), self.sniffer.message_id.as_deref());
             if ok {
-                CcSessionLink::record(
-                    key,
-                    lane,
-                    self.upstream_request_id.as_deref(),
-                    self.sniffer.message_id.as_deref(),
-                );
-            } else if let (Some(fp), ChainLane::Main, Some(_)) = (fp, lane, &failure) {
-                CcSessionLink::mark_failed(key, *fp);
+                // 主线程按发出先后挡掉迟到的旧响应，见 [`CcSessionLink::record_main`]。
+                match main_turn {
+                    Some(t) => CcSessionLink::record_main(key, t, req_id, message_id),
+                    None => CcSessionLink::record(key, lane, req_id, message_id),
+                }
+            } else if let (Some(t), Some(_)) = (main_turn, &failure) {
+                CcSessionLink::mark_failed(key, t);
             }
         }
         // message thread：只有完整成功、拿到 `message.id` 的才能被下一轮接着 `continue`；上游报错
@@ -754,15 +756,15 @@ pub(crate) fn record_early_failure(
     if let Some(pending) = upstream.sim.as_ref().and_then(|s| s.take_thread()) {
         CcSessionLink::drop_thread(&pending);
     }
-    if let Some((sid, fp)) = upstream
+    if let Some((sid, turn)) = upstream
         .sim
         .as_ref()
         .map(|s| (s.session_id.as_str(), &s.link))
         .or_else(|| upstream.client_link.as_ref().map(|(sid, l)| (sid.as_str(), l)))
         .filter(|(_, l)| l.lane == Some(ChainLane::Main))
-        .and_then(|(sid, l)| Some((sid, l.turn_fp?)))
+        .and_then(|(sid, l)| Some((sid, l.turn.as_ref()?)))
     {
-        CcSessionLink::mark_failed(CcSessionKey { cred_id: cred.id, session_id: sid }, fp);
+        CcSessionLink::mark_failed(CcSessionKey { cred_id: cred.id, session_id: sid }, turn);
     }
     let Some(cap) =
         telemetry_capture(state, cred, upstream, sent, started, flags, billable, organization_id)

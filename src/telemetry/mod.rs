@@ -353,7 +353,7 @@ impl Telemetry {
             .collect();
         for k in given_up {
             if let Some(h) = st.held_retries.remove(&k) {
-                Self::finish_retry_chain(&mut st, h.calls);
+                Self::finish_retry_chain(&mut st, h);
             }
         }
         // 扣住太久的侧查询：没等到主线程请求，按会话现有的 prompt id 补发。
