@@ -208,6 +208,10 @@ pub const REJECT_TAMPERED_THINKING: &str = "reject_tampered_thinking";
 /// 见 [`ForwardFlags::api_key_parity`]。
 pub const API_KEY_PARITY: &str = "api_key_parity";
 
+/// messages 请求体按上游 32MB 就地回 413 的 settings 键名。缺省视为开启，
+/// 见 [`ForwardFlags::cap_messages_body`]。
+pub const CAP_MESSAGES_BODY: &str = "cap_messages_body";
+
 /// 模拟路径是否按官方 message threads 形态写 `thread`（首轮 `create`、接得上的续轮 `continue`
 /// 只发增量）的 settings 键名。缺省视为开启，见 [`ForwardFlags::sim_message_threads`]。
 pub const SIM_MESSAGE_THREADS: &str = "sim_message_threads";
@@ -788,6 +792,9 @@ impl CredentialStore {
         if let Some(v) = on(API_KEY_PARITY) {
             flags.api_key_parity = v;
         }
+        if let Some(v) = on(CAP_MESSAGES_BODY) {
+            flags.cap_messages_body = v;
+        }
         if let Some(v) = on(SIM_BILLING_RELOCATE) {
             flags.sim_billing_relocate = v;
         }
@@ -1171,6 +1178,7 @@ mod tests {
             (REJECT_ENABLED_THINKING, "0"),
             (REJECT_TAMPERED_THINKING, "0"),
             (API_KEY_PARITY, "0"),
+            (CAP_MESSAGES_BODY, "0"),
             (SIM_BILLING_RELOCATE, "0"),
             (SIM_MESSAGE_THREADS, "0"),
             (FILL_METADATA, "0"),
@@ -1227,6 +1235,7 @@ mod tests {
                 reject_enabled_thinking: false,
                 reject_tampered_thinking: false,
                 api_key_parity: false,
+                cap_messages_body: false,
                 sim_billing_relocate: false,
                 sim_message_threads: false,
                 fill_metadata: false,

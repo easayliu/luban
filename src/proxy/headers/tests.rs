@@ -405,6 +405,7 @@ fn all_flags_off_only_injects_auth() {
         reject_enabled_thinking: false,
         reject_tampered_thinking: false,
         api_key_parity: false,
+        cap_messages_body: false,
         reject_session_conflict: false,
         reject_probes: false,
         reject_probes_strict: false,

@@ -259,12 +259,30 @@ pub async fn handle(
     resp
 }
 
-/// 转发请求体的上限。上游官方 /v1/messages 收 32MB，长对话、带附件的合法请求很容易超过
-/// axum 默认的 2MB，这里放到 64MB 留出余量，真正的大小判决交给上游。
+/// 转发请求体的上限（[`MAX_MESSAGES_BODY_BYTES`] 管不到的那些接口）。batches、files 之类
+/// 上游收得比 32MB 大，这里给 64MB，再大的交给上游判。
 ///
 /// 体在 Key、最低版本、头上的会话闸都过了之后才读（`handler::admit`）：先读后验的话，
 /// 不带 Key 的人并发灌 64MB 的体就能把内存吃满。
 pub(super) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// `/v1/messages` 与 `count_tokens` 的请求体上限，与上游一致的 32MB（2.1.306 客户端
+/// `mtt=33554432`，超了上游回 413 `request_too_large`）。超出的体转过去也是 413，不如就地回，
+/// 省得多读多转一份。
+pub(super) const MAX_MESSAGES_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// 按路径取请求体上限：`cap_messages_body` 开着时 messages 那组用 [`MAX_MESSAGES_BODY_BYTES`]，
+/// 其余（及开关关着时）用 [`MAX_BODY_BYTES`]。见 [`crate::store::ForwardFlags::cap_messages_body`]。
+pub(super) fn body_limit(path_and_query: &str, cap_messages_body: bool) -> usize {
+    if !cap_messages_body {
+        return MAX_BODY_BYTES;
+    }
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    match path.trim_end_matches('/') {
+        "/v1/messages" | "/v1/messages/count_tokens" => MAX_MESSAGES_BODY_BYTES,
+        _ => MAX_BODY_BYTES,
+    }
+}
 
 /// 来访 `X-Request-Id` 能沿用的形态：`[A-Za-z0-9._-]`，1 到 128 位。
 ///

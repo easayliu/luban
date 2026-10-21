@@ -139,7 +139,8 @@ pub struct ForwardFlags {
     ///   新会话首轮约少 1.4 万 token 的写入。
     /// - **关**：注入完整的 14 条，与官方默认配置相同。
     pub sim_trim_tools: bool,
-    /// 只在 `system[0]` 注一条最小 billing header（`cc_version` / `cc_entrypoint` / `cch`），
+    /// 只在 `system[0]` 注一条 billing header（与完整模拟同一份：`cc_version` / `cc_entrypoint` / `cch`，
+    /// 加会话链的 `cc_prev_req` / `cc_prompt_id` / `cc_turn_origin` / 轮次，与出站头的 prompt id 同值），
     /// 其余注入一概跳过（[`Self::simulate_cc`] 的子项，实验性）。对所有来访生效：真实 CC 客户端
     /// 不走模拟，自带的 billing header 照旧（缺了只补 billing header、不补身份句），`metadata.user_id`
     /// 的去留看 [`Self::sim_billing_keep_user_id`] / [`Self::real_billing_keep_user_id`]，身份补全 / 会话链 / 工具名混淆 / 断点与 system 整形 / 字段剥除等改写同样一概跳过，见 [`Self::billing_only`]。
@@ -148,12 +149,14 @@ pub struct ForwardFlags {
     ///   `output_config`，不重排顶层键（`metadata.user_id` 另由两项子开关管）；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。
     ///   换头照旧；`cch` 跟随 [`Self::cch_sim_compute`]（开算真值、关填随机值）。上游放行只认
     ///   身份句或合法 billing header 二者其一，billing header 单独就能过闸、且不强加 CC 人格。
-    ///   形态：官方辅助调用正是这样——2.1.296 的 `Tno` → `p_s` 在 `skipSystemPromptPrefix` 时
-    ///   发 `[三段 billing header, ...调用方自有 system]`、不带身份句与 `thread`（自动模式分类器
-    ///   两段、记忆筛选（带多轮历史）、`hook_prompt`、`agent_classifier`、`agent_namer` 等；抓包
-    ///   `cap/2.1.260/00030` 分类器即此形态，带 `metadata.user_id`）。header 字段、次序与版本后缀
-    ///   算法与官方 `ymo` / `ug` 一致（2.1.296 非续轮 122 条后缀全中）。差别只在官方辅助调用不带
-    ///   工具，第三方客户端带自己的工具。
+    ///   形态：出站头按官方主线程发（`x-claude-code-request-class: main`、带 `x-claude-code-prompt-id`），
+    ///   billing header 随之用主线程那份（[`crate::proxy::simulated_billing_header_text`]）：首条带
+    ///   `cc_prompt_id` / `cc_turn_origin` / 轮次，续轮再带 `cc_prev_req`，与头里的 prompt id 同值。
+    ///   官方主线程走 2.1.306 的 `Qxs`，链条字段从这条请求的 `messages` 推出，2.1.303 ~ 2.1.306 抓包
+    ///   的 main 类请求无一只发三段。只发三段的是 `Zxs` 那条辅助调用（`skipSystemPromptPrefix`：自动
+    ///   模式分类器、记忆筛选、`hook_prompt` 等，`[三段 billing header, ...调用方自有 system]`），但那些
+    ///   请求的类别是 `auxiliary`、不带 prompt id 头、不带工具；0.3.263 之前这里照它写三段，头却是
+    ///   主线程的，两处对不上。
     ///   2026-10-10 实测：客户端 system 12KB、出站 system 9 块均照常走订阅额度、未判第三方，
     ///   故这条路不跑完整模拟的 `cap_system_blocks` 块数封顶。
     /// - **关**（默认）：按完整官方形态模拟。
@@ -366,6 +369,13 @@ pub struct ForwardFlags {
     /// - **开**（默认）：命中即本地 400，与 API Key 直连逐字相同。
     /// - **关**：照发，由订阅通道放行。
     pub api_key_parity: bool,
+    /// `/v1/messages` 与 `count_tokens` 的请求体按上游的 32MB 卡（2.1.306 客户端 `mtt=33554432`，
+    /// 超了上游回 413 `request_too_large`），超出即本地回同一个 413，不多读多转。其余接口
+    /// （batches、files 等上游收得更大）不受影响，始终按 64MB，见 [`crate::proxy::body_limit`]。
+    ///
+    /// - **开**（默认）：messages 那组超 32MB 本地 413。
+    /// - **关**：一律按 64MB，32MB～64MB 之间的转给上游，由上游回 413。
+    pub cap_messages_body: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。
     ///
     /// 官方两处逐字相同，不同值说明来访自己就不自洽——而 luban 拿会话 id 当会话链
@@ -542,6 +552,7 @@ impl Default for ForwardFlags {
             reject_enabled_thinking: true,
             reject_tampered_thinking: true,
             api_key_parity: true,
+            cap_messages_body: true,
             reject_session_conflict: true,
             reject_probes: true,
             reject_probes_strict: false,

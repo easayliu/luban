@@ -1050,7 +1050,7 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     static MB: [u8; 1024 * 1024] = [b' '; 1024 * 1024];
     let mock = MockUpstream::start(vec![]).await;
     let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
-    let chunks = crate::proxy::MAX_BODY_BYTES / MB.len() + 1;
+    let chunks = crate::proxy::MAX_MESSAGES_BODY_BYTES / MB.len() + 1;
     let stream = futures_util::stream::iter(
         (0..chunks).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&MB))),
     );
@@ -1064,6 +1064,18 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["error"]["type"], "request_too_large");
     assert!(mock.seen().is_empty());
+}
+
+/// 开关开着：messages 与 count_tokens 按上游 32MB，batches 等其余接口仍是 64MB；关着一律 64MB。
+#[test]
+fn body_limit_by_path() {
+    use crate::proxy::{MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, body_limit};
+    assert_eq!(body_limit("/v1/messages", true), MAX_MESSAGES_BODY_BYTES);
+    assert_eq!(body_limit("/v1/messages?beta=true", true), MAX_MESSAGES_BODY_BYTES);
+    assert_eq!(body_limit("/v1/messages/count_tokens?beta=true", true), MAX_MESSAGES_BODY_BYTES);
+    assert_eq!(body_limit("/v1/messages/batches", true), MAX_BODY_BYTES);
+    assert_eq!(body_limit("/v1/files", true), MAX_BODY_BYTES);
+    assert_eq!(body_limit("/v1/messages?beta=true", false), MAX_BODY_BYTES);
 }
 
 /// 一条下游中转的探活：`Go-http-client`、不带身份、无 tools、一句话、`max_tokens` 8（判据 ping）。

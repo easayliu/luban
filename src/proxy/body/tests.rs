@@ -812,6 +812,7 @@ fn body_flags_off_passes_through_byte_for_byte() {
         reject_enabled_thinking: false,
         reject_tampered_thinking: false,
         api_key_parity: false,
+        cap_messages_body: false,
         reject_session_conflict: false,
         reject_probes: false,
         reject_probes_strict: false,
@@ -1729,6 +1730,7 @@ fn strip_extra_fields_is_wired_and_switchable() {
             reject_enabled_thinking: false,
             reject_tampered_thinking: false,
             api_key_parity: false,
+            cap_messages_body: false,
             reject_session_conflict: false,
             reject_probes: false,
             reject_probes_strict: false,
@@ -2457,6 +2459,7 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
         reject_enabled_thinking: false,
         reject_tampered_thinking: false,
         api_key_parity: false,
+        cap_messages_body: false,
         reject_session_conflict: false,
         reject_probes: false,
         reject_probes_strict: false,
@@ -2694,7 +2697,7 @@ fn trim_switch_drops_exactly_the_three_user_switchable_tools() {
     assert_eq!(v["tools"].as_array().unwrap().len(), 14);
 }
 
-/// 开关 `sim_billing_only`：开着时模拟路径只在 `system[0]` 注一条最小 billing header，客户端自己的
+/// 开关 `sim_billing_only`：开着时模拟路径只在 `system[0]` 注一条 billing header，客户端自己的
 /// system 块 / 工具 / metadata 原样透传，不补身份句 / 基座 / 第四块 / 官方工具 / diagnostics /
 /// output_config / thread；`fallbacks` 归一照做，cch 仍按出站字节重算。默认停用。
 #[cfg(test)]
@@ -2723,7 +2726,7 @@ mod billing_only {
             .unwrap()
     }
 
-    /// 开着时 `system` = 一条最小 billing header + 客户端原块；官方整形一律不做，工具原样。
+    /// 开着时 `system` = 一条 billing header + 客户端原块；官方整形一律不做，工具原样。
     #[test]
     fn emits_only_billing_header_and_client_blocks() {
         let raw = Bytes::from_static(RAW.as_bytes());
@@ -2751,6 +2754,56 @@ mod billing_only {
         let names: Vec<&str> =
             v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["my_lookup", "my_exec"], "工具原样，不注官方工具");
+    }
+
+    /// billing header 与完整模拟同一份：首条带 `cc_prompt_id` 起那几段、与出站头的 prompt id 同值，
+    /// 续轮再带 `cc_prev_req`（官方主线程从不只发三段，`cap/auto-2.1.306-20261021-full` 的 main 类
+    /// 请求无一例外；只有三段的是单条消息的 auxiliary 请求）。
+    #[test]
+    fn billing_header_carries_the_session_chain() {
+        let raw = Bytes::from_static(RAW.as_bytes());
+        let mut sim = detect_for(&raw, on_flags()).unwrap();
+        assert!(on_flags().cch_sim_compute, "下面按真值校验 cch");
+        // 出站 billing header；顺带校验 cch 是对最终出站字节（cch 段归零）算的真值——会话链几段
+        // 排在 `cch` 之后，回填要在 header 中段定位。
+        let billing = |sim: &crate::proxy::Simulation| {
+            let out = rewrite_body(&raw, &test_cred(), "fp", on_flags(), Some(sim), None);
+            let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let text = v["system"][0]["text"].as_str().unwrap().to_string();
+            let (_, tail) = text.split_once(" cch=").expect(&text);
+            let cch = &tail[..5];
+            let s = std::str::from_utf8(&out).unwrap();
+            assert_eq!(s.matches(&format!("cch={cch};")).count(), 1, "{s}");
+            let zeroed = s.replace(&format!("cch={cch};"), "cch=00000;");
+            assert_eq!(super::super::compute_cch(zeroed.as_bytes()), cch, "cch 真值: {text}");
+            text
+        };
+        let h = crate::proxy::build_forward_headers_for(
+            &crate::proxy::HeaderMap::new(),
+            "tok",
+            on_flags(),
+            Some(&sim),
+            None,
+            Some("claude-opus-5-5"),
+            false,
+            crate::proxy::BetaCtx::MAIN,
+        );
+        let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
+        let first = billing(&sim);
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.306."), "{first}");
+        assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
+        assert!(first.contains(" cc_prompt_index="), "{first}");
+        assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
+
+        sim.link.prev_req = Some("req_011CgEiSW5ayUjJ33H1ALC8C".into());
+        let next = billing(&sim);
+        assert!(next.contains("; cch="), "{next}");
+        assert!(
+            next.contains(&format!(
+                " cc_prev_req=req_011CgEiSW5ayUjJ33H1ALC8C; cc_prompt_id={pid};"
+            )),
+            "续轮接上一环、段序同官方: {next}"
+        );
     }
 
     /// `metadata.user_id` 完全原样透传，不剥、不重建。

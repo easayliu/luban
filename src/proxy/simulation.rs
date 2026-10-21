@@ -91,7 +91,7 @@ pub(crate) struct Simulation {
     /// 注入的官方工具去掉 Artifact / ListAgents / SendFeedback 三条（开关 `sim_trim_tools`，见
     /// [`crate::store::ForwardFlags::sim_trim_tools`] 与 [`crate::proxy::cc_tools_core`]）。
     pub(super) trim_tools: bool,
-    /// 只注 `system[0]` 的最小 billing header、其余注入全部跳过（开关 `sim_billing_only`，见
+    /// 只注 `system[0]` 的 billing header（与完整模拟同一份，带会话链那几段）、其余注入全部跳过（开关 `sim_billing_only`，见
     /// [`crate::store::ForwardFlags::sim_billing_only`]）。开着时 [`rewrite_body_out`](crate::proxy::rewrite_body_out) 里的下游
     /// 整形（身份句、基座、第四块、工具、metadata、thread、顶层重排等）一律不做。
     pub(super) billing_only: bool,
@@ -1398,16 +1398,17 @@ pub(crate) fn simulate_system(
     if sim.profile.system == config::CcSystemShape::None {
         return false;
     }
-    // `sim_billing_only`：只在 `system[0]` 注一条最小 billing header（上游放行闸认的那把钥匙），
+    // `sim_billing_only`：只在 `system[0]` 注一条 billing header（上游放行闸认的那把钥匙），
     // 客户端自己的 system 块原样透传，不补身份句 / 基座 / 第四块。`cch` 先填占位，出站前由
     // [`finalize_cch`] 按最终字节重算（`system[0]` 是 billing header → `billing_cch_region` 命中）。
+    //
+    // header 与完整模拟同一份（[`simulated_billing_header_text`]，带会话链那几段）：出站头仍是
+    // 主线程的 `x-claude-code-request-class: main` 与 `x-claude-code-prompt-id`，而官方主线程从不
+    // 只发三段——2.1.303 / 2.1.305 / 2.1.306 抓包的 main 类请求首条恒带 `cc_prompt_id` 起那几段、
+    // 续轮再带 `cc_prev_req`，只有三段的是单条消息的辅助请求（标题生成、预热）。此前写最小三段，
+    // 头里有 prompt id、billing 里没有，官方两处恒同进同出。
     if sim.billing_only {
-        let header = format!(
-            "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch={};",
-            sim.profile.version,
-            cc_version_suffix(v, sim.profile.version),
-            cch_value(),
-        );
+        let header = simulated_billing_header_text(v, sim);
         // 客户端自己的 system 按**原块**透传：不合并、不剥身份句，正文原样。只做三处改动：
         // - 它自己抄来的 billing header（只认每块首行，[`billing_only_block_fates`]）由 luban 前插的
         //   这块顶替、原行去掉（`cch` 只回填 `system[0]` 那一条）；只剩 header 的块随之去掉。首块

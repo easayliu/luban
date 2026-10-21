@@ -137,6 +137,8 @@ struct ForwardingResp {
     reject_tampered_thinking: bool,
     /// 订阅通道放行、直连 400 的几种形态按 API Key 直连原文本地拒绝。
     api_key_parity: bool,
+    /// messages 请求体超上游 32MB 时本地回 413。
+    cap_messages_body: bool,
     /// billing-only 下也挪客户端 system；默认关。
     sim_billing_relocate: bool,
     /// 模拟路径的主线程按官方 message threads 形态写 `thread`（[`Self::simulate_cc`] 的子项）。
@@ -214,6 +216,7 @@ impl From<crate::store::ForwardFlags> for ForwardingResp {
             reject_enabled_thinking: f.reject_enabled_thinking,
             reject_tampered_thinking: f.reject_tampered_thinking,
             api_key_parity: f.api_key_parity,
+            cap_messages_body: f.cap_messages_body,
             sim_billing_relocate: f.sim_billing_relocate,
             sim_message_threads: f.sim_message_threads,
             fill_metadata: f.fill_metadata,
