@@ -85,6 +85,24 @@ impl EventBuilder<'_> {
             };
             for (i, tu) in shape.tool_uses.iter().enumerate() {
                 let i = i as i64;
+                if tu.is_error && tu.result_head.starts_with(NO_SUCH_TOOL) {
+                    self.emit_no_such_tool(&step, i, tu);
+                    continue;
+                }
+                if tu.is_error
+                    && let Some(msg) = &tu.tool_error
+                    && let Some(detail) = msg.strip_prefix("InputValidationError: ")
+                {
+                    self.emit_input_schema_error(&step, i, tu, detail);
+                    continue;
+                }
+                if tu.is_error
+                    && let Some(msg) = &tu.tool_error
+                    && let Some(code) = validate_error_code(&tu.name, msg)
+                {
+                    self.emit_validate_error(&step, i, tu, msg, code);
+                    continue;
+                }
                 self.emit_tool_permission(&step, i, tu);
                 self.emit_tool_result(&step, i, tu);
             }
@@ -131,6 +149,168 @@ impl EventBuilder<'_> {
                 }),
             );
         }
+    }
+
+    /// 模型调了这一轮没声明的工具（`Glob` 之类）：客户端找不到它，不走权限、不执行，只报
+    /// `feature_bad{tool_not_found}` 与 `tool_use_error{NO_SUCH_TOOL}`（官方 `qYr`；
+    /// `cap/auto-2.1.306-20261021-full/00387` 的 Glob，2.1.300 / 2.1.305 同形）。
+    fn emit_no_such_tool(&mut self, step: &ToolStep, i: i64, tu: &ToolUse) {
+        let env = self.env;
+        let TurnFacts { ref chain_id, v293, .. } = *env.f;
+        let EventEnv { builtin_agent, ref effort, .. } = *env;
+        let ToolStep { is_sub, ref prev_req, prev_depth, .. } = *step;
+        let t_done = self.unrun_tool_at(step, i);
+        // 官方工具名报原名、错误归 `registered_base_tool`；别的名字官方脱敏（`IJ`）：`mcp__` 开头的是 `mcp_tool`，
+        // 功能名另叫 `tool_unregistered_mcp`，其余 `unknown_tool`（2.1.306 `qYr`）。
+        let known = config::CC_TOOL_NAMES.contains(&tu.name.as_str());
+        let (tool_name, error, feature) = if known {
+            (
+                tu.name.as_str(),
+                "No such tool available: registered_base_tool",
+                tool_feature_name(&tu.name),
+            )
+        } else if tu.name.starts_with("mcp__") {
+            ("mcp_tool", "No such tool available: mcp_tool", "tool_unregistered_mcp".to_string())
+        } else {
+            (
+                "unknown_tool",
+                "No such tool available: unknown_tool",
+                tool_feature_name("unknown_tool"),
+            )
+        };
+        let mut bad = json!({ "feature_name": feature, "error_code": "tool_not_found" });
+        if v293 {
+            bad["tengu_quizzical_giraffe"] = json!("unset");
+        }
+        self.push_dd(ms(t_done, -1), "tengu_feature_bad", bad);
+        let mut err = json!({
+            "error": error,
+            "errorCode": "NO_SUCH_TOOL",
+            "toolName": tool_name,
+            "toolNameHash": &sha256_hex(tu.name.as_bytes())[..12],
+            "toolUseID": &tu.id,
+            "isMcp": tu.name.starts_with("mcp__")
+        });
+        if is_sub {
+            err["subagent_type"] =
+                json!(env.call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
+            err["is_built_in_agent"] = json!(builtin_agent.is_some());
+        }
+        if let Some(e) = &effort {
+            err["effort_level"] = json!(e);
+        }
+        err["queryChainId"] = json!(chain_id);
+        err["queryDepth"] = json!(prev_depth);
+        err["requestId"] = json!(prev_req);
+        self.push_dd_snake(t_done, "tengu_tool_use_error", err);
+    }
+
+    /// 没跑起来的工具（找不到、验证不过）报错的时刻：贴着这条请求之前，与跑完的工具同一套取法。
+    fn unrun_tool_at(&self, step: &ToolStep, i: i64) -> DateTime<Utc> {
+        let ToolStep { prev_end_dt, n, .. } = *step;
+        if self.env.f.v285 {
+            ms(self.env.t0, -8 - 4 * (n - 1 - i)).max(ms(prev_end_dt, i + 1))
+        } else {
+            ms(prev_end_dt, i + 1)
+        }
+    }
+
+    /// 入参没过 schema（缺必填参数、类型不对、多了参数……）或根本不是合法 JSON：客户端在验证之前就拦下，回
+    /// `<tool_use_error>InputValidationError: …</tool_use_error>`。只报 `feature_sad{tool_input_validation_failed}`
+    /// 与 `tool_use_error{InputValidationError}`（官方 `o4r`）：schema 那种是 `ZOD_VALIDATION`，带按文案认出的
+    /// `zodIssueCodes`（[`zod_issue_codes`]）与整段文案的哈希；JSON 那种是 `JSON_PARSE`，哈希的是
+    /// `"<工具名>: unparsed tool input"`。字段序照 `cap/2.1.2xx` 里 Read 那两条。
+    fn emit_input_schema_error(&mut self, step: &ToolStep, i: i64, tu: &ToolUse, detail: &str) {
+        let env = self.env;
+        let TurnFacts { ref chain_id, v293, .. } = *env.f;
+        let EventEnv { builtin_agent, ref effort, .. } = *env;
+        let ToolStep { is_sub, ref prev_req, ref prev_msg, prev_depth, .. } = *step;
+        let t_done = self.unrun_tool_at(step, i);
+        let mut sad = json!({
+            "feature_name": tool_feature_name(&tu.name),
+            "error_code": "tool_input_validation_failed"
+        });
+        if v293 {
+            sad["tengu_quizzical_giraffe"] = json!("unset");
+        }
+        self.push_dd(ms(t_done, -1), "tengu_feature_sad", sad);
+        let json_parse =
+            detail.contains(" was called with input that could not be parsed as JSON.");
+        let mut err = json!({ "error": "InputValidationError" });
+        if json_parse {
+            err["errorCode"] = json!("JSON_PARSE");
+            err["errorDetailsHash"] =
+                json!(&sha256_hex(format!("{}: unparsed tool input", tu.name).as_bytes())[..12]);
+        } else {
+            err["errorCode"] = json!("ZOD_VALIDATION");
+            err["zodIssueCodes"] = json!(zod_issue_codes(detail));
+            err["errorDetailsHash"] = json!(&sha256_hex(detail.as_bytes())[..12]);
+        }
+        err["messageID"] = json!(prev_msg);
+        err["toolName"] = json!(&tu.name);
+        err["isMcp"] = json!(tu.name.starts_with("mcp__"));
+        if is_sub {
+            err["subagent_type"] =
+                json!(env.call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
+            err["is_built_in_agent"] = json!(builtin_agent.is_some());
+        }
+        if let Some(e) = &effort {
+            err["effort_level"] = json!(e);
+        }
+        err["toolInputSizeBytes"] = json!(tu.input_len);
+        err["queryChainId"] = json!(chain_id);
+        err["queryDepth"] = json!(prev_depth);
+        err["requestId"] = json!(prev_req);
+        self.push_dd_snake(t_done, "tengu_tool_use_error", err);
+    }
+
+    /// 已声明的工具在验证这一步被拦下（Edit 改不存在的文件、Write 没先读……，[`validate_error_code`]）：
+    /// 不走权限、不执行，只报 `feature_sad{tool_validate_input_rejected}` 与
+    /// `tool_use_error{ValidateInputError}`，报错文案脱敏后取哈希（官方 `Rt` / `Dp` / `dZe`）。
+    fn emit_validate_error(&mut self, step: &ToolStep, i: i64, tu: &ToolUse, msg: &str, code: u32) {
+        let env = self.env;
+        let TurnFacts { ref chain_id, v293, .. } = *env.f;
+        let EventEnv { builtin_agent, ref effort, .. } = *env;
+        let ToolStep { is_sub, ref prev_req, ref prev_msg, prev_depth, .. } = *step;
+        let t_done = self.unrun_tool_at(step, i);
+        // 子代理写报告文件被拦：校验那一步先报一条，带要写的内容字节数（官方 Write 的 `validateInput`）。
+        if tu.name == "Write" && code == 5 {
+            let bytes = tu.input.get("content").and_then(|c| c.as_str()).map_or(0, str::len);
+            self.push(
+                ms(t_done, -2),
+                "tengu_subagent_md_report_blocked",
+                json!({ "contentBytes": bytes }),
+            );
+        }
+        let mut sad = json!({
+            "feature_name": tool_feature_name(&tu.name),
+            "error_code": "tool_validate_input_rejected"
+        });
+        if v293 {
+            sad["tengu_quizzical_giraffe"] = json!("unset");
+        }
+        self.push_dd(ms(t_done, -1), "tengu_feature_sad", sad);
+        let mut err = json!({
+            "messageID": prev_msg,
+            "toolUseID": &tu.id,
+            "toolName": &tu.name,
+            "error": "ValidateInputError",
+            "error_message_hash": &sha256_hex(scrub_error_message(msg).as_bytes())[..12],
+            "errorCode": code,
+            "isMcp": false
+        });
+        if is_sub {
+            err["subagent_type"] =
+                json!(env.call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
+            err["is_built_in_agent"] = json!(builtin_agent.is_some());
+        }
+        if let Some(e) = &effort {
+            err["effort_level"] = json!(e);
+        }
+        err["queryChainId"] = json!(chain_id);
+        err["queryDepth"] = json!(prev_depth);
+        err["requestId"] = json!(prev_req);
+        self.push_dd_snake(t_done, "tengu_tool_use_error", err);
     }
 
     /// 一个工具调用的权限判定：配置放行、auto 模式的分类器、或弹框让用户点头。
@@ -214,8 +394,22 @@ impl EventBuilder<'_> {
             }
             show["originAgentType"] = json!(if is_sub { "subagent" } else { "main" });
             self.push(shown, "tengu_tool_use_show_permission_request", show);
+            // 子代理里的弹框也报，挂在子代理身份上（`cap/auto-2.1.306-20261021-full/00186`，
+            // 2.1.285 起各版抓包同样）。
+            self.push_unary(shown, "response", (&tu.name, &tu.input), prev_msg);
+            self.note_edit_decision((&tu.name, &tu.input), "accept", "user_temporary");
             // 用户点头落在这条请求发出前（两次请求之间就是在等他）。
             let tp = ms(t0, -40).max(ms(shown, 1));
+            // 心跳：弹框把界面从干活切到等用户，上一条回复收尾后 11ms 上下；点头后 20ms 上下回到干活
+            // （`cap/auto-2.1.305-20261021-full` B1 的 Edit：.862 → .873，点头 .744 → .765；A16 的
+            // AskUserQuestion 是 `input needed`）。子代理里的弹框不动主线程这条。
+            if !is_sub {
+                self.beat(
+                    ms(prev_end_dt, 11),
+                    heartbeat::Trigger::Run(Some(heartbeat::awaiting_for(&tu.name))),
+                );
+                self.beat(ms(tp, 21), heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
+            }
             // 点「Yes」：确认提交，Bash 另报选了第几项。Skill、AskUserQuestion、ExitPlanMode
             // 没有这一步。弹框挂在子代理上时，这两条是主线程界面上的操作，不带子代理身份
             // （`07:58:17.850`）。
@@ -267,6 +461,10 @@ impl EventBuilder<'_> {
                 ));
             }
             self.push_dd(tp, "tengu_feature_ok", feature("permission_user_grant"));
+            self.push_unary(tp, "accept", (&tu.name, &tu.input), prev_msg);
+            if !is_sub {
+                self.push_file_suggestions_refresh(tp);
+            }
             self.push(
                 ms(tp, 2),
                 "tengu_tool_use_can_use_tool_allowed",
@@ -293,6 +491,7 @@ impl EventBuilder<'_> {
                 granted["permission_mode"] = json!(shape.permission_mode);
             }
             self.push(tg, "tengu_tool_use_granted_in_config", granted);
+            self.note_edit_decision((&tu.name, &tu.input), "accept", "config");
             self.push_dd(ms(tg, 1), "tengu_feature_ok", feature("permission_auto_approve_config"));
             self.push(
                 ms(tg, 2),
@@ -321,6 +520,8 @@ impl EventBuilder<'_> {
             v293,
             v299,
             v303,
+            v305,
+            v306,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -357,6 +558,10 @@ impl EventBuilder<'_> {
             (gap / (n + 1) - 12).max(1)
         };
         let bash_failed = tu.name == "Bash" && tu.is_error;
+        // 别的工具跑了、却以失败收尾（`tool.call` 抛错）。用户在弹框上拒绝的不算，那串另报。
+        let call_failed = tu.name != "Bash"
+            && tu.is_error
+            && !tu.result_head.trim_start().starts_with(USER_REJECTED_TOOL_USE);
         let command = tu.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
         let read_only = tu.name == "Bash"
             && bash_read_only(&bash_profile(command), env.f.session_cwd.as_deref());
@@ -425,6 +630,7 @@ impl EventBuilder<'_> {
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
+                self.emit_bash_mentions(command, t_done, prev_msg);
                 self.push_dd(t_done, "tengu_feature_ok", feature("tool_bash"));
             }
         }
@@ -450,7 +656,8 @@ impl EventBuilder<'_> {
                 }),
             );
         }
-        if tu.name != "Bash" {
+        self.emit_file_ops(tu, t_done, prev_msg);
+        if tu.name != "Bash" && !call_failed {
             let before = match tu.name.as_str() {
                 "Agent" | "Task" => Some("subagent_launch"),
                 "Skill" => Some("skill_invoke"),
@@ -560,8 +767,16 @@ impl EventBuilder<'_> {
             // 2.1.291 取自 `cap/auto-2.1.291-20261006-full`（B4 那条失败的 Bash），后者还多了异常的
             // 构造器名（压缩后的类名）；2.1.293（`cap/auto-2.1.293-20261008-full` 的两条失败 Bash）
             // 又没有构造器名了。2.1.299（`cap/auto-2.1.299-20261014-full` 两条）、2.1.303
-            // （`cap/auto-2.1.303-20261019-full` 两条）各换一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299。
-            if v303 {
+            // （`cap/auto-2.1.303-20261019-full` 两条）、2.1.305（`cap/auto-2.1.305-20261021-full` 两条）各换
+            // 一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299，2.1.304 沿用 2.1.303。2.1.306
+            // （`cap/auto-2.1.306-20261021-full` 三条）只换了 chunk 名与摘要。
+            if v306 {
+                err["error_stack_hash"] = json!("c19e7dcf6637");
+                err["error_top_frame"] = json!("chunk-z4fyjkxt.js:3654:6164");
+            } else if v305 {
+                err["error_stack_hash"] = json!("a4913bdffc8a");
+                err["error_top_frame"] = json!("chunk-h56h5ggw.js:3654:6164");
+            } else if v303 {
                 err["error_stack_hash"] = json!("99830f66ede0");
                 err["error_top_frame"] = json!("chunk-jh3cvmqy.js:3614:6109");
             } else if v299 {
@@ -583,11 +798,45 @@ impl EventBuilder<'_> {
             err["heapUsedDeltaBytes"] = json!(0);
             err["externalDeltaBytes"] = json!(2_856);
             self.push_dd_snake(t_done, "tengu_tool_use_error", err);
+        } else if call_failed {
+            // 执行抛错（官方 `o4r` 的 catch）：同一份调用字段，`error` / `errorCode` 是异常类名，再带
+            // `Dp` 的文案哈希。没有样本能对出各工具的异常类与栈指纹，类名按通用的 `Error`、不报栈——
+            // 宁可少几项，也不把一次失败报成成功。
+            let mut err = json!({
+                "messageID": &prev_msg,
+                "toolName": &tu.name,
+                "toolUseID": &tu.id,
+                "isMcp": tu.name.starts_with("mcp__"),
+                "toolInputSizeBytes": tu.input_len,
+                "durationMs": duration,
+                "preToolHookDurationMs": 0,
+                "permissionDurationMs": permission_ms.max(5)
+            });
+            if is_sub {
+                err["subagent_type"] =
+                    json!(call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
+                err["is_built_in_agent"] = json!(builtin_agent.is_some());
+            }
+            if let Some(e) = &effort {
+                err["effort_level"] = json!(e);
+            }
+            err["queryChainId"] = json!(&chain_id);
+            err["queryDepth"] = json!(prev_depth);
+            err["requestId"] = json!(&prev_req);
+            err["error"] = json!("Error");
+            let msg = tu.tool_error.as_deref().unwrap_or(&tu.result_head);
+            err["error_message_hash"] =
+                json!(&sha256_hex(scrub_error_message(msg).as_bytes())[..12]);
+            err["errorCode"] = json!("Error");
+            self.push_dd_snake(t_done, "tengu_tool_use_error", err);
         } else {
             self.push_dd_snake(t_done, "tengu_tool_use_success", success);
         }
     }
 }
+
+/// 模型调了没声明的工具时客户端回的结果开头。
+const NO_SUCH_TOOL: &str = "<tool_use_error>Error: No such tool available:";
 
 /// 一次 Bash 调用的计时：总时长、等外部（子进程）的时长、第一次等外部之前的准备时长（后两项 2.1.299
 /// 起报），会话第一条还有同批报的快照耗时（2.1.291 起报）。

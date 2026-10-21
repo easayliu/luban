@@ -11,7 +11,8 @@ use super::learned_rules::{
 };
 use super::rate_limit::RateLimitInfo;
 use super::session_link::{
-    CcSessionKey, CcSessionLink, REPLY_TEXT_FP_INIT, ReplyFp, ThreadPending, reply_text_fp,
+    CcSessionKey, CcSessionLink, ChainLane, REPLY_TEXT_FP_INIT, ReplyFp, ThreadPending,
+    reply_text_fp,
 };
 use super::upstream::{
     InFlightGuard, SessionConcurrencyGuard, Upstream, UpstreamRouteGuard, error_status,
@@ -89,13 +90,15 @@ pub(crate) struct ReqLog {
     /// 不上报（开关关着、非计费路径、非 2xx）。响应侧的量在 Drop 时从 `sniffer` 取，
     /// 一起交给 [`crate::telemetry::Telemetry::record`]。
     pub(super) telemetry: Option<crate::telemetry::Capture>,
-    /// 走模拟路径时这条请求用的会话 id；收尾时把本次的上游 `request-id` 与回复
-    /// `message.id` 记回该会话，供**下一条**请求写 `cc_prev_req` 与
+    /// 这条请求的会话 id 与它所在的链（[`ChainLane`]）；完整成功时把本次的上游 `request-id`
+    /// 与回复 `message.id` 记回那条链，供链上**下一条**请求写 `cc_prev_req` 与
     /// `diagnostics.previous_message_id`，见 [`CcSessionLink::record`]。
     ///
-    /// 非模拟路径为 `None`：真实 CC 来访自己维护这条链，luban 不该替它记，更不该拿自己
-    /// 记的那份去覆盖。
-    pub(super) cc_session: Option<String>,
+    /// 模拟路径恒为主线程；真实 CC 只在 luban 替它补关联字段时才有（[`super::client_session_link`]），
+    /// 且只有主线程与子代理有——「猜下一句」、分叉这些只读链、不推进。其余为 `None`。
+    ///
+    /// 第三项是主线程新输入的指纹（[`CcSessionLink::turn_fp`]）：失败时记进会话，认紧接着的重发。
+    pub(super) cc_session: Option<(String, ChainLane, Option<u64>)>,
     /// 模拟路径这条请求按 message thread 改写后等回程提交的那份（[`ThreadPending`]）：完整成功
     /// 才记成线程状态，失败把它接的那条线程作废。取自 [`super::Simulation::take_thread`]；
     /// 非模拟路径与没写 `thread` 的为 `None`。
@@ -437,19 +440,23 @@ impl Drop for ReqLog {
             && self.status == StatusCode::OK.as_u16()
             && failure.is_none();
 
-        // 模拟路径的会话链条：把这一条的上游 request-id 与回复 message.id 记回去，
-        // 同会话的下一条据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。
-        // 失败的那些照记 request-id——官方那条链上并不跳过报错的请求。**被客户端取消的不记**：
-        // 官方下一条的 `cc_prev_req` 仍指取消之前那条（`cap/auto-2.1.285-20260930/00264` 指回
-        // `00252`，跳过了按 Esc 打断的 `00261`）。
-        if let Some(sid) = &self.cc_session
-            && !aborted
-        {
-            CcSessionLink::record(
-                CcSessionKey { cred_id: self.cred_id, session_id: sid },
-                self.upstream_request_id.as_deref(),
-                self.sniffer.message_id.as_deref(),
-            );
+        // 会话链条：把这一条的上游 request-id 与回复 message.id 记回它那条链，链上的下一条
+        // 据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。**只记完整成功的**：官方
+        // 链上跳过报错的请求（`cap/auto-2.1.306-20261021-retry` R4，见 [`CcSessionLink::record`]），
+        // 也跳过被客户端取消的（`cap/auto-2.1.285-20260930/00264` 指回 `00252`，跳过了按 Esc
+        // 打断的 `00261`）。
+        if let Some((sid, lane, fp)) = &self.cc_session {
+            let key = CcSessionKey { cred_id: self.cred_id, session_id: sid };
+            if ok {
+                CcSessionLink::record(
+                    key,
+                    lane,
+                    self.upstream_request_id.as_deref(),
+                    self.sniffer.message_id.as_deref(),
+                );
+            } else if let (Some(fp), ChainLane::Main, Some(_)) = (fp, lane, &failure) {
+                CcSessionLink::mark_failed(key, *fp);
+            }
         }
         // message thread：只有完整成功、拿到 `message.id` 的才能被下一轮接着 `continue`；上游报错
         // 或断流的把它接的那条线程作废（线程过期之类的错接着 `continue` 只会一直错）。被客户端
@@ -502,6 +509,10 @@ impl Drop for ReqLog {
                 reply_input_chars: self.sniffer.reply_input_chars(),
                 thinking_chars: self.sniffer.thinking_chars,
                 saw_thinking: self.sniffer.saw_thinking,
+                stream_events: self
+                    .sniffer
+                    .is_stream
+                    .then(|| self.sniffer.events.saturating_sub(self.sniffer.pings)),
                 tool_use_lens: self.sniffer.tool_use_lens(),
                 tool_calls: self.sniffer.tool_calls(),
                 cost_usd,
@@ -509,6 +520,8 @@ impl Drop for ReqLog {
                 failure,
                 aborted,
                 cache_keepalive_ok: cap.cache_keepalive_ok,
+                dispatch: cap.dispatch,
+                prior_attempts: Vec::new(),
             });
         }
     }
@@ -709,14 +722,14 @@ pub(super) fn ban_context(
 
 /// 转发那一刻能确定的取证字段：出口代理、是否模拟、出站体形态摘要、会话 id。
 /// 错误文案、第三方判定、改写标签在响应到达后再补（见 [`handle`](crate::proxy::handle) 的 4xx 段与 [`ReqLog::note_retry`]）。
-/// 在**没有 [`ReqLog`]** 的早退路径上，补上失败请求该有的两件事：把这一发记进模拟会话链，
-/// 与报一条 `tengu_api_error`。正常路径上这两件事都在 [`ReqLog::drop`] 里。
+/// 在**没有 [`ReqLog`]** 的早退路径上，补上失败请求该有的两件事：作废它接的那条 message
+/// thread，与报一条 `tengu_api_error`。正常路径上这两件事都在 [`ReqLog::drop`] 里。
 ///
 /// 两个调用点：`upstream.send()` 连接层就失败（`ReqLog` 建都没建），以及 401 那条路
 /// ——它把响应体 `bytes()` 掉了，没法再 `break` 出去走正常收尾，只能就地返回。
 ///
-/// 会话链照记：官方那条 `cc_prev_req` 链**不跳过报错的请求**（同 [`ReqLog::drop`] 里的
-/// 说明）。连接层失败那条没有上游 request-id，`record` 会自己跳过。
+/// 会话链不记：官方 `cc_prev_req` 链跳过报错的请求（同 [`ReqLog::drop`] 里的说明）。主线程新输入
+/// 的指纹照记（[`CcSessionLink::mark_failed`]），紧接着的原样重发才不会换轮。
 ///
 /// `organization_id` 取自**上游响应头** `anthropic-organization-id`，事件的 `auth` 块要它
 /// （[`crate::telemetry::Identity::auth_block`]：没有就整个 `organization_uuid` 键都不出现，
@@ -736,22 +749,20 @@ pub(crate) fn record_early_failure(
     organization_id: Option<String>,
     failure: crate::telemetry::CallFailure,
 ) {
-    if let Some(sid) = upstream
-        .sim
-        .as_ref()
-        .map(|s| s.session_id.clone())
-        .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone()))
-    {
-        CcSessionLink::record(
-            CcSessionKey { cred_id: cred.id, session_id: &sid },
-            up_request_id,
-            None,
-        );
-    }
     // 这一发接着某条线程 `continue` 却失败了：那条线程作废，下一轮退回 `create`，见
     // [`CcSessionLink::drop_thread`]。
     if let Some(pending) = upstream.sim.as_ref().and_then(|s| s.take_thread()) {
         CcSessionLink::drop_thread(&pending);
+    }
+    if let Some((sid, fp)) = upstream
+        .sim
+        .as_ref()
+        .map(|s| (s.session_id.as_str(), &s.link))
+        .or_else(|| upstream.client_link.as_ref().map(|(sid, l)| (sid.as_str(), l)))
+        .filter(|(_, l)| l.lane == Some(ChainLane::Main))
+        .and_then(|(sid, l)| Some((sid, l.turn_fp?)))
+    {
+        CcSessionLink::mark_failed(CcSessionKey { cred_id: cred.id, session_id: sid }, fp);
     }
     let Some(cap) =
         telemetry_capture(state, cred, upstream, sent, started, flags, billable, organization_id)
@@ -793,6 +804,7 @@ pub(super) fn telemetry_capture(
         betas: header_opt(&upstream.headers, "anthropic-beta"),
         session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
         client_request_id: header_opt(&upstream.headers, "x-client-request-id"),
+        dispatch: header_opt(&upstream.headers, "anthropic-dispatch-id"),
         agent: crate::telemetry::AgentHeaders {
             agent_id: header_opt(&upstream.headers, "x-claude-code-agent-id"),
             agent_type: header_opt(&upstream.headers, "x-claude-code-agent-type"),
@@ -1209,6 +1221,8 @@ pub(crate) struct UsageSniffer {
     /// 但上游没在产出内容，与 `last_event=message_start` 是两种不同的死法。
     pub(super) last_event: Option<String>,
     pub(super) events: u32,
+    /// 其中 `ping` 的个数：遥测的 `streamEventCount` 不算它，见 [`ApiCall::stream_events`](crate::telemetry::ApiCall::stream_events)。
+    pub(super) pings: u32,
     /// 响应的 `message.id`（`msg_…`）、最终 `stop_reason`，以及正文里 text / thinking 的
     /// 字符数。都是逐请求遥测（`tengu_api_success` / `tengu_turn_first_text` /
     /// `tengu_prompt_cache_diagnosis_received`）要的量，顺着已经在做的逐行解析记下来。
@@ -1417,6 +1431,7 @@ impl UsageSniffer {
                 }
                 self.events += 1;
                 match t {
+                    "ping" => self.pings += 1,
                     "error" => self.stream_error = Some(v.clone()),
                     "message_stop" => {
                         self.saw_message_stop = true;

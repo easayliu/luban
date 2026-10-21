@@ -153,7 +153,7 @@ struct ForwardingResp {
     eager_tool_streaming: bool,
     /// 非流式 `/v1/messages` 改成流式发给上游，再把 SSE 聚合回整段 JSON 给客户端。
     nonstream_as_sse: bool,
-    /// 剥掉官方客户端从不发送的顶层字段（缺省语义的 `tool_choice`、`thinking.display`）。
+    /// 剥掉官方主线程从不发送的顶层字段（缺省语义的 `tool_choice`），真实 CC 不剥。
     strip_extra_fields: bool,
     /// 把会被上游判成第三方应用的工具名换成假名转发，回程再还原。
     tool_name_mimic: bool,

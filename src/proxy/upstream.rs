@@ -701,8 +701,10 @@ fn event_index(v: &serde_json::Value) -> Option<usize> {
 }
 
 /// 上游拒了 luban 补的 `fallbacks`（见 [`is_fallback_rejection`](crate::proxy::is_fallback_rejection)）：同一个号、同一份客户端
-/// 体，**不补 `fallbacks`** 再发一次。头上的 `server-side-fallback` beta 留着——「有 beta
-/// 没字段」本身就是官方形态（[`config::known_fingerprint_gaps`] 第 7 条）。
+/// 体，**不带 `fallbacks`** 再发一次——客户端自带的字符串 `"default"` 一并去掉
+/// （[`without_string_fallbacks`](crate::proxy::body::without_string_fallbacks)）。头上的
+/// `server-side-fallback` beta 留着——「有 beta 没字段」本身就是官方形态
+/// （[`config::known_fingerprint_gaps`] 第 7 条）。
 ///
 /// 成了按重试那次记账，标签 `no_fallbacks`；没成把原来那条 400 原样透传。
 pub(super) async fn retry_without_fallbacks(
@@ -712,6 +714,8 @@ pub(super) async fn retry_without_fallbacks(
     client_body: &Bytes,
     rl: &mut ReqLog,
 ) -> Option<wreq::Response> {
+    let stripped = crate::proxy::body::without_string_fallbacks(client_body);
+    let client_body = stripped.as_ref().unwrap_or(client_body);
     let retried = upstream.shape_with(client_body, None, cred, device_fp, None).0;
     let up = match upstream.send(retried.clone()).await {
         Ok(up) => up,

@@ -54,14 +54,20 @@ pub(crate) fn cc_cli_version(ua: &str) -> Option<(u64, u64, u64)> {
 ///
 /// 官方 billing header 的 `cc_entrypoint` 与 UA 这一段同源，`cap/` 里 433 条带 billing 的
 /// 请求逐条成对（418 条 `cli` ↔ `cli`、15 条 `sdk-cli` ↔ `sdk-cli`）。段名只认小写字母、
-/// 数字与 `-`，最长 32 字节；读不出或不规矩时返回 `None`，调用方按 `cli` 处理。
+/// 数字、`-` 与 `_`，最长 32 字节；读不出或不规矩时返回 `None`，调用方按 `cli` 处理。
+///
+/// 下划线是官方本来就有的写法：`remote_projects`、`claude_in_slack` 这类内置名，2.1.305 起又多了
+/// bridge 子会话的 `local_projects` 与桌面 3P 用 `CLAUDE_CODE_ENTRYPOINT_ON_REQUESTS` 自定义的名字
+/// （客户端校验 1–32 位 `a-z0-9_-`、字母开头），两处都同时改 UA 与 `cc_entrypoint`。
 pub(crate) fn cc_ua_entrypoint(ua: &str) -> Option<&str> {
     let rest = ua.split_once("claude-cli/")?.1;
     let inner = rest.split_once('(')?.1.split_once(')')?.0;
     let ep = inner.split(',').nth(1)?.trim();
     (!ep.is_empty()
         && ep.len() <= 32
-        && ep.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+        && ep
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'))
     .then_some(ep)
 }
 

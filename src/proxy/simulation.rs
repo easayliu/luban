@@ -293,10 +293,15 @@ impl Simulation {
             (Some(sid), SimSessionSeed::Slot(_)) if !flags.spoof_identity => sid,
             (_, SimSessionSeed::Slot(s) | SimSessionSeed::Prefix(s)) => session_id_for(cred, s),
         };
-        let link = CcSessionLink::load(
+        // 没有 prompt 头可认重发：按新输入的指纹认（[`CcSessionLink::load_retryable`]）。
+        let new_prompt = crate::telemetry::last_is_new_prompt_body(v);
+        let link = CcSessionLink::load_retryable(
             CcSessionKey { cred_id: cred.id, session_id: &session_id },
-            crate::telemetry::last_is_new_prompt_body(v),
+            new_prompt,
+            false,
             profile.has_billing_header(),
+            None,
+            new_prompt.then(|| super::session_link::turn_fp(v)).flatten(),
         );
         // 那台「机器」：来访自己写了工作目录就用它那份（[`client_env`]），没写才按账号 + 设备派生
         // 一台（[`sim_env_for`]）。第四块的记忆目录与首轮环境说明（在 `messages` 里，不受第四块开关

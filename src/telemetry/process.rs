@@ -95,6 +95,42 @@ impl Telemetry {
             st.presession.entry((call.cred_id, session_id)).or_default().push((call, now));
             return;
         }
+        // 主线程的重试链（[`HeldRetry`]）。官方遇到可重试的失败自己重发，重试途中只报重发事件，最终成功或
+        // 失败才收尾；luban 每次尝试都看得到，单看一次失败分不出是不是最后一次，所以先扣住：
+        // - 扣着一串、这条还是同一请求：接上（这条也是可重试的失败就继续扣，否则带着前面几次往下处理）；
+        // - 扣着一串、这条换了请求：前面那串最后一次就是最终失败，先把它补报，再处理这条；
+        // - 没扣着、这条是可重试的失败：开一串扣住。
+        // 必须在判会话来历（`resolve_lineage`）之前扣：那一步会改会话表（`/clear` 的旧会话标成已清、`--continue` 的
+        // 旧会话删掉重建），扣住的这条之后补处理时还要靠它认来历。扣着的时候会话照样算活跃，免得等重发那会儿
+        // 被当成闲置退出（[`Telemetry::gc`] 也跳过有扣着的会话）。
+        let key = (call.cred_id, session_id.clone());
+        let mut call = call;
+        if allow_defer && classify_kind(&call, &shape, is_agent) == Kind::Main {
+            let sig: RetrySig = (shape.cc_prompt_id.clone(), shape.messages_len, shape.tools_count);
+            let mut prior: Vec<ApiCall> = Vec::new();
+            if let Some(held) = st.held_retries.remove(&key) {
+                if held.sig == sig {
+                    prior = held.calls;
+                } else {
+                    Self::finish_retry_chain(st, held.calls);
+                }
+            }
+            let retryable =
+                !call.aborted && call.failure.as_ref().is_some_and(|f| is_retryable(f.status));
+            if retryable {
+                if let Some(sess) = st.sessions.get_mut(&key) {
+                    sess.last_seen = now;
+                }
+                prior.push(call);
+                st.held_retries.insert(
+                    key,
+                    HeldRetry { calls: prior, sig, at: now, device_id: device_id.clone() },
+                );
+                return;
+            }
+            call.prior_attempts = prior.iter().map(PriorAttempt::of).collect();
+        }
+        let call = call;
         let Lineage { continued_from, cleared_from, cleared_prev, parent_session_id } =
             st.resolve_lineage(&call, &shape, &session_id, &device_id);
         let identity = Identity {
@@ -128,7 +164,7 @@ impl Telemetry {
             if has_1m { format!("{}[1m]", shape.model) } else { shape.model.clone() };
         let resp_model = call.resp_model.clone().unwrap_or_else(|| shape.model.clone());
 
-        let key = (call.cred_id, session_id.clone());
+        // 放在重试链之后判：补报前面那串最终失败时可能刚把会话建起来。
         let is_new_session = !st.sessions.contains_key(&key);
         // 侧查询（标题生成等）先扣住：它没有 cc_prompt_id，真实客户端给它打的是紧随其后那条
         // 主线程请求的新一轮 id。等到那条再补发，或者超时按现有 id 发（见 [`Self::gc`]）。
@@ -202,6 +238,8 @@ impl Telemetry {
             prev_main_anchor_end,
             prev_main_anchor_tool_call,
             prompt_id,
+            prev_prompt_id,
+            delegated_running,
         } = sess.advance_turn(&call, &shape, flags, &version, &prev_reply_calls);
         // 主线程与猜下一句走 `previousRequestId` 链；标题那类没有。
         //
@@ -214,7 +252,7 @@ impl Telemetry {
         // 来访）才回落到会话状态。
         // 子代理支线：首条请求建档（链、起点、拉起它的那条主线程请求），之后每条读它。
         // 摘要请求只读不推进。
-        let agent = kind.is_agent().then(|| sess.agent_view(&call, &shape, &agent_key));
+        let agent = kind.is_agent().then(|| sess.agent_view(&call, &shape, &agent_key, kind));
         let previous_request_id = kind
             .has_chain()
             .then(|| {
@@ -318,13 +356,18 @@ impl Telemetry {
         // 2.1.303：`tengu_tool_use_success` 在 `messageID` 之后多 `toolUseID`
         // （`cap/auto-2.1.303-20261019-full` 55 条全有）。
         let v303 = version_at_least(&version, "2.1.303");
+        // 2.1.305：`tengu_api_success` 在 `firstContentMs` 之后多 `streamEventCount`
+        // （`cap/auto-2.1.305-20261021-full` 165 条全有）。
+        let v305 = version_at_least(&version, "2.1.305");
+        // 2.1.306：失败 Bash 的错误栈指纹换了（`cap/auto-2.1.306-20261021-full` 三条）。
+        let v306 = version_at_least(&version, "2.1.306");
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
         let first_prompt_tpl = new_prompt && !injected && !sess.first_prompt_tpl_done;
         // 2.1.296 模板才有那条曝光；分组取这个会话钉住的那份，与模拟出站的 `Agent` 说明同源。
         let lucky_cerf: Vec<crate::proxy::LuckyCerfExposure> = if v296 && new_prompt {
-            crate::proxy::lucky_cerf_exposures(call.cred_id, &session_id, &shape.model)
+            crate::proxy::lucky_cerf_exposures(call.cred_id, &session_id, &shape.model, &version)
                 .into_iter()
                 .filter(|e| !sess.lucky_cerf_exposed.contains(&e.feature))
                 .collect()
@@ -337,6 +380,8 @@ impl Telemetry {
         }
         // 后台任务那段：进程启动后多久该出现的，这条请求发出时已经过了就补上（每条一次）。
         let background = sess.take_background(&version, shape.sdk, call.started_at);
+        let ide_detect = sess.take_ide_detect(&version, shape.sdk, call.started_at);
+        let attachment_counts = sess.attachment_counts.clone();
         let first_main = v280 && is_main && !failed && !sess.first_main_done;
         if first_main {
             sess.first_main_done = true;
@@ -382,6 +427,16 @@ impl Telemetry {
 
         let marks =
             TurnMarks { new_prompt, user_turn, first_text_in_turn, shell_snapshot_first, this_end };
+        // 这条请求带回的工具结果是这条线上一条回复调的工具：改动行数记在那条回复的 `message.model` 名下
+        // （官方跨进程执行工具时传的是发起调用那条 assistant 消息的 `message.model`，`R?.message.model`），
+        // 不是这条请求的模型——请求 opus、回落到 sonnet 写的文件，记在 sonnet 上。
+        let loc_reply_model = if is_main {
+            sess.last_main_reply_model.clone()
+        } else if kind == Kind::Subagent {
+            sess.agents.get(&agent_key).and_then(|a| a.last_reply_model.clone())
+        } else {
+            None
+        };
         let CallRecord {
             usage_before,
             ignored_suggestion,
@@ -394,9 +449,16 @@ impl Telemetry {
         let dd_model = ctx_model.trim_end_matches("[1m]").to_string();
 
         let mut file_sizes = std::mem::take(&mut sess.file_sizes);
+        let mut hb = std::mem::take(&mut sess.hb);
+        hb.refresh(call.cred_id);
+        let mut files = std::mem::take(&mut sess.files);
         // 这一轮到这条为止跑过的工具数（`-p` 收尾那条 `tengu_sdk_result.tool_use_count`）。
         let sess_turn_tools = sess.turn_tool_calls;
         let (sess_turn_api_calls, sess_turn_api_ms) = (sess.turn_api_calls, sess.turn_api_ms);
+        let (sess_turn_mcp, sess_turn_toolsearch) =
+            (sess.turn_mcp_calls, sess.turn_toolsearch_calls);
+        let turn_first_reply_end = sess.turn_first_reply_end.map(DateTime::<Utc>::from);
+        let sess_turn_retry = sess.turn_retry_status;
         let session_cwd = sess.cwd.clone();
         let betas_full = call.betas.clone().unwrap_or_default();
         let betas_own = session_betas(&betas_full);
@@ -468,6 +530,8 @@ impl Telemetry {
             notifications,
             prev_main_end,
             prompt_id,
+            prev_prompt_id,
+            delegated_running,
             agent,
             previous_request_id,
             prev_main_message_id,
@@ -504,6 +568,8 @@ impl Telemetry {
             v299,
             v300,
             v303,
+            v305,
+            v306,
             lucky_cerf,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
@@ -516,6 +582,8 @@ impl Telemetry {
             injected,
             first_prompt_tpl,
             background,
+            ide_detect,
+            attachment_counts,
             first_main,
             snapshot,
             sleepy,
@@ -531,14 +599,25 @@ impl Telemetry {
             sess_turn_tools,
             sess_turn_api_calls,
             sess_turn_api_ms,
+            sess_turn_mcp,
+            sess_turn_toolsearch,
+            turn_first_reply_end,
+            sess_turn_retry,
             session_cwd,
             betas_full,
             betas_own,
             thread_step,
             betas_session,
         };
-        let BuiltEvents { events, dd, probe_side } =
-            build_events(&call, &shape, &facts, &mut file_sizes);
+        let BuiltEvents { events, dd, probe_side, loc, decisions, post_compact_attachments } =
+            build_events(&call, &shape, &facts, &mut file_sizes, &mut hb, &mut files);
+        sess.note_attachments(&events);
+        // 压缩成功：官方统计的是压缩那一刻内部消息表里的附件。压完之后表里只剩保留那组带的与压缩时放回去的
+        // （[`BuiltEvents::post_compact_attachments`]），账本换成它，之后各轮再接着记（这一条自己的统计上面
+        // 已经用旧账本算过）。
+        if kind == Kind::Compact && !failed && !aborted {
+            sess.attachment_counts = post_compact_attachments.unwrap_or_default();
+        }
         let TurnFacts {
             device_id,
             session_id,
@@ -590,6 +669,8 @@ impl Telemetry {
         }
         if let Some(sess) = st.sessions.get_mut(&key) {
             sess.file_sizes = file_sizes;
+            sess.hb = hb;
+            sess.files = files;
         }
 
         // ---- 入队 ----
@@ -618,6 +699,10 @@ impl Telemetry {
             session_id,
             device_id,
             account_uuid,
+            loc_model: loc_reply_model
+                .unwrap_or_else(|| display_model.trim_end_matches("[1m]").to_string()),
+            loc,
+            decisions,
             model: display_model,
             category: kind.category(),
             effort: shape.effort.clone(),
@@ -651,6 +736,13 @@ impl Telemetry {
         for (c, _) in st.presession.remove(key).unwrap_or_default() {
             Self::process(st, c, false, None);
         }
+    }
+
+    /// 一串扣住的失败到头了（换了请求或扣太久）：最后一次就是最终失败，带着前面几次照常处理（不再扣）。
+    pub(super) fn finish_retry_chain(st: &mut State, mut calls: Vec<ApiCall>) {
+        let Some(mut last) = calls.pop() else { return };
+        last.prior_attempts = calls.iter().map(PriorAttempt::of).collect();
+        Self::process(st, last, false, None);
     }
 
     /// 把某会话扣住的侧查询按顺序补发（主线程请求到了，或扣得太久）。
@@ -690,6 +782,9 @@ struct TurnStart {
     prev_main_anchor_end: Option<SystemTime>,
     prev_main_anchor_tool_call: bool,
     prompt_id: String,
+    prev_prompt_id: String,
+    /// 见 [`TurnFacts::delegated_running`]。
+    delegated_running: bool,
 }
 
 /// [`Session::record_call`] 要的这一轮里的几样标记。
@@ -907,18 +1002,48 @@ impl Session {
             self.turn_depth = 0;
             // 换 `turn_started` 之前先把上一轮的提交时刻挪走：`user_secs` 的窗口下界要它。
             self.prev_prompt_submit = self.turn_started;
-            self.turn_started = Some(call.started_at - Duration::from_millis(15));
+            // 本轮从用户提交算起，在客户端的重试循环之外：首条请求重发过的，从头一次尝试发出算
+            // （SDK `duration_ms` / `ttft_ms` 都要含此前的尝试与退避）。
+            self.turn_started = Some(call.logical_start() - Duration::from_millis(15));
             self.turn_text_seen = false;
             self.turn_tool_calls = 0;
             self.turn_api_calls = 0;
             self.turn_api_ms = 0;
+            self.turn_mcp_calls = 0;
+            self.turn_toolsearch_calls = 0;
+            self.turn_first_reply_end = None;
+            self.turn_retry_status = None;
         }
-        if let Some(pid) = shape.cc_prompt_id.clone() {
-            self.prompt_id = pid;
+        // 会话的 prompt 只跟主线程这一侧走：子代理那一侧的请求带的是派它那一轮的 id，后台代理晚到时主线程
+        // 早换了几轮，拿它覆盖会把会话拨回去（下一次提交前的 `user_input` 就挂错了 prompt）。归属按请求实际
+        // 带的 `x-claude-code-agent-id` 认，不只看类别：子代理里的 WebFetch 应用、进度摘要这类辅助请求也带它
+        // （`cap/2.1.285` 六条 auxiliary，计费头写着 `cc_is_subagent=true`）。这一侧自己的事件照旧报它带的那个。
+        let own_prompt = shape.cc_prompt_id.clone();
+        let agent_side = kind.is_agent()
+            || kind == Kind::AgentSummaryShort
+            || call.agent.agent_id.as_deref().is_some_and(|a| !a.is_empty());
+        if !agent_side && let Some(pid) = own_prompt.clone() {
+            if pid != self.prompt_id {
+                self.prev_prompt_id = std::mem::replace(&mut self.prompt_id, pid);
+            }
         } else if self.prompt_id.is_empty() {
             self.prompt_id = uuid_v4();
         }
-        let prompt_id = self.prompt_id.clone();
+        let prompt_id = match own_prompt {
+            Some(pid) if agent_side => pid,
+            _ => self.prompt_id.clone(),
+        };
+        let prev_prompt_id = self.prev_prompt_id.clone();
+        // 新一轮用户输入：上一轮派出去没跑完的不再占着（子代理失败或被打断不会收尾，别让它一直挂着）。
+        if new_prompt {
+            self.delegated_pending.clear();
+            self.nested_pending = 0;
+            for a in self.agents.values_mut() {
+                a.delegated = false;
+            }
+        }
+        let delegated_running = is_main
+            && (!self.delegated_pending.is_empty() || self.agents.values().any(|a| a.delegated));
         TurnStart {
             emit_first_turn,
             new_prompt,
@@ -934,15 +1059,59 @@ impl Session {
             prev_main_anchor_end,
             prev_main_anchor_tool_call,
             prompt_id,
+            prev_prompt_id,
+            delegated_running,
         }
+    }
+
+    /// 新露面的子代理认领一次派遣：首条用户消息的一个文本块就是派它那次 `Agent` 调用的 `prompt`，但不一定
+    /// 原样——客户端常在末尾补一个换行（`cap/` 2.1.280 ~ 2.1.306 全部 61 个子代理，原样相同的只有 14 个，
+    /// 其余去掉首尾空白后都相同），所以两边都去掉首尾空白再比。对上主线程派的那份就是主线程直接派的；
+    /// 对不上、而子代理那边有没认领的派遣，就是孙代理。只有缺了可比的信息才退回：派遣那头 `prompt` 取不到
+    /// （空串那项），或这条请求体读不出首条用户消息。两头都有文本却对不上（上一轮的后台代理晚到）不认领，
+    /// 免得占掉这一轮别人的那份。返回它是不是占了主线程那份。
+    fn claim_delegation(&mut self, call: &ApiCall) -> bool {
+        if self.delegated_pending.is_empty() && self.nested_pending == 0 {
+            return false;
+        }
+        let texts = first_user_texts(&call.body);
+        if let Some(i) = self
+            .delegated_pending
+            .iter()
+            .position(|p| !p.is_empty() && texts.iter().any(|t| t.trim() == p))
+        {
+            self.delegated_pending.remove(i);
+            return true;
+        }
+        if self.nested_pending > 0 {
+            self.nested_pending -= 1;
+            return false;
+        }
+        let i = if texts.is_empty() {
+            (!self.delegated_pending.is_empty()).then_some(0)
+        } else {
+            self.delegated_pending.iter().position(String::is_empty)
+        };
+        let Some(i) = i else { return false };
+        self.delegated_pending.remove(i);
+        true
     }
 
     /// 子代理支线：首条请求建档（链、起点、拉起它的那条主线程请求），之后每条读它。
     /// 摘要请求只读不推进。
-    fn agent_view(&mut self, call: &ApiCall, shape: &RequestShape, agent_key: &str) -> AgentView {
+    fn agent_view(
+        &mut self,
+        call: &ApiCall,
+        shape: &RequestShape,
+        agent_key: &str,
+        kind: Kind,
+    ) -> AgentView {
         let spawn = self.last_spawn_request_id.clone();
         // 摘要器在子代理起跑时读当前主模型：按它首条请求的发出时刻查，处理到这条时主线程可能已经换了。
         let session_model = self.main_model_at(call.started_at);
+        let first =
+            kind == Kind::Subagent && self.agents.get(agent_key).is_none_or(|a| !a.claim_checked);
+        let delegated = first && self.claim_delegation(call);
         let a = self.agents.entry(agent_key.to_string()).or_default();
         if a.agent_type.is_none() {
             a.agent_type = call.agent.agent_type.clone().filter(|t| !t.is_empty());
@@ -953,6 +1122,10 @@ impl Session {
             a.session_model = session_model;
             a.prompt_chars = shape.prompt_len;
             a.invoking_request_id = spawn;
+        }
+        if first {
+            a.delegated = delegated;
+            a.claim_checked = true;
         }
         AgentView {
             chain_id: a.chain_id.clone(),
@@ -1031,7 +1204,8 @@ impl Session {
         if !new_prompt {
             0.0
         } else {
-            let submit = call.started_at - Duration::from_millis(15);
+            // 提交在客户端的重试循环之外：重发过的从头一次尝试算。
+            let submit = call.logical_start() - Duration::from_millis(15);
             let typed = 0.8 + 0.1 * shape.prompt_len as f64;
             let base = self.prev_prompt_submit.unwrap_or(self.started_wall);
             let window = submit.duration_since(base).map_or(typed, |d| d.as_secs_f64());
@@ -1056,6 +1230,51 @@ impl Session {
         }
         self.background_done = to;
         from..to
+    }
+
+    /// 进程启动后约 30 秒那条 IDE 探测（官方 `TCr`：每秒找一次装了扩展的 IDE，30 秒找不到报
+    /// `ide_detect{found:false}`；`cap/auto-2.1.291-20261006-full` 起每份全量抓包的交互式会话都在首条事件后
+    /// 30.4 ~ 30.8 秒，不到 30 秒就退出的没有，`-p` 没有）：这条请求发出时已经过了那一刻就补上，一个进程
+    /// 一次。
+    fn take_ide_detect(&mut self, version: &str, sdk: bool, started_at: SystemTime) -> bool {
+        if self.ide_detect_done || sdk || !version_at_least(version, "2.1.285") {
+            return false;
+        }
+        let due = self.started_wall + Duration::from_millis(IDE_DETECT_MS) <= started_at;
+        if due {
+            self.ide_detect_done = true;
+        }
+        due
+    }
+
+    /// 记下这条调用报过的主线程附件（见 [`Session::attachment_counts`]）。子代理那条线上的不算。
+    fn note_attachments(&mut self, events: &[(DateTime<Utc>, Value)]) {
+        for (_, e) in events {
+            if e["event_data"]["event_name"].as_str() != Some("tengu_attachments") {
+                continue;
+            }
+            let Some(meta) = e["event_data"]["additional_metadata"]
+                .as_str()
+                .and_then(|b| STANDARD.decode(b).ok())
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            else {
+                continue;
+            };
+            if meta
+                .get("query_source")
+                .and_then(|q| q.as_str())
+                .is_some_and(|q| q.starts_with("agent:"))
+            {
+                continue;
+            }
+            for t in meta.get("attachment_types").and_then(|t| t.as_array()).into_iter().flatten() {
+                let Some(t) = t.as_str() else { continue };
+                match self.attachment_counts.iter_mut().find(|(k, _)| k == t) {
+                    Some((_, n)) => *n += 1,
+                    None => self.attachment_counts.push((t.to_string(), 1)),
+                }
+            }
+        }
     }
 
     /// 这条线（主线程或某个子代理）的快照 hash：头一次录下（`live_recorded`），之后沿用。
@@ -1163,6 +1382,9 @@ impl Session {
                 call.request_id.clone().or(self.last_main_request_id.take());
             self.last_main_message_id =
                 call.message_id.clone().or(self.last_main_message_id.take());
+            if let Some(m) = call.resp_model.clone().filter(|m| !m.is_empty()) {
+                self.last_main_reply_model = Some(m);
+            }
         }
         if is_main {
             self.last_main_depth = self.turn_depth;
@@ -1176,8 +1398,33 @@ impl Session {
             self.last_model = Some(display_model.to_string());
             self.note_main_model(call.started_at, display_model);
             self.turn_tool_calls += shape.tool_uses.len() as u32;
+            for tu in &shape.tool_uses {
+                if tu.name.starts_with("mcp__") {
+                    self.turn_mcp_calls += 1;
+                } else if tu.name == "ToolSearch" {
+                    self.turn_toolsearch_calls += 1;
+                }
+            }
             self.turn_api_calls += 1;
-            self.turn_api_ms += call.total_ms as i64;
+            let retry = RetryView::of(&call.prior_attempts, call.dispatch.as_deref());
+            if retry.retries > 0 {
+                self.turn_retry_status =
+                    Some(self.turn_retry_status.unwrap_or(0).max(retry.max_retry_status));
+            }
+            // 失败的不算进 API 耗时（`sdk_result.duration_api_ms`，`cap/auto-2.1.306-20261021-retry` R2 报 0）；重发过才
+            // 成功的从头一次发出算起（R1 报 1947，就是那条的 `durationMsIncludingRetries`）。
+            if !failed {
+                self.turn_api_ms += match call.prior_attempts.first() {
+                    Some(first) => this_end_wall(call)
+                        .duration_since(first.started_at)
+                        .map_or(call.total_ms as i64, |d| d.as_millis() as i64),
+                    None => call.total_ms as i64,
+                };
+            }
+            if self.turn_first_reply_end.is_none() && !failed && !aborted {
+                self.turn_first_reply_end =
+                    Some(call.started_at + Duration::from_millis(call.total_ms));
+            }
             if first_text_in_turn {
                 self.turn_text_seen = true;
             }
@@ -1189,8 +1436,38 @@ impl Session {
             }
         }
         // 拉起子代理的那条主线程请求（回复里调了 `Agent`），见 [`Session::last_spawn_request_id`]。
-        if is_main && call.tool_use_lens.iter().any(|(name, _)| name == "Agent" || name == "Task") {
+        // 按实际调用数，不按工具长度表：那张表按工具名聚合，一条回复并行派两个 Agent 只有一项。
+        // 调用表缺了（老抓包回放只给长度表）时退回长度表，至少算一个。
+        let is_agent = |name: &str| name == "Agent" || name == "Task";
+        let spawned = call
+            .tool_calls
+            .iter()
+            .filter(|c| is_agent(&c.name))
+            .count()
+            .max(usize::from(call.tool_use_lens.iter().any(|(name, _)| is_agent(name))));
+        if is_main && spawned > 0 {
             self.last_spawn_request_id = call.request_id.clone();
+            if !failed && !aborted {
+                let mut prompts: Vec<String> = call
+                    .tool_calls
+                    .iter()
+                    .filter(|c| is_agent(&c.name))
+                    .map(|c| {
+                        c.input
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
+                    .collect();
+                prompts.resize(spawned, String::new());
+                self.delegated_pending.extend(prompts);
+            }
+        }
+        // 子代理再派的孙代理：只记个数，孙代理首条按它认领，不占主线程那份。
+        if kind == Kind::Subagent && spawned > 0 && !failed && !aborted {
+            self.nested_pending += spawned as u32;
         }
         // 子代理以 SubagentHandback 收尾（`cap/auto-2.1.285-20260930` 07:51:29.419–.455）：那个工具
         // 客户端当场执行，子代理不再发请求，这一条就是它的最后一条。
@@ -1241,6 +1518,9 @@ impl Session {
             a.tool_uses += shape.tool_uses.len() as u32;
             a.last_request_id = call.request_id.clone().or(a.last_request_id.take());
             a.last_message_id = call.message_id.clone().or(a.last_message_id.take());
+            if let Some(m) = call.resp_model.clone().filter(|m| !m.is_empty()) {
+                a.last_reply_model = Some(m);
+            }
             if !failed {
                 a.prev_total = call.input_tokens
                     + call.cache_read_tokens
@@ -1270,5 +1550,22 @@ impl Session {
             handback,
             agent_done,
         }
+    }
+}
+
+/// 请求体里首条用户消息的各个文本块（字符串内容算一块）。
+fn first_user_texts(body: &[u8]) -> Vec<String> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else { return Vec::new() };
+    let Some(m) = v["messages"].as_array().and_then(|ms| ms.iter().find(|m| m["role"] == "user"))
+    else {
+        return Vec::new();
+    };
+    match &m["content"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
     }
 }

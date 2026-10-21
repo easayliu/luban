@@ -69,15 +69,59 @@ impl EventBuilder<'_> {
                 DateTime::<Utc>::from(e) + chrono::Duration::milliseconds(500)
             });
             let tc = ms(t0, -5_400).max(floor).min(ms(t0, -50));
-            self.push(
+            // 心跳：敲 `/clear`、清空时与逐出提示同一毫秒报 `conversation_clear` 并清场（官方 `aFn`；状态机
+            // 是进程的，新会话接着旧会话那台，见 [`ClearedPrev::hb`]）。清场那一刻还在旧会话上，
+            // 见 [`ClearIds`]。
+            let (old_parent, old_prompt) = cleared_prev
+                .as_ref()
+                .map(|p| (p.parent_session_id.clone(), p.prompt_id.clone()))
+                .unwrap_or_default();
+            let ids = ClearIds {
+                old: Identity {
+                    session_id: prev.clone(),
+                    parent_session_id: old_parent,
+                    ..base_identity.clone()
+                },
+                old_prompt,
+                clearing: Identity {
+                    session_id: prev.clone(),
+                    parent_session_id: Some(prev.clone()),
+                    ..base_identity.clone()
+                },
+                clear_prompt: uuid_v4(),
+            };
+            self.beat_at(ms(tc, -980), heartbeat::Trigger::UserInput, BeatAt::ClearInput);
+            self.beat_at(tc, heartbeat::Trigger::Reset("conversation_clear"), BeatAt::Clearing);
+            let (clearing, clear_prompt) = (ids.clearing.clone(), ids.clear_prompt.clone());
+            self.cleared = Some(ids);
+            let prompt = MetaStage::Prompt;
+            self.push_as(
                 tc,
                 "tengu_cache_eviction_hint",
+                &clearing,
+                prompt,
+                &clear_prompt,
+                false,
                 json!({ "scope": "conversation_clear", "last_request_id": prev_req.as_deref().unwrap_or("") }),
             );
-            self.push(tc, "tengu_shell_set_cwd", json!({ "success": true }));
-            self.push(
+            self.push_as(
+                tc,
+                "tengu_shell_set_cwd",
+                &clearing,
+                prompt,
+                &clear_prompt,
+                false,
+                json!({ "success": true }),
+            );
+            // 新会话起来到下一次提交之前没有 prompt。
+            let fresh = MetaStage::Renderer;
+            self.push_as(
                 ms(tc, 1),
                 "tengu_session_start",
+                base_identity,
+                fresh,
+                "",
+                false,
                 json!({
                     "previous_session_id": prev,
                     "source": "clear",
@@ -88,11 +132,23 @@ impl EventBuilder<'_> {
                 }),
             );
             for (off, name) in [(3, "cmd_clear"), (6, "cmd_dispatch")] {
-                self.push_dd(ms(tc, off), "tengu_feature_ok", feature(name));
+                self.push_as(
+                    ms(tc, off),
+                    "tengu_feature_ok",
+                    base_identity,
+                    fresh,
+                    "",
+                    true,
+                    feature(name),
+                );
             }
-            self.push(
+            self.push_as(
                 ms(tc, 6),
                 "tengu_input_command",
+                base_identity,
+                fresh,
+                "",
+                false,
                 json!({ "input": "clear", "invocation_trigger": "user-slash" }),
             );
         } else if is_new_session {
@@ -100,13 +156,22 @@ impl EventBuilder<'_> {
         }
     }
 
-    /// 这一轮到期的后台模板事件。
+    /// 这一轮到期的后台模板事件，以及进程启动 30 秒后那条 IDE 探测（`Session::take_ide_detect`）。
     pub(super) fn emit_background(&mut self) {
         let env = self.env;
-        let TurnFacts { started_wall, ref background, .. } = *env.f;
+        let TurnFacts { started_wall, ref background, ide_detect, .. } = *env.f;
         let EventEnv { tpl, .. } = *env;
         if !background.is_empty() {
             self.take_tpl(&tpl.background[background.clone()], started_wall.into());
+        }
+        if ide_detect {
+            // 找 IDE 那个循环从启动段某处起算 30 秒，落在首条事件后 30.4 ~ 30.8 秒。
+            let dt = ms(started_wall.into(), IDE_DETECT_MS as i64 + (env.req_hash % 400) as i64);
+            self.push(
+                dt,
+                "tengu_feature_ok",
+                json!({ "found": false, "feature_name": "ide_detect" }),
+            );
         }
     }
 
@@ -129,6 +194,9 @@ impl EventBuilder<'_> {
         // 08:01:01.376 按 Esc）：弹框、拒绝那几条、turn、`turn_end{aborted_tools}`，没有 stop hook；
         // 客户端不再发请求，直到用户敲下一句——代理只能在这条新输入里看出来，补在它前面。
         if !rejected_calls.is_empty() {
+            // 这一整段都是上一轮的事：弹框、拒绝、文件建议刷新、turn 与 `turn_end`，官方挂的都是上一轮的 prompt
+            // （`cap/auto-2.1.305-20261021-full` B1 .484 ~ .412 全是 1572cea5，下一轮提交之后才换）。
+            self.prev_prompt_scope = true;
             let prev_end_dt: DateTime<Utc> =
                 prev_end.unwrap_or(call.started_at - Duration::from_secs(6)).into();
             let shown = ms(prev_end_dt, 8);
@@ -150,6 +218,13 @@ impl EventBuilder<'_> {
                         "originAgentType": "main"
                     }),
                 );
+                // 弹框与被拒的 `unary_event`（`cap/auto-2.1.305-20261021-full` B1 的 Bash：.484 / .360），编辑类
+                // 工具另记一次拒绝。
+                let tool = (c.name.as_str(), &c.input);
+                self.push_unary(shown, "response", tool, &prev_msg);
+                self.push_unary(t_rej, "reject", tool, &prev_msg);
+                self.note_edit_decision(tool, "reject", "user_reject");
+                self.push_file_suggestions_refresh(t_rej);
                 self.push_dd(t_rej, "tengu_feature_ok", feature("permission_user_deny"));
                 self.push(t_rej, "tengu_permission_request_escape", json!({}));
                 let mut can_use = json!({
@@ -186,6 +261,16 @@ impl EventBuilder<'_> {
                 self.push_dd_snake(t_rej, "tengu_tool_use_rejected_in_prompt", rejected);
             }
             let t2 = ms(t_rej, 2);
+            // 心跳：弹框把界面切到等用户；被拒后这一轮停手，等用户那段在 `turn_end` 之后 27ms 收
+            // （`cap/auto-2.1.305-20261021-full` B1：.364 → .391），不再回到干活。这都是上一轮的事，挂上一轮的
+            // prompt（B1 那三条都是 1572cea5，下一轮提交后的开工才换）。
+            if let Some((c, _)) = rejected_calls.first() {
+                self.beat_before_prompt(
+                    ms(prev_end_dt, 11),
+                    heartbeat::Trigger::Run(Some(heartbeat::awaiting_for(&c.name))),
+                );
+                self.beat_before_prompt(ms(t2, 27), heartbeat::Trigger::Run(None));
+            }
             self.push_dd(t2, "tengu_feature_ok", feature("turn"));
             let started: DateTime<Utc> = prev_turn.2.unwrap_or(call.started_at).into();
             self.push(
@@ -193,6 +278,7 @@ impl EventBuilder<'_> {
                 "tengu_turn_end",
                 env.turn_end("aborted_tools", (t2 - started).num_milliseconds().max(0), None),
             );
+            self.prev_prompt_scope = false;
         }
     }
 
@@ -281,11 +367,20 @@ impl EventBuilder<'_> {
                     "tengu_tool_search_mode_decision",
                     tool_search_decision(shape, display_model, kind.is_agent()),
                 );
-            } else if first_prompt_tpl {
-                self.take_tpl(&tpl.prompt, t0);
-                self.take_tpl(&tpl.first_prompt, t0);
             } else {
-                self.take_tpl(&tpl.prompt_next, t0);
+                let seg = if first_prompt_tpl { &tpl.prompt } else { &tpl.prompt_next };
+                // 文件历史的快照在模板那条 `snapshot_success` 处：上次备份后改过的先各备份一版。
+                if let Some(e) =
+                    seg.iter().find(|e| e.name == "tengu_file_history_snapshot_success")
+                {
+                    self.emit_snapshot_backups(ms(t0, e.off));
+                }
+                if first_prompt_tpl {
+                    self.take_tpl(&tpl.prompt, t0);
+                    self.take_tpl(&tpl.first_prompt, t0);
+                } else {
+                    self.take_tpl(&tpl.prompt_next, t0);
+                }
             }
             // `tengu_lucky_cerf` 曝光：首次输入那段模板里有它（`-p` 的在启动那段），位置照模板；
             // 别的输入（中途切到精简提示词的模型、注入的一轮）模板里没有，这里按模板那条的偏移
@@ -392,6 +487,16 @@ impl EventBuilder<'_> {
                 }
             } else {
                 self.push(ms(t0, input_at), "tengu_input_prompt", input);
+            }
+            // 心跳（交互式）：用户敲字那一刻报 `user_input`——比提交早一秒上下（`cap/auto-2.1.305-20261021-full`
+            // 提交前 863 ~ 988ms，驱动先敲字、停 0.8 秒再回车；代理看不到敲了多久，按这个算）；这一轮开工，
+            // 界面转入 `turn_running`，落在这条请求发出后几毫秒。客户端自己注入的一轮没有敲字。
+            // 敲字那条挂上一轮 prompt（官方那时还没换），提交后的开工才是这一轮的。
+            if !shape.sdk {
+                if typed {
+                    self.beat_before_prompt(ms(t0, input_at - 980), heartbeat::Trigger::UserInput);
+                }
+                self.beat(ms(t0, 5), heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
             }
             if heron {
                 self.push(

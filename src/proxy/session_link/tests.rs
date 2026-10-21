@@ -191,7 +191,12 @@ fn session_link_is_isolated_per_credential() {
 
     let first_a = crate::proxy::CcSessionLink::load(a, true, true);
     assert!(first_a.first_seen, "A 的第一条");
-    crate::proxy::CcSessionLink::record(a, Some("req_a"), Some("msg_a"));
+    crate::proxy::CcSessionLink::record(
+        a,
+        &crate::proxy::ChainLane::Main,
+        Some("req_a"),
+        Some("msg_a"),
+    );
 
     // 换到 B：同一个会话 id，但对 B 来说这是**新会话**——要触发 B 自己的启动握手，
     // 且拿不到 A 的那两个 id。
@@ -202,7 +207,12 @@ fn session_link_is_isolated_per_credential() {
     assert_ne!(first_b.prompt_id, first_a.prompt_id, "两条链各自的一轮");
 
     // B 记自己的，不影响 A。
-    crate::proxy::CcSessionLink::record(b, Some("req_b"), Some("msg_b"));
+    crate::proxy::CcSessionLink::record(
+        b,
+        &crate::proxy::ChainLane::Main,
+        Some("req_b"),
+        Some("msg_b"),
+    );
     let again_a = crate::proxy::CcSessionLink::load(a, false, true);
     assert_eq!(again_a.prev_req.as_deref(), Some("req_a"), "A 还是 A 那条");
     assert_eq!(again_a.prompt_id, first_a.prompt_id, "换号没把 A 这一轮转掉");
@@ -221,7 +231,12 @@ fn session_link_carries_prompt_and_previous_ids() {
     assert!(first.prev_message_id.is_none(), "首轮 previous_message_id 为 null");
 
     // 回程记下这一条的两个 id。
-    crate::proxy::CcSessionLink::record(key(&sid), Some("req_001"), Some("msg_001"));
+    crate::proxy::CcSessionLink::record(
+        key(&sid),
+        &crate::proxy::ChainLane::Main,
+        Some("req_001"),
+        Some("msg_001"),
+    );
 
     // 工具续轮：prompt_id 沿用，两个 prev 指向上一条。
     let second = tool_turn();
@@ -230,7 +245,12 @@ fn session_link_carries_prompt_and_previous_ids() {
     assert_eq!(second.prev_message_id.as_deref(), Some("msg_001"));
 
     // 新一轮用户输入：换 prompt_id，prev 仍指最近一条。
-    crate::proxy::CcSessionLink::record(key(&sid), Some("req_002"), Some("msg_002"));
+    crate::proxy::CcSessionLink::record(
+        key(&sid),
+        &crate::proxy::ChainLane::Main,
+        Some("req_002"),
+        Some("msg_002"),
+    );
     let third = new_prompt();
     assert_ne!(third.prompt_id.as_deref(), Some(pid.as_str()), "新输入要换一轮 id");
     assert_eq!(third.prev_req.as_deref(), Some("req_002"));
@@ -257,11 +277,103 @@ fn session_link_carries_prompt_and_previous_ids() {
 fn session_link_record_keeps_what_it_was_not_told() {
     let sid = format!("test-{}", crate::proxy::uuid_v4());
     let _ = crate::proxy::CcSessionLink::load(key(&sid), true, true);
-    crate::proxy::CcSessionLink::record(key(&sid), Some("req_001"), Some("msg_001"));
-    crate::proxy::CcSessionLink::record(key(&sid), Some("req_002"), None);
+    crate::proxy::CcSessionLink::record(
+        key(&sid),
+        &crate::proxy::ChainLane::Main,
+        Some("req_001"),
+        Some("msg_001"),
+    );
+    crate::proxy::CcSessionLink::record(
+        key(&sid),
+        &crate::proxy::ChainLane::Main,
+        Some("req_002"),
+        None,
+    );
     let link = crate::proxy::CcSessionLink::load(key(&sid), false, true);
     assert_eq!(link.prev_req.as_deref(), Some("req_002"), "request-id 更新了");
     assert_eq!(link.prev_message_id.as_deref(), Some("msg_001"), "message.id 保留上一次的");
+}
+
+/// 子代理各走一条链、不推进主线程（`cap/auto-2.1.306-20261021-full` `00075` → 子代理 `00077` →
+/// `00080`；主线程 `00078` 仍指 `00075`），见 [`super::ChainLane`]。
+#[test]
+fn session_link_agents_have_their_own_chain() {
+    use super::{CcSessionLink, ChainLane};
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let main = || CcSessionLink::load(key(&sid), false, true);
+    let _ = CcSessionLink::load(key(&sid), true, true);
+    CcSessionLink::record(key(&sid), &ChainLane::Main, Some("req_main"), Some("msg_main"));
+
+    let first = main().on_agent_chain(key(&sid), "a1", None);
+    assert!(first.prev_req.is_none(), "子代理首条不写 cc_prev_req");
+    assert!(first.prev_message_id.is_none(), "首条 previous_message_id 为 null");
+    assert_eq!(first.lane, Some(ChainLane::Agent("a1".into())));
+    let lane = first.lane.clone().unwrap();
+    CcSessionLink::record(key(&sid), &lane, Some("req_a1"), Some("msg_a1"));
+
+    let next = main().on_agent_chain(key(&sid), "a1", None);
+    assert_eq!(next.prev_req.as_deref(), Some("req_a1"), "接它自己的上一条");
+    assert!(main().on_agent_chain(key(&sid), "a2", None).prev_req.is_none(), "另一个子代理另起");
+    assert_eq!(main().prev_req.as_deref(), Some("req_main"), "主线程没被子代理推进");
+    assert_eq!(main().prev_message_id.as_deref(), Some("msg_main"));
+}
+
+/// 失败后原样重发：客户端报的还是会话当前这一轮，不换 prompt id、`cc_prompt_index` 不加
+/// （`cap/auto-2.1.306-20261021-retry` R4）；换了 id 才是新输入。
+#[test]
+fn session_link_retry_with_same_prompt_id_keeps_the_turn() {
+    use super::CcSessionLink;
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let turn = |pid| CcSessionLink::load_turn(key(&sid), true, false, true, Some(pid));
+    assert_eq!(turn("p1").prompt_index, 1);
+    let retry = turn("p1");
+    assert_eq!((retry.prompt_id.as_deref(), retry.prompt_index), (Some("p1"), 1), "重发不换轮");
+    let next = turn("p2");
+    assert_eq!((next.prompt_id.as_deref(), next.prompt_index), (Some("p2"), 2), "新输入换轮");
+}
+
+/// 没有 prompt 头（模拟路径）：主线程失败后指纹相同的那条是重发，不换轮；成功一条之后、或指纹
+/// 不同（用户重新输入，历史多了一条），照常换轮。
+#[test]
+fn session_link_retry_without_prompt_header_keeps_the_turn() {
+    use super::{CcSessionLink, ChainLane};
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let turn = |fp| CcSessionLink::load_retryable(key(&sid), true, false, true, None, Some(fp));
+    let first = turn(1);
+    CcSessionLink::mark_failed(key(&sid), 1);
+    let retry = turn(1);
+    assert_eq!((retry.prompt_id.clone(), retry.prompt_index), (first.prompt_id.clone(), 1), "重发");
+
+    CcSessionLink::record(key(&sid), &ChainLane::Main, Some("req_1"), Some("msg_1"));
+    let again = turn(1);
+    assert_eq!(again.prompt_index, 2, "成功之后同样的输入是新的一轮");
+    CcSessionLink::mark_failed(key(&sid), 1);
+    assert_eq!(turn(2).prompt_index, 3, "指纹不同即是新输入");
+}
+
+/// 后台子代理属于派生它的那一轮：主线程换了轮它不跟着变，迟到的子代理也不把主线程拨回去。
+#[test]
+fn session_link_agent_prompt_is_isolated_from_main() {
+    use super::CcSessionLink;
+    let sid = format!("test-{}", crate::proxy::uuid_v4());
+    let main = |new, pid| CcSessionLink::load_turn(key(&sid), new, false, true, pid);
+    let _ = main(true, Some("p1"));
+    let agent = main(false, None).on_agent_chain(key(&sid), "a1", None);
+    assert_eq!(agent.prompt_id.as_deref(), Some("p1"));
+
+    let _ = main(true, Some("p2"));
+    let late = main(false, None).on_agent_chain(key(&sid), "a1", None);
+    assert_eq!(late.prompt_id.as_deref(), Some("p1"), "没带头的续轮仍是派生它的那一轮");
+    let late = main(false, None).on_agent_chain(key(&sid), "a1", Some("p1"));
+    assert_eq!(late.prompt_id.as_deref(), Some("p1"));
+    let now = main(false, None);
+    assert_eq!((now.prompt_id.as_deref(), now.prompt_index), (Some("p2"), 2), "主线程没被倒拨");
+
+    // 主线程进了本地命令那一轮（不写 cc_prompt_id），旧子代理仍写它自己那一轮。
+    let local = CcSessionLink::load_turn(key(&sid), true, true, true, Some("p3"));
+    assert!(local.prompt_id.is_none());
+    let old = main(false, None).on_agent_chain(key(&sid), "a1", None);
+    assert_eq!(old.prompt_id.as_deref(), Some("p1"), "本地命令那一轮不吞掉子代理的 prompt");
 }
 
 /// **真实 CC（API-key 模式）** 的主线程请求也要补上会话关联字段。

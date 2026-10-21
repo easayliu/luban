@@ -56,6 +56,37 @@ pub(crate) struct CcSessionLink {
     /// 输入上加一，`turnIndex` 每个新 turn 加一（可执行文件里的 `OQt`）；模拟路径的每一轮都是
     /// human，两者恒等。0 即不在会话链上（额度探测、连通性测试），不写。
     pub(super) prompt_index: u32,
+    /// 回程把这条的 `request-id` / `message.id` 记到哪条链上，`None` 即不记。见 [`ChainLane`]。
+    pub(super) lane: Option<ChainLane>,
+    /// 这条主线程新输入的指纹（[`turn_fp`]），失败时记进会话（[`Self::mark_failed`]），用来认出
+    /// 紧接着原样重发的那一条。不是新输入的为 `None`。
+    pub(super) turn_fp: Option<u64>,
+}
+
+/// 一条新输入的指纹：消息条数 + 末条消息。失败后原样重发两样都不变；用户重新输入时历史里多了
+/// 一条（官方把报错前那句留在历史里），条数就不同。只取末条，不为大上下文整段再序列化一遍。
+pub(super) fn turn_fp(v: &serde_json::Value) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let msgs = v.get("messages")?.as_array()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    msgs.len().hash(&mut h);
+    serde_json::to_string(msgs.last()?).ok()?.hash(&mut h);
+    Some(h.finish())
+}
+
+/// 会话里的一条关联链：`cc_prev_req` / `diagnostics.previous_message_id` 指的是**同一条链**
+/// 上一条成功回复，不是同会话随便哪条。官方 2.1.306（`cap/auto-2.1.306-20261021-full`）：
+///
+/// - 主线程只由主线程自己的回复推进。「猜下一句」与 `/btw` 这类分叉读主线程那一环、自己的
+///   回复不记（`00043` → 建议 `00044` → `00045` 仍指 `00043`；`00096` → `/btw` `00101` →
+///   `00147` 仍指 `00096`）。
+/// - 每个子代理（`x-claude-code-agent-id`）自己一条链：首条 `cc_prev_req` 不写、
+///   `previous_message_id` 为 null，之后接它自己的上一条（`00077` → `00080` → `00082`），
+///   也不推进主线程（`00075` → 子代理 `00077` → `00078` 仍指 `00075`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainLane {
+    Main,
+    Agent(String),
 }
 
 impl CcSessionLink {
@@ -80,8 +111,48 @@ pub(crate) struct CcSessionEntry {
     /// 模拟路径在这个会话里开过的 message thread，见 [`ThreadState`]。同一个会话 id 下可能有
     /// 好几段对话（会话槽位按账号复用，[`super::Simulation::detect`]），各占一条。
     threads: Vec<ThreadState>,
+    /// 子代理各自那条链（[`ChainLane::Agent`]），按最近使用排在后面。
+    agents: Vec<AgentChain>,
+    /// 主线程上一条请求失败了：它那条新输入的指纹（[`CcSessionLink::turn_fp`]）。下一条新输入
+    /// 指纹相同即是重发，不换轮；主线程成功一条就清掉。
+    failed_turn: Option<u64>,
     last_seen: std::time::Instant,
 }
+
+/// 一个子代理自己那条链的上一环，见 [`ChainLane`]。
+struct AgentChain {
+    agent_id: String,
+    /// 这个子代理所属那一轮的 `cc_prompt_id`：派生它的那次输入，主线程后来换了轮也不跟着变。
+    /// 生在本地命令那一轮（[`CcSessionEntry::local_turn`]，那一轮不写 `cc_prompt_id`）时为 `None`。
+    prompt_id: Option<String>,
+    prev_req: Option<String>,
+    prev_message_id: Option<String>,
+}
+
+impl CcSessionEntry {
+    /// 子代理 `agent_id` 那条链，没有就以主线程当前这一轮新建；用过的挪到末尾，满了先丢最久未用的。
+    fn agent_mut(&mut self, agent_id: &str) -> &mut AgentChain {
+        let chain = match self.agents.iter().position(|a| a.agent_id == agent_id) {
+            Some(i) => self.agents.remove(i),
+            None => {
+                if self.agents.len() >= MAX_AGENTS_PER_SESSION {
+                    self.agents.remove(0);
+                }
+                AgentChain {
+                    agent_id: agent_id.to_string(),
+                    prompt_id: (!self.local_turn).then(|| self.prompt_id.clone()),
+                    prev_req: None,
+                    prev_message_id: None,
+                }
+            }
+        };
+        self.agents.push(chain);
+        self.agents.last_mut().expect("just pushed")
+    }
+}
+
+/// 一个会话里最多记几个子代理的链。超了丢最久未用的那个——它若再发，就从链首重来。
+const MAX_AGENTS_PER_SESSION: usize = 32;
 
 /// 一个会话里最多记几条 thread。超了按最久未用淘汰——淘汰掉的那段对话下一轮退回 `create`，
 /// 与官方切模型后的形态相同，不会出错。
@@ -835,6 +906,7 @@ impl CcSessionLink {
     ///
     /// `wants_prompt_id` 为假时不写 `cc_prompt_id`，但**会话状态照样推进**——官方那条
     /// 「猜下一句」请求也在同一条链上，只是自己不写这个字段。
+    #[cfg(test)]
     pub(super) fn load(key: CcSessionKey<'_>, new_prompt: bool, wants_prompt_id: bool) -> Self {
         Self::load_turn(key, new_prompt, false, wants_prompt_id, None)
     }
@@ -845,13 +917,31 @@ impl CcSessionLink {
     /// `client_prompt_id` 是来访自己在 `x-claude-code-prompt-id` 头里报的这一轮 id：有就以它为准
     /// 并记进会话（同一轮后面没带头的续轮也沿用它）。2.1.285 起这个头与 billing header 里的
     /// `cc_prompt_id` 同值同现（[`config::CC_HEADER_ORDER`]），luban 补 billing header 时另造一个
-    /// 就是一条请求里两个不同的 prompt id。
+    /// 就是一条请求里两个不同的 prompt id。只该传主线程的：别的类别记进会话会把主线程这一轮改掉。
+    ///
+    /// 报的正是会话当前这一轮时，即便末条是一句新输入也不换轮：那是失败后原样重发的同一条请求，
+    /// 官方整条重试链同一个 prompt id、`cc_prompt_index` 不加（`cap/auto-2.1.306-20261021-retry`
+    /// R4 的 inj007–010）。没有这个头的来访（模拟路径）看 `fp`，见 [`Self::load_retryable`]。
+    #[cfg(test)]
     pub(super) fn load_turn(
         key: CcSessionKey<'_>,
         new_prompt: bool,
         local_turn: bool,
         wants_prompt_id: bool,
         client_prompt_id: Option<&str>,
+    ) -> Self {
+        Self::load_retryable(key, new_prompt, local_turn, wants_prompt_id, client_prompt_id, None)
+    }
+
+    /// [`Self::load_turn`] 外加这条新输入的指纹 `fp`（[`turn_fp`]）：主线程上一条失败、这条
+    /// 指纹与它相同，即是失败后原样重发，与报了同一个 prompt 头一样不换轮。
+    pub(super) fn load_retryable(
+        key: CcSessionKey<'_>,
+        new_prompt: bool,
+        local_turn: bool,
+        wants_prompt_id: bool,
+        client_prompt_id: Option<&str>,
+        fp: Option<u64>,
     ) -> Self {
         let now = std::time::Instant::now();
         let mut map = CC_SESSIONS.lock();
@@ -871,9 +961,17 @@ impl CcSessionLink {
             prev_message_id: None,
             local_turn: false,
             threads: Vec::new(),
+            agents: Vec::new(),
+            failed_turn: None,
             last_seen: now,
         });
-        // 新建的那份 id 就是这一轮的，别再换一次。
+        // 新建的那份 id 就是这一轮的，别再换一次；客户端报的还是这一轮、或与刚失败那条指纹相同，
+        // 即是重发，也不换。
+        let retry = match client_prompt_id {
+            Some(id) => id == entry.prompt_id,
+            None => fp.is_some() && fp == entry.failed_turn,
+        };
+        let new_prompt = new_prompt && !retry;
         if known && new_prompt {
             entry.prompt_id = uuid_v4();
             entry.prompt_index = entry.prompt_index.saturating_add(1);
@@ -894,25 +992,78 @@ impl CcSessionLink {
             // [`CcSessionLink::with_diagnostics`] 按 [`CcRequestKind`] 覆写。
             diagnostics: true,
             prompt_index: entry.prompt_index,
+            // 缺省记主线程：模拟路径只造主线程。真实 CC 那条路由 [`client_session_link`] 按类别覆写。
+            lane: Some(ChainLane::Main),
+            turn_fp: fp,
         }
     }
 
-    /// 回程记下这一条的上游 `request-id` 与回复的 `message.id`，供同会话下一条引用。
-    /// 两个都没有（上游连头都没回）时什么也不做——把 `None` 写回去会把链条清空，
-    /// 而官方那边链条是不会中断的。
-    pub(super) fn record(key: CcSessionKey<'_>, req_id: Option<&str>, message_id: Option<&str>) {
+    /// 主线程这条失败了（上游报错，或连上游都没到）：记下它的新输入指纹，供
+    /// [`Self::load_retryable`] 认出紧接着的原样重发。
+    pub(super) fn mark_failed(key: CcSessionKey<'_>, fp: u64) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.failed_turn = Some(fp);
+        }
+    }
+
+    /// 改接到子代理 `agent_id` 自己那条链上：`cc_prev_req` 与 `previous_message_id` 换成它
+    /// 自己的上一环（首条两者都没有），回程也记回那条链。见 [`ChainLane`]。
+    ///
+    /// `cc_prompt_id` 也用它自己那一轮的（[`AgentChain::prompt_id`]）：主线程已经进了下一轮
+    /// （哪怕是不写 `cc_prompt_id` 的本地命令那一轮），后台还在跑的子代理仍属派生它的那一轮。
+    /// 来访头里报了（`client_prompt_id`）就以头为准并记下，但**不写回主线程**——迟到的子代理
+    /// 会把主线程倒拨回旧的一轮。
+    fn on_agent_chain(
+        mut self,
+        key: CcSessionKey<'_>,
+        agent_id: &str,
+        client_prompt_id: Option<&str>,
+    ) -> Self {
+        let mut map = CC_SESSIONS.lock();
+        let Some(entry) = map.get_mut(&key.owned()) else { return self };
+        let a = entry.agent_mut(agent_id);
+        if let Some(id) = client_prompt_id {
+            a.prompt_id = Some(id.to_string());
+        }
+        self.prompt_id = a.prompt_id.clone();
+        self.prev_req = a.prev_req.clone();
+        self.prev_message_id = a.prev_message_id.clone();
+        self.lane = Some(ChainLane::Agent(agent_id.to_string()));
+        self
+    }
+
+    /// 回程记下这一条的上游 `request-id` 与回复的 `message.id`，供同一条链（`lane`）的下一条
+    /// 引用。**只给完整成功的回复调用**：官方链上跳过报错的请求，下一条仍指此前成功的那条
+    /// （`cap/auto-2.1.306-20261021-retry` 的 R4：连续 5 次注入 529 都带 `request-id`，下一轮
+    /// `00125` 没有 `cc_prev_req`）。两个都没有时什么也不做——把 `None` 写回去会把链条清空。
+    pub(super) fn record(
+        key: CcSessionKey<'_>,
+        lane: &ChainLane,
+        req_id: Option<&str>,
+        message_id: Option<&str>,
+    ) {
         if req_id.is_none() && message_id.is_none() {
             return;
         }
         let mut map = CC_SESSIONS.lock();
         let Some(entry) = map.get_mut(&key.owned()) else { return };
+        entry.last_seen = std::time::Instant::now();
+        let (prev_req, prev_message_id) = match lane {
+            ChainLane::Main => {
+                entry.failed_turn = None;
+                (&mut entry.prev_req, &mut entry.prev_message_id)
+            }
+            ChainLane::Agent(id) => {
+                let a = entry.agent_mut(id);
+                (&mut a.prev_req, &mut a.prev_message_id)
+            }
+        };
         if let Some(r) = req_id {
-            entry.prev_req = Some(r.to_string());
+            *prev_req = Some(r.to_string());
         }
         if let Some(m) = message_id {
-            entry.prev_message_id = Some(m.to_string());
+            *prev_message_id = Some(m.to_string());
         }
-        entry.last_seen = std::time::Instant::now();
     }
 
     /// 一条按线程改写的请求**完整成功**（有 `message.id`）后，把它记成这段对话最新的线程状态：
@@ -1300,13 +1451,43 @@ pub(crate) fn client_session_link(
         .and_then(|h| h.to_str().ok())
         .map(str::trim)
         .filter(|h| super::simulation::looks_like_uuid(h));
-    let mut link = CcSessionLink::load_turn(
-        CcSessionKey { cred_id: cred.id, session_id: &session_id },
+    let key = CcSessionKey { cred_id: cred.id, session_id: &session_id };
+    // 来访报的 prompt id 只有主线程的记进会话；其余几类可能属于更早的一轮（后台子代理），只用在
+    // 这一条上，见 [`CcSessionLink::load_turn`]。
+    let main = kind == CcRequestKind::Main;
+    let mut link = CcSessionLink::load_retryable(
+        key,
         new_prompt,
         starts_local_turn(v),
         kind.wants_prompt_id(),
-        client_prompt_id,
+        client_prompt_id.filter(|_| main),
+        new_prompt.then(|| turn_fp(v)).flatten(),
     );
+    // 只有主线程与子代理的回复推进链条，各推各的（[`ChainLane`]）；其余几类只读主线程那一环。
+    // 子代理认不出支线号（2.1.277 之前不发 `x-claude-code-agent-id`）就不接任何链。
+    link.lane = None;
+    match kind {
+        CcRequestKind::Main => link.lane = Some(ChainLane::Main),
+        CcRequestKind::Subagent => match headers
+            .get("x-claude-code-agent-id")
+            .and_then(|h| h.to_str().ok())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            Some(agent_id) => link = link.on_agent_chain(key, agent_id, client_prompt_id),
+            None => {
+                link.prev_req = None;
+                link.prev_message_id = None;
+            }
+        },
+        _ => {}
+    }
+    if !main
+        && let Some(id) = client_prompt_id
+        && link.prompt_id.is_some()
+    {
+        link.prompt_id = Some(id.to_string());
+    }
     if !kind.wants_prev_req() {
         link.prev_req = None;
     }

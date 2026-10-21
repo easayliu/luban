@@ -35,7 +35,10 @@ use crate::config;
 
 mod bash_ast;
 mod call;
+mod compact;
 mod events;
+mod files;
+mod heartbeat;
 mod identity;
 mod kind;
 mod process;
@@ -49,6 +52,8 @@ mod upload;
 
 pub use call::*;
 use events::*;
+use files::Files;
+use heartbeat::Heartbeat;
 pub use identity::*;
 use kind::*;
 pub use session::*;
@@ -338,6 +343,19 @@ impl Telemetry {
     pub fn gc(&self, now: Instant) {
         let idle = Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS);
         let mut st = self.0.state.lock();
+        // 扣住太久的重试链：客户端没再重发，最后一次就是最终失败（见 [`HeldRetry`]）。
+        let retry_hold = Duration::from_secs(config::TELEMETRY_RETRY_HOLD_SECS);
+        let given_up: Vec<(i64, String)> = st
+            .held_retries
+            .iter()
+            .filter(|(_, h)| now.duration_since(h.at) >= retry_hold)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in given_up {
+            if let Some(h) = st.held_retries.remove(&k) {
+                Self::finish_retry_chain(&mut st, h.calls);
+            }
+        }
         // 扣住太久的侧查询：没等到主线程请求，按会话现有的 prompt id 补发。
         let hold = Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS);
         let stale: Vec<(i64, String)> = st
@@ -362,7 +380,16 @@ impl Telemetry {
             let keys: Vec<(i64, String)> = st
                 .sessions
                 .iter()
-                .filter(|(_, s)| now.duration_since(s.last_seen) >= idle)
+                // 扣着等重发的不算闲置；同一台设备上的其他会话也留着——`/clear` 后新会话的头一条扣着时，旧会话一过期，
+                // 补处理时就认不出 `/clear` 来历了。
+                .filter(|(k, s)| {
+                    now.duration_since(s.last_seen) >= idle
+                        && !st.held_retries.contains_key(*k)
+                        && !st
+                            .held_retries
+                            .iter()
+                            .any(|((c, _), h)| *c == k.0 && h.device_id == s.device_id)
+                })
                 .map(|(k, _)| k.clone())
                 .collect();
             keys.into_iter().filter_map(|k| st.sessions.remove(&k).map(|s| (k, s))).collect()
@@ -384,7 +411,7 @@ impl Telemetry {
         for (k, _) in &expired {
             st.ended.insert(k.clone(), now);
         }
-        for ((cred_id, session_id), s) in expired {
+        for ((cred_id, session_id), mut s) in expired {
             // 被 `/clear` 换掉的会话：进程还在，没有退出那一串。`-p` 的退出收尾在它那份模板的
             // turn 段里，跑完那一轮就报过了。
             if s.cleared || s.sdk {
@@ -409,15 +436,72 @@ impl Telemetry {
             let start: DateTime<Utc> = s.started_wall.into();
             let uptime =
                 |dt: DateTime<Utc>| ((dt - start).num_milliseconds().max(0) as f64) / 1000.0;
+            // 2.1.293 起退出是敲 `/exit` 提交的一轮：提交那两条（`paste_text` / `prompt_submit`）还挂旧 prompt，
+            // 从 `cmd_exit` 起换成新的，逐出提示、`session_end` 与之后导出的 `internal_metrics_export` 都是新的
+            // （`cap/auto-2.1.305-20261021-full` C2 / B1）。
+            let v293 = version_at_least(&identity.version, "2.1.293");
+            let submit_at = ms(-265);
+            let exit_prompt = if v293 { identity::uuid_v4() } else { s.prompt_id.clone() };
             let ctx = |dt: DateTime<Utc>| EventCtx {
                 model: &model,
                 betas: &s.betas,
-                prompt_id: &s.prompt_id,
+                prompt_id: if dt > submit_at { &exit_prompt } else { &s.prompt_id },
                 uptime_secs: uptime(dt),
             };
             let feature = |name: &str| json!({ "feature_name": name });
-            let mut events: Vec<(DateTime<Utc>, Value)> = Vec::with_capacity(6);
-            let mut dd: Vec<Value> = Vec::with_capacity(3);
+            let mut events: Vec<(DateTime<Utc>, Value)> = Vec::with_capacity(16);
+            let mut dd: Vec<Value> = Vec::with_capacity(6);
+            // 进程起满 30 秒之后没再发过请求就退出的：那条 IDE 探测没赶上任何一条请求，在这里补
+            // （见 `Session::take_ide_detect`；时刻相对进程起点，排在退出那串前面）。
+            if !s.ide_detect_done && version_at_least(&identity.version, "2.1.285") {
+                let jitter = session_id.bytes().map(u32::from).sum::<u32>() % 400;
+                let at =
+                    start + chrono::Duration::milliseconds(IDE_DETECT_MS as i64 + jitter as i64);
+                if at <= t0 {
+                    let meta = json!({ "found": false, "feature_name": "ide_detect" });
+                    events.push((at, identity.event("tengu_feature_ok", at, &ctx(at), meta)));
+                }
+            }
+            // 2.1.293 起退出走的是敲 `/exit`（`cap/auto-2.1.293-20261008-full` 起每份全量抓包 16 条 `cmd_exit`）：
+            // 提交（`paste_text` / `prompt_submit`）→ `cmd_exit` → 2.6 秒后分派命令（`cmd_dispatch` +
+            // `input_command{exit}`）→ 下面那串收尾 → 更新检查与输入历史落盘；这一批 Datadog 也是这几条，
+            // `lsp_shutdown` / `swarm_session_cleanup` 不再进 Datadog（2.1.291 时还在）。逐出提示离收尾那串
+            // 860 ~ 990ms（2.1.260 时 544）。时刻都相对收尾那串（`t0`），见 `cap/auto-2.1.305-20261021-full` C2。
+            let hint_off = if v293 { 960 } else { 544 };
+            if v293 {
+                let tp = submit_at;
+                events.push((
+                    tp,
+                    identity.event(
+                        "tengu_paste_text",
+                        tp,
+                        &ctx(tp),
+                        json!({ "pastedTextCount": 0, "pastedTextBytes": 0 }),
+                    ),
+                ));
+                for (off, name) in
+                    [(-265, "prompt_submit"), (-263, "cmd_exit"), (-2, "cmd_dispatch")]
+                {
+                    let t = ms(off);
+                    events.push((t, identity.event("tengu_feature_ok", t, &ctx(t), feature(name))));
+                    dd.push(identity.dd_entry(
+                        "tengu_feature_ok",
+                        &ctx(t),
+                        &dd_model,
+                        feature(name),
+                    ));
+                }
+                let t = ms(-2);
+                events.push((
+                    t,
+                    identity.event(
+                        "tengu_input_command",
+                        t,
+                        &ctx(t),
+                        json!({ "input": "exit", "invocation_trigger": "user-slash" }),
+                    ),
+                ));
+            }
             // 2.1.299 起退出时先打印「Resume this session with: claude --resume <id>」并报一条，与
             // `config_cache_stats` 同一毫秒、排在它前面（`cap/auto-2.1.299-20261014-full` 每个交互式
             // 会话退出时一条：`arg: id`，没起名、不在 worktree、没有额外提示）。
@@ -448,9 +532,59 @@ impl Telemetry {
             for (offset, name) in [(1, "lsp_shutdown"), (6, "swarm_session_cleanup")] {
                 let t = ms(offset);
                 events.push((t, identity.event("tengu_feature_ok", t, &ctx(t), feature(name))));
-                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t), &dd_model, feature(name)));
+                if !v293 {
+                    dd.push(identity.dd_entry(
+                        "tengu_feature_ok",
+                        &ctx(t),
+                        &dd_model,
+                        feature(name),
+                    ));
+                }
             }
-            let t = ms(544);
+            if v293 {
+                // `/exit` 也是一次提交：文件历史照样拍一张快照（上次备份后改过的先备份）。
+                let t = ms(1);
+                for (version, size) in s.files.snapshot() {
+                    events.push((
+                        t,
+                        identity.event(
+                            "tengu_file_history_backup_file_created",
+                            t,
+                            &ctx(t),
+                            json!({ "version": version, "fileSize": size }),
+                        ),
+                    ));
+                }
+                events.push((
+                    t,
+                    identity.event(
+                        "tengu_file_history_snapshot_success",
+                        t,
+                        &ctx(t),
+                        json!({ "trackedFilesCount": s.files.tracked(), "snapshotCount": s.files.snapshots() }),
+                    ),
+                ));
+                let t = ms(23);
+                let update = json!({
+                    "duration_ms": 0,
+                    "first_in_process": false,
+                    "installation_type": "native",
+                    "feature_name": "update_detection"
+                });
+                events.push((t, identity.event("tengu_feature_ok", t, &ctx(t), update.clone())));
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t), &dd_model, update));
+                events.push((
+                    t,
+                    identity.event("tengu_feature_ok", t, &ctx(t), feature("history_save")),
+                ));
+                dd.push(identity.dd_entry(
+                    "tengu_feature_ok",
+                    &ctx(t),
+                    &dd_model,
+                    feature("history_save"),
+                ));
+            }
+            let t = ms(hint_off);
             events.push((
                 t,
                 identity.event(
@@ -463,6 +597,17 @@ impl Telemetry {
                     }),
                 ),
             ));
+            // 心跳：敲 `/exit` 报一条 `user_input`（退出前 2.0 ~ 2.3 秒，`cap/auto-2.1.305-20261021-full` 交互式
+            // 会话 14 个里 13 个有，B1 那个离上一次输入不到 10 秒被节流掉）；`session_end` 与逐出提示同一毫秒、
+            // 排在它后面。
+            let beats = vec![
+                (ms(hint_off - 2_250), heartbeat::Trigger::UserInput),
+                (t, heartbeat::Trigger::Reset("session_end")),
+            ];
+            s.hb.refresh(cred_id);
+            for (t, meta) in s.hb.fold(beats) {
+                events.push((t, identity.event("tengu_cache_heartbeat_shadow", t, &ctx(t), meta)));
+            }
 
             // 入队并强制到期：把三路的起算点拨到很久以前，下一次 `take_due` 就全发出去。
             let long_ago = now.checked_sub(Duration::from_secs(86_400)).unwrap_or(now);
@@ -476,7 +621,7 @@ impl Telemetry {
             p.identity = Some(identity);
             p.model = model;
             p.betas = s.betas;
-            p.prompt_id = s.prompt_id;
+            p.prompt_id = exit_prompt;
             p.started_wall = Some(s.started_wall);
             p.events.extend(events);
             p.events_since = Some(long_ago);
@@ -484,7 +629,7 @@ impl Telemetry {
             p.dd_since = Some(long_ago);
             if !p.metrics.is_empty() {
                 p.metrics_since = Some(long_ago);
-                p.export_at = Some(ms(542));
+                p.export_at = Some(ms(hint_off - 2));
             }
         }
     }

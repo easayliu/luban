@@ -812,6 +812,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
             betas: None,
             session_header: None,
             client_request_id: None,
+            dispatch: None,
             agent: Default::default(),
             organization_id: None,
             started_at: std::time::SystemTime::now(),

@@ -1013,3 +1013,146 @@ pub(super) fn auto_mode_of_messages(msgs: &[Value]) -> Option<bool> {
     }
     None
 }
+
+/// 报错文案进哈希前的脱敏（官方 `dZe`，逐条照搬）：取前 500 个 UTF-16 码元，依次把 URL、邮箱、密钥、
+/// Windows / UNC / Unix 路径、UUID、请求 id、长十六进制、长 base64、IP、四位以上的数字换成占位符。
+/// JS 的 `\b` / `\w` / `\d` 只认 ASCII，这里写成 `(?-u:\b)` 与显式字符类；`\s` 是 ECMAScript 的空白集合（含 U+FEFF、
+/// 不含 U+0085，与 Rust 的 Unicode `\s` 不同），显式写出；`/i` 没带 `u` 标志，非 ASCII 字符不会折成 ASCII 字母
+/// （`ſ`、开尔文符号 `K` 都不算 `s` / `k`），所以忽略大小写只按 ASCII（`(?i-u:…)`）。
+pub(super) fn scrub_error_message(message: &str) -> String {
+    static RULES: std::sync::LazyLock<Vec<(regex::Regex, &'static str)>> = std::sync::LazyLock::new(
+        || {
+            const B: &str = r"(?-u:\b)";
+            // ECMAScript 的 `\s`（WhiteSpace + LineTerminator）。
+            const WS: &str = r"\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+            [
+                (format!(r"(?i-u:https?://)[^{WS}]+"), "<url>"),
+                (format!(r"{B}[0-9A-Za-z_.+-]+@[0-9A-Za-z_.-]+\.[0-9A-Za-z_]{{2,}}{B}"), "<email>"),
+                (
+                    format!(
+                        r"{B}(?i-u:sk-ant|sk|pk|ghp|gho|ghs|ghu|github_pat|xox[bpoars])[-_][0-9A-Za-z_-]{{8,}}{B}"
+                    ),
+                    "<key>",
+                ),
+                (format!(r#"[A-Za-z]:\\[^{WS}"']*"#), "<path>"),
+                (format!(r#"\\\\[^{WS}"']+"#), "<path>"),
+                (format!(r#"(?:[^{WS}"'\\]+\\){{2,}}[^{WS}"']+"#), "<path>"),
+                (format!(r#"(?:/[^{WS}"':]+){{2,}}"#), "<path>"),
+                (
+                    format!(
+                        r"{B}[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}{B}"
+                    ),
+                    "<id>",
+                ),
+                (format!(r"{B}req_[A-Za-z0-9_-]{{12,}}"), "<id>"),
+                (format!(r"{B}[0-9a-fA-F]{{16,}}{B}"), "<id>"),
+                (format!(r"{B}[A-Za-z0-9+/]{{32,}}={{0,2}}"), "<b64>"),
+                (format!(r"{B}[0-9]{{1,3}}(?:\.[0-9]{{1,3}}){{3}}{B}"), "<ip>"),
+                (format!(r"{B}[0-9]{{4,}}{B}"), "<num>"),
+            ]
+            .into_iter()
+            .map(|(re, to)| (regex::Regex::new(&re).expect("dZe pattern"), to))
+            .collect()
+        },
+    );
+    // `slice(0, 500)` 按 UTF-16 码元截：第 500 个落在代理对中间时留下半个代理，哈希前编成 UTF-8 时它变成
+    // U+FFFD（`EF BF BD`）。这里照样补一个 U+FFFD，而不是把整个字符丢掉。
+    let mut units = 0;
+    let mut head = String::new();
+    for c in message.chars() {
+        let n = c.len_utf16();
+        if units + n > 500 {
+            if units < 500 {
+                head.push('\u{FFFD}');
+            }
+            break;
+        }
+        units += n;
+        head.push(c);
+    }
+    RULES.iter().fold(head, |s, (re, to)| re.replace_all(&s, *to).into_owned())
+}
+
+/// 已声明的工具在验证这一步就被客户端拦下（`validateInput` 不过）时报的 `errorCode`：按各工具的提示文案认
+/// （2.1.306 的 Edit / Write / NotebookEdit）。认不出的不算——别的工具、别的失败形态没有样本，照旧走执行。
+pub(super) fn validate_error_code(tool: &str, message: &str) -> Option<u32> {
+    let table: &[(&str, u32)] = match tool {
+        "Edit" => &[
+            ("No changes to make: old_string and new_string are exactly the same.", 1),
+            ("File does not exist.", 4),
+            ("Cannot create new file - file already exists.", 3),
+            ("File is a Jupyter Notebook.", 5),
+            ("File has not been read yet.", 6),
+            ("File has been modified", 7),
+            ("String to replace not found in file.", 8),
+            ("Found ", 9),
+            ("File is too large to edit", 10),
+        ],
+        "Write" => &[
+            ("File has not been read yet.", 2),
+            ("File has been modified", 3),
+            // 子代理写 `REPORT*.md` 之类的报告文件（官方另报 `tengu_subagent_md_report_blocked`）。
+            ("Subagents should return findings as text, not write report files.", 5),
+        ],
+        "NotebookEdit" => &[
+            ("Notebook file does not exist.", 1),
+            ("File must be a Jupyter notebook", 2),
+            ("Cell type is required", 5),
+            ("Notebook is not valid JSON.", 6),
+            // JSON 合法但不是 notebook 的结构（官方 `CRe`）。
+            ("Notebook file is not a valid Jupyter notebook", 6),
+            ("Cell ID must be specified", 7),
+            ("Cell with index ", 7),
+            ("Cell with ID ", 8),
+            ("File has not been read yet.", 9),
+            ("File has been modified since read", 10),
+        ],
+        _ => &[],
+    };
+    if tool == "Edit"
+        && message.starts_with("Found ")
+        && !message.contains(" matches of the string to replace")
+    {
+        return None;
+    }
+    // 文件不是 UTF-8 文本（旧编码 / 二进制、前 8KB 有 NUL、UTF-16 大端）：官方 `VSt` 按原因换开头，后面那句固定。
+    if matches!(tool, "Edit" | "NotebookEdit")
+        && message.starts_with("File ")
+        && message.contains("These tools write UTF-8 (or UTF-16LE behind its byte-order mark)")
+    {
+        return Some(15);
+    }
+    if tool == "Write" {
+        if message.contains(" is a directory, not a file.") {
+            return Some(17);
+        }
+        if message.contains(" exists but is not a regular file") {
+            return Some(18);
+        }
+    }
+    table.iter().find(|(p, _)| message.starts_with(p)).map(|(_, c)| *c)
+}
+
+/// schema 不过时的 `zodIssueCodes`：从客户端拼的文案反认 zod 的 issue code（官方 `xL` 逐条一句：缺必填参数、
+/// 类型不对是 `invalid_type`，多了参数是 `unrecognized_keys`，都不符是 `invalid_union`），去重、按出现顺序、
+/// 逗号相连。认不出一条的（只有 zod 自己那句 message）报 `custom`。
+pub(super) fn zod_issue_codes(detail: &str) -> String {
+    let mut codes: Vec<&str> = Vec::new();
+    for line in detail.lines() {
+        let code = if line.starts_with("The required parameter `") && line.ends_with("` is missing")
+            || line.contains("` type is expected as `")
+        {
+            "invalid_type"
+        } else if line.starts_with("An unexpected parameter `") {
+            "unrecognized_keys"
+        } else if line.ends_with(" matches none of the accepted forms") {
+            "invalid_union"
+        } else {
+            continue;
+        };
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    if codes.is_empty() { "custom".into() } else { codes.join(",") }
+}

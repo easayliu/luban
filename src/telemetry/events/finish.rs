@@ -32,6 +32,7 @@ impl EventBuilder<'_> {
             v280,
             v285,
             v291,
+            v305,
             first_main,
             ref snapshot,
             ref dd_model,
@@ -70,7 +71,7 @@ impl EventBuilder<'_> {
             // 2.1.285 起报这条请求头上的 `anthropic-dispatch-id`（12 条恒为 `v2d`，见
             // [`config::CC_DISPATCH_ID`]）。
             if v285 {
-                put("dispatch", json!(config::CC_DISPATCH_ID));
+                put("dispatch", json!(env.dispatch()));
             }
             if has_1m {
                 put("preNormalizedModel", json!(&display_model));
@@ -145,12 +146,15 @@ impl EventBuilder<'_> {
                 }
             }
             put("durationMs", json!(total));
-            put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
-            put("attempt", json!(1));
+            put("durationMsIncludingRetries", json!(env.duration_including_retries()));
+            put("attempt", json!(env.retry.attempt()));
             put("ttftMs", json!(ttft));
             // 首个内容块到达：比首字节晚 0–1ms（`cap/2.1.280` 九条里七条 +1、两条 +0）。
             if v270 {
                 put("firstContentMs", json!(ttft + i64::from(retry_pad % 2)));
+            }
+            if v305 && let Some(n) = call.stream_events {
+                put("streamEventCount", json!(n));
             }
             // 2.1.285：发请求前客户端这一侧的开销，主线程 6–46ms（首条 25），标题那类侧查询
             // 不报。按 request-id 取个稳定值，同 `retry_pad`。
@@ -235,7 +239,7 @@ impl EventBuilder<'_> {
                 put("toolUseContentLengths", json!(Value::Object(table).to_string()));
             }
             put("imageBlockCount", json!(shape.image_blocks));
-            put("imageTotalPixels", json!(0));
+            put("imageTotalPixels", json!(shape.image_pixels));
             put("imageTotalBytes", json!(shape.image_bytes));
             put("documentBlockCount", json!(shape.doc_blocks));
             put("documentTotalBytes", json!(shape.doc_bytes));
@@ -293,6 +297,33 @@ impl EventBuilder<'_> {
                 self.push_dd(t_end, "tengu_feature_ok", feature("api_cache_keepalive"));
             }
             self.push(t_end, "tengu_api_success", success.clone());
+            // 心跳（交互式主线程）：回复里调了 `Agent`，派出去那一刻界面转入 `subagent_running`，
+            // 落在这条收尾前 2ms（`cap/auto-2.1.305-20261021-full` A8b .811 / .813、A19 .213 / .215，
+            // A8a 早 18ms）。登记在拉起它的这条上，而不是子代理首条上——那条落地时主线程多半又完成了
+            // 续轮，早于已折算时刻的切换会被当过时丢掉。派出去的子代理还在跑时，续轮的流一收尾界面又回到
+            // 等工具那段，收尾前 3ms 切回 `subagent_running`（A8a .198 / .201、A8b .118 / .121、
+            // A19 .432 / .435）；一轮结束再切回来的那下在下面停手处。
+            if kind == Kind::Main && !shape.sdk {
+                if env.f.delegated_running {
+                    self.beat(
+                        ms(t_end, -3),
+                        heartbeat::Trigger::Run(Some(heartbeat::SUBAGENT_RUNNING)),
+                    );
+                }
+                if call.tool_use_lens.iter().any(|(name, _)| name == "Agent" || name == "Task") {
+                    self.beat(
+                        ms(t_end, -2),
+                        heartbeat::Trigger::Run(Some(heartbeat::SUBAGENT_RUNNING)),
+                    );
+                }
+            }
+            // 心跳：主循环（交互式主线程与 `-p` 的 sdk 主线程）请求成功那一刻报 `main_request`。
+            // 没有 request-id 的不登记（官方 `tEt` 遇到 `dV()` 为空就返回，时刻也不记）。
+            if kind == Kind::Main
+                && let Some(id) = call.request_id.clone().filter(|id| !id.is_empty())
+            {
+                self.beat(t_end, heartbeat::Trigger::MainRequest(id));
+            }
             // Datadog 那份比 event_logging 少两项：工具长度表的 hash 与各工具入参长度
             // （`cap/2.1.260-2`、`2.1.277`、`2.1.280` 三份的 Datadog 批次里一条都没有）。
             let mut dd_success = snake_flat(&success);
@@ -363,6 +394,86 @@ impl EventBuilder<'_> {
         }
     }
 
+    /// 同一请求先前几次失败（[`ApiCall::prior_attempts`]）在客户端那头报的重发事件，落在各自失败收尾后 2ms
+    /// （`cap/auto-2.1.306-20261021-retry`）：头一次 5xx / 连接层失败换 `v2p` 原样重发，报
+    /// `tengu_dispatch_header_fallback`；之后每次失败报 `tengu_api_retry`（`attempt` 从 1 数，`delayMs` 是到下一次
+    /// 发出的间隔）。最终那条的收尾照常由 [`Self::emit_success`] / [`Self::emit_failure`] 报。
+    pub(super) fn emit_retries(&mut self) {
+        let env = self.env;
+        let (call, shape) = (env.call, env.shape);
+        if call.prior_attempts.is_empty() {
+            return;
+        }
+        let query_source = env.query_source.clone();
+        let mut attempt = 0u32;
+        for (i, a) in call.prior_attempts.iter().enumerate() {
+            let start: DateTime<Utc> = a.started_at.into();
+            let end = ms(start, a.total_ms as i64);
+            let t = ms(end, 2);
+            if i == 0 && env.retry.fallback {
+                if !env.f.v285 {
+                    continue;
+                }
+                let mut fb = json!({
+                    "model": &shape.model,
+                    "dispatch": a.dispatch.as_deref().unwrap_or(config::CC_DISPATCH_ID),
+                    "resend_dispatch": "v2p",
+                    "reason": if a.status.is_some() { "5xx" } else { "conn_err" },
+                    "status": a.status.map_or_else(|| "none".to_string(), |s| s.to_string()),
+                    "query_source": &query_source
+                });
+                if let Some(r) = a.request_id.as_deref().filter(|r| !r.is_empty()) {
+                    fb["request_id"] = json!(r);
+                }
+                self.push(t, "tengu_dispatch_header_fallback", fb);
+                continue;
+            }
+            attempt += 1;
+            let next: DateTime<Utc> =
+                call.prior_attempts.get(i + 1).map_or(call.started_at, |n| n.started_at).into();
+            let failure = CallFailure {
+                status: a.status,
+                error_type: a.error_type.clone(),
+                message: a.message.clone(),
+                in_band: a.in_band,
+            };
+            let kind_name = error_kind(&failure);
+            let mut m = Map::new();
+            m.insert("attempt".into(), json!(attempt));
+            m.insert("delayMs".into(), json!((next - end).num_milliseconds().max(0)));
+            m.insert(
+                "error".into(),
+                json!(format!(
+                    "API error: type={kind_name} status={}",
+                    a.status.map_or_else(|| "none".to_string(), |s| s.to_string())
+                )),
+            );
+            m.insert("errorType".into(), json!(&kind_name));
+            if env.f.v305 {
+                m.insert(
+                    "error_message_hash".into(),
+                    json!(error_message_hash(
+                        a.status,
+                        a.error_type.as_deref(),
+                        &a.message,
+                        a.request_id.as_deref()
+                    )),
+                );
+                if let Some((ctor, stack, top)) = error_trace(&env.f.version, a.status) {
+                    m.insert("error_constructor".into(), json!(ctor));
+                    m.insert("error_stack_hash".into(), json!(stack));
+                    m.insert("error_top_frame".into(), json!(top));
+                }
+            }
+            if let Some(st) = a.status {
+                m.insert("status".into(), json!(st));
+            }
+            m.insert("provider".into(), json!("firstParty"));
+            m.insert("attempt_duration_ms".into(), json!(a.total_ms));
+            self.push(t, "tengu_api_retry", Value::Object(m));
+        }
+    }
+
     /// 失败收尾：`tengu_feature_bad{api_request}` + `tengu_api_error`。
     pub(super) fn emit_failure(&mut self) {
         let env = self.env;
@@ -376,7 +487,7 @@ impl EventBuilder<'_> {
             query_depth,
             ..
         } = *env.f;
-        let EventEnv { total, t_end, retry_pad, body_chars, gzip_skip, ref effort, .. } = *env;
+        let EventEnv { total, t_end, body_chars, gzip_skip, ref effort, .. } = *env;
         let query_source = env.query_source.as_str();
         // 失败收尾：`tengu_feature_bad{api_request}` + `tengu_api_error`，两条都进 Datadog
         // （官方那份 Datadog 白名单里 `tengu_api_error` 与 `tengu_feature_bad` 都在）。
@@ -391,6 +502,9 @@ impl EventBuilder<'_> {
                 err.insert(k.to_string(), v);
             };
             put("model", json!(&display_model));
+            if env.f.v305 {
+                put("dispatch", json!(env.dispatch()));
+            }
             // 上游文案原样报（官方截断在 4000 字），除非连 request-id 都没拿到——那种情形
             // 官方换成 `API error: type=… status=…` 这句合成文案。
             let has_request_id = call.request_id.as_deref().is_some_and(|r| !r.is_empty());
@@ -407,6 +521,23 @@ impl EventBuilder<'_> {
                 )
             };
             put("error", json!(message));
+            // 错误的哈希与栈（官方 `Dp`，`cap/auto-2.1.306-20261021-retry`），见 [`error_message_hash`] / [`error_trace`]。
+            if env.f.v305 {
+                put(
+                    "error_message_hash",
+                    json!(error_message_hash(
+                        fail.status,
+                        fail.error_type.as_deref(),
+                        &fail.message,
+                        call.request_id.as_deref()
+                    )),
+                );
+                if let Some((ctor, stack, top)) = error_trace(&env.f.version, fail.status) {
+                    put("error_constructor", json!(ctor));
+                    put("error_stack_hash", json!(stack));
+                    put("error_top_frame", json!(top));
+                }
+            }
             // `status` 是十进制串而不是数字（官方 `FP()` 就是 `String(status)`）；流内错误
             // 那种 SDK 侧没有状态码，整个字段不出现。
             if let Some(st) = fail.status {
@@ -419,8 +550,8 @@ impl EventBuilder<'_> {
             put("messageCount", json!(shape.messages_len));
             put("messageTokens", json!(message_tokens));
             put("durationMs", json!(total));
-            put("durationMsIncludingRetries", json!(total + 1 + i64::from(retry_pad)));
-            put("attempt", json!(1));
+            put("durationMsIncludingRetries", json!(env.duration_including_retries()));
+            put("attempt", json!(env.retry.attempt()));
             put("provider", json!("firstParty"));
             if has_request_id {
                 put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
@@ -452,28 +583,40 @@ impl EventBuilder<'_> {
         let (call, shape) = (env.call, env.shape);
         let TurnFacts {
             ref identity,
-            ref resp_model,
             turn_over,
             failed,
             aborted,
             emit_first_turn,
             is_main,
-            started_wall,
             turn_started,
             prompt_seq,
             v280,
             v285,
             v291,
-            v299,
-            v300,
             ref dd_model,
-            sess_turn_tools,
-            sess_turn_api_calls,
-            sess_turn_api_ms,
             ..
         } = *env.f;
-        let EventEnv { total, t_first, t_end, tpl, pre_count, ref effort, .. } = *env;
+        let EventEnv { total, t_end, tpl, pre_count, ref effort, .. } = *env;
         let error_kind_name = env.error_kind_name.as_str();
+        // 心跳：主线程这一轮停手，界面从「干活」回到闲着，落在 `turn_end` 之后十几毫秒
+        // （`cap/auto-2.1.305-20261021-full` B1：+64、+19、+15）。`-p` 没有界面运行态，登记了也不动。
+        let idle_at = if is_main && turn_over && failed {
+            Some(ms(t_end, 16))
+        } else if is_main && aborted {
+            Some(ms(t_end, 18))
+        } else if is_main && turn_over {
+            Some(ms(t_end, 17))
+        } else {
+            None
+        };
+        // 后台子代理还在跑时的一轮结束：`turn_end` 之后 2ms 先从 `subagent_running` 切回 `turn_running`，
+        // 再照常停手（A8a .213 → .215 → .228，A8b .127 → .129 → .143，A19 .444 → .447 → .462）。
+        if is_main && turn_over && !failed && !aborted && env.f.delegated_running && !shape.sdk {
+            self.beat(ms(t_end, 4), heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
+        }
+        if let Some(t) = idle_at {
+            self.beat(t, heartbeat::Trigger::Run(None));
+        }
         if is_main && turn_over && failed {
             // 请求失败也是一轮的终点，但没有 stop hook、没有 `tengu_feature_ok{turn}`、
             // 也没有首轮那串——那些都挂在「跑完了」这条路上。
@@ -486,6 +629,26 @@ impl EventBuilder<'_> {
                     Some(if error_kind_name.is_empty() { "unknown" } else { error_kind_name }),
                 ),
             );
+            if shape.sdk {
+                self.emit_sdk_result(SdkOutcome::Failed);
+            }
+        } else if is_main && aborted && shape.sdk {
+            // `-p` / SDK 里被中止：没有界面上的 Esc、也不撤回输入，只有 turn_end 与 `terminated` 的结果
+            // （官方 `subtype: error_during_execution` 且被中止时改报 `terminated`）。
+            if let Some(live) = env.live_outcome("aborted") {
+                self.push_dd_snake(ms(t_end, 2), "tengu_tether_live_outcome", live);
+            }
+            let t3 = ms(t_end, 3);
+            self.push(
+                t3,
+                "tengu_turn_end",
+                env.turn_end(
+                    "aborted_streaming",
+                    (t3 - turn_started).num_milliseconds().max(total),
+                    None,
+                ),
+            );
+            self.emit_sdk_result(SdkOutcome::Aborted);
         } else if is_main && aborted {
             // 按 Esc 打断（`cap/auto-2.1.285-20260930` 08:01:42.630–.635）：取消、tether 收尾报
             // `aborted`、turn、`turn_end{aborted_streaming}`，没有 stop hook；一个字都还没出的话
@@ -537,54 +700,8 @@ impl EventBuilder<'_> {
             }
         } else if is_main && turn_over {
             self.take_tpl(&tpl.turn, t_end);
-            // `-p` 跑完这一轮进程就退出（`00448` 08:06:45.632–46.376）：首字耗时与结果两条（从进程
-            // 启动算），最后一条会话结束的缓存逐出提示；中间那几条静态的退出收尾在模板里。
             if shape.sdk {
-                let t4 = ms(t_end, 4);
-                let start: DateTime<Utc> = started_wall.into();
-                self.push(
-                    t4,
-                    "tengu_sdk_ttft",
-                    json!({
-                        "ttft_ms": (t_first - start).num_milliseconds().max(0),
-                        "model": &resp_model,
-                        "tool_pool_reused": false
-                    }),
-                );
-                let mut result = json!({
-                        "subtype": "success",
-                        "is_error": false,
-                        "num_turns": sess_turn_api_calls,
-                        "duration_ms": (t4 - start).num_milliseconds().max(0),
-                        "duration_api_ms": sess_turn_api_ms + 3,
-                        "saw_retry": false,
-                        "saw_compact": false,
-                        "tool_use_count": sess_turn_tools,
-                        "mcp_tool_calls": 0,
-                        "toolsearch_calls": 0,
-                        "builtin_tool_calls": sess_turn_tools,
-                        "turn_index": 0,
-                        "mcp_pending_at_start": 0,
-                        "mcp_pending_at_end": 0
-                });
-                // 2.1.299：末尾多报进程里加载了几个 mod（`cap/auto-2.1.299-20261014-full` 的 `-p` 全是 0）。
-                if v299 {
-                    result["installed_mods"] = json!(0);
-                }
-                // 2.1.300：再多 debug 输出被丢掉的条数，stderr 一项、调试文件一项（`-p` 的 6 条全是 0）。
-                if v300 {
-                    result["debug_stderr_dropped_total"] = json!(0);
-                    result["debug_file_dropped_total"] = json!(0);
-                }
-                self.push(t4, "tengu_sdk_result", result);
-                self.push(
-                    ms(t_end, 748),
-                    "tengu_cache_eviction_hint",
-                    json!({
-                        "scope": "session_end",
-                        "last_request_id": call.request_id.as_deref().unwrap_or("")
-                    }),
-                );
+                self.emit_sdk_result(SdkOutcome::Success);
             }
             if emit_first_turn {
                 self.take_tpl(&tpl.first_turn, t_end);
@@ -718,5 +835,125 @@ impl EventBuilder<'_> {
                 ));
             }
         }
+    }
+}
+
+/// `-p` / SDK 这一轮怎么结束的，见 [`EventBuilder::emit_sdk_result`]。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SdkOutcome {
+    Success,
+    Failed,
+    Aborted,
+}
+
+impl EventBuilder<'_> {
+    /// `-p` 跑完这一轮进程就退出（`cap/auto-2.1.306-20261021-full` D1 七条）：首字耗时（只有成功才报）与
+    /// 结果两条，最后一条会话结束的缓存逐出提示；中间那几条静态的退出收尾在模板里。
+    ///
+    /// 两个时长都从**本轮开始**算（官方 `submitMessage` 起点，落在 `input_prompt` 前二三十毫秒，比
+    /// luban 记的 `turn_started` 早约 42ms：七条里六条 `duration_ms − turn_end.duration_ms` 是 38～46），
+    /// 首字量到第一条 assistant 消息产出——SDK 整条消息收完才吐，比那条回复流收尾早约 5ms
+    /// （`ttft_ms` 比 `duration_ms` 少 18～26）。工具按名字分 MCP / ToolSearch / 内置（官方 `ux`）。
+    /// 请求失败（重试用尽或不可重试）报的仍是 `subtype: success`、`is_error: true`，另带 `retry_status` /
+    /// `api_error_status`，失败的尝试不算进 `duration_api_ms`，之前没有成功过的主请求就没有会话结束的逐出提示与心跳
+    /// （`cap/auto-2.1.306-20261021-retry` R2）；被中止报 `terminated`。
+    pub(super) fn emit_sdk_result(&mut self, outcome: SdkOutcome) {
+        let env = self.env;
+        let TurnFacts {
+            ref resp_model,
+            ref prev_main_request_id,
+            turn_started,
+            turn_first_reply_end,
+            v299,
+            v300,
+            sess_turn_tools,
+            sess_turn_mcp,
+            sess_turn_toolsearch,
+            sess_turn_api_calls,
+            sess_turn_api_ms,
+            sess_turn_retry,
+            ..
+        } = *env.f;
+        let EventEnv { t_end, .. } = *env;
+        let t4 = ms(t_end, 4);
+        let start = ms(turn_started, -42);
+        if outcome == SdkOutcome::Success {
+            let first = turn_first_reply_end.unwrap_or(t_end);
+            self.push(
+                t4,
+                "tengu_sdk_ttft",
+                json!({
+                    "ttft_ms": (ms(first, -5) - start).num_milliseconds().max(0),
+                    "model": resp_model,
+                    "tool_pool_reused": false
+                }),
+            );
+        }
+        let (subtype, is_error) = match outcome {
+            SdkOutcome::Success => ("success", false),
+            SdkOutcome::Failed => ("success", true),
+            SdkOutcome::Aborted => ("terminated", true),
+        };
+        let api_ms = if sess_turn_api_ms > 0 { sess_turn_api_ms + 3 } else { 0 };
+        let builtin = sess_turn_tools.saturating_sub(sess_turn_mcp + sess_turn_toolsearch);
+        let mut result = json!({
+            "subtype": subtype,
+            "is_error": is_error,
+            "num_turns": sess_turn_api_calls,
+            "duration_ms": (t4 - start).num_milliseconds().max(0),
+            "duration_api_ms": api_ms,
+            "saw_retry": sess_turn_retry.is_some(),
+            "saw_compact": false,
+            "tool_use_count": sess_turn_tools,
+            "mcp_tool_calls": sess_turn_mcp,
+            "toolsearch_calls": sess_turn_toolsearch,
+            "builtin_tool_calls": builtin,
+            "turn_index": 0,
+            "mcp_pending_at_start": 0,
+            "mcp_pending_at_end": 0
+        });
+        // 本轮重试过就在 `saw_compact` 之后报各次重试状态码的最大值（整轮累计，首条重试过、之后工具续轮正常收尾的
+        // 照样报），请求最终失败再报它的状态码（R2：529 / 529）。
+        let failed_status = env.call.failure.as_ref().and_then(|f| f.status);
+        let extra: Vec<(&str, Value)> = [
+            sess_turn_retry.map(|s| ("retry_status", json!(s))),
+            failed_status
+                .filter(|_| outcome == SdkOutcome::Failed)
+                .map(|s| ("api_error_status", json!(s))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !extra.is_empty() {
+            insert_after(&mut result, "saw_compact", extra);
+        }
+        // 2.1.299：末尾多报进程里加载了几个 mod（`cap/auto-2.1.299-20261014-full` 的 `-p` 全是 0）。
+        if v299 {
+            result["installed_mods"] = json!(0);
+        }
+        // 2.1.300：再多 debug 输出被丢掉的条数，stderr 一项、调试文件一项（`-p` 的 6 条全是 0）。
+        if v300 {
+            result["debug_stderr_dropped_total"] = json!(0);
+            result["debug_file_dropped_total"] = json!(0);
+        }
+        self.push(t4, "tengu_sdk_result", result);
+        // 逐出提示报的是最后一条**成功**的主请求（官方 `dV()`）：失败或被中止的那条都不算，之前也没成功过就整条
+        // 不报，心跳的 `session_end` 一样报不出来（R2）。
+        let last_ok = match outcome {
+            SdkOutcome::Success => env.call.request_id.as_deref(),
+            SdkOutcome::Failed | SdkOutcome::Aborted => prev_main_request_id.as_deref(),
+        };
+        if last_ok.is_some() {
+            self.push(
+                ms(t_end, 748),
+                "tengu_cache_eviction_hint",
+                json!({
+                    "scope": "session_end",
+                    "last_request_id": last_ok.unwrap_or("")
+                }),
+            );
+        }
+        // 心跳的 `session_end` 与它同一毫秒、排在它后面（`cap/auto-2.1.305-20261021-full` D1）。
+        self.beat(ms(t_end, 748), heartbeat::Trigger::Reset("session_end"));
     }
 }

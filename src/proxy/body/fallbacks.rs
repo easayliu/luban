@@ -154,6 +154,24 @@ pub(crate) fn remember_fallback_rejection(
     })
 }
 
+/// 去掉客户端自带的字符串形态 `fallbacks`（2.1.258 的 `"default"`），没有这种字段时 `None`。
+///
+/// 给 [`retry_without_fallbacks`](crate::proxy::upstream::retry_without_fallbacks) 用：重试不带计划时
+/// [`normalize_fallbacks`] 会把这个字符串归一成 profile 的官方数组，而 fable 那份恰是刚被拒的
+/// 同一个字面量，留着就是原样再撞一次。
+///
+/// 删完要重新序列化，思考块按原件字节还原（[`preserve_thinking_encoding`]）：之后的整形拿这份
+/// 当原件，到那时原始的 `\uXXXX` / `\/` 写法已经找不回来了。
+pub(crate) fn without_string_fallbacks(body: &Bytes) -> Option<Bytes> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !v.get("fallbacks").is_some_and(|f| f.is_string()) {
+        return None;
+    }
+    v.as_object_mut()?.shift_remove("fallbacks");
+    let out = serde_json::to_vec(&v).ok()?;
+    Some(Bytes::from(preserve_thinking_encoding(body, out)))
+}
+
 /// 补 `fallbacks`：客户端没写、或写的是 2.1.258 的字符串 `"default"`，都换成 `plan`
 /// 那份数组；客户端自己已经发了数组形态（自己就是 2.1.260 一代）时原样不动。
 ///

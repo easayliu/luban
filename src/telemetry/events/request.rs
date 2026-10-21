@@ -104,6 +104,9 @@ impl EventBuilder<'_> {
                 ts,
                 base_identity.event("tengu_agent_tool_selected", ts, &env.ctx(ts), selected),
             ));
+            // 心跳里转入 `subagent_running` 那一下不在这里登记：子代理首条落地时主线程往往已经又完成了
+            // 一两条，这里登记的时刻早于已折算过的会被当过时丢掉。改由拉起它的那条主线程请求登记，见
+            // `finish.rs` 的 `delegated`。
             let resolve = json!({
                 "feature_name": "subagent_model_resolve",
                 "source": "spawn",
@@ -115,11 +118,60 @@ impl EventBuilder<'_> {
             });
             self.push_dd(ts, "tengu_feature_ok", resolve);
         }
+        // `/compact` 的提交与开头（`cap/auto-2.1.305-20261021-full` A18，2.1.296 / 2.1.303 同序）：提交两条
+        // （请求前 19ms），压缩尝试一条（前 6ms），请求发出后更新检查、输入历史落盘与文件历史快照（+19 ~ +23）。
+        // 尝试里的组数与待摘要消息数官方按内部消息表数，比请求体多出附件那些：两次抓包都是组数 = 助手消息
+        // + 2、消息数 = 内容块 + 29（305：35 / 150 → 37 / 179；303：32 / 143 → 34 / 172），照这个估。
+        if v285 && kind == Kind::Compact {
+            let submit = ms(t0, -19);
+            self.push(
+                submit,
+                "tengu_paste_text",
+                json!({ "pastedTextCount": 0, "pastedTextBytes": 0 }),
+            );
+            self.push_dd(submit, "tengu_feature_ok", feature("prompt_submit"));
+            let groups = shape.assistant_messages + 2;
+            self.push(
+                ms(t0, -6),
+                "tengu_reactive_compact_attempt",
+                json!({
+                    "attempt": 1,
+                    "groupsToSummarize": groups - 1,
+                    "groupsToPreserve": 1,
+                    "messagesToSummarize": shape.content_blocks + 29,
+                    "strippedMedia": false,
+                    "splitKind": "round",
+                    "headTruncations": 0
+                }),
+            );
+            self.push_dd(
+                ms(t0, 19),
+                "tengu_feature_ok",
+                json!({
+                    "duration_ms": 0,
+                    "first_in_process": false,
+                    "installation_type": "native",
+                    "feature_name": "update_detection"
+                }),
+            );
+            self.push_dd(ms(t0, 21), "tengu_feature_ok", feature("history_save"));
+            let ts = ms(t0, 22);
+            self.emit_snapshot_backups(ts);
+            self.push(
+                ts,
+                "tengu_file_history_snapshot_success",
+                json!({
+                    "trackedFilesCount": self.files.tracked(),
+                    "snapshotCount": self.files.snapshots()
+                }),
+            );
+        }
         // `/compact`、`/btw` 也是一次输入：挂着的建议在提交那一刻算 ignored（`07:57:01.971`）。
         if matches!(kind, Kind::Compact | Kind::SideQuestion)
             && let Some((rid, shown_end, chars)) = &ignored_suggestion
         {
-            let submit = ms(t0, -11);
+            // `/compact` 的提交落在上面那两条同一刻（请求前 19ms）。
+            let submit = ms(t0, if v285 && kind == Kind::Compact { -19 } else { -11 });
             // 敲的是斜杠命令本身：`/compact` 8 个字，`/btw ` 加问句。
             let typed = if kind == Kind::Compact { 8 } else { shape.prompt_len + 5 };
             self.push(
@@ -484,6 +536,13 @@ impl EventBuilder<'_> {
         // 首字节到达。失败那条没有这一条：官方的 `tengu_feature_ok{api_request}` 是请求
         // **成功返回**之后才打的，失败走的是下面的 `tengu_feature_bad{api_request}`。
         if !failed && (!aborted || call.ttft_ms.is_some()) {
+            // 心跳：主线程续轮出字，界面回到「回答中」——派出去的后台子代理还在跑时，界面在等工具那段
+            // 报 `subagent_running`，出字就切回 `turn_running`（`cap/auto-2.1.305-20261021-full` A8a：
+            // .813 派出、.917 发请求、.728 切回）。别的时候已经是 `turn_running`，登记了也不动。
+            // 流收尾又切回去那一下在 `finish.rs`。
+            if env.f.kind == Kind::Main && !env.f.new_prompt && !shape.sdk {
+                self.beat(t_first, heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
+            }
             self.push_dd(t_first, "tengu_feature_ok", feature("api_request"));
             // 会话首条主线程请求的首字节处，客户端头一回用上这几项能力各报一次，与 beta 一一
             // 对应（`cap/2.1.285/00040` 06:34:19.500，紧跟 `api_request`；`cap/2.1.280` 两个会话

@@ -16,6 +16,8 @@ pub(super) struct ToolUse {
     pub(super) is_error: bool,
     /// `tool_result` 正文的开头（至多 400 字符），认「被用户拒绝」「命令失败」用。
     pub(super) result_head: String,
+    /// 客户端回的 `<tool_use_error>…</tool_use_error>` 里那段话（整段，不截），见 [`tool_error_of`]。
+    pub(super) tool_error: Option<String>,
     /// 见 [`ToolResultInfo::stripped_bytes`] / [`ToolResultInfo::image_b64`] /
     /// [`ToolResultInfo::media_blocks`]。
     pub(super) stripped_bytes: usize,
@@ -30,6 +32,38 @@ pub(super) struct ToolUse {
     /// 结果太大被客户端落了盘、请求里只带预览（`<persisted-output>` 开头）时，预览里写的原始
     /// 大小（字节，按 `Output too large (58.9KB)` 还原）。见 [`persisted_original_size`]。
     pub(super) persisted_from: Option<usize>,
+    /// Read 成功时从结果还原出的原文（[`super::files::read_content`]），`file_operation.contentHash`
+    /// 与文件历史的大小用它。别的工具、读图片、落了盘的为 `None`。
+    pub(super) read_content: Option<String>,
+    /// 结果里第一张图片 base64 的哈希，见 [`ToolResultInfo::image_hash`]。
+    pub(super) image_hash: Option<String>,
+    /// Read 命中了去重（文件没变、又是同一段），见 [`ToolResultInfo::read_dedup`]。
+    pub(super) read_dedup: Option<ReadDedup>,
+}
+
+/// Read 命中去重时客户端直接回一句话、不读文件（官方 `ePr`：`readFileState` 里有、文件 mtime 没变、
+/// offset / limit 又相同），这时只报 `tengu_file_read_dedup`，不报 `file_operation`，账本也不动。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadDedup {
+    /// 「Wasted call — file unchanged since your last Read…」（老一点的版本是「File unchanged since last
+    /// read…」）。
+    Plain,
+    /// 记忆文件那样随上下文种进来的：「<system-reminder>This file is already in your context (see
+    /// "Contents of …" above) and has not changed on disk…」，事件多一项 `source: "seeded"`。
+    Seeded,
+}
+
+/// 结果正文是不是去重那句话（官方 `D4n`：三个固定开头之一）。
+pub(super) fn read_dedup_of(text: &str) -> Option<ReadDedup> {
+    if text.starts_with("<system-reminder>This file is already in your context") {
+        Some(ReadDedup::Seeded)
+    } else if text.starts_with("File unchanged since last read.")
+        || text.starts_with("Wasted call \u{2014} file unchanged since your last Read.")
+    {
+        Some(ReadDedup::Plain)
+    } else {
+        None
+    }
 }
 
 /// 被落盘的工具结果在请求里是一段预览：`<persisted-output>\nOutput too large (58.9KB). Full
@@ -114,6 +148,8 @@ pub(super) struct RequestShape {
     pub(super) estimated_tokens: usize,
     pub(super) image_blocks: usize,
     pub(super) image_bytes: usize,
+    /// 各图片宽×高之和（`imageTotalPixels`），见 [`image_dims`]。
+    pub(super) image_pixels: u64,
     pub(super) doc_blocks: usize,
     pub(super) doc_bytes: usize,
     pub(super) temperature: f64,
@@ -147,6 +183,8 @@ pub(super) struct RequestShape {
     pub(super) side_question: bool,
     /// 末条用户消息以 `/compact` 的「CRITICAL: Respond with TEXT ONLY」开头，见 [`Kind::Compact`]。
     pub(super) compact: bool,
+    /// 压缩请求正文的上下文统计（`tengu_reactive_compact_succeeded`），只有 `compact` 时算。
+    pub(super) compact_stats: Option<super::compact::CompactStats>,
     /// billing header 的 `cc_entrypoint=sdk-cli`：`-p` 打印模式，主线程报 `querySource: sdk`。
     pub(super) sdk: bool,
     /// 这一轮是 `!` 跑的 shell 命令（末条用户消息以 `<bash-input>` 开头）：报 `tengu_input_bash`
@@ -181,6 +219,8 @@ pub(super) struct RequestShape {
     /// [`ThreadBase::fill`] 配回去。
     pub(super) orphan_results: Vec<ToolResultInfo>,
     pub(super) assistant_messages: usize,
+    /// 全部消息的内容块数（字符串内容算一块）：`/compact` 那条 `reactive_compact_attempt` 估待摘要的消息数用。
+    pub(super) content_blocks: usize,
     /// 最后一条 assistant 消息之后还有几条消息（没有 assistant 消息记 0）：
     /// `tengu_tether_live_outcome.deltaMessageCount`（`cap/2.1.277` 主线程续轮报 2、
     /// 子代理续轮报 1，与这个数逐条相等）。
@@ -276,12 +316,29 @@ pub(super) struct ToolResultInfo {
     pub(super) is_error: bool,
     /// 正文开头，见 [`ToolUse::result_head`]。
     pub(super) head: String,
+    /// 见 [`ToolUse::tool_error`]。
+    pub(super) tool_error: Option<String>,
     /// Read 结果去掉行号前缀后的字节数，见 [`read_content_bytes`]。
     pub(super) stripped_bytes: usize,
     /// 结果里图片块 base64 的总长（Read 读图片时 `sidecarFileBase64Bytes`）。
     pub(super) image_b64: usize,
     /// 结果里的图片块数（`toolResultMediaBlocks`）。
     pub(super) media_blocks: usize,
+    /// 去掉末尾提醒之后的全文；只在 [`tool_uses_of`] 里给 Read 还原原文时用一次。
+    pub(super) text: String,
+    /// 第一张图片的 base64 的 sha256（Read 读图片时官方 `contentHash` 算的就是这串，`cap/auto-2.1.305-20261021-full/00049`
+    /// 的 logo.png）；超过官方上限或没有图片为 `None`。
+    pub(super) image_hash: Option<String>,
+    /// 结果是 Read 去重那句话，见 [`ReadDedup`]。按剥掉尾部提醒之前的原文判（种进来那种整段就是一个
+    /// `<system-reminder>`，剥完就空了）。
+    pub(super) read_dedup: Option<ReadDedup>,
+}
+
+/// 客户端在工具没跑起来时回的 `<tool_use_error>…</tool_use_error>`：取出中间那段话（验证不过、找不到
+/// 工具……，官方 `content: \`<tool_use_error>${message}</tool_use_error>\``）。
+pub(super) fn tool_error_of(text: &str) -> Option<String> {
+    let rest = text.trim_start().strip_prefix("<tool_use_error>")?;
+    Some(rest.split_once("</tool_use_error>").map_or(rest, |(m, _)| m).to_string())
 }
 
 /// 一条消息里的全部 `tool_result`。
@@ -314,7 +371,18 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                     };
                     // 客户端发请求时在结果末尾追一段 `<system-reminder>`（total_tokens 那类），官方量的是
                     // 工具自己的输出，不含它（`00412`：206 − 87 = 119）。
-                    let tail = strip_trailing_reminder(&text);
+                    let read_dedup = read_dedup_of(&text);
+                    // 空文件的结果整段就是一句提醒，剥完什么都不剩：那句是 Read 自己的输出，留下它——长度照它算
+                    // （87 字），[`read_content`] 也才认得出空文件、照样报空串的 `contentHash`。
+                    let empty_file = super::files::EMPTY_FILE_WARNING;
+                    let stripped = strip_trailing_reminder(&text);
+                    let lead = text.len() - text.trim_start().len();
+                    let tail = if stripped.trim().is_empty() && text[lead..].starts_with(empty_file)
+                    {
+                        &text[..lead + empty_file.len()]
+                    } else {
+                        stripped
+                    };
                     let len = match content {
                         Some(Value::String(_)) => js_len(tail),
                         Some(c) => content_chars(c)
@@ -328,7 +396,17 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                         persisted: content.and_then(persisted_original_size),
                         is_error: b.get("is_error").and_then(|e| e.as_bool()) == Some(true),
                         head: text.chars().take(400).collect(),
+                        tool_error: tool_error_of(&text),
+                        text: text.clone(),
+                        image_hash: match content {
+                            Some(Value::Array(blocks)) => blocks
+                                .iter()
+                                .find_map(|x| x.get("source")?.get("data")?.as_str())
+                                .and_then(super::files::content_hash),
+                            _ => None,
+                        },
                         stripped_bytes: read_content_bytes(&text),
+                        read_dedup,
                         image_b64,
                         media_blocks: match content {
                             Some(Value::Array(blocks)) => blocks
@@ -395,7 +473,19 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                     let command_len =
                         input.get("command").and_then(|c| c.as_str()).map_or(0, js_len);
                     let hit = results.iter().find(|r| r.id == id);
+                    let read_content = hit
+                        .filter(|r| {
+                            name == "Read"
+                                && !r.is_error
+                                && r.persisted.is_none()
+                                && r.image_b64 == 0
+                                && r.read_dedup.is_none()
+                        })
+                        .and_then(|r| super::files::read_content(&r.text));
                     Some(ToolUse {
+                        read_content,
+                        read_dedup: hit.and_then(|r| r.read_dedup),
+                        image_hash: hit.and_then(|r| r.image_hash.clone()),
                         id,
                         name,
                         input_len: tool_input_len(b.get("name")?.as_str()?, &input),
@@ -404,6 +494,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         persisted_from: hit.and_then(|r| r.persisted),
                         is_error: hit.is_some_and(|r| r.is_error),
                         result_head: hit.map(|r| r.head.clone()).unwrap_or_default(),
+                        tool_error: hit.and_then(|r| r.tool_error.clone()),
                         stripped_bytes: hit.map_or(0, |r| r.stripped_bytes),
                         image_b64: hit.map_or(0, |r| r.image_b64),
                         media_blocks: hit.map_or(0, |r| r.media_blocks),
@@ -493,12 +584,96 @@ pub(super) fn error_kind(f: &CallFailure) -> String {
 /// 压根不重试」分别报 `api_request_retry_exhausted` 与 `api_request_non_retryable`
 /// （可重试的状态码是 `{401,403,404,407,413,429}` 加 5xx 与连接层错误）。
 pub(super) fn api_request_error_code(f: &CallFailure) -> &'static str {
-    let retryable = match f.status {
-        // 没有状态码（连接层）与流内错误都属于会重试的那类。
+    if is_retryable(f.status) { "api_request_retry_exhausted" } else { "api_request_non_retryable" }
+}
+
+/// 同一请求先前几次失败的概况（[`ApiCall::prior_attempts`]），官方重发那套规则（`cap/auto-2.1.306-20261021-retry`）：
+/// 头一次失败是 5xx 或连接层的，客户端先换 `anthropic-dispatch-id: v2p` 原样重发一次（`tengu_dispatch_header_fallback`，
+/// 不算重试）；之后每次失败报一条 `tengu_api_retry`，`attempt` 从 1 数；最终那条的 `attempt` 是重试次数加一。
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RetryView {
+    /// 头一次失败触发了换 dispatch 重发。
+    pub(super) fallback: bool,
+    /// `tengu_api_retry` 的条数。
+    pub(super) retries: u32,
+    /// 各次重试失败里最大的状态码，连接层（没有状态码）算 0（`sdk_result.retry_status` 按整轮取它的最大值）。
+    pub(super) max_retry_status: u16,
+}
+
+impl RetryView {
+    /// `final_dispatch` 是最终那条实际出站的 `anthropic-dispatch-id`。换 dispatch 重发只认实际的请求头：头一次失败
+    /// 是 5xx / 连接层、发的不是 `v2p`，下一次实际换成了 `v2p`（模拟路径恒发 `v2d`，它的重发都算普通重试）。
+    pub(super) fn of(prior: &[PriorAttempt], final_dispatch: Option<&str>) -> Self {
+        let next_dispatch = prior.get(1).map_or(final_dispatch, |a| a.dispatch.as_deref());
+        let fallback = prior.first().is_some_and(|a| {
+            !a.in_band
+                && a.status.is_none_or(|s| s >= 500)
+                && a.dispatch.as_deref() != Some("v2p")
+                && next_dispatch == Some("v2p")
+        });
+        let skip = usize::from(fallback);
+        let retried = prior.get(skip..).unwrap_or_default();
+        RetryView {
+            fallback,
+            retries: retried.len() as u32,
+            max_retry_status: retried.iter().map(|a| a.status.unwrap_or(0)).max().unwrap_or(0),
+        }
+    }
+
+    /// 最终那条的 `attempt`。
+    pub(super) fn attempt(&self) -> u32 {
+        self.retries + 1
+    }
+}
+
+/// 错误消息的哈希（官方 `Dp` 的 `error_message_hash`）：先按 `dZe` 规整（[`super::tools::scrub_error_message`]），再取
+/// SHA-256 前 12 位。API 错误的消息是 SDK 的
+/// `${status} ${JSON.stringify(body)}`：`529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},
+/// "request_id":"…"}` → `028822c6cf53`（`cap/auto-2.1.306-20261021-retry` 十条全中）。没有状态码的（连接层）就是那句消息。
+pub(super) fn error_message_hash(
+    status: Option<u16>,
+    error_type: Option<&str>,
+    message: &str,
+    request_id: Option<&str>,
+) -> String {
+    let raw = match status {
+        Some(s) => {
+            let mut body = serde_json::Map::new();
+            body.insert("type".into(), json!("error"));
+            body.insert(
+                "error".into(),
+                json!({ "type": error_type.unwrap_or("api_error"), "message": message }),
+            );
+            if let Some(r) = request_id.filter(|r| !r.is_empty()) {
+                body.insert("request_id".into(), json!(r));
+            }
+            format!("{s} {}", Value::Object(body))
+        }
+        None => message.to_string(),
+    };
+    sha256_hex(super::tools::scrub_error_message(&raw).as_bytes())[..12].to_string()
+}
+
+/// 这个构建里 API 错误那条栈的固定三样（`error_constructor` / `error_stack_hash` / `error_top_frame`）：压缩后的类名与
+/// 打包块名随构建变，只登记抓到过的。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值）。
+pub(super) fn error_trace(
+    version: &str,
+    status: Option<u16>,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match (version, status) {
+        ("2.1.306", Some(s)) if s >= 500 => {
+            Some(("Yzt", "5b32b751db51", "chunk-75zwyap8.js:11:1510"))
+        }
+        _ => None,
+    }
+}
+
+/// 官方会重试的那类失败：没有状态码（连接层、流内错误）、`{401,403,404,407,413,429}` 与 5xx。
+pub(super) fn is_retryable(status: Option<u16>) -> bool {
+    match status {
         None => true,
         Some(s) => matches!(s, 401 | 403 | 404 | 407 | 413 | 429) || s >= 500,
-    };
-    if retryable { "api_request_retry_exhausted" } else { "api_request_non_retryable" }
+    }
 }
 
 /// 一条消息的粗估 token 数：逐块 `round(长度 / 4)` 相加（长度按 UTF-16 计），text 取正文、
@@ -535,14 +710,116 @@ pub(super) fn js_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
-/// 内容块里 base64 数据的字节数估算（4 个字符 3 字节）。
-pub(super) fn source_bytes(block: &Value) -> usize {
-    block
-        .get("source")
-        .and_then(|s| s.get("data"))
-        .and_then(|d| d.as_str())
-        .map(|d| d.len() * 3 / 4)
-        .unwrap_or(0)
+/// 内容块的 base64 数据（`source.type == "base64"` 且 `data` 是字符串，官方 `WXe`），别的来源没有。
+fn base64_data(block: &Value) -> Option<&str> {
+    let source = block.get("source")?;
+    (source.get("type")?.as_str()? == "base64").then_some(())?;
+    source.get("data")?.as_str()
+}
+
+/// base64 解出来的字节数：4 个字符 3 字节，再扣掉末尾的 `=`（官方 `pfn`；32×32 的 PNG
+/// 164 个字符、一个 `=` 是 121 字节，`cap/auto-2.1.306-20261021-full` A0）。
+fn base64_decoded_len(data: &str) -> usize {
+    let pad = if data.ends_with("==") { 2 } else { usize::from(data.ends_with('=')) };
+    (data.len() * 3 / 4).saturating_sub(pad)
+}
+
+/// 文档块的字节数（官方同一处）：base64 按解出的字节，纯文本按字符数，`content` 来源按字符串或其中
+/// 各文本块的字符数。
+fn document_bytes(block: &Value) -> usize {
+    let Some(source) = block.get("source") else { return 0 };
+    match source.get("type").and_then(|t| t.as_str()) {
+        Some("base64") => base64_data(block).map_or(0, base64_decoded_len),
+        Some("text") => source.get("data").and_then(|d| d.as_str()).map_or(0, js_len),
+        Some("content") => match source.get("content") {
+            Some(Value::String(s)) => js_len(s),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(js_len)
+                .sum(),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// 图片的宽高：只解 base64 的前 87400 个字符，按文件头认 PNG / GIF / JPEG（找第一个 SOF 帧）/ WebP，
+/// 认不出就没有（官方 `lN`，逐项照搬）。
+pub(super) fn image_dims(data: &str) -> Option<(u32, u32)> {
+    let head = &data.as_bytes()[..data.len().min(87_400)];
+    let n = base64::engine::general_purpose::STANDARD
+        .decode(head)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(head))
+        .ok()?;
+    let u16be = |i: usize| Some(u16::from_be_bytes([*n.get(i)?, *n.get(i + 1)?]) as u32);
+    let u16le = |i: usize| Some(u16::from_le_bytes([*n.get(i)?, *n.get(i + 1)?]) as u32);
+    let u32be = |i: usize| Some(u32::from_be_bytes(n.get(i..i + 4)?.try_into().ok()?));
+    let u32le = |i: usize| Some(u32::from_le_bytes(n.get(i..i + 4)?.try_into().ok()?));
+    let u24le = |i: usize| {
+        let b = n.get(i..i + 3)?;
+        Some(u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16)
+    };
+    if n.len() < 10 {
+        return None;
+    }
+    if n.starts_with(&[137, 80, 78, 71]) && n.len() >= 24 {
+        return Some((u32be(16)?, u32be(20)?));
+    }
+    if n.starts_with(b"GIF") {
+        return Some((u16le(6)?, u16le(8)?));
+    }
+    if let Some(e) = jpeg_frame(&n) {
+        return Some((u16be(e + 7)?, u16be(e + 5)?));
+    }
+    if n.starts_with(&[255, 216]) {
+        return None;
+    }
+    if n.starts_with(b"RIFF") && n.len() >= 30 && &n[8..12] == b"WEBP" {
+        return match &n[12..16] {
+            b"VP8 " => Some((u16le(26)? & 16383, u16le(28)? & 16383)),
+            b"VP8L" => {
+                let r = u32le(21)?;
+                Some(((r & 16383) + 1, (r >> 14 & 16383) + 1))
+            }
+            b"VP8X" => Some((u24le(24)? + 1, u24le(27)? + 1)),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// JPEG 里第一个 SOF 段的位置（官方 `B`）。
+fn jpeg_frame(n: &[u8]) -> Option<usize> {
+    if n.len() < 4 || n[0] != 255 || n[1] != 216 {
+        return None;
+    }
+    let mut e = 2;
+    while e + 9 < n.len() {
+        if n[e] != 255 {
+            e += 1;
+            continue;
+        }
+        let t = n[e + 1];
+        if t == 255 {
+            e += 1;
+            continue;
+        }
+        if (192..=207).contains(&t) && t != 196 && t != 200 && t != 204 {
+            return Some(e);
+        }
+        if (208..=217).contains(&t) || t == 1 {
+            e += 2;
+            continue;
+        }
+        let r = usize::from(u16::from_be_bytes([n[e + 2], n[e + 3]]));
+        if r < 2 {
+            return None;
+        }
+        e += 2 + r;
+    }
+    None
 }
 
 /// 一条消息的 content：字符串或块数组。
@@ -568,11 +845,16 @@ pub(super) fn walk_content(content: &Value, shape: &mut RequestShape) {
                     }
                     Some("image") => {
                         shape.image_blocks += 1;
-                        shape.image_bytes += source_bytes(b);
+                        if let Some(data) = base64_data(b) {
+                            shape.image_bytes += base64_decoded_len(data);
+                            if let Some((w, h)) = image_dims(data) {
+                                shape.image_pixels += u64::from(w) * u64::from(h);
+                            }
+                        }
                     }
                     Some("document") => {
                         shape.doc_blocks += 1;
-                        shape.doc_bytes += source_bytes(b);
+                        shape.doc_bytes += document_bytes(b);
                     }
                     Some("tool_result") => {
                         if let Some(c) = b.get("content") {
@@ -834,6 +1116,7 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         for m in msgs {
             if let Some(c) = m.get("content") {
                 walk_content(c, &mut shape);
+                shape.content_blocks += c.as_array().map_or(1, Vec::len);
             }
             match m.get("role").and_then(|r| r.as_str()) {
                 Some("system") => shape.api_system_messages += 1,
@@ -970,6 +1253,9 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
             shape.away_summary = text.is_some_and(|t| {
                 t.trim_start().starts_with("The user stepped away and is coming back.")
             });
+            if shape.compact {
+                shape.compact_stats = Some(super::compact::compact_stats_of(msgs));
+            }
         }
         if msgs.len() == 1
             && shape.tools_count == 0

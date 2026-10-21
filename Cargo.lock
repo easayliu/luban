@@ -1391,6 +1391,7 @@ dependencies = [
  "mime_guess",
  "parking_lot",
  "rand",
+ "regex",
  "rust-embed",
  "serde",
  "serde_json",

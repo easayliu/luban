@@ -174,6 +174,17 @@ fn message_stop_marks_a_complete_stream() {
     assert_eq!(complete.last_event.as_deref(), Some("message_stop"));
 }
 
+/// `ping` 也算进 `events`（断流定位要它），但另记一份：2.1.305 的 `streamEventCount` 跳过 ping，
+/// 抓包里每条都是事件总数减去那一个 ping。
+#[test]
+fn pings_are_counted_apart() {
+    let mut s = crate::proxy::UsageSniffer::new(true, false);
+    s.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n");
+    s.feed(b"event: ping\ndata: {\"type\": \"ping\"}\n\n");
+    s.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    assert_eq!((s.events, s.pings), (3, 1));
+}
+
 /// 非流式响应体里的 `{"type":"error"}` 不走流内那套：那条路的 4xx 由
 /// [`crate::proxy::classify_account_rejection`] 一侧处理，这里再记一份会让同一个错误告警两次。
 /// 但**类型与文案照记**（`body_error`）——`tengu_api_error` 的 `errorType`/`error`

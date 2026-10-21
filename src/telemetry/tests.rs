@@ -223,6 +223,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             reply_input_chars: 87,
             thinking_chars: 0,
             saw_thinking: false,
+            stream_events: Some(12),
             tool_use_lens: Vec::new(),
             tool_calls: Vec::new(),
             cost_usd: Some(0.18),
@@ -230,6 +231,8 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             failure: None,
             aborted: false,
             cache_keepalive_ok: false,
+            dispatch: Some("v2d".into()),
+            prior_attempts: Vec::new(),
         }
 }
 
@@ -251,6 +254,372 @@ fn failed(mut c: ApiCall, status: Option<u16>, etype: &str, message: &str) -> Ap
         in_band: status.is_none() && !etype.is_empty(),
     });
     c
+}
+
+/// 错误消息的哈希照官方 `Dp`：`${status} ${JSON.stringify(body)}` 规整后取 SHA-256 前 12 位，request-id 换成占位
+/// （`cap/auto-2.1.306-20261021-retry` 十次注入的 529 全是 `028822c6cf53`）。
+#[test]
+fn error_message_hash_matches_the_capture() {
+    for rid in ["req_injected1792566703261005", "req_injected1792566756200010"] {
+        assert_eq!(
+            super::shape::error_message_hash(
+                Some(529),
+                Some("overloaded_error"),
+                "Overloaded",
+                Some(rid)
+            ),
+            "028822c6cf53"
+        );
+    }
+}
+
+/// 客户端自己重发的几次（`cap/auto-2.1.306-20261021-retry`）。`-p` 一条请求：`fails` 次 529 之后，`ok` 为真再成功一次，否则
+/// 让扣住超时按最终失败补报。每次尝试 8ms 失败，间隔照抓包 0 / 606 / 1152ms。
+fn retried_sdk_turn(fails: usize, ok: bool, ua: &str) -> Vec<(String, Value)> {
+    retried_sdk_turn_with(fails, ok, ua, true)
+}
+
+/// 同上；`real` 为真时照真实客户端换 dispatch（头一次 `v2d`，之后都是 `v2p`），否则照模拟路径一律 `v2d`。
+fn retried_sdk_turn_with(fails: usize, ok: bool, ua: &str, real: bool) -> Vec<(String, Value)> {
+    let t = Telemetry::default();
+    let body = String::from_utf8(cc_body(true))
+        .unwrap()
+        .replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+    let base = frozen_now() - Duration::from_secs(60);
+    let gaps = [0u64, 606, 1_152, 2_000, 4_000];
+    let mut at = base;
+    for (i, gap) in gaps.iter().enumerate().take(fails) {
+        let mut c = failed(
+            call(
+                body.clone().into_bytes(),
+                &format!("req_injected17925667032610{i:02}"),
+                "end_turn",
+            ),
+            Some(529),
+            "overloaded_error",
+            "Overloaded",
+        );
+        c.ua_out = ua.into();
+        c.started_at = at;
+        c.total_ms = 8;
+        c.dispatch = Some(if real && i > 0 { "v2p" } else { "v2d" }.into());
+        t.ingest(c);
+        at += Duration::from_millis(8 + gap);
+    }
+    if ok {
+        let mut c = call(body.into_bytes(), "req_ok", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = at;
+        c.total_ms = 1_936;
+        c.dispatch = Some(if real && fails > 0 { "v2p" } else { "v2d" }.into());
+        t.ingest(c);
+    } else {
+        give_up_retries(&t);
+    }
+    let st = t.0.state.lock();
+    st.pending
+        .values()
+        .flat_map(|p| p.events.iter())
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect()
+}
+
+/// R1：头一次 529 换 `v2p` 原样重发（`dispatch_header_fallback`，不算重试）后成功——只报一次成功、`attempt: 1`、
+/// `dispatch: v2p`，`durationMsIncludingRetries` 从头一次算起；没有失败收尾，结果是一条 `success`。
+#[test]
+fn a_dispatch_fallback_then_success_is_one_turn() {
+    let ev = retried_sdk_turn(1, true, "claude-cli/2.1.306 (external, sdk-cli)");
+    let all =
+        |n: &str| ev.iter().filter(|(x, _)| x == n).map(|(_, m)| m.clone()).collect::<Vec<_>>();
+    let fb = all("tengu_dispatch_header_fallback");
+    assert_eq!(fb.len(), 1);
+    assert_eq!(
+        (&fb[0]["dispatch"], &fb[0]["resend_dispatch"], &fb[0]["reason"], &fb[0]["status"]),
+        (&json!("v2d"), &json!("v2p"), &json!("5xx"), &json!("529"))
+    );
+    assert!(all("tengu_api_retry").is_empty() && all("tengu_api_error").is_empty());
+    let ok = all("tengu_api_success");
+    assert_eq!(ok.len(), 1);
+    assert_eq!((&ok[0]["attempt"], &ok[0]["dispatch"]), (&json!(1), &json!("v2p")));
+    assert!(ok[0]["durationMsIncludingRetries"].as_i64().unwrap() >= 1_936 + 8);
+    let r = all("tengu_sdk_result");
+    assert_eq!(r.len(), 1, "只有一条结果");
+    assert_eq!(
+        (&r[0]["subtype"], &r[0]["is_error"], &r[0]["saw_retry"]),
+        (&json!("success"), &json!(false), &json!(false))
+    );
+    assert_eq!(all("tengu_turn_end").len(), 1);
+}
+
+/// R2：`CLAUDE_CODE_MAX_RETRIES=2`，四次 529（换 dispatch 重发一次 + 重试两次 + 最后一次）。中间只有一条
+/// `dispatch_header_fallback` 与两条 `api_retry`（attempt 1 / 2，带错误哈希与 306 的栈），最后一条才收尾：
+/// `api_error{attempt: 3}`、`turn_end{api_error}` 与结果 `success` + `is_error`，带两项状态码、API 耗时 0；之前没有成功过的
+/// 主请求，就没有会话结束的逐出提示。
+#[test]
+fn retries_exhausted_end_the_turn_once() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.306 (external, sdk-cli)");
+    let all =
+        |n: &str| ev.iter().filter(|(x, _)| x == n).map(|(_, m)| m.clone()).collect::<Vec<_>>();
+    assert_eq!(all("tengu_dispatch_header_fallback").len(), 1);
+    let retries = all("tengu_api_retry");
+    assert_eq!(retries.len(), 2);
+    for (i, r) in retries.iter().enumerate() {
+        assert_eq!(r["attempt"], i as u64 + 1);
+        assert_eq!(r["error"], "API error: type=server_overload status=529");
+        assert_eq!(
+            (&r["errorType"], &r["status"], &r["attempt_duration_ms"]),
+            (&json!("server_overload"), &json!(529), &json!(8))
+        );
+        assert_eq!(r["error_message_hash"], "028822c6cf53");
+        assert_eq!(
+            (&r["error_constructor"], &r["error_stack_hash"]),
+            (&json!("Yzt"), &json!("5b32b751db51"))
+        );
+    }
+    assert_eq!(retries[0]["delayMs"], 606);
+    assert_eq!(retries[1]["delayMs"], 1_152);
+    let err = all("tengu_api_error");
+    assert_eq!(err.len(), 1, "只在最后一次报失败");
+    assert_eq!((&err[0]["attempt"], &err[0]["dispatch"]), (&json!(3), &json!("v2p")));
+    assert_eq!(err[0]["error_message_hash"], "028822c6cf53");
+    assert_eq!(all("tengu_turn_end").len(), 1);
+    let r = all("tengu_sdk_result");
+    assert_eq!(r.len(), 1, "只有一条结果");
+    assert_eq!(
+        (
+            &r[0]["subtype"],
+            &r[0]["is_error"],
+            &r[0]["saw_retry"],
+            &r[0]["retry_status"],
+            &r[0]["api_error_status"],
+            &r[0]["duration_api_ms"]
+        ),
+        (&json!("success"), &json!(true), &json!(true), &json!(529), &json!(529), &json!(0))
+    );
+    let keys: Vec<&str> = r[0].as_object().unwrap().keys().map(String::as_str).collect();
+    let pos = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+    assert_eq!(
+        (pos("retry_status"), pos("api_error_status")),
+        (pos("saw_compact") + 1, pos("saw_compact") + 2)
+    );
+    assert!(all("tengu_cache_eviction_hint").is_empty(), "之前没有成功过的主请求");
+}
+
+/// 换了别的请求就说明前面那串已经放弃了：它的最后一次按最终失败补报，再处理新的这条。
+#[test]
+fn a_new_request_closes_a_held_retry_chain() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.306 (external, cli)";
+    let mut f = failed(
+        call(cc_body(true), "req_f", "end_turn"),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    );
+    f.ua_out = ua.into();
+    f.started_at = frozen_now() - Duration::from_secs(60);
+    t.ingest(f);
+    assert!(
+        t.0.state
+            .lock()
+            .pending
+            .get(&key())
+            .is_none_or(|p| p.events.iter().all(|(_, e)| ev_name(e) != "tengu_api_error")),
+        "先扣着"
+    );
+    let mut next = call(with_prompt(cc_body(true), PROMPT_2), "req_next", "end_turn");
+    next.ua_out = ua.into();
+    next.started_at = frozen_now() - Duration::from_secs(30);
+    t.ingest(next);
+    let st = t.0.state.lock();
+    let names: Vec<&str> = st.pending[&key()].events.iter().map(|(_, e)| ev_name(e)).collect();
+    let err = names.iter().position(|n| *n == "tengu_api_error").expect("补报了最终失败");
+    let ok = names.iter().position(|n| *n == "tengu_api_success").unwrap();
+    assert!(err < ok);
+}
+
+/// 模拟路径的出站 dispatch 恒为 `v2d`：重发没有真换成 `v2p`，就不算换 dispatch 重发，头一次失败照普通重试报，成功那条的
+/// `dispatch` 也照实际报 `v2d`。
+#[test]
+fn a_resend_without_v2p_is_an_ordinary_retry() {
+    let ev = retried_sdk_turn_with(1, true, "claude-cli/2.1.306 (external, sdk-cli)", false);
+    let all =
+        |n: &str| ev.iter().filter(|(x, _)| x == n).map(|(_, m)| m.clone()).collect::<Vec<_>>();
+    assert!(all("tengu_dispatch_header_fallback").is_empty());
+    let retries = all("tengu_api_retry");
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0]["attempt"], 1);
+    let ok = all("tengu_api_success");
+    assert_eq!((&ok[0]["attempt"], &ok[0]["dispatch"]), (&json!(2), &json!("v2d")));
+}
+
+/// `/clear` 之后新会话的头一条遇到 529、重发成功：扣着的那次不能先去判会话来历（那一步会把旧会话标成已清），
+/// 重发那条到了照样认出是 `/clear` 过来的——不出启动串、带着旧会话的 `parent_session_id`。
+#[test]
+fn a_retry_after_clear_keeps_the_lineage() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let s2 = "22222222-2222-4222-8222-222222222222";
+    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
+    t.ingest(main_call(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
+    let at = base + Duration::from_secs(60);
+    t.ingest(failed(
+        main_call(s2, "req_f", "msg_f", at),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    ));
+    t.ingest(main_call(s2, "req_2", "msg_2", at + Duration::from_millis(20)));
+    let ev = events_of(&t, s2);
+    assert!(!ev.is_empty());
+    assert!(!ev.iter().any(|(n, _, _)| n == "tengu_startup_telemetry"), "不出启动串");
+    for (n, _, d) in ev.iter().filter(|(_, _, d)| d.get("event_name").is_some()) {
+        assert_eq!(d["parent_session_id"], SESSION, "{n}");
+    }
+}
+
+/// 合并重发之后，请求前缀（提交、`api_query`）挂在头一次尝试上，早于重发事件；首字与成功收尾按最后那次算
+/// （`cap/auto-2.1.306-20261021-retry` R1：`api_query` .534、换 dispatch .545、成功 36.482）。
+#[test]
+fn a_retried_request_keeps_its_prefix_at_the_first_attempt() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.306 (external, cli)";
+    let base = frozen_now() - Duration::from_secs(60);
+    let mut f = failed(
+        call(cc_body(true), "req_f", "end_turn"),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    );
+    f.ua_out = ua.into();
+    f.started_at = base;
+    f.total_ms = 8;
+    f.dispatch = Some("v2d".into());
+    t.ingest(f);
+    let mut ok = call(cc_body(true), "req_ok", "end_turn");
+    ok.ua_out = ua.into();
+    ok.started_at = base + Duration::from_millis(10);
+    ok.total_ms = 1_936;
+    ok.dispatch = Some("v2p".into());
+    t.ingest(ok);
+    let st = t.0.state.lock();
+    let at = |n: &str| {
+        st.pending[&key()].events.iter().find(|(_, e)| ev_name(e) == n).map(|(dt, _)| *dt).unwrap()
+    };
+    let start: DateTime<Utc> = base.into();
+    assert!(at("tengu_api_query") <= at("tengu_dispatch_header_fallback"));
+    assert!(at("tengu_input_prompt") <= at("tengu_api_query"));
+    assert!(
+        at("tengu_api_query") < start + chrono::Duration::milliseconds(8),
+        "前缀在头一次尝试上"
+    );
+    assert_eq!(at("tengu_api_success"), start + chrono::Duration::milliseconds(10 + 1_936));
+}
+
+/// `/clear` 后新会话的头一条扣着等重发时，同一台设备上的旧会话就算到了闲置期限也留着：重发成功后照样认出
+/// `/clear` 来历。
+#[test]
+fn a_held_retry_keeps_the_cleared_predecessor() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let s2 = "22222222-2222-4222-8222-222222222222";
+    t.ingest(quota_probe_call("11111111-1111-4111-8111-111111111111", base));
+    t.ingest(main_call(SESSION, "req_1", "msg_1", base + Duration::from_secs(5)));
+    let at = base + Duration::from_secs(60);
+    t.ingest(failed(
+        main_call(s2, "req_f", "msg_f", at),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    ));
+    let idle = Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS);
+    let now = Instant::now();
+    t.0.state.lock().sessions.get_mut(&key()).unwrap().last_seen =
+        now - idle - Duration::from_secs(1);
+    t.gc(now);
+    assert!(t.0.state.lock().sessions.contains_key(&key()), "旧会话留着");
+    t.ingest(main_call(s2, "req_2", "msg_2", at + Duration::from_millis(20)));
+    let ev = events_of(&t, s2);
+    assert!(!ev.iter().any(|(n, _, _)| n == "tengu_startup_telemetry"), "不出启动串");
+    for (n, _, d) in ev.iter().filter(|(_, _, d)| d.get("event_name").is_some()) {
+        assert_eq!(d["parent_session_id"], SESSION, "{n}");
+    }
+}
+
+/// 等重试的那段算在逻辑请求里：首条请求重发了 60 秒才成功，进程起点仍从头一次尝试往前推；第二次提交与上一次只隔
+/// 1 秒、自己又等了 60 秒重试，用户敲字的时长窗口仍按两次提交的间隔算。
+#[test]
+fn retry_wait_does_not_shift_process_start_or_typing_time() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.306 (external, cli)";
+    let base = frozen_now() - Duration::from_secs(600);
+    let attempt = |body: Vec<u8>, rid: &str, at: SystemTime, fail: bool| {
+        let mut c = call(body, rid, "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = at;
+        c.total_ms = 1_000;
+        if fail {
+            c = failed(c, Some(529), "overloaded_error", "Overloaded");
+            c.total_ms = 8;
+        }
+        c
+    };
+    t.ingest(attempt(cc_body(true), "req_f1", base, true));
+    t.ingest(attempt(cc_body(true), "req_ok1", base + Duration::from_secs(60), false));
+    {
+        let st = t.0.state.lock();
+        let wall = st.sessions[&key()].started_wall;
+        assert!(wall < base, "进程起点在头一次尝试之前");
+        assert!(base.duration_since(wall).unwrap() < Duration::from_secs(10), "{wall:?}");
+    }
+    drop(t);
+    // 第一次提交很快完成，第二次只隔 1 秒，自己等了 60 秒重试：敲字估算（0.8 + 0.1 × 11 字 = 1.9 秒）要截到
+    // 两次提交的间隔 1 秒，不能拿等重试那 60 秒当窗口。
+    let t = Telemetry::default();
+    t.ingest(attempt(cc_body(true), "req_1", base, false));
+    let p2 = base + Duration::from_secs(1);
+    t.ingest(attempt(with_prompt(cc_body(true), PROMPT_2), "req_f2", p2, true));
+    t.ingest(attempt(
+        with_prompt(cc_body(true), PROMPT_2),
+        "req_ok2",
+        p2 + Duration::from_secs(60),
+        false,
+    ));
+    let st = t.0.state.lock();
+    let users: Vec<f64> = st.pending[&key()].metrics.iter().map(|m| m.user_secs).collect();
+    let last = *users.last().unwrap();
+    assert!((last - 1.0).abs() < 1e-6, "窗口是两次提交的间隔 1 秒：{users:?}");
+}
+
+/// 扣着等重发的会话不算闲置：快到闲置期限时遇到 529，清理时会话照样留着，不报退出。
+#[test]
+fn a_session_waiting_for_a_retry_is_not_idle() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.306 (external, cli)";
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    first.ua_out = ua.into();
+    t.ingest(first);
+    let idle = Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS);
+    let now = Instant::now();
+    t.0.state.lock().sessions.get_mut(&key()).unwrap().last_seen =
+        now - idle + Duration::from_secs(1);
+    let mut f = failed(
+        call(with_prompt(cc_body(true), PROMPT_2), "req_f", "end_turn"),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    );
+    f.ua_out = ua.into();
+    t.ingest(f);
+    t.gc(now + Duration::from_secs(2));
+    let st = t.0.state.lock();
+    assert!(st.sessions.contains_key(&key()), "会话还在");
+    assert!(st.held_retries.contains_key(&key()), "还在等重发");
+}
+
+/// 可重试的失败会先扣着等客户端重发（[`config::TELEMETRY_RETRY_HOLD_SECS`]）：让它超时，按最终失败补报。
+fn give_up_retries(t: &Telemetry) {
+    t.gc(Instant::now() + Duration::from_secs(config::TELEMETRY_RETRY_HOLD_SECS + 1));
 }
 
 /// `cc_body` 里 metadata 的 session_id；待发批次按 (凭证, 会话) 取。
@@ -509,6 +878,1396 @@ fn latest_session_hands_the_real_identity_to_the_keepalive() {
     assert_eq!(after.model, s.model, "会话主模型不该被标题生成改成 haiku");
     assert_eq!(after.betas, s.betas, "会话级 beta 不该被标题生成那套覆盖");
     assert_eq!(after.prompt_id, s.prompt_id, "prompt_id 同样不该被侧查询改掉");
+}
+
+/// PDF 按 `pages` 分页读：`file_operation` 的内容哈希是固定串 `PDF pages <pages>`（官方 305 `OE` 那处），
+/// 不是渲染出来那张图的 base64；不带 `pages` 的图片读照旧哈希 base64。
+#[test]
+fn a_paged_pdf_read_hashes_the_pages_string() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let step = |tool: Value, result: Value, rid: &str, stop: &str| {
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[tool]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":result}]});
+        let mut c = call(body.to_string().into_bytes(), rid, stop);
+        c.ua_out = ua.into();
+        c
+    };
+    let image = |data: &str| json!([{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":data}}]);
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    t.ingest(first);
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/p/doc.PDF","pages":"1-5"}}),
+        image("QUJD"),
+        "req_2",
+        "tool_use",
+    ));
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/p/pic.png"}}),
+        image("REVG"),
+        "req_3",
+        "end_turn",
+    ));
+    let st = t.0.state.lock();
+    let ops: Vec<Value> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_file_operation")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    assert_eq!(ops[0]["contentHash"], sha256_hex(b"PDF pages 1-5"));
+    assert_eq!(ops[1]["contentHash"], sha256_hex(b"REVG"));
+}
+
+/// 读写文件那一组：Read 带原文哈希的 `file_operation`；头一次 Edit 先备份原文件、记一笔，再报改动行数、
+/// `file_operation{edit}`、字符串长度与 `file_activity`；auto 模式自动放行，编辑决定的来源是 `config`。改动行数与
+/// 编辑决定进 OTel 指标。
+#[test]
+fn file_tools_report_the_edit_group() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let step = |tool: Value, result: &str, rid: &str, stop: &str| {
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[tool]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":result}]});
+        let mut c = call(body.to_string().into_bytes(), rid, stop);
+        c.ua_out = ua.into();
+        c
+    };
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    t.ingest(first);
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/p/a.md"}}),
+        "1\t# a\n2\t",
+        "req_2",
+        "tool_use",
+    ));
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/p/a.md","old_string":"# a","new_string":"# bb"}}),
+        "The file /p/a.md has been updated successfully.",
+        "req_3",
+        "end_turn",
+    ));
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let got = |n: &str| -> Vec<Value> {
+        p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+    };
+    let read = &got("tengu_file_operation")[0];
+    assert_eq!(read["operation"], "read");
+    assert_eq!(read["filePathHash"], crate::telemetry::files::path_hash("/p/a.md"));
+    assert_eq!(read["contentHash"], sha256_hex(b"# a\n"));
+    let edit = &got("tengu_file_operation")[1];
+    assert_eq!((&edit["operation"], &edit["tool"]), (&json!("edit"), &json!("FileEditTool")));
+    assert!(edit.get("contentHash").is_none(), "改动不带内容哈希");
+    assert_eq!(got("tengu_file_history_backup_file_created")[0]["fileSize"], 4);
+    assert_eq!(got("tengu_file_history_track_edit_success")[0]["isNewFile"], false);
+    let changed = &got("tengu_file_changed")[0];
+    assert_eq!((&changed["lines_added"], &changed["lines_removed"]), (&json!(1), &json!(1)));
+    let len = &got("tengu_edit_string_lengths")[0];
+    assert_eq!((&len["oldStringBytes"], &len["newStringBytes"]), (&json!(3), &json!(4)));
+    let activity = &got("tengu_file_activity")[0];
+    assert_eq!((&activity["activity"], &activity["fileExtension"]), (&json!("edit"), &json!("md")));
+    let m = metrics_body(&p.metrics, "2.1.305", "team", None);
+    let names: Vec<&str> =
+        m["metrics"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+    let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+    assert!(at("claude_code.session.count") < at("claude_code.lines_of_code.count"));
+    assert!(at("claude_code.lines_of_code.count") < at("claude_code.cost.usage"));
+    assert!(at("claude_code.token.usage") < at("claude_code.code_edit_tool.decision"));
+    let loc = &m["metrics"][at("claude_code.lines_of_code.count")]["data_points"];
+    assert_eq!((&loc[0]["attributes"]["type"], &loc[0]["value"]), (&json!("added"), &json!(1)));
+    assert_eq!((&loc[1]["attributes"]["type"], &loc[1]["value"]), (&json!("removed"), &json!(1)));
+    let d =
+        &m["metrics"][at("claude_code.code_edit_tool.decision")]["data_points"][0]["attributes"];
+    assert_eq!(
+        (&d["decision"], &d["source"], &d["tool_name"], &d["language"]),
+        (&json!("accept"), &json!("config"), &json!("Edit"), &json!("Markdown"))
+    );
+}
+
+/// 改动行数记在发起那次工具调用的回复模型名下：请求 opus、回落到 sonnet 写的文件，下一条（仍请求 opus）带回
+/// 写入结果时，`lines_of_code` 的 `model` 是 sonnet。NotebookEdit 的编辑决定按 `notebook_path` 的扩展名报语言
+/// （`.ipynb` 查不到是 `unknown`），不是弹框那条按单元格类型的 python。
+#[test]
+fn edit_metrics_follow_the_reply_model_and_the_path_language() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let step = |tool: Value, result: &str, rid: &str, stop: &str| {
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[tool]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":result}]});
+        let mut c = call(body.to_string().into_bytes(), rid, stop);
+        c.ua_out = ua.into();
+        c
+    };
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    first.resp_model = Some("claude-sonnet-5-5".into());
+    t.ingest(first);
+    let mut second = step(
+        json!({"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"/p/new.py","content":"a\nb\n"}}),
+        "File created successfully at: /p/new.py",
+        "req_2",
+        "tool_use",
+    );
+    second.resp_model = Some("claude-opus-5".into());
+    t.ingest(second);
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"NotebookEdit","input":{"notebook_path":"/p/a.ipynb","new_source":"x=1","cell_type":"code"}}),
+        "Updated cell",
+        "req_3",
+        "end_turn",
+    ));
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let with_loc: Vec<&str> =
+        p.metrics.iter().filter(|c| !c.loc.is_empty()).map(|c| c.loc_model.as_str()).collect();
+    assert_eq!(with_loc, ["claude-sonnet-5-5"], "Write 是 sonnet 那条回复调的");
+    let langs: Vec<(String, Option<String>)> = p
+        .metrics
+        .iter()
+        .flat_map(|c| c.decisions.iter())
+        .map(|d| (d.tool.clone(), d.language.clone()))
+        .collect();
+    assert!(
+        langs.contains(&("NotebookEdit".to_string(), Some("unknown".to_string()))),
+        "{langs:?}"
+    );
+    // NotebookEdit 成功后一条 `file_activity{notebook_edit}`，扩展名取 `notebook_path`。
+    let activity: Vec<Value> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_file_activity")
+        .map(|(_, e)| meta_of(e))
+        .filter(|m| m["toolName"] == "NotebookEdit")
+        .collect();
+    assert_eq!(activity.len(), 1, "{activity:?}");
+    assert_eq!(
+        (&activity[0]["activity"], &activity[0]["fileExtension"], &activity[0]["isNewFile"]),
+        (&json!("notebook_edit"), &json!("ipynb"), &json!(false))
+    );
+}
+
+/// 压缩后重建的附件账本按版本：技能清单 2.1.305 起才在压缩时放回（`cap/auto-2.1.303-20261019-full/00175` 没有
+/// 这一段，305 的 `00173` 有），303 的账本里不该有它，其余放回的几类两个版本都有。
+#[test]
+fn post_compact_ledger_restores_the_skill_listing_from_2_1_305() {
+    let mut posts = Vec::new();
+    for (ua, skills) in [
+        ("claude-cli/2.1.303 (external, cli)", None),
+        ("claude-cli/2.1.305 (external, cli)", Some(1)),
+    ] {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(120);
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        first.ua_out = ua.into();
+        first.started_at = base;
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"text","text":"ok"}]},
+            {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]},
+            {"role":"system","content":"<total_tokens>0 tokens left</total_tokens>"}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30);
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        t.ingest(c);
+        let after = t.0.state.lock().sessions[&key()].attachment_counts.clone();
+        let has = |k: &str| after.iter().find(|(x, _)| x == k).map(|(_, n)| *n);
+        assert_eq!(has("skill_listing"), skills, "{ua}: {after:?}");
+        for k in ["agent_listing_delta", "mcp_instructions_delta", "environment", "model"] {
+            assert_eq!(has(k), Some(1), "{ua} {k}: {after:?}");
+        }
+        let (post, model) = t.0.state.lock().pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+            .map(|(_, e)| {
+                let post = meta_of(e)["postCompactTokens"].as_u64().unwrap();
+                (post, e["event_data"]["model"].as_str().unwrap().to_string())
+            })
+            .unwrap();
+        posts.push((post, model));
+    }
+    // `postCompactTokens` 里估的放回附件与账本同一口径：两个版本只差技能清单那一段。
+    let mut skill = json!({ "attachment_types": ["skill_listing"] });
+    super::kind::fill_attachment_estimates(&mut skill, "unknown", false, &posts[1].1);
+    let skill: u64 = skill["attachment_token_estimates"][0].as_str().unwrap().parse().unwrap();
+    assert!(skill > 0);
+    assert_eq!(posts[1].0 - posts[0].0, skill, "{posts:?}");
+}
+
+/// 关了工具搜索（请求里没有 `defer_loading` 的工具）：压缩时不放回延迟工具清单，恢复条数、账本一起少这一条
+/// （305 没有恢复文件、计划文件时是 5 条，开着是 6 条）。
+#[test]
+fn restored_attachment_count_drops_the_deferred_tools_when_tool_search_is_off() {
+    for (deferred, count) in [(true, 6), (false, 5)] {
+        let t = Telemetry::default();
+        let ua = "claude-cli/2.1.305 (external, cli)";
+        let base = frozen_now() - Duration::from_secs(120);
+        let strip = |mut v: Value| {
+            if !deferred {
+                v["tools"].as_array_mut().unwrap().retain(|x| x.get("defer_loading").is_none());
+            }
+            v
+        };
+        let mut first = call(
+            strip(serde_json::from_slice(&cc_body(true)).unwrap()).to_string().into_bytes(),
+            "req_1",
+            "end_turn",
+        );
+        first.ua_out = ua.into();
+        first.started_at = base;
+        t.ingest(first);
+        let mut body = strip(serde_json::from_slice(&cc_body(false)).unwrap());
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"text","text":"ok"}]},
+            {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30);
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let succeeded = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(succeeded["restoredAttachmentCount"], count, "deferred={deferred}");
+        let after = &st.sessions[&key()].attachment_counts;
+        assert_eq!(after.iter().any(|(k, _)| k == "deferred_tools_delta"), deferred, "{after:?}");
+        assert_eq!(after.iter().map(|(_, n)| *n as usize).sum::<usize>(), count, "{after:?}");
+    }
+}
+
+/// 重读账本里已有的文件：先报 `file_read_reread{priorOp}`；文件没变、又是同一段时客户端直接回去重那句话，只再报
+/// `file_read_dedup{ext}`（种进来的多一项 `source: seeded`），不报 `file_operation`，账本里的原文也不动——之后真的
+/// 重读仍按上一次改动报 `priorOp: edit_write`、带新内容的哈希。
+#[test]
+fn rereading_an_unchanged_file_is_deduplicated() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let step = |tool: Value, result: &str, rid: &str| {
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[tool]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":result}]});
+        let mut c = call(body.to_string().into_bytes(), rid, "tool_use");
+        c.ua_out = ua.into();
+        c
+    };
+    let read = |p: &str| json!({"type":"tool_use","id":"t1","name":"Read","input":{"file_path":p}});
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    t.ingest(first);
+    t.ingest(step(read("/p/a.md"), "1\t# a\n2\t", "req_2"));
+    t.ingest(step(
+        read("/p/a.md"),
+        "Wasted call \u{2014} file unchanged since your last Read. Refer to that earlier tool_result instead.",
+        "req_3",
+    ));
+    t.ingest(step(
+        json!({"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/p/a.md","old_string":"# a","new_string":"# bb"}}),
+        "The file /p/a.md has been updated successfully.",
+        "req_4",
+    ));
+    t.ingest(step(
+        read("/p/a.md"),
+        "<system-reminder>This file is already in your context (see \"Contents of /p/a.md\" above) and has not changed on disk. Use that content instead of re-reading.</system-reminder>",
+        "req_5",
+    ));
+    t.ingest(step(read("/p/a.md"), "1\t# bb\n2\t", "req_6"));
+    // 没有扩展名的文件 `ext` 不带；超过 10 个字符的是 `other`。
+    t.ingest(step(read("/p/Makefile"), "1\tall:\n2\t", "req_7"));
+    t.ingest(step(read("/p/Makefile"), "File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current.", "req_8"));
+    t.ingest(step(read("/p/x.verylongextension"), "1\tz\n2\t", "req_9"));
+    t.ingest(step(read("/p/x.verylongextension"), "File unchanged since last read.", "req_10"));
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let got = |n: &str| -> Vec<Value> {
+        p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+    };
+    let ops: Vec<String> = got("tengu_file_operation")
+        .iter()
+        .map(|m| m["operation"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ops, ["read", "edit", "read", "read", "read"], "去重命中的两次不报 file_operation");
+    assert_eq!(
+        got("tengu_file_operation")[2]["contentHash"],
+        sha256_hex(b"# bb\n"),
+        "去重没有清掉账本，Edit 之后的原文照旧"
+    );
+    let reread: Vec<String> = got("tengu_file_read_reread")
+        .iter()
+        .map(|m| m["priorOp"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(reread, ["read", "seeded", "edit_write", "read", "read"]);
+    let dedup = got("tengu_file_read_dedup");
+    assert_eq!(dedup.len(), 4);
+    // meta 里前三项是阶段上下文，后面才是事件自己的。
+    let own = |m: &Value| -> Vec<(String, Value)> {
+        m.as_object().unwrap().iter().skip(3).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    assert_eq!(own(&dedup[0]), [("ext".to_string(), json!("md"))]);
+    assert_eq!(
+        own(&dedup[1]),
+        [("source".to_string(), json!("seeded")), ("ext".to_string(), json!("md"))]
+    );
+    assert_eq!(own(&dedup[2]), [], "没有扩展名不带 ext");
+    assert_eq!(own(&dedup[3]), [("ext".to_string(), json!("other"))]);
+    // 同一次 Read 里 reread 在 dedup 前、都在工具收尾前。
+    let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
+    let i = names.iter().position(|n| *n == "tengu_file_read_dedup").unwrap();
+    assert_eq!(names[i - 1], "tengu_file_read_reread");
+}
+
+/// 终端里跑的会话：进程启动 30 秒多那条 `ide_detect{found:false}`，一个进程一条，不到 30 秒就退出的没有；
+/// 启动段模板里 IDE 底子带来的两条 `found:true` 不再发（`cap/auto-2.1.305-20261021-full` 16 个会话里活过 30 秒的
+/// 9 个都是启动后 30.4 ~ 30.8 秒一条 `found:false`，2.1.291 起每份抓包同此）。
+#[test]
+fn ide_detect_fires_once_thirty_seconds_after_startup() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(300);
+    let mut c1 = call(cc_body(true), "req_1", "end_turn");
+    c1.ua_out = "claude-cli/2.1.305 (external, cli)".into();
+    c1.started_at = base;
+    t.ingest(c1);
+    let ide = |st: &State| -> Vec<(String, Value)> {
+        st.pending[&key()]
+            .events
+            .iter()
+            .filter(|(_, e)| {
+                ev_name(e) == "tengu_feature_ok" && meta_of(e)["feature_name"] == "ide_detect"
+            })
+            .map(|(_, e)| (ev_ts(e).to_string(), meta_of(e)))
+            .collect()
+    };
+    assert!(ide(&t.0.state.lock()).is_empty(), "首条请求时进程还没起满 30 秒");
+    for (i, secs) in [40u64, 80].iter().enumerate() {
+        let mut c = call(cc_body(true), &format!("req_{}", i + 2), "end_turn");
+        c.ua_out = "claude-cli/2.1.305 (external, cli)".into();
+        c.started_at = base + Duration::from_secs(*secs);
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let got = ide(&st);
+    assert_eq!(got.len(), 1, "一个进程一条：{got:?}");
+    assert_eq!(
+        (&got[0].1["found"], &got[0].1["feature_name"]),
+        (&json!(false), &json!("ide_detect"))
+    );
+    let at: DateTime<Utc> = got[0].0.parse().unwrap();
+    let base_dt: DateTime<Utc> = base.into();
+    let off = (at - base_dt).num_milliseconds();
+    // 进程起点在首条请求前 6.3s，探测在起点后 30.45 ~ 30.85s。
+    assert!((24_100..=24_600).contains(&off), "offset {off}ms");
+    drop(st);
+
+    // 起满 30 秒之后没再发请求就退出的：退出那串前面补一条。
+    let t2 = Telemetry::default();
+    let mut only = call(cc_body(true), "req_only", "end_turn");
+    only.ua_out = "claude-cli/2.1.305 (external, cli)".into();
+    only.started_at = frozen_now() - Duration::from_secs(60);
+    t2.ingest(only);
+    let later = Instant::now() + Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS + 1);
+    t2.gc(later);
+    let due = t2.take_due(later);
+    let names: Vec<&str> = due
+        .iter()
+        .flat_map(|f| f.events.iter())
+        .map(|e| {
+            if ev_name(e) == "tengu_feature_ok" && meta_of(e)["feature_name"] == "ide_detect" {
+                "ide"
+            } else {
+                ev_name(e)
+            }
+        })
+        .collect();
+    let i = names.iter().position(|n| *n == "ide").expect("退出时补上");
+    assert_eq!(names.iter().filter(|n| **n == "ide").count(), 1);
+    assert!(i < names.iter().rposition(|n| *n == "tengu_paste_text").unwrap(), "在退出那串前面");
+}
+
+/// `/compact` 收尾：恢复文件之后重宣告两个池子（`messagesLength` 是保留的消息数），`compact_reactive` 之后、逐出提示
+/// 之前一条 `reactive_compact_succeeded`（键序照官方：分组与保留、token、用量、上下文统计、百分比）；压缩完主线程的
+/// 读状态清空，再读不算重读。
+#[test]
+fn compact_reports_success_with_the_context_breakdown() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    first.ua_out = ua.into();
+    first.started_at = base;
+    first.input_tokens = 100;
+    first.cache_read_tokens = 5_000;
+    first.cache_creation_tokens = 0;
+    first.output_tokens = 50;
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"] = json!([
+        {"role":"user","content":[{"type":"text","text":"hello there"}]},
+        {"role":"system","content":"<total_tokens>1 tokens left</total_tokens>"},
+        {"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"s"},{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/p/a.md"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","content":"1\t# a\n2\t"},{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]},
+        {"role":"system","content":"<total_tokens>0 tokens left</total_tokens>"}
+    ]);
+    let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+    c.ua_out = ua.into();
+    c.started_at = base + Duration::from_secs(30);
+    c.input_tokens = 20;
+    c.cache_read_tokens = 5_100;
+    c.cache_creation_tokens = 30;
+    c.output_tokens = 400;
+    c.text_chars = 1_600;
+    c.agent =
+        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("compaction".into()) };
+    // 压缩前账本里已有各轮宣告过的附件：这一条的统计照用，压完之后旧附件都不在上下文里了，账本清空。
+    t.0.state
+        .lock()
+        .sessions
+        .get_mut(&key())
+        .unwrap()
+        .attachment_counts
+        .push(("plan_mode".into(), 2));
+    t.ingest(c);
+    // 压完之后账本换成上下文里还在的：保留那组的 `<total_tokens>`，加上放回去的清单、MCP 说明、环境与模型；
+    // 压缩前各轮宣告过、已经被摘要掉的（种进去的 plan_mode）不在了。
+    let after = t.0.state.lock().sessions[&key()].attachment_counts.clone();
+    let has = |k: &str| after.iter().find(|(x, _)| x == k).map(|(_, n)| *n);
+    assert_eq!(has("total_tokens_reminder"), Some(1), "{after:?}");
+    for k in
+        ["agent_listing_delta", "skill_listing", "mcp_instructions_delta", "environment", "model"]
+    {
+        assert_eq!(has(k), Some(1), "{k}: {after:?}");
+    }
+    assert_eq!(has("plan_mode"), None, "{after:?}");
+    let succeeded = t.0.state.lock().pending[&key()]
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    assert_eq!(succeeded["attachment_plan_mode_count"], 2);
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let names: Vec<String> = p
+        .events
+        .iter()
+        .map(|(_, e)| match ev_name(e) {
+            "tengu_feature_ok" => format!("ok:{}", meta_of(e)["feature_name"].as_str().unwrap()),
+            n => n.to_string(),
+        })
+        .collect();
+    let i = names.iter().position(|n| n == "ok:compact_reactive").expect("压缩收尾");
+    assert_eq!(names[i + 1], "tengu_reactive_compact_succeeded");
+    assert_eq!(names[i + 2], "tengu_cache_eviction_hint");
+    let j = names.iter().position(|n| n == "tengu_mcp_instructions_pool_change").unwrap();
+    assert!(j < i, "池子重宣告在压缩收尾之前");
+    // 首轮模板里也有一条（messagesLength 0），压缩那条在后面。
+    let pool = p
+        .events
+        .iter()
+        .rev()
+        .find(|(_, e)| ev_name(e) == "tengu_mcp_instructions_pool_change")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    assert_eq!(pool["messagesLength"], 3);
+    assert_eq!(pool["attachmentCount"], 0);
+    let deferred = p
+        .events
+        .iter()
+        .rev()
+        .find(|(_, e)| ev_name(e) == "tengu_deferred_tools_pool_change")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    assert_eq!(
+        (&deferred["callSite"], &deferred["querySource"]),
+        (&json!("reactive_compact"), &json!("unknown"))
+    );
+    let m = p
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let head: Vec<&str> = keys.iter().copied().take_while(|k| *k != "total_tokens").collect();
+    assert_eq!(
+        head,
+        [
+            "renderer_mode",
+            "subscription_type",
+            "cc_prompt_id",
+            "effort_level",
+            "attempts",
+            "groupsPreserved",
+            "totalGroups",
+            "splitKind",
+            "headTruncations",
+            "preservedUuidCount",
+            "preservedMessageCount",
+            "keptThinkingBlockCount",
+            "keptThinkingStripped",
+            "keptThinkingStripDecidedBy",
+            "forkAssistantMessageCount",
+            "summaryPromptArm",
+            "trigger",
+            "preCompactTokens",
+            "postCompactTokens",
+            "restoredAttachmentCount",
+            "durationMs",
+            "userWaitMs",
+            "precomputed",
+            "manualPrecomputeReuse",
+            "compactionInputTokens",
+            "compactionOutputTokens",
+            "compactionCacheReadTokens",
+            "compactionCacheCreationTokens",
+            "compactionTotalTokens",
+            "cacheHitRate",
+            "cacheCold"
+        ]
+    );
+    assert_eq!(m["trigger"], "manual");
+    assert_eq!(m["effort_level"], "high");
+    assert_eq!((&m["preservedMessageCount"], &m["keptThinkingBlockCount"]), (&json!(3), &json!(1)));
+    // 上一条主线程 100 + 5000 + 50 = 5150，加最后一条 assistant 之后那两条的估算。
+    assert_eq!(m["preCompactTokens"], json!(5150 + 2 + 11));
+    assert_eq!(m["compactionTotalTokens"], json!(20 + 5_100 + 30 + 400));
+    assert!(m["tool_request_Read_tokens"].as_u64().unwrap() > 0);
+    assert!(m["tool_result_Read_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(m["attachment_total_tokens_reminder_count"], 1, "首轮宣告过的附件按类计数");
+    assert_eq!(m["duplicate_read_file_count"], 0);
+    assert_eq!(m["restoredAttachmentCount"], 6, "没有读过的文件：只有固定那 6 条附件");
+    assert!(keys.last().unwrap().ends_with("_percent"));
+    assert_eq!(
+        m["human_message_percent"].as_u64().unwrap()
+            + m["assistant_message_percent"].as_u64().unwrap()
+            + m["tool_request_percent"].as_u64().unwrap()
+            + m["tool_result_percent"].as_u64().unwrap()
+            + ((m["other_tokens"].as_f64().unwrap() / m["total_tokens"].as_f64().unwrap()) * 100.0)
+                .round() as u64
+            + m["local_command_output_percent"].as_u64().unwrap(),
+        100,
+        "{m}"
+    );
+}
+
+/// 会话活动心跳（`tengu_cache_heartbeat_shadow`）：号的 `tengu_dapper_dawn` 开着、出站 ≥ 2.1.305 才报。
+/// 首轮：开工压着，头一条主循环请求带 `interactive` 并补上开工，收尾停手；闲置到期退出时先报敲 `/exit` 的
+/// `user_input`，再紧跟逐出提示报 `session_end`。
+#[test]
+fn cache_heartbeat_follows_the_account_flag() {
+    let heartbeats_with = |cred: i64, flag: bool, ua: &str, with_id: bool| {
+        let eval = json!({"tengu_dapper_dawn": {"value": flag}});
+        crate::proxy::dapper_dawn::note_eval(cred, eval.as_object().unwrap());
+        let t = Telemetry::default();
+        let mut c = call(cc_body(true), "req_hb", "end_turn");
+        c.cred_id = cred;
+        c.ua_out = ua.into();
+        if !with_id {
+            c.request_id = None;
+        }
+        c.started_at = frozen_now() - Duration::from_secs(60);
+        t.ingest(c);
+        let now = Instant::now();
+        t.gc(now + Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS + 1));
+        let due = t.take_due(now + Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS + 1));
+        due.iter()
+            .flat_map(|f| f.events.iter())
+            .filter(|e| {
+                ev_name(e) == "tengu_cache_heartbeat_shadow"
+                    || ev_name(e) == "tengu_cache_eviction_hint"
+            })
+            .map(|e| (ev_name(e).to_string(), meta_of(e)))
+            .collect::<Vec<_>>()
+    };
+    let heartbeats = |cred: i64, flag: bool, ua: &str| heartbeats_with(cred, flag, ua, true);
+    let got = heartbeats(9_305, true, "claude-cli/2.1.305 (external, cli)");
+    let kinds: Vec<String> = got
+        .iter()
+        .map(|(n, m)| match n.as_str() {
+            "tengu_cache_eviction_hint" => "hint".to_string(),
+            _ => format!(
+                "{}{}",
+                m["kind"].as_str().unwrap(),
+                m.get("work").map_or(String::new(), |w| format!(":{}", w.as_str().unwrap()))
+            ),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "main_request",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            "user_input",
+            "hint",
+            "session_end"
+        ]
+    );
+    assert_eq!(got[0].1["interactive"], true);
+    assert_eq!(got[0].1["requestId"], "req_hb");
+    assert!(got[1].1.get("interactive").is_none());
+    assert_eq!(got[5].1["requestId"], "req_hb");
+
+    let off = heartbeats(9_306, false, "claude-cli/2.1.305 (external, cli)");
+    assert!(off.iter().all(|(n, _)| n != "tengu_cache_heartbeat_shadow"), "开关关着不报");
+    let old = heartbeats(9_307, true, "claude-cli/2.1.300 (external, cli)");
+    assert!(old.iter().all(|(n, _)| n != "tengu_cache_heartbeat_shadow"), "301 之前按没有算");
+    // 301 / 303 的客户端已经整套接好，号的开关开着就报（303 抓包没有只是那天开关是关的）。
+    for (cred, ua) in [
+        (9_319, "claude-cli/2.1.301 (external, cli)"),
+        (9_320, "claude-cli/2.1.303 (external, cli)"),
+    ] {
+        let got = heartbeats(cred, true, ua);
+        assert!(got.iter().any(|(n, _)| n == "tengu_cache_heartbeat_shadow"), "{ua}: {got:?}");
+    }
+    // 主循环请求没有 request-id：官方 `tEt` 直接返回，这条不报，时刻也不记，之后一直开不了口。
+    let no_id = heartbeats_with(9_308, true, "claude-cli/2.1.305 (external, cli)", false);
+    assert!(no_id.iter().all(|(n, _)| n != "tengu_cache_heartbeat_shadow"), "{no_id:?}");
+}
+
+/// 心跳测试用：号开关、2.1.305 的 UA、按秒排时刻，并把队列里的心跳取成 `(kind[:work], cc_prompt_id)`。
+fn heartbeat_calls(cred: i64) -> impl Fn(&mut ApiCall, u64, u64, u64) {
+    let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
+    crate::proxy::dapper_dawn::note_eval(cred, eval.as_object().unwrap());
+    let base = frozen_now() - Duration::from_secs(120);
+    move |c: &mut ApiCall, start_secs: u64, ttft_ms: u64, total_ms: u64| {
+        c.cred_id = cred;
+        c.ua_out = "claude-cli/2.1.305 (external, cli)".into();
+        c.started_at = base + Duration::from_secs(start_secs);
+        c.ttft_ms = Some(ttft_ms);
+        c.total_ms = total_ms;
+    }
+}
+
+fn heartbeats_of(t: &Telemetry, cred: i64) -> Vec<(String, String)> {
+    let st = t.0.state.lock();
+    let Some(p) = st.pending.get(&(cred, SESSION.to_string())) else { return Vec::new() };
+    let mut got: Vec<(DateTime<Utc>, String, String)> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_cache_heartbeat_shadow")
+        .map(|(dt, e)| {
+            let m = meta_of(e);
+            let kind = format!(
+                "{}{}",
+                m["kind"].as_str().unwrap(),
+                m.get("work").map_or(String::new(), |w| format!(":{}", w.as_str().unwrap()))
+            );
+            (*dt, kind, m["cc_prompt_id"].as_str().unwrap_or("").to_string())
+        })
+        .collect();
+    got.sort_by_key(|(dt, _, _)| *dt);
+    got.into_iter().map(|(_, k, p)| (k, p)).collect()
+}
+
+/// 把主线程请求体换成另一轮的 prompt id。
+fn with_prompt(body: Vec<u8>, prompt_id: &str) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&body).unwrap();
+    v["system"][0]["text"] = json!(format!(
+        "x-anthropic-billing-header: cc_version=2.1.305.abc; cc_entrypoint=cli; cch=0f7f8; cc_prompt_id={prompt_id};"
+    ));
+    v.to_string().into_bytes()
+}
+
+const PROMPT_1: &str = "6c079143-0c53-4c48-817d-105460b3f622";
+const PROMPT_2: &str = "16d7a19d-7939-4638-9703-b31d2fc92661";
+const PROMPT_3: &str = "7f5dfb62-1111-4222-8333-944455556666";
+
+/// 提交前敲字那条 `user_input` 挂上一轮 prompt（客户端那时还没换），提交后的 `work_start` 才是这一轮的
+/// （`cap/auto-2.1.305-20261021-full` B1：.139 的 `user_input` 是 82f0dc87，.142 的 `work_start` 才是 227ea7bd）。
+#[test]
+fn cache_heartbeat_user_input_before_submit_keeps_the_previous_prompt() {
+    let cred = 9_311;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let mut second = call(with_prompt(cc_body(true), PROMPT_2), "req_2", "end_turn");
+    at(&mut second, 30, 1_000, 3_000);
+    t.ingest(second);
+    let got = heartbeats_of(&t, cred);
+    let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "main_request",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            "user_input",
+            "work_start:turn_running",
+            "main_request",
+            "work_end:turn_running"
+        ]
+    );
+    assert_eq!(got[3], ("user_input".to_string(), PROMPT_1.to_string()), "敲字时还是上一轮");
+    assert_eq!(got[4].1, PROMPT_2, "提交后的开工才换");
+    assert_eq!(got[5].1, PROMPT_2);
+}
+
+/// `/clear`：敲命令那下的 `user_input` 还挂旧会话与它最后一轮的 prompt；清场那一刻的逐出提示、
+/// `conversation_clear` 心跳与 `shell_set_cwd` 是旧会话 id、parent 指向自己、`/clear` 自己的 prompt；
+/// `session_start` 起才换新会话，且不带 `cc_prompt_id`（`cap/auto-2.1.306-20261021-full/00485`）。
+#[test]
+fn clear_keeps_the_old_session_until_session_start() {
+    let cred = 9_313;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let s2 = "22222222-2222-4222-8222-222222222222";
+    let mut probe = quota_probe_call("11111111-1111-4111-8111-111111111111", SystemTime::now());
+    at(&mut probe, 0, 300, 400);
+    t.ingest(probe);
+    let mut first = main_call(SESSION, "req_1", "msg_1", SystemTime::now());
+    first.body = Bytes::from(with_prompt(first.body.to_vec(), PROMPT_1));
+    at(&mut first, 5, 1_000, 3_000);
+    t.ingest(first);
+    let mut second = main_call(s2, "req_2", "msg_2", SystemTime::now());
+    second.body = Bytes::from(with_prompt(second.body.to_vec(), PROMPT_2));
+    at(&mut second, 60, 1_000, 3_000);
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<Value> =
+        st.pending[&(cred, s2.to_string())].events.iter().map(|(_, e)| e.clone()).collect();
+    let find = |name: &str, kind: Option<&str>| {
+        ev.iter()
+            .find(|e| ev_name(e) == name && kind.is_none_or(|k| meta_of(e)["kind"] == k))
+            .unwrap_or_else(|| panic!("{name} {kind:?}"))
+    };
+    let typed = find("tengu_cache_heartbeat_shadow", Some("user_input"));
+    assert_eq!(typed["event_data"]["session_id"], SESSION);
+    assert!(typed["event_data"].get("parent_session_id").is_none(), "{typed}");
+    assert_eq!(meta_of(typed)["cc_prompt_id"], PROMPT_1, "敲 /clear 时还是旧会话最后一轮");
+    let clear_prompt = meta_of(find("tengu_cache_eviction_hint", None))["cc_prompt_id"].clone();
+    assert!(clear_prompt.as_str().is_some_and(|p| !p.is_empty() && p != PROMPT_1 && p != PROMPT_2));
+    for (name, kind) in [
+        ("tengu_cache_eviction_hint", None),
+        ("tengu_cache_heartbeat_shadow", Some("conversation_clear")),
+        ("tengu_shell_set_cwd", None),
+    ] {
+        let e = find(name, kind);
+        assert_eq!(e["event_data"]["session_id"], SESSION, "{name}");
+        assert_eq!(e["event_data"]["parent_session_id"], SESSION, "{name}");
+        assert_eq!(meta_of(e)["cc_prompt_id"], clear_prompt, "{name}");
+    }
+    for name in ["tengu_session_start", "tengu_input_command"] {
+        let e = find(name, None);
+        assert_eq!(e["event_data"]["session_id"], s2, "{name}");
+        assert!(meta_of(e).get("cc_prompt_id").is_none(), "{name}: 下一次提交前没有 prompt");
+    }
+    assert_eq!(meta_of(find("tengu_input_prompt", None))["cc_prompt_id"], PROMPT_2);
+}
+
+/// 后台子代理：派出那一刻由拉起它的那条主线程请求登记 `subagent_running`（子代理首条落地时主线程续轮已经
+/// 完成，晚登记会被当过时丢掉）；续轮出字切回 `turn_running`，流收尾又切回 `subagent_running`，一轮结束
+/// 先切回 `turn_running` 再停手（`cap/auto-2.1.305-20261021-full` A8a / A8b / A19 三处同序）。子代理跑完
+/// 之后的一轮不再有这一下。
+#[test]
+fn cache_heartbeat_follows_a_background_subagent() {
+    let cred = 9_312;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    // 第二轮：回复里调 `Agent`。
+    let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "tool_use");
+    at(&mut spawn, 30, 1_800, 6_000);
+    spawn.tool_calls =
+        vec![ToolCall { id: "t1".into(), name: "Agent".into(), input: json!({}), verdict: None }];
+    spawn.tool_use_lens = vec![("Agent".into(), 80)];
+    t.ingest(spawn);
+    // 主线程续轮（子代理在后台跑，工具结果立刻回来）先于子代理首条落地。
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{}}]});
+    let mut cont =
+        call(with_prompt(body.to_string().into_bytes(), PROMPT_2), "req_cont", "end_turn");
+    at(&mut cont, 36, 1_000, 2_000);
+    t.ingest(cont);
+    let agent = AgentHeaders {
+        agent_id: Some("a1".into()),
+        agent_type: Some("Explore".into()),
+        request_class: Some("subagent".into()),
+    };
+    let mut s1 = call(with_prompt(cc_body(true), PROMPT_2), "req_s1", "tool_use");
+    at(&mut s1, 30, 800, 9_000);
+    s1.agent = agent.clone();
+    s1.tool_calls =
+        vec![ToolCall { id: "t2".into(), name: "Read".into(), input: json!({}), verdict: None }];
+    t.ingest(s1);
+    let mut s2 = call(with_prompt(cc_body(false), PROMPT_2), "req_s2", "end_turn");
+    at(&mut s2, 40, 800, 2_000);
+    s2.agent = agent;
+    t.ingest(s2);
+    // 第三轮：子代理已经跑完，一轮结束直接停手。
+    let mut third = call(with_prompt(cc_body(true), PROMPT_3), "req_3", "end_turn");
+    at(&mut third, 60, 1_000, 3_000);
+    t.ingest(third);
+    let got = heartbeats_of(&t, cred);
+    let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "main_request",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            // 第二轮
+            "user_input",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            "work_start:subagent_running",
+            "main_request",
+            // 续轮：出字切回，收尾切走，一轮结束切回再停手
+            "work_end:subagent_running",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            "work_start:subagent_running",
+            "main_request",
+            "work_end:subagent_running",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            // 第三轮
+            "user_input",
+            "work_start:turn_running",
+            "main_request",
+            "work_end:turn_running",
+        ]
+    );
+}
+
+/// 一条回复并行派两个 Agent：工具长度表按名字聚合只有一项，计数要按实际调用。头一个跑完、另一个还在跑，
+/// 主线程续轮照样有 `subagent_running` 来回切。
+#[test]
+fn cache_heartbeat_counts_parallel_agents_by_call() {
+    let cred = 9_314;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let agent_call = |id: &str| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input: json!({}),
+        verdict: None,
+    };
+    let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "tool_use");
+    at(&mut spawn, 30, 1_800, 6_000);
+    spawn.tool_calls = vec![agent_call("t1"), agent_call("t2")];
+    spawn.tool_use_lens = vec![("Agent".into(), 160)];
+    t.ingest(spawn);
+    // 头一个子代理跑完。
+    let mut s1 = call(with_prompt(cc_body(true), PROMPT_2), "req_s1", "end_turn");
+    at(&mut s1, 37, 800, 2_000);
+    s1.agent = AgentHeaders {
+        agent_id: Some("a1".into()),
+        agent_type: Some("Explore".into()),
+        request_class: Some("subagent".into()),
+    };
+    t.ingest(s1);
+    // 另一个还在跑时主线程续轮回来。
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{}}]});
+    let mut cont =
+        call(with_prompt(body.to_string().into_bytes(), PROMPT_2), "req_cont", "end_turn");
+    at(&mut cont, 40, 1_000, 2_000);
+    t.ingest(cont);
+    let got = heartbeats_of(&t, cred);
+    let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+    let from = kinds.iter().rposition(|k| *k == "main_request").unwrap();
+    assert_eq!(
+        kinds[from - 4..].to_vec(),
+        [
+            "work_end:subagent_running",
+            "work_start:turn_running",
+            "work_end:turn_running",
+            "work_start:subagent_running",
+            "main_request",
+            "work_end:subagent_running",
+            "work_start:turn_running",
+            "work_end:turn_running"
+        ],
+        "{kinds:?}"
+    );
+}
+
+/// 嵌套代理：主线程派父代理、父代理再派孙代理，孙代理先跑完不扣主线程那份——父代理还在跑，主线程续轮
+/// 照样有 `subagent_running` 来回切；父代理跑完之后的续轮就没有了。父子关系请求头里没有，按首条用户消息里
+/// 那段 `prompt` 认（对上主线程派的那份才算）。
+#[test]
+fn cache_heartbeat_ignores_grandchild_agents() {
+    let cred = 9_315;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let agent_call = |id: &str, prompt: &str| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input: json!({ "prompt": prompt }),
+        verdict: None,
+    };
+    // 子代理首条：首条用户消息是 system-reminder + 派它的 prompt，客户端常在末尾补一个换行
+    // （`cap/auto-2.1.305-20261021-full` 六个子代理里五个）。
+    let agent_body = |prompt: &str| {
+        let mut v: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_2)).unwrap();
+        v["messages"] = json!([{"role":"user","content":[
+            {"type":"text","text":"<system-reminder>ctx</system-reminder>"},
+            {"type":"text","text":format!("{prompt}\n")}
+        ]}]);
+        v.to_string().into_bytes()
+    };
+    let headers = |id: &str| AgentHeaders {
+        agent_id: Some(id.into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some("subagent".into()),
+    };
+    let continuation = |rid: &str| {
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{}}]});
+        call(with_prompt(body.to_string().into_bytes(), PROMPT_2), rid, "tool_use")
+    };
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "tool_use");
+    at(&mut spawn, 30, 1_800, 6_000);
+    spawn.tool_calls = vec![agent_call("t1", "parent task")];
+    spawn.tool_use_lens = vec![("Agent".into(), 80)];
+    t.ingest(spawn);
+    // 父代理首条：再派一个孙代理。
+    let mut p1 = call(agent_body("parent task"), "req_p1", "tool_use");
+    at(&mut p1, 37, 800, 1_000);
+    p1.agent = headers("parent");
+    p1.tool_calls = vec![agent_call("t9", "grandchild task")];
+    p1.tool_use_lens = vec![("Agent".into(), 80)];
+    t.ingest(p1);
+    // 孙代理一条就跑完。
+    let mut g1 = call(agent_body("grandchild task"), "req_g1", "end_turn");
+    at(&mut g1, 39, 800, 1_000);
+    g1.agent = headers("grandchild");
+    t.ingest(g1);
+    // 父代理还在跑：主线程续轮照样切。
+    let mut c1 = continuation("req_c1");
+    at(&mut c1, 41, 1_000, 2_000);
+    t.ingest(c1);
+    let kinds = |t: &Telemetry| -> Vec<String> {
+        heartbeats_of(t, cred).into_iter().map(|(k, _)| k).collect()
+    };
+    let got = kinds(&t);
+    let from = got.iter().rposition(|k| k == "main_request").unwrap();
+    assert_eq!(
+        got[from - 2..from + 1].to_vec(),
+        ["work_end:turn_running", "work_start:subagent_running", "main_request"],
+        "孙代理跑完不该把父代理那份扣掉：{got:?}"
+    );
+    // 父代理跑完，再来一条续轮就不切了。
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t9","name":"Agent","input":{}}]});
+    let mut p2 = call(with_prompt(body.to_string().into_bytes(), PROMPT_2), "req_p2", "end_turn");
+    at(&mut p2, 44, 800, 1_000);
+    p2.agent = headers("parent");
+    t.ingest(p2);
+    let mut c2 = continuation("req_c2");
+    at(&mut c2, 46, 1_000, 2_000);
+    t.ingest(c2);
+    let got = kinds(&t);
+    let from = got.iter().rposition(|k| k == "main_request").unwrap();
+    assert_eq!(
+        got[from - 2..from + 1].to_vec(),
+        ["work_end:subagent_running", "work_start:turn_running", "main_request"],
+        "父代理跑完之后不再有委派的活：{got:?}"
+    );
+}
+
+/// 上一轮的后台代理晚到：它的 `prompt` 与这一轮派的对不上，不能占掉这一轮那份。它跑完之后，这一轮派的
+/// 还在跑，主线程续轮照样切 `subagent_running`。
+#[test]
+fn cache_heartbeat_a_late_agent_from_an_earlier_turn_does_not_claim() {
+    let cred = 9_316;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let agent_call = |prompt: &str| ToolCall {
+        id: "t1".into(),
+        name: "Agent".into(),
+        input: json!({ "prompt": prompt }),
+        verdict: None,
+    };
+    let agent_body = |prompt: &str| {
+        let mut v: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_3)).unwrap();
+        v["messages"] = json!([{"role":"user","content":[
+            {"type":"text","text":"<system-reminder>ctx</system-reminder>"},
+            {"type":"text","text":prompt}
+        ]}]);
+        v.to_string().into_bytes()
+    };
+    let headers = |id: &str| AgentHeaders {
+        agent_id: Some(id.into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some("subagent".into()),
+    };
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    // 第二轮派出 A，A 的首条迟迟不回。
+    let mut spawn_a = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn_a", "tool_use");
+    at(&mut spawn_a, 20, 1_000, 2_000);
+    spawn_a.tool_calls = vec![agent_call("old A task")];
+    t.ingest(spawn_a);
+    // 第三轮派出 B。
+    let mut spawn_b = call(with_prompt(cc_body(true), PROMPT_3), "req_spawn_b", "tool_use");
+    at(&mut spawn_b, 40, 1_000, 2_000);
+    spawn_b.tool_calls = vec![agent_call("new B task")];
+    t.ingest(spawn_b);
+    // A 晚到、一条就跑完。
+    let mut a1 = call(agent_body("old A task"), "req_a1", "end_turn");
+    at(&mut a1, 21, 800, 22_000);
+    a1.agent = headers("a");
+    t.ingest(a1);
+    // B 还没露面，主线程续轮：照样切。
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{}}]});
+    let mut cont =
+        call(with_prompt(body.to_string().into_bytes(), PROMPT_3), "req_cont", "end_turn");
+    at(&mut cont, 45, 1_000, 2_000);
+    t.ingest(cont);
+    let got: Vec<String> = heartbeats_of(&t, cred).into_iter().map(|(k, _)| k).collect();
+    let from = got.iter().rposition(|k| k == "main_request").unwrap();
+    assert_eq!(
+        got[from - 2..from + 1].to_vec(),
+        ["work_end:turn_running", "work_start:subagent_running", "main_request"],
+        "{got:?}"
+    );
+}
+
+/// 上一轮的后台代理晚到，它带的是派它那一轮的 prompt：不能把会话的 prompt 拨回去——下一次提交前敲字那条
+/// `user_input` 挂的仍是刚结束那一轮。
+#[test]
+fn cache_heartbeat_a_late_agent_does_not_rewind_the_prompt() {
+    let cred = 9_317;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "end_turn");
+    at(&mut spawn, 20, 1_000, 2_000);
+    t.ingest(spawn);
+    let mut third = call(with_prompt(cc_body(true), PROMPT_3), "req_3", "end_turn");
+    at(&mut third, 40, 1_000, 2_000);
+    t.ingest(third);
+    // 第二轮派出的代理这时才落地，带着第二轮的 prompt。
+    let mut late = call(with_prompt(cc_body(true), PROMPT_2), "req_late", "end_turn");
+    at(&mut late, 21, 800, 25_000);
+    late.agent = AgentHeaders {
+        agent_id: Some("old".into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some("subagent".into()),
+    };
+    t.ingest(late);
+    // 那个子代理里的 WebFetch 页面处理（没有工具、`auxiliary`、带它的 agent-id）也晚到，同样带第二轮的 prompt。
+    let mut v: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_2)).unwrap();
+    v["tools"] = json!([]);
+    let mut fetch = call(v.to_string().into_bytes(), "req_fetch", "end_turn");
+    at(&mut fetch, 22, 800, 26_000);
+    fetch.agent = AgentHeaders {
+        agent_id: Some("old".into()),
+        agent_type: None,
+        request_class: Some("auxiliary".into()),
+    };
+    t.ingest(fetch);
+    let fourth_prompt = "a1b2c3d4-0000-4000-8000-000000000004";
+    let mut fourth = call(with_prompt(cc_body(true), fourth_prompt), "req_4", "end_turn");
+    at(&mut fourth, 60, 1_000, 2_000);
+    t.ingest(fourth);
+    let got = heartbeats_of(&t, cred);
+    let last_input = got.iter().rposition(|(k, _)| k == "user_input").unwrap();
+    assert_eq!(got[last_input].1, PROMPT_3, "{got:?}");
+    assert_eq!(got[last_input + 1], ("work_start:turn_running".to_string(), fourth_prompt.into()));
+}
+
+/// 进度摘要比子代理首条先落地（它也会给这条支线建档）：子代理首条照样认领派遣，跑完之后主线程续轮不再切
+/// `subagent_running`。
+#[test]
+fn cache_heartbeat_claims_even_when_a_summary_lands_first() {
+    let cred = 9_318;
+    let at = heartbeat_calls(cred);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "tool_use");
+    at(&mut spawn, 30, 1_000, 2_000);
+    spawn.tool_calls = vec![ToolCall {
+        id: "t1".into(),
+        name: "Agent".into(),
+        input: json!({ "prompt": "do the task" }),
+        verdict: None,
+    }];
+    spawn.tool_use_lens = vec![("Agent".into(), 80)];
+    t.ingest(spawn);
+    let headers = |class: &str| AgentHeaders {
+        agent_id: Some("a1".into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some(class.into()),
+    };
+    let mut summary = call(with_prompt(cc_body(true), PROMPT_2), "req_sum", "end_turn");
+    at(&mut summary, 33, 500, 800);
+    summary.agent = headers("auxiliary");
+    t.ingest(summary);
+    let mut v: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_2)).unwrap();
+    v["messages"] = json!([{"role":"user","content":[
+        {"type":"text","text":"<system-reminder>ctx</system-reminder>"},
+        {"type":"text","text":"do the task\n"}
+    ]}]);
+    let mut s1 = call(v.to_string().into_bytes(), "req_s1", "end_turn");
+    at(&mut s1, 32, 800, 4_000);
+    s1.agent = headers("subagent");
+    t.ingest(s1);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Agent","input":{}}]});
+    let mut cont =
+        call(with_prompt(body.to_string().into_bytes(), PROMPT_2), "req_cont", "end_turn");
+    at(&mut cont, 40, 1_000, 2_000);
+    t.ingest(cont);
+    let got: Vec<String> = heartbeats_of(&t, cred).into_iter().map(|(k, _)| k).collect();
+    let from = got.iter().rposition(|k| k == "main_request").unwrap();
+    assert_eq!(
+        got[from - 2..].to_vec(),
+        [
+            "work_end:subagent_running",
+            "work_start:turn_running",
+            "main_request",
+            "work_end:turn_running"
+        ],
+        "子代理跑完、派遣已认领：{got:?}"
+    );
+}
+
+/// `/compact` 被取消或失败：敲字与转入 `compacting` 照样报，收尾后切出来回到闲着，不报 `compaction`、不清场；
+/// 成功才报 `compaction`。
+#[test]
+fn cache_heartbeat_reports_a_cancelled_compaction() {
+    for (cred, outcome) in [(9_321, "aborted"), (9_322, "failed"), (9_323, "ok")] {
+        let at = heartbeat_calls(cred);
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        at(&mut first, 0, 1_000, 3_000);
+        t.ingest(first);
+        let mut body: Value =
+            serde_json::from_slice(&with_prompt(cc_body(false), PROMPT_2)).unwrap();
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"text","text":"ok"}]},
+            {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        at(&mut c, 30, 1_000, 20_000);
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        match outcome {
+            "aborted" => c.aborted = true,
+            "failed" => c = failed(c, Some(500), "api_error", "boom"),
+            _ => {}
+        }
+        t.ingest(c);
+        let got: Vec<String> = heartbeats_of(&t, cred).into_iter().map(|(k, _)| k).collect();
+        let tail: Vec<&str> = got[3..].iter().map(String::as_str).collect();
+        let want: &[&str] = if outcome == "ok" {
+            &["user_input", "work_start:compacting", "compaction"]
+        } else {
+            &["user_input", "work_start:compacting", "work_end:compacting"]
+        };
+        assert_eq!(tail, want, "{outcome}: {got:?}");
+    }
+}
+
+/// 上一轮的工具在权限弹框上被拒，代理在下一次输入里才看出来、补报那一段：弹框、拒绝、文件建议刷新、turn 与
+/// `turn_end{aborted_tools}` 都是上一轮的事，挂上一轮的 prompt；这次输入才是新的
+/// （`cap/auto-2.1.305-20261021-full` B1：.484 ~ .412 全是 1572cea5）。
+#[test]
+fn rejected_tool_events_keep_the_previous_prompt() {
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.305 (external, cli)";
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    first.started_at = base;
+    first.tool_calls = vec![ToolCall {
+        id: "t1".into(),
+        name: "Bash".into(),
+        input: json!({"command": "ls"}),
+        verdict: None,
+    }];
+    first.tool_use_lens = vec![("Bash".into(), 16)];
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_2)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]});
+    body["messages"][2] = json!({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."},
+        {"type":"text","text":"[Request interrupted by user for tool use]\n"},
+        {"type":"text","text":"do something else"}
+    ]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = ua.into();
+    second.started_at = base + Duration::from_secs(30);
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let p = &st.pending[&key()];
+    let pid = |name: &str, pick: &dyn Fn(&Value) -> bool| -> Vec<String> {
+        p.events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == name)
+            .map(|(_, e)| meta_of(e))
+            .filter(|m| pick(m))
+            .map(|m| m["cc_prompt_id"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    let all = |_: &Value| true;
+    for name in [
+        "tengu_tool_use_rejected_in_prompt",
+        "tengu_tool_use_can_use_tool_rejected",
+        "tengu_permission_request_escape",
+    ] {
+        assert_eq!(pid(name, &all), [PROMPT_1], "{name}");
+    }
+    assert_eq!(pid("tengu_unary_event", &all), [PROMPT_1, PROMPT_1], "弹框与拒绝两条");
+    assert_eq!(pid("tengu_turn_end", &|m| m["terminal_reason"] == "aborted_tools"), [PROMPT_1]);
+    let deny: Vec<&Value> =
+        p.dd.iter().filter(|d| d["feature_name"] == "permission_user_deny").collect();
+    assert_eq!(deny.len(), 1);
+    assert!(deny[0].to_string().contains(PROMPT_1), "Datadog 那份同样挂上一轮：{}", deny[0]);
+    assert_eq!(pid("tengu_input_prompt", &all).last().unwrap(), PROMPT_2, "这次输入是新的");
+}
+
+/// 号的开关会话中途换了值就跟着换：关了不报、状态机不动，再开又接着报（官方每次触发都重读
+/// `tengu_dapper_dawn`）。
+#[test]
+fn cache_heartbeat_follows_the_flag_as_it_changes() {
+    let cred = 9_313;
+    let at = heartbeat_calls(cred);
+    let set = |on: bool| {
+        let eval = json!({"tengu_dapper_dawn": {"value": on}});
+        crate::proxy::dapper_dawn::note_eval(cred, eval.as_object().unwrap());
+    };
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "end_turn");
+    at(&mut first, 0, 1_000, 3_000);
+    t.ingest(first);
+    let n1 = heartbeats_of(&t, cred).len();
+    assert_eq!(n1, 3);
+    set(false);
+    let mut second = call(with_prompt(cc_body(true), PROMPT_2), "req_2", "end_turn");
+    at(&mut second, 30, 1_000, 3_000);
+    t.ingest(second);
+    assert_eq!(heartbeats_of(&t, cred).len(), n1, "关了就不报");
+    set(true);
+    let mut third = call(with_prompt(cc_body(true), PROMPT_3), "req_3", "end_turn");
+    at(&mut third, 60, 1_000, 3_000);
+    t.ingest(third);
+    let got = heartbeats_of(&t, cred);
+    let kinds: Vec<&str> = got[n1..].iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["user_input", "work_start:turn_running", "main_request", "work_end:turn_running"],
+        "再开接着报"
+    );
+}
+
+/// 2.1.293 起退出走敲 `/exit`：提交、`cmd_exit`、分派命令，收尾之后是快照、更新检查与输入历史落盘，最后才是
+/// 逐出提示；Datadog 那批是 `prompt_submit` / `cmd_exit` / `cmd_dispatch` / `update_detection` / `history_save`，
+/// 不再有 `lsp_shutdown` / `swarm_session_cleanup`（`cap/auto-2.1.305-20261021-full` C2）。
+#[test]
+fn exit_goes_through_the_exit_command_from_2_1_293() {
+    let t = Telemetry::default();
+    let mut last = call(cc_body(true), "req_last", "end_turn");
+    last.ua_out = "claude-cli/2.1.305 (external, cli)".into();
+    last.started_at = frozen_now() - Duration::from_secs(60);
+    t.ingest(last);
+    let later = Instant::now() + Duration::from_secs(config::TELEMETRY_SESSION_IDLE_SECS + 1);
+    t.gc(later);
+    let due = t.take_due(later);
+    let f = &due[0];
+    let names: Vec<String> = f
+        .events
+        .iter()
+        .map(|e| match ev_name(e) {
+            "tengu_feature_ok" => format!("ok:{}", meta_of(e)["feature_name"].as_str().unwrap()),
+            n => n.to_string(),
+        })
+        .collect();
+    let from = names.iter().rposition(|n| n == "tengu_paste_text").unwrap();
+    assert_eq!(
+        names[from..]
+            .iter()
+            .map(String::as_str)
+            .filter(|n| *n != "ok:internal_metrics_export")
+            .collect::<Vec<_>>(),
+        [
+            "tengu_paste_text",
+            "ok:prompt_submit",
+            "ok:cmd_exit",
+            "ok:cmd_dispatch",
+            "tengu_input_command",
+            "tengu_resume_hint_printed",
+            "tengu_config_cache_stats",
+            "ok:lsp_shutdown",
+            "tengu_file_history_snapshot_success",
+            "ok:swarm_session_cleanup",
+            "ok:update_detection",
+            "ok:history_save",
+            "tengu_cache_eviction_hint",
+        ]
+    );
+    let dd: Vec<&str> = f.dd.iter().filter_map(|d| d["feature_name"].as_str()).collect();
+    // 官方这一批同样以指标导出那条收尾。
+    let tail = &dd[dd.len() - 6..];
+    assert_eq!(
+        tail,
+        [
+            "prompt_submit",
+            "cmd_exit",
+            "cmd_dispatch",
+            "update_detection",
+            "history_save",
+            "internal_metrics_export"
+        ]
+    );
+    assert!(!dd.contains(&"lsp_shutdown") && !dd.contains(&"swarm_session_cleanup"));
+    // 敲 `/exit` 是一次提交：`paste_text` / `prompt_submit` 还挂上一轮的 prompt，从 `cmd_exit` 起换新的，
+    // 一直到逐出提示与指标导出（`cap/auto-2.1.305-20261021-full` C2）。
+    let pid = |i: usize| meta_of(&f.events[i])["cc_prompt_id"].as_str().unwrap().to_string();
+    let at = |n: &str| names.iter().rposition(|x| x == n).unwrap();
+    let old_id = pid(at("ok:prompt_submit"));
+    assert_eq!(pid(at("tengu_paste_text")), old_id);
+    assert_eq!(old_id, "6c079143-0c53-4c48-817d-105460b3f622", "提交那两条是上一轮的");
+    let new_id = pid(at("ok:cmd_exit"));
+    assert_ne!(new_id, old_id);
+    for n in ["tengu_input_command", "tengu_cache_eviction_hint", "ok:internal_metrics_export"] {
+        assert_eq!(pid(at(n)), new_id, "{n}");
+    }
 }
 
 /// 会话闲置到期 = 客户端退出：补退出事件链，三路立刻到期一起发（`cap/2.1.260-1`）。
@@ -1608,6 +3367,7 @@ fn a_failed_call_reports_an_api_error_instead_of_a_success() {
         "rate_limit_error",
         "This request would exceed your organization's rate limit",
     ));
+    give_up_retries(&t);
     let st = t.0.state.lock();
     let p = st.pending.get(&key()).expect("入队");
     let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
@@ -1693,6 +3453,7 @@ fn a_capture_can_report_a_failure_without_a_response() {
         betas: Some("claude-code-20250219,oauth-2025-04-20".into()),
         session_header: None,
         client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
+        dispatch: None,
         agent: AgentHeaders::default(),
         organization_id: None,
         started_at: frozen_now() - Duration::from_secs(3),
@@ -1711,6 +3472,7 @@ fn a_capture_can_report_a_failure_without_a_response() {
             in_band: false,
         },
     );
+    give_up_retries(&t);
     let st = t.0.state.lock();
     let p = st.pending.get(&key()).expect("入队");
     let names: Vec<&str> = p.events.iter().map(|(_, e)| ev_name(e)).collect();
@@ -1758,6 +3520,7 @@ fn a_401_early_return_still_reports_an_auth_error() {
         betas: None,
         session_header: None,
         client_request_id: None,
+        dispatch: None,
         agent: AgentHeaders::default(),
         organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
         started_at: frozen_now() - Duration::from_secs(2),
@@ -1775,6 +3538,7 @@ fn a_401_early_return_still_reports_an_auth_error() {
             in_band: false,
         },
     );
+    give_up_retries(&t);
     let st = t.0.state.lock();
     let p = st.pending.get(&key()).unwrap();
     let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_error").unwrap();
@@ -1806,6 +3570,7 @@ fn an_in_band_stream_error_is_reported_as_in_band() {
         "overloaded_error",
         "Overloaded",
     ));
+    give_up_retries(&t);
     let st = t.0.state.lock();
     let p = st.pending.get(&key()).unwrap();
     let (_, e) = p.events.iter().find(|(_, e)| ev_name(e) == "tengu_api_error").unwrap();
@@ -2865,6 +4630,9 @@ fn dump_telemetry_replay() {
         return;
     };
     let calls: Vec<Value> = serde_json::from_slice(&std::fs::read(inp).unwrap()).unwrap();
+    // 抓包那个号 2.1.305 起开着会话活动心跳（`tengu_dapper_dawn` 是 force 的 true）。
+    let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
+    crate::proxy::dapper_dawn::note_eval(7, eval.as_object().unwrap());
     let t = Telemetry::default();
     let s = |c: &Value, k: &str| c[k].as_str().map(str::to_string);
     for c in &calls {
@@ -2897,6 +4665,7 @@ fn dump_telemetry_replay() {
         a.reply_input_chars = a.text_chars;
         a.thinking_chars = c["thinking_chars"].as_u64().unwrap_or(0) as usize;
         a.saw_thinking = c["saw_thinking"].as_bool().unwrap_or(false);
+        a.stream_events = c["stream_events"].as_u64().map(|n| n as u32);
         a.tool_use_lens = c["tool_use_lens"]
             .as_array()
             .unwrap()
@@ -3566,9 +5335,9 @@ fn version_2_1_293_telemetry_shape() {
 
     for ev in [&opus, &h55, &h45] {
         assert!(!has(ev, "tengu_ochre_wren-agnostic-intro"));
-        for n in ["tengu_org_config_gate_shadow", "tengu_frontmatter_shadow_unknown_key"] {
-            assert!(has(ev, n), "{n}");
-        }
+        assert!(has(ev, "tengu_org_config_gate_shadow"));
+        // 抓包那台机器上某个技能的 frontmatter 带了未知键才有，是环境不是版本，不报。
+        assert!(!has(ev, "tengu_frontmatter_shadow_unknown_key"));
         // 会话级 betas 里没有 `-clear-at`。
         for (n, _, b) in ev.iter() {
             if let Some(b) = b.as_str() {
@@ -4869,6 +6638,33 @@ fn version_2_1_300_telemetry_shape() {
     );
 }
 
+/// 2.1.305：`tengu_api_success` 在 `firstContentMs` 之后多 `streamEventCount`（除 ping 外的 SSE 事件数，
+/// `cap/auto-2.1.305-20261021-full` 165 条全有）；非流式不报；2.1.303 没有。
+#[test]
+fn version_2_1_305_telemetry_shape() {
+    let run = |ua: &str, events: Option<u32>| {
+        let t = Telemetry::default();
+        let mut c = call(cc_body(true), "req_1", "end_turn");
+        c.ua_out = ua.into();
+        c.stream_events = events;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let ok = run("claude-cli/2.1.305 (external, cli)", Some(17));
+    let k: Vec<String> = ok.as_object().unwrap().keys().cloned().collect();
+    let at = k.iter().position(|k| k == "firstContentMs").unwrap();
+    assert_eq!(k[at + 1], "streamEventCount", "{ok}");
+    assert_eq!(ok["streamEventCount"], 17);
+    assert!(run("claude-cli/2.1.305 (external, cli)", None).get("streamEventCount").is_none());
+    assert!(run("claude-cli/2.1.303 (external, cli)", Some(17)).get("streamEventCount").is_none());
+}
+
 /// 2.1.303 的遥测（`cap/auto-2.1.303-20261019-full`）：`tengu_init` 在 `mcpClientCount` 之后多
 /// `repoMcpAllowList` / `repoMcpDenyList` / `mcpConfigBlockedCount`，`tengu_tool_use_success` 在
 /// `messageID` 之后多 `toolUseID`；`-p` 模板多一条 `tengu_fork_subagent_enabled`。2.1.301 都没有。
@@ -4931,6 +6727,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.306 (external, cli)", "c19e7dcf6637", "chunk-z4fyjkxt.js:3654:6164"),
+        ("claude-cli/2.1.305 (external, cli)", "a4913bdffc8a", "chunk-h56h5ggw.js:3654:6164"),
         ("claude-cli/2.1.303 (external, cli)", "99830f66ede0", "chunk-jh3cvmqy.js:3614:6109"),
         ("claude-cli/2.1.299 (external, cli)", "1dada4b9379c", "chunk-4xx9trad.js:3588:6085"),
         ("claude-cli/2.1.293 (external, cli)", "2e671ed03fc0", "chunk-nwqfvmza.js:3493:5989"),
@@ -5416,4 +7214,470 @@ fn a_tool_less_main_thread_continue_is_filled_from_its_create() {
     assert_eq!(ok.len(), 2);
     assert_eq!(ok[1]["querySource"], "repl_main_thread", "{}", ok[1]);
     assert_eq!(ok[1]["systemCharLength"], ok[0]["systemCharLength"], "续轮按底本补回完整 system");
+}
+
+/// 空文件的 Read：结果整段是那句提醒（后面可能还追着别的提醒），剥完提醒后照样认得出空文件，
+/// `file_operation.contentHash` 报空串的 SHA-256。
+#[test]
+fn an_empty_file_read_keeps_its_content_hash() {
+    let warning =
+        "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>";
+    for result in [warning.to_string(), format!("{warning}\n<system-reminder>x</system-reminder>")]
+    {
+        let msg =
+            json!({"content": [{"type": "tool_result", "tool_use_id": "t1", "content": result}]});
+        let r = &tool_results_of(&msg)[0];
+        assert_eq!(super::files::read_content(&r.text).as_deref(), Some(""), "{result}");
+        assert_eq!(r.stripped_bytes, 0);
+        assert_eq!(r.len, 87, "长度按那句提醒算：{result}");
+    }
+}
+
+/// Bash 命令里提到的扩展名（官方 `hjr`）：小写、按 `\b` 收尾、去重后按字母序。
+#[test]
+fn bash_mentions_follow_the_official_pattern() {
+    use super::files::bash_mentioned_exts;
+    assert_eq!(bash_mentioned_exts("tail -5 README.md | cat > out.TXT && cat a.md"), ["md", "txt"]);
+    assert_eq!(
+        bash_mentioned_exts("open report.docx notes.doc deck.pptx"),
+        ["doc", "docx", "pptx"]
+    );
+    // `.mdx`、`.jsonl`、`.htm` 不算；`.json.bak` 的 json 后面是点，算。
+    assert_eq!(bash_mentioned_exts("cat a.mdx b.jsonl c.htm d.json.bak"), ["json"]);
+    assert!(bash_mentioned_exts("ls -la").is_empty());
+}
+
+/// `-p` 的一轮：新输入那条调三个工具（MCP、ToolSearch、Bash），续轮收尾。
+fn sdk_turn(t: &Telemetry, end: impl FnOnce(ApiCall) -> ApiCall) {
+    sdk_turn_with(t, |_, c| c, end);
+}
+
+/// 同 [`sdk_turn`]，首条也能改（先拿到 `Telemetry`，可以在它之前送几次失败的尝试）。
+fn sdk_turn_with(
+    t: &Telemetry,
+    start: impl FnOnce(&Telemetry, ApiCall) -> ApiCall,
+    end: impl FnOnce(ApiCall) -> ApiCall,
+) {
+    let sdk = |body: Value| body.to_string().replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+    let base = frozen_now() - Duration::from_secs(60);
+    let first: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+    let mut c1 = call(sdk(first.clone()).into_bytes(), "req_1", "tool_use");
+    c1.ua_out = "claude-cli/2.1.306 (external, sdk-cli)".into();
+    c1.started_at = base;
+    c1.ttft_ms = Some(1_000);
+    c1.total_ms = 3_000;
+    let names = ["mcp__s__x", "ToolSearch", "Bash"];
+    c1.tool_calls = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ToolCall {
+            id: format!("t{i}"),
+            name: (*n).into(),
+            input: json!({}),
+            verdict: None,
+        })
+        .collect();
+    let c1 = start(t, c1);
+    t.ingest(c1);
+    let mut cont = first;
+    let uses: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| json!({"type":"tool_use","id":format!("t{i}"),"name":n,"input":{}}))
+        .collect();
+    let results: Vec<Value> = (0..names.len())
+        .map(|i| json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"ok"}))
+        .collect();
+    let msgs = cont["messages"].as_array_mut().unwrap();
+    msgs.push(json!({"role":"assistant","content":uses}));
+    msgs.push(json!({"role":"user","content":results}));
+    let mut c2 = call(sdk(cont).into_bytes(), "req_2", "end_turn");
+    c2.ua_out = "claude-cli/2.1.306 (external, sdk-cli)".into();
+    c2.started_at = base + Duration::from_secs(4);
+    c2.total_ms = 2_000;
+    t.ingest(end(c2));
+}
+
+fn sdk_events(t: &Telemetry) -> Vec<(String, Value)> {
+    let st = t.0.state.lock();
+    st.pending[&key()].events.iter().map(|(_, e)| (ev_name(e).to_string(), meta_of(e))).collect()
+}
+
+/// `tengu_sdk_result` / `tengu_sdk_ttft`：时长从本轮开始算、首字量到第一条回复收完，工具按名字分
+/// MCP / ToolSearch / 内置（官方 `ux`）。
+#[test]
+fn sdk_result_counts_tools_and_times_from_the_turn() {
+    let t = Telemetry::default();
+    sdk_turn(&t, |c| c);
+    let ev = sdk_events(&t);
+    let get = |n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone()).unwrap();
+    let r = get("tengu_sdk_result");
+    assert_eq!(r["subtype"], "success");
+    assert_eq!(r["num_turns"], 2);
+    let counts = ["tool_use_count", "mcp_tool_calls", "toolsearch_calls", "builtin_tool_calls"];
+    assert_eq!(counts.map(|k| r[k].as_u64().unwrap()), [3, 1, 1, 1], "{r}");
+    // 本轮开始 = 首条发出前 15 + 42ms；首字 = 首条回复收完前 5ms；结果在末条收尾后 4ms。
+    assert_eq!(get("tengu_sdk_ttft")["ttft_ms"], 3_000 - 5 + 57);
+    assert_eq!(r["duration_ms"], 4_000 + 2_000 + 4 + 57);
+}
+
+/// `-p` 这一轮请求失败报 `success` + `is_error`、被中止报 `terminated`，都不报首字；中止也不报界面上的
+/// Esc 与撤回输入。
+#[test]
+fn sdk_result_reports_failures_and_aborts() {
+    let failed_t = Telemetry::default();
+    sdk_turn(&failed_t, |c| failed(c, Some(529), "overloaded_error", "Overloaded"));
+    give_up_retries(&failed_t);
+    let ev = sdk_events(&failed_t);
+    let r = ev.iter().find(|(n, _)| n == "tengu_sdk_result").map(|(_, m)| m).unwrap();
+    // 请求失败官方报的仍是 `success`，`is_error` 为真，另带最终失败的状态码
+    // （`cap/auto-2.1.306-20261021-retry` R2）。
+    assert_eq!((r["subtype"].as_str(), r["is_error"].as_bool()), (Some("success"), Some(true)));
+    assert_eq!(r["api_error_status"], 529);
+    assert!(!ev.iter().any(|(n, _)| n == "tengu_sdk_ttft"));
+
+    let aborted_t = Telemetry::default();
+    sdk_turn(&aborted_t, |mut c| {
+        c.aborted = true;
+        c.stop_reason = None;
+        c
+    });
+    let ev = sdk_events(&aborted_t);
+    let r = ev.iter().find(|(n, _)| n == "tengu_sdk_result").map(|(_, m)| m).unwrap();
+    assert_eq!((r["subtype"].as_str(), r["is_error"].as_bool()), (Some("terminated"), Some(true)));
+    for absent in ["tengu_sdk_ttft", "tengu_cancel", "tengu_conversation_rewind"] {
+        assert!(!ev.iter().any(|(n, _)| n == absent), "{absent}");
+    }
+}
+
+/// 图片的字节数扣掉 base64 填充、像素数按文件头读出宽高（`cap/auto-2.1.306-20261021-full` A0：
+/// 32×32 的 PNG、121 字节）。
+#[test]
+fn image_stats_follow_the_official_decoder() {
+    let png = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAQElEQVR4nGOQizqBFf3HgUhVzzBqwagFQ8ACahmES/2oBaMWDAULqGUQLvWjFoxaMBQsoJZBuNSPWjBqwRCwAACst8JbyMsFeQAAAABJRU5ErkJggg==";
+    assert_eq!(super::shape::image_dims(png), Some((32, 32)));
+    let mut shape = RequestShape::default();
+    let content = json!([{"type":"tool_result","tool_use_id":"t","content":[
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":png}}
+    ]}]);
+    super::shape::walk_content(&content, &mut shape);
+    assert_eq!((shape.image_blocks, shape.image_bytes, shape.image_pixels), (1, 121, 1024));
+}
+
+/// 模型调了这一轮没声明的工具（Glob）：只报 `feature_bad{tool_not_found}` 与 `tool_use_error{NO_SUCH_TOOL}`，
+/// 不报授权与成功（`cap/auto-2.1.306-20261021-full/00387`）。
+#[test]
+fn an_undeclared_tool_reports_no_such_tool() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Glob","input":{"pattern":"*"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":"<tool_use_error>Error: No such tool available: Glob. Glob is not available in this session</tool_use_error>"}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    let tool_ev = |n: &str| ev.iter().filter(|(x, m)| x == n && m["toolName"] == "Glob").count();
+    for absent in [
+        "tengu_tool_use_success",
+        "tengu_tool_use_granted_in_config",
+        "tengu_tool_use_can_use_tool_allowed",
+    ] {
+        assert_eq!(tool_ev(absent), 0, "{absent}");
+    }
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!(err["error"], "No such tool available: registered_base_tool");
+    assert_eq!(err["errorCode"], "NO_SUCH_TOOL");
+    assert_eq!(err["toolNameHash"], "18d00f7df062");
+    let bad = ev.iter().find(|(n, _)| n == "tengu_feature_bad").map(|(_, m)| m).unwrap();
+    assert_eq!(
+        (&bad["feature_name"], &bad["error_code"]),
+        (&json!("tool_glob"), &json!("tool_not_found"))
+    );
+}
+
+/// 没注册的 MCP 工具：官方脱敏成 `mcp_tool`，文案 `No such tool available: mcp_tool`，功能名另叫
+/// `tool_unregistered_mcp`（2.1.306 `qYr` / `IJ`）。
+#[test]
+fn an_unregistered_mcp_tool_reports_mcp_tool() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__my_local_server__lookup","input":{}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":"<tool_use_error>Error: No such tool available: mcp__my_local_server__lookup</tool_use_error>"}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!(
+        (&err["toolName"], &err["error"], &err["isMcp"]),
+        (&json!("mcp_tool"), &json!("No such tool available: mcp_tool"), &json!(true))
+    );
+    let bad = ev.iter().find(|(n, _)| n == "tengu_feature_bad").map(|(_, m)| m).unwrap();
+    assert_eq!(bad["feature_name"], "tool_unregistered_mcp");
+}
+
+/// 字符匹配照 JS 正则：`\s` 是 ECMAScript 的空白集合（U+FEFF 算、U+0085 不算），`/i` 没有 `u` 标志时非 ASCII 字符
+/// 不折成 ASCII 字母（开尔文符号不算 `k`）。期望哈希是官方 2.1.305 原函数跑出来的。
+#[test]
+fn scrub_follows_js_whitespace_and_case_rules() {
+    use super::tools::scrub_error_message as dze;
+    let feff = "Read failed for /tmp/a\u{FEFF}b/file.txt";
+    assert_eq!(dze(feff), "Read failed for <path>\u{FEFF}b/file.txt");
+    assert_eq!(&sha256_hex(dze(feff).as_bytes())[..12], "69bedba00c59");
+    let nel = "Read failed for /tmp/a\u{0085}b/file.txt";
+    assert_eq!(dze(nel), "Read failed for <path>", "U+0085 在 JS 里不是空白");
+    // `s` 后面跟开尔文符号（U+212A）：Unicode 折叠会把它当 `k`，JS 不会。
+    assert_eq!(
+        dze("token s\u{212A}-abcdefghijk"),
+        "token s\u{212A}-abcdefghijk",
+        "开尔文符号不折成 k"
+    );
+    assert_eq!(dze("token SK-abcdefghijk"), "token <key>", "ASCII 大小写照样不分");
+}
+
+/// 截断照官方按 UTF-16 码元：第 500 个码元落在 emoji 代理对中间时，留下的半个代理编成 UTF-8 是 U+FFFD，
+/// 而不是整个 emoji 都丢掉。
+#[test]
+fn scrub_truncation_splits_a_surrogate_pair_like_js() {
+    use super::tools::scrub_error_message as dze;
+    // 填充用带空格的短词，避开 base64 之类的规整规则。
+    let fill = |n: usize| "a ".repeat(n / 2) + if n % 2 == 1 { "a" } else { "" };
+    let msg = format!("{}😀tail", fill(499));
+    assert_eq!(dze(&msg), format!("{}\u{FFFD}", fill(499)));
+    let fits = format!("{}😀tail", fill(498));
+    assert_eq!(dze(&fits), format!("{}😀", fill(498)), "整个装得下就留着");
+}
+
+/// 报错文案脱敏与官方 `dZe` 逐条一致（期望值是把 2.1.306 里那个函数原样拿到 node 里跑出来的）。
+#[test]
+fn error_message_scrub_matches_the_official_function() {
+    use super::tools::scrub_error_message as dze;
+    for (input, want) in [
+        (
+            "File does not exist. Note: your current working directory is /Users/x/proj. Did you mean /Users/x/proj/a.py?",
+            "File does not exist. Note: your current working directory is <path> Did you mean <path>",
+        ),
+        (
+            "String to replace not found in file.\nString: foo 12345 bar",
+            "String to replace not found in file.\nString: foo <num> bar",
+        ),
+        (
+            "see https://a.b/c?x=1 and me@x.io key sk-ant-abcdefghijkl",
+            "see <url> and <email> key <key>",
+        ),
+        ("C:\\Users\\x y \\\\srv\\share a\\b\\c", "<path> y <path> <path>"),
+        (
+            "id 3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e req_011CgEiRQ6PstaucYdYEZ6Kd deadbeefdeadbeef00 ip 10.0.0.1 n 2026 x 123",
+            "id <id> <id> <id> ip <ip> n <num> x 123",
+        ),
+        ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0MTIzNDU2Nzg5MA== end", "<b64> end"),
+        ("中文/路径/a.txt ok", "中文<path> ok"),
+    ] {
+        assert_eq!(dze(input), want, "{input}");
+    }
+}
+
+/// Edit 改不存在的文件：验证这一步就被拦下，报 `feature_sad{tool_validate_input_rejected}` 与
+/// `tool_use_error{ValidateInputError, errorCode: 4}`，不报授权与成功。
+#[test]
+fn a_rejected_validation_reports_validate_input_error() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let msg = "File does not exist. Note: your current working directory is /Users/x/proj.";
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit",
+        "input":{"file_path":"/Users/x/proj/nope.py","old_string":"a","new_string":"b"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":format!("<tool_use_error>{msg}</tool_use_error>")}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    let edit = |n: &str| ev.iter().filter(|(x, m)| x == n && m["toolName"] == "Edit").count();
+    for absent in [
+        "tengu_tool_use_success",
+        "tengu_tool_use_granted_in_config",
+        "tengu_tool_use_can_use_tool_allowed",
+        "tengu_file_operation",
+    ] {
+        assert_eq!(edit(absent), 0, "{absent}");
+    }
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!((&err["error"], &err["errorCode"]), (&json!("ValidateInputError"), &json!(4)));
+    let hash = &sha256_hex(super::tools::scrub_error_message(msg).as_bytes())[..12];
+    assert_eq!(err["error_message_hash"], *hash);
+    let sad = ev.iter().find(|(n, _)| n == "tengu_feature_sad").map(|(_, m)| m).unwrap();
+    assert_eq!(sad["error_code"], "tool_validate_input_rejected");
+    assert_eq!(sad["feature_name"], "tool_edit");
+}
+
+/// 校验失败的错误码补齐 2.1.305 / 2.1.306 的几种：Edit 前后相同 1、Write 子代理写报告文件 5、NotebookEdit 结构不对 6、
+/// Edit / NotebookEdit 遇到非 UTF-8 文本 15（官方 `VSt` 三种开头）。
+#[test]
+fn validate_error_codes_cover_the_remaining_cases() {
+    use super::tools::validate_error_code as code;
+    let enc = |head: &str| {
+        format!(
+            "File {head}. These tools write UTF-8 (or UTF-16LE behind its byte-order mark) and never convert a file's encoding on their own, so nothing was written."
+        )
+    };
+    for (tool, msg, want) in [
+        ("Edit", "No changes to make: old_string and new_string are exactly the same.".to_string(), 1),
+        ("Write", "Subagents should return findings as text, not write report files. Include this content in your final response instead.".to_string(), 5),
+        ("NotebookEdit", "Notebook file is not a valid Jupyter notebook (top-level \"cells\" must be an array of cell objects, each with a string or string-array \"source\").".to_string(), 6),
+        ("Edit", enc("is not valid UTF-8: it uses a legacy encoding such as Windows-1252, Shift-JIS or GBK, or it is binary"), 15),
+        ("Edit", enc("has NUL bytes in its first 8 KB: binary data, UTF-16/UTF-32 without a byte-order mark, or text with embedded NULs"), 15),
+        ("NotebookEdit", enc("is UTF-16 big-endian (it starts FE FF), which these tools do not write"), 15),
+    ] {
+        assert_eq!(code(tool, &msg), Some(want), "{tool}: {msg}");
+    }
+    // 原有的照旧。
+    assert_eq!(code("Edit", "File does not exist."), Some(4));
+}
+
+/// Edit 前后字符串相同：验证这一步就拦下，报 1 号 `ValidateInputError`，不走授权、不执行。
+#[test]
+fn a_no_op_edit_is_rejected_at_validation() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let msg = "No changes to make: old_string and new_string are exactly the same.";
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit",
+        "input":{"file_path":"/Users/x/proj/a.py","old_string":"a","new_string":"a"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":format!("<tool_use_error>{msg}</tool_use_error>")}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    let edit = |n: &str| ev.iter().filter(|(x, m)| x == n && m["toolName"] == "Edit").count();
+    for absent in ["tengu_tool_use_granted_in_config", "tengu_tool_use_success"] {
+        assert_eq!(edit(absent), 0, "{absent}");
+    }
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!((&err["error"], &err["errorCode"]), (&json!("ValidateInputError"), &json!(1)));
+}
+
+/// `-p` 首条请求重发过两次才成功、之后工具续轮正常收尾：`saw_retry` / `retry_status` 按整轮累计（取各次重试
+/// 状态码的最大值），两个时长从头一次尝试发出算起。
+#[test]
+fn sdk_result_keeps_the_turn_retries() {
+    let t = Telemetry::default();
+    sdk_turn_with(
+        &t,
+        |t, c1| {
+            // 同一条请求先失败两次（503、529），各隔 1.5 秒重发。
+            for (back_ms, status) in [(3_000, 503), (1_500, 529)] {
+                let mut a = call(c1.body.to_vec(), "req_0", "end_turn");
+                a.ua_out = c1.ua_out.clone();
+                a.started_at = c1.started_at - Duration::from_millis(back_ms);
+                a.total_ms = 300;
+                t.ingest(failed(a, Some(status), "overloaded_error", "Overloaded"));
+            }
+            c1
+        },
+        |c| c,
+    );
+    let ev = sdk_events(&t);
+    let get = |n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone()).unwrap();
+    let r = get("tengu_sdk_result");
+    assert_eq!((&r["saw_retry"], &r["retry_status"]), (&json!(true), &json!(529)), "{r}");
+    assert_eq!(r["duration_ms"], 4_000 + 2_000 + 4 + 57 + 3_000);
+    assert_eq!(get("tengu_sdk_ttft")["ttft_ms"], 3_000 - 5 + 57 + 3_000);
+}
+
+/// 入参没过 schema（Edit 缺 `old_string`）：报 `ZOD_VALIDATION` 与按文案认出的 `zodIssueCodes`，不报成功。
+#[test]
+fn a_schema_failure_reports_zod_validation() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let detail =
+        "Edit failed due to the following issue:\nThe required parameter `old_string` is missing";
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit",
+        "input":{"file_path":"/p/a.py","new_string":"b"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":format!("<tool_use_error>InputValidationError: {detail}</tool_use_error>")}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    assert!(!ev.iter().any(|(n, m)| n == "tengu_tool_use_success" && m["toolName"] == "Edit"));
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!(
+        (&err["error"], &err["errorCode"]),
+        (&json!("InputValidationError"), &json!("ZOD_VALIDATION"))
+    );
+    assert_eq!(err["zodIssueCodes"], "invalid_type");
+    assert_eq!(err["errorDetailsHash"], json!(&sha256_hex(detail.as_bytes())[..12]));
+    let sad = ev.iter().find(|(n, _)| n == "tengu_feature_sad").map(|(_, m)| m).unwrap();
+    assert_eq!(sad["error_code"], "tool_input_validation_failed");
+}
+
+/// 认不出的执行失败（WebFetch 抛错）也不报成成功：报 `tool_use_error`，不报 `tool_web_fetch` 的 feature_ok。
+#[test]
+fn an_unrecognized_tool_failure_is_not_a_success() {
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"WebFetch",
+        "input":{"url":"https://example.invalid","prompt":"x"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,
+        "content":"<tool_use_error>Error: getaddrinfo ENOTFOUND example.invalid</tool_use_error>"}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.306 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let ev: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    assert!(!ev.iter().any(|(n, m)| n == "tengu_tool_use_success" && m["toolName"] == "WebFetch"));
+    assert!(
+        !ev.iter().any(|(n, m)| n == "tengu_feature_ok" && m["feature_name"] == "tool_web_fetch")
+    );
+    let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
+    assert_eq!((&err["toolName"], &err["error"]), (&json!("WebFetch"), &json!("Error")));
 }

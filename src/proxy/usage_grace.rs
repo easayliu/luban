@@ -57,6 +57,8 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::cache_keepalive::note_eval(cred_id, features);
     // 子代理进度摘要器的配置（`full` / `short`、输入上限、等待），收尾那条摘要器统计要报。
     super::agent_summary_config::note_eval(cred_id, features);
+    // 会话活动心跳（`tengu_cache_heartbeat_shadow`）开没开。
+    super::dapper_dawn::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)
     };

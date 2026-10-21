@@ -181,6 +181,54 @@ pub(super) fn metrics_body(
             active_points.push(point(a, json!((v * 100.0).round() / 100.0)));
         }
     }
+    // 改动的行数：按（会话, 模型）各一对 `added` / `removed`，删了 0 行也报那个点（`cap/auto-2.1.305-20261021-full`
+    // 五批全是成对的）。编辑类工具的权限决定：按（会话, 决定, 来源, 工具, 语言）计数。
+    let mut loc: Vec<(&CallMetric, usize, usize)> = Vec::new();
+    let mut decisions: Vec<(&CallMetric, &EditDecision, u64)> = Vec::new();
+    for c in calls {
+        if !c.loc.is_empty() {
+            let (a, d) = c.loc.iter().fold((0, 0), |(x, y), (a, d)| (x + a, y + d));
+            match loc
+                .iter_mut()
+                .find(|(k, _, _)| k.session_id == c.session_id && k.loc_model == c.loc_model)
+            {
+                Some((_, x, y)) => {
+                    *x += a;
+                    *y += d;
+                }
+                None => loc.push((c, a, d)),
+            }
+        }
+        for e in &c.decisions {
+            match decisions.iter_mut().find(|(k, x, _)| k.session_id == c.session_id && *x == e) {
+                Some((_, _, n)) => *n += 1,
+                None => decisions.push((c, e, 1)),
+            }
+        }
+    }
+    let mut loc_points: Vec<Value> = Vec::new();
+    for (c, added, removed) in &loc {
+        for (ty, v) in [("added", *added), ("removed", *removed)] {
+            let mut a = attrs(c);
+            a.insert("type".into(), json!(ty));
+            a.insert("model".into(), json!(c.loc_model));
+            loc_points.push(point(a, json!(v)));
+        }
+    }
+    let decision_points: Vec<Value> = decisions
+        .iter()
+        .map(|(c, e, n)| {
+            let mut a = attrs(c);
+            a.insert("decision".into(), json!(e.decision));
+            a.insert("source".into(), json!(e.source));
+            a.insert("tool_name".into(), json!(e.tool));
+            if let Some(l) = &e.language {
+                a.insert("language".into(), json!(l));
+            }
+            point(a, json!(n))
+        })
+        .collect();
+    // 数组里的先后照官方：session → lines_of_code → cost → token → code_edit_tool → active_time。
     let mut metrics = Vec::new();
     if !sessions.is_empty() {
         metrics.push(json!({
@@ -188,6 +236,14 @@ pub(super) fn metrics_body(
             "description": "Count of CLI sessions started",
             "unit": "",
             "data_points": sessions
+        }));
+    }
+    if !loc_points.is_empty() {
+        metrics.push(json!({
+            "name": "claude_code.lines_of_code.count",
+            "description": "Count of lines of code modified, with the 'type' attribute indicating whether lines were added or removed and the 'model' attribute indicating which model made the change",
+            "unit": "",
+            "data_points": loc_points
         }));
     }
     // 一批里全是失败请求时这两项没有任何数据点——官方那种批次里它们压根不出现，
@@ -206,6 +262,14 @@ pub(super) fn metrics_body(
             "description": "Number of tokens used",
             "unit": "tokens",
             "data_points": token_points
+        }));
+    }
+    if !decision_points.is_empty() {
+        metrics.push(json!({
+            "name": "claude_code.code_edit_tool.decision",
+            "description": "Count of code editing tool permission decisions (accept/reject) for Edit, Write, and NotebookEdit tools",
+            "unit": "",
+            "data_points": decision_points
         }));
     }
     if !active_points.is_empty() {

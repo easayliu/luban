@@ -403,7 +403,7 @@ pub(super) async fn prepare<'a>(
                 .ok()
                 .and_then(|m| m.model)
                 .unwrap_or_default();
-            if first.settle(&model) {
+            if first.settle(&model, config::CC_VERSION_BASE) {
                 (sent, sent_bits) =
                     upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
             }

@@ -204,11 +204,32 @@ pub(super) static TEMPLATE_2_1_303_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_303_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.303 起用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 2.1.305 的两份模板：以 2.1.303 那两份为底，按 `cap/auto-2.1.305-20261021-full` 生成
+/// （`_driver/build_tpl_305.py`）。相对 2.1.303 只动了启动期几条影子事件的 meta 键：`signed_cache_shadow`
+/// 多 `age_s` / `cert_hours_left`，`org_config_gate_shadow` 换成 `settings_cache_age_ms` / `shadow_trigger`
+/// 那套，`policy_limits_fetch` 多 `request_id_present`。2.1.306 沿用这两份：`cap/auto-2.1.306-20261021-full`
+/// 与 2.1.305-full 比，luban 发的事件 meta 键都没变（零星几条多出的键是场景分支，两版 JS 逐字相同）。
+pub(super) static TEMPLATE_2_1_305: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_305.json"))
+            .expect("assets/cc_telemetry_template_2_1_305.json must parse")
+    });
+
+/// 2.1.305 `-p` 打印模式的模板，见 [`TEMPLATE_2_1_305`]。
+pub(super) static TEMPLATE_2_1_305_SDK: std::sync::LazyLock<Template> =
+    std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_305_sdk.json"))
+            .expect("assets/cc_telemetry_template_2_1_305_sdk.json must parse")
+    });
+
+/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
     let at = |v: &str| version_at_least(version, v);
+    if at("2.1.305") {
+        return if sdk { &TEMPLATE_2_1_305_SDK } else { &TEMPLATE_2_1_305 };
+    }
     if at("2.1.303") {
         return if sdk { &TEMPLATE_2_1_303_SDK } else { &TEMPLATE_2_1_303 };
     }
@@ -322,8 +343,15 @@ pub(super) struct Subst<'a> {
     pub(super) permission_mode: &'a str,
     /// 这个会话是 `--resume` 回来的（`tengu_timer{startup}.resumed`）。
     pub(super) resumed: bool,
-    /// 第几次输入（`tengu_file_history_snapshot_success.snapshotCount`）。
+    /// 文件历史的快照张数（`tengu_file_history_snapshot_success.snapshotCount`）：起初是输入序号，2.1.285 起
+    /// 由拍快照那一刻按账本数的覆盖（[`Files`]，注入的那几轮不拍）。
     pub(super) prompt_index: u32,
+    /// 会话在 git 仓库里（[`Identity::vcs`]）：启动时的文件建议走 `git ls-files`，见 [`emit_template`]。
+    pub(super) git: bool,
+    /// 这条调用的稳定散列：几项本机耗时按它在官方的范围里取值，不至于每个会话都一模一样。
+    pub(super) seed: u32,
+    /// 文件历史跟踪中的文件数（`tengu_file_history_snapshot_success.trackedFilesCount`），见 [`Files`]。
+    pub(super) tracked_files: usize,
     /// 正文里有延迟加载的工具（`defer_loading: true`）。没有就不发
     /// `tengu_deferred_tools_pool_change`、`tengu_attachments` 里也没有 `deferred_tools_delta`
     /// ——官方 API-key 端（全量声明、无 ToolSearch）正是这个形态（`cap/2.1.258-api/00002`、
@@ -601,6 +629,35 @@ where
             if e.name == "tengu_deferred_tools_pool_change" && !subst.deferred {
                 continue;
             }
+            // IDE 里抓的模板底子：2.1.285 起的自动抓包（终端里跑）一次都没有。启动段那两条
+            // `ide_detect{found:true}` 同理——终端里是启动 30 秒后一条 `found:false`，由代码补
+            // （`Session::take_ide_detect`）。
+            if (e.name == "tengu_mcp_ide_server_connection_succeeded"
+                || (e.name == "tengu_feature_ok"
+                    && e.meta.get("feature_name").and_then(|f| f.as_str()) == Some("ide_detect")))
+                && version_at_least(subst.version, "2.1.285")
+            {
+                continue;
+            }
+            // 只在 2.1.293 那次抓包出现过：那台机器上某个技能的 frontmatter 带了未知键，是环境不是版本。
+            if e.name == "tengu_frontmatter_shadow_unknown_key" {
+                continue;
+            }
+            // 启动时的文件建议：git 仓库里官方一律走 `git ls-files`（`cap/auto-2.1.285-20260930` 起每份全量抓包
+            // 26 ~ 30 条，没有一条 ripgrep），否则与同一会话的 `vcs: git` 自相矛盾。代理不知道仓库里有几个文件，
+            // 个数沿用模板那条、全算已跟踪；耗时官方 48 ~ 89ms，按调用散列取。
+            if e.name == "tengu_file_suggestions_ripgrep" && subst.git {
+                let n = e.meta.get("file_count").cloned().unwrap_or(json!(15));
+                let meta = json!({
+                    "file_count": n,
+                    "tracked_count": n,
+                    "untracked_count": 0,
+                    "duration_ms": 48 + subst.seed % 42
+                });
+                let name = "tengu_file_suggestions_git_ls_files";
+                events.push((t, id.event_at(e.stage, name, t, &ctx(t), meta)));
+                continue;
+            }
             let mut meta = substitute(&e.meta, subst);
             if e.name == "tengu_tool_search_mode_decision" {
                 meta = subst.tool_search.clone();
@@ -634,6 +691,7 @@ where
                 && let Some(obj) = meta.as_object_mut()
             {
                 obj.insert("snapshotCount".into(), Value::from(subst.prompt_index));
+                obj.insert("trackedFilesCount".into(), Value::from(subst.tracked_files));
             }
             let v291 = version_at_least(subst.version, "2.1.291");
             let off = if subst.sdk { ToolsOff::default() } else { subst.tools_off };

@@ -277,7 +277,8 @@ pub struct ForwardFlags {
     /// 官方都发；剥掉 `summarized` 还会让回程的思考正文为空。补齐与 beta 配对见
     /// `proxy::fill_thinking_display` / `proxy::thinking_display_explicit`。
     ///
-    /// 对真实 CC 基本是空操作：它本来就不发多余字段。
+    /// **真实 CC 不剥**：它发什么就是官方形态——WebSearch 子调用就带 `tool_choice:auto`
+    /// （`cap/auto-2.1.306-20261021-full/00062`）。
     pub strip_extra_fields: bool,
     /// 把上游会判成第三方应用的工具名换成假名转发，回程再还原（见
     /// [`crate::proxy::ToolNameMap`]）。

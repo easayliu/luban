@@ -228,12 +228,13 @@ async fn relay_ok(
         forensics,
         telemetry,
         // 两条路都要把回程记回去：模拟那条的会话 id 在 `sim` 里，真实 CC 那条在
-        // `client_link` 里（键是客户端自己的会话 id）。
+        // `client_link` 里（键是客户端自己的会话 id）。记到哪条链、记不记，看 `lane`。
         cc_session: upstream
             .sim
             .as_ref()
-            .map(|s| s.session_id.clone())
-            .or_else(|| upstream.client_link.as_ref().map(|(sid, _)| sid.clone())),
+            .map(|s| (s.session_id.clone(), &s.link))
+            .or_else(|| upstream.client_link.as_ref().map(|(sid, l)| (sid.clone(), l)))
+            .and_then(|(sid, l)| Some((sid, l.lane.clone()?, l.turn_fp))),
         // 按 message thread 改写过的，回程据回复提交或作废线程状态，见 [`ReqLog::cc_thread`]。
         cc_thread: upstream.sim.as_ref().and_then(|s| s.take_thread()),
         // 只给计费路径分类：count_tokens 之流没有「回复」可言。三把键各自跟着拦截开关走：

@@ -13,6 +13,8 @@ pub(super) struct Session {
     /// 消息条数都用它——peer 那一轮也是客户端里实打实的一次提交与一条消息，只是不编号。
     pub(super) prompts_seen: u32,
     pub(super) prompt_id: String,
+    /// 上一轮的 prompt_id：提交前敲字的 `user_input` 心跳挂它（官方提交后才换）。
+    pub(super) prev_prompt_id: String,
     pub(super) chain_id: String,
     /// 最近一条**主线程**请求的上游 request-id：`previousRequestId` 只串主线程那条链
     /// （标题生成那类侧查询不算，猜下一句那条也接在主线程后面），退出时的
@@ -37,6 +39,15 @@ pub(super) struct Session {
     /// 2 与 5734 + 3909 + 3 = 9646）。
     pub(super) turn_api_calls: u32,
     pub(super) turn_api_ms: i64,
+    /// 本轮工具调用里 MCP 工具与 ToolSearch 各几次（`tengu_sdk_result` 的 `mcp_tool_calls` /
+    /// `toolsearch_calls`，其余算 `builtin_tool_calls`，官方 `ux`）。
+    pub(super) turn_mcp_calls: u32,
+    pub(super) turn_toolsearch_calls: u32,
+    /// 本轮第一条主线程回复收完的时刻：`-p` 收尾 `tengu_sdk_ttft` 量到的是第一条 assistant 消息产出。
+    pub(super) turn_first_reply_end: Option<SystemTime>,
+    /// 本轮主线程请求里重试过的：各次重试失败状态码的最大值（官方 SDK 在整轮里累计 `saw_retry` 与
+    /// `retry_status = max(error_status ?? 0)`，不只看最后那条）。没重试过是 `None`。
+    pub(super) turn_retry_status: Option<u16>,
     /// 会话里已经发过 `shell_snapshot_create`（首次 Bash 才有）。
     pub(super) shell_snapshot_done: bool,
     /// 会话里的首条主线程请求已经报过它那几条一次性事件（2.1.285：首字节时的
@@ -56,6 +67,14 @@ pub(super) struct Session {
     pub(super) lucky_cerf_exposed: Vec<&'static str>,
     /// 模板 `background` 段已经补发到第几条。
     pub(super) background_done: usize,
+    /// 进程启动约 30 秒后那条 `ide_detect{found:false}` 已经补发过（按进程记，`/clear` 接着算）。
+    pub(super) ide_detect_done: bool,
+    /// 主线程各轮 `tengu_attachments` 里报过的附件类型与条数（首次出现的先后）：`/compact` 收尾那条
+    /// `reactive_compact_succeeded` 按类型报 `attachment_*_count`，官方数的是内部消息表里的附件，与各轮
+    /// 宣告过的逐类相等（`cap/auto-2.1.305-20261021-full` A0：33 条 total_tokens_reminder 等 11 类全对上）。
+    pub(super) attachment_counts: Vec<(String, u32)>,
+    /// 主线程上一条回复的 `message.model`，见 [`AgentState::last_reply_model`]。
+    pub(super) last_main_reply_model: Option<String>,
     /// 最近几条请求的完成时刻（不分类别）。`timeSinceLastApiCallMs` 取「在这条之前完成的最近
     /// 一条」：并发时 `last_call_end` 可能是一条比这条晚结束的，差出负数就报不出来。
     pub(super) recent_ends: VecDeque<SystemTime>,
@@ -104,6 +123,10 @@ pub(super) struct Session {
     /// 主线程最近一条**有效**（没被取消的）回复里有没有工具调用：`anchorHasToolCall` 的工具锚点。
     /// 与上面的时间锚点分开记；两样都只在本会话里算，`/clear` 换出来的新会话从空白起。
     pub(super) main_anchor_tool_call: bool,
+    /// 会话活动心跳（`tengu_cache_heartbeat_shadow`）的状态机，见 [`Heartbeat`]。
+    pub(super) hb: Heartbeat,
+    /// 读写过的文件与文件历史，见 [`Files`]。
+    pub(super) files: Files,
     /// 刚做完一次 `/compact`，下一条主线程请求是压缩之后的第一条。
     pub(super) post_compact: bool,
     /// `default_model`：用户设置里的默认模型，取会话启动时那台设备的
@@ -155,6 +178,12 @@ pub(super) struct Session {
     pub(super) thread_bases: HashMap<String, ThreadBase>,
     /// 会话里的子代理，按支线号（`x-claude-code-agent-id`）分开记。
     pub(super) agents: HashMap<String, AgentState>,
+    /// 主线程派出去、子代理还没露面的那几次 `Agent` 调用的 `prompt`（取不到的记空串）。心跳里主线程续轮
+    /// 收尾要知道有没有委派的活在跑：这里没认领完的，加上认领了、还没跑完的（[`AgentState::delegated`]）。
+    /// 新一轮用户输入清空（失败或被打断、没收尾的不再占着）。
+    pub(super) delegated_pending: Vec<String>,
+    /// 子代理自己再派出去、孙代理还没露面的次数：孙代理首条按它认领，不占主线程那份。
+    pub(super) nested_pending: u32,
     /// 最近一条回复里调了 `Agent` 工具的主线程请求：随后拉起的子代理首条报它为
     /// `invokingRequestId`。不能拿「最近一条主线程请求」代替——子代理是异步跑的，它的首条
     /// 回来之前主线程往往已经又完成了一条（`cap/2.1.280`：主线程 27.020 完成、子代理首条
@@ -211,6 +240,14 @@ pub(super) struct AgentState {
     pub(super) tether: Option<TetherThread>,
     /// 首条的 `invokingRequestId`（拉起它的那条主线程请求）。
     pub(super) invoking_request_id: Option<String>,
+    /// 它是主线程直接派的（认领了 [`Session::delegated_pending`] 里的一项）：跑完才从「委派的活」里扣掉。
+    /// 子代理再派的孙代理不算——请求头里没有父子关系，按首条用户消息里那段 `prompt` 认。
+    pub(super) delegated: bool,
+    /// 支线自己的首条请求已经来过、认领过派遣（认没认上都算）。不能拿 `chain_id` 有没有代替：进度摘要请求
+    /// 可能比子代理首条先完成，它也会建档。
+    pub(super) claim_checked: bool,
+    /// 这条支线上一条回复的 `message.model`：下一条请求带回的工具结果是那条回复调的工具，改动行数记在它名下。
+    pub(super) last_reply_model: Option<String>,
     /// 工具长度表报过的那份 hash（`tengu_tool_schema_sizes` 每条支线首次报一次）。
     pub(super) tools_hash: Option<String>,
     /// 子代理类型（请求头 `x-claude-code-agent-type`）。它的摘要请求头上只有 `agent-id`，
@@ -268,6 +305,13 @@ pub(super) struct ThreadBase {
     pub(super) messages: usize,
     pub(super) assistant_messages: usize,
     pub(super) input_text_chars: usize,
+    /// 历史里的图片与文档：增量体不再带它们，客户端照样按整段对话报（同一张图之后的主线程
+    /// 续轮仍报一张，`cap/auto-2.1.306-20261021-full` A0）。
+    pub(super) image_blocks: usize,
+    pub(super) image_bytes: usize,
+    pub(super) image_pixels: u64,
+    pub(super) doc_blocks: usize,
+    pub(super) doc_bytes: usize,
     /// 这条请求的**回复**按 `inputTextCharLength` 口径的字数：下一条增量请求里省掉的正是它，
     /// 客户端报的输入长度却含它。
     pub(super) reply_chars: usize,
@@ -301,6 +345,11 @@ impl ThreadBase {
             messages: s.messages_len,
             assistant_messages: s.assistant_messages,
             input_text_chars: s.input_text_chars,
+            image_blocks: s.image_blocks,
+            image_bytes: s.image_bytes,
+            image_pixels: s.image_pixels,
+            doc_blocks: s.doc_blocks,
+            doc_bytes: s.doc_bytes,
             reply_chars,
             reply_tools,
         }
@@ -365,11 +414,22 @@ impl ThreadBase {
                         persisted_from: r.persisted,
                         is_error: r.is_error,
                         result_head: r.head.clone(),
+                        tool_error: r.tool_error.clone(),
                         stripped_bytes: r.stripped_bytes,
                         image_b64: r.image_b64,
                         media_blocks: r.media_blocks,
                         input: Value::Null,
                         verdict: None,
+                        // 线程续轮的增量体里没有那条助手消息，工具名取自回复流；Read 的原文照样从结果还原。
+                        read_content: (name == "Read"
+                            && !r.is_error
+                            && r.persisted.is_none()
+                            && r.image_b64 == 0
+                            && r.read_dedup.is_none())
+                        .then(|| super::files::read_content(&r.text))
+                        .flatten(),
+                        read_dedup: r.read_dedup,
+                        image_hash: r.image_hash.clone(),
                     }
                 })
                 .collect();
@@ -377,6 +437,11 @@ impl ThreadBase {
         s.messages_len += self.messages + 1;
         s.assistant_messages += self.assistant_messages + 1;
         s.input_text_chars += self.input_text_chars + self.reply_chars;
+        s.image_blocks += self.image_blocks;
+        s.image_bytes += self.image_bytes;
+        s.image_pixels += self.image_pixels;
+        s.doc_blocks += self.doc_blocks;
+        s.doc_bytes += self.doc_bytes;
         s.estimated_tokens = estimate_tokens(&s.model, s.input_text_chars);
     }
 }
@@ -462,6 +527,11 @@ pub(super) struct CallMetric {
     pub(super) resumed: bool,
     /// 新进程 `--continue` 接上的（`start_type: continue`），见 [`State::process_starts`]。
     pub(super) continued: bool,
+    /// 这条调用里工具改动的（增, 删）行数与编辑类工具的权限决定，进 `lines_of_code.count` 与
+    /// `code_edit_tool.decision`；`loc_model` 是那两个点上的 `model`（不带 `[1m]`）。
+    pub(super) loc: Vec<(usize, usize)>,
+    pub(super) loc_model: String,
+    pub(super) decisions: Vec<EditDecision>,
     /// 这条请求真的拿到了用量。失败的请求照样占 `session.count` 与 `active_time`（会话确实
     /// 起了、CLI 确实忙过），但**不进** `cost.usage` 与 `token.usage`——官方那两个计数器
     /// 是在成功回包时才加的，替它记一串 0 只会凭空多出一堆零值数据点。
@@ -529,6 +599,11 @@ pub(super) struct TurnFacts {
     pub(super) notifications: Vec<usize>,
     pub(super) prev_main_end: Option<SystemTime>,
     pub(super) prompt_id: String,
+    /// 见 [`Session::prev_prompt_id`]。
+    pub(super) prev_prompt_id: String,
+    /// 这条主线程请求发出时有没有派出去、还没跑完的子代理（[`Session::delegated`]，不含这条自己
+    /// 新派的）。
+    pub(super) delegated_running: bool,
     pub(super) agent: Option<AgentView>,
     pub(super) previous_request_id: Option<String>,
     pub(super) prev_main_message_id: Option<String>,
@@ -565,6 +640,8 @@ pub(super) struct TurnFacts {
     pub(super) v299: bool,
     pub(super) v300: bool,
     pub(super) v303: bool,
+    pub(super) v305: bool,
+    pub(super) v306: bool,
     /// 这一轮要发的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text` 实验曝光。客户端头一次给精简提示词
     /// 的模型拼 `Agent` 说明时读这两个开关、各记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词
     /// 模型开头、中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮；从 opus-5-5（不在
@@ -581,6 +658,10 @@ pub(super) struct TurnFacts {
     pub(super) injected: bool,
     pub(super) first_prompt_tpl: bool,
     pub(super) background: std::ops::Range<usize>,
+    /// 这条请求发出时进程已经起了 30 秒多、还没报过 IDE 探测：补那条 `ide_detect{found:false}`。
+    pub(super) ide_detect: bool,
+    /// 见 [`Session::attachment_counts`]。
+    pub(super) attachment_counts: Vec<(String, u32)>,
     pub(super) first_main: bool,
     pub(super) snapshot: Option<(&'static str, String)>,
     pub(super) sleepy: bool,
@@ -597,6 +678,10 @@ pub(super) struct TurnFacts {
     pub(super) sess_turn_tools: u32,
     pub(super) sess_turn_api_calls: u32,
     pub(super) sess_turn_api_ms: i64,
+    pub(super) sess_turn_mcp: u32,
+    pub(super) sess_turn_toolsearch: u32,
+    pub(super) turn_first_reply_end: Option<DateTime<Utc>>,
+    pub(super) sess_turn_retry: Option<u16>,
     pub(super) session_cwd: Option<String>,
     pub(super) betas_full: String,
     pub(super) betas_own: String,
@@ -660,10 +745,34 @@ pub(super) struct State {
     /// 同一进程里 `/clear`；探测之后冒出来的是之前见过的会话 id → 新进程 `--continue` 接上了它
     /// （探测带的是进程启动时那个临时 id）。
     pub(super) process_starts: HashMap<(i64, String), (String, SystemTime)>,
+    /// 主线程请求遇到可重试的失败、还不知道客户端会不会重发的那几次，按 `(凭证, session_id)` 记（会话可能还
+    /// 没建起来：`-p` 的头一条就失败）。见 [`HeldRetry`]。
+    pub(super) held_retries: HashMap<(i64, String), HeldRetry>,
 }
+
+/// 扣住的一串失败尝试：同一请求（同一 prompt、同样的消息与工具数）的连续几次，客户端还可能再发。官方
+/// 重试途中只报重发事件，最终成功或失败才收尾（`cap/auto-2.1.306-20261021-retry`），所以先扣着，等下一次
+/// 尝试来了再定：还是同一请求就接上，换了别的请求或扣太久（[`config::TELEMETRY_RETRY_HOLD_SECS`]）就把
+/// 最后一次当最终失败报。
+pub(super) struct HeldRetry {
+    pub(super) calls: Vec<ApiCall>,
+    /// 发它的设备：同一台设备上的会话在扣着期间都不算闲置（`/clear` 后新会话的头一条扣着时，补处理时还要靠
+    /// 旧会话认来历，见 [`Telemetry::gc`]）。
+    pub(super) device_id: String,
+    pub(super) sig: RetrySig,
+    pub(super) at: Instant,
+}
+
+/// 认同一请求的几样：prompt id、消息条数、工具数。重发的请求体逐字相同（`x-client-request-id` 每次换新、
+/// 重试计数头恒为 0，`cap/auto-2.1.306-20261021-retry` 的十次注入）。
+pub(super) type RetrySig = (Option<String>, usize, usize);
 
 /// [`Session::main_models`] 记多少条。
 pub(super) const MAIN_MODEL_HISTORY: usize = 32;
+
+/// 进程启动到那条 `ide_detect{found:false}` 的毫秒数（官方找 IDE 的循环限时 30 秒，起点在启动段中途），见
+/// [`Session::take_ide_detect`]。
+pub(super) const IDE_DETECT_MS: u64 = 30_450;
 
 impl Session {
     /// 记一条主线程请求的发出时刻与模型。
@@ -700,9 +809,11 @@ impl Session {
             // 进程启动到首条请求：2.1.260 模板的启动段从 -1.3s 起、按 3.1s 算；2.1.285 那份启动段
             // 从 -6.2s 起（`cap/2.1.285/00040`：进程 06:34:08.6 起，扣掉信任对话框后约 6.2s 到首条
             // api_query）。
+            // 首条请求客户端自己重发过的，从头一次尝试算（[`ApiCall::logical_start`]），不然等重试那段会把进程
+            // 起点推后、`uptime` 压成 0。
             started_wall: cleared_prev.map_or_else(
                 || {
-                    call.started_at
+                    call.logical_start()
                         - Duration::from_millis(if id.sdk {
                             // `-p` 的启动段从 -4.4s 起（`00448`）。
                             4_450
@@ -718,6 +829,7 @@ impl Session {
             prompt_index: 0,
             prompts_seen: 0,
             prompt_id: String::new(),
+            prev_prompt_id: String::new(),
             chain_id: String::new(),
             last_main_request_id: None,
             last_main_message_id: None,
@@ -729,6 +841,10 @@ impl Session {
             turn_tool_calls: 0,
             turn_api_calls: 0,
             turn_api_ms: 0,
+            turn_mcp_calls: 0,
+            turn_toolsearch_calls: 0,
+            turn_first_reply_end: None,
+            turn_retry_status: None,
             shell_snapshot_done: false,
             first_main_done: false,
             main_betas: String::new(),
@@ -740,6 +856,9 @@ impl Session {
                 .unwrap_or_default(),
             // `/clear` 换的是会话不是进程：运行时长与后台任务的进度接着上一个会话的算。
             background_done: cleared_prev.map_or(0, |p| p.background_done),
+            ide_detect_done: cleared_prev.is_some_and(|p| p.ide_detect_done),
+            attachment_counts: Vec::new(),
+            last_main_reply_model: None,
             recent_ends: VecDeque::new(),
             last_call_end: None,
             prev_total_input: 0,
@@ -765,6 +884,8 @@ impl Session {
             tether_main: None,
             thread_bases: HashMap::new(),
             agents: HashMap::new(),
+            delegated_pending: Vec::new(),
+            nested_pending: 0,
             last_spawn_request_id: None,
             main_permission: "default",
             main_effort: None,
@@ -787,6 +908,12 @@ impl Session {
             // `/clear` 换出来的会话也从空白起：首条没有锚点（`00356`：-1 / false）。
             last_main_anchor_end: None,
             main_anchor_tool_call: false,
+            // 心跳按进程：`/clear` 接着旧会话那台（清场那条由新会话首条请求报）；新进程按版本钉住有没有
+            // 这台状态机，号的开关每条调用折算前重读（[`Heartbeat::refresh`]）。
+            files: Files::default(),
+            hb: cleared_prev.map(|p| p.hb.clone()).unwrap_or_else(|| {
+                Heartbeat::new(version_at_least(&id.version, heartbeat::MIN_VERSION), !id.sdk)
+            }),
         }
     }
 }
@@ -802,9 +929,17 @@ pub(super) struct ClearedPrev {
     pub(super) started_wall: SystemTime,
     /// 进程里已经补发过的后台任务数，新会话接着算。
     pub(super) background_done: usize,
+    /// 进程里那条 IDE 探测已经报过。
+    pub(super) ide_detect_done: bool,
     /// 进程里已经发过的 `tengu_lucky_cerf` 一系曝光（按 feature）：GrowthBook 的曝光按进程记，
     /// `/clear` 之后不再发。
     pub(super) lucky_cerf_exposed: Vec<&'static str>,
+    /// 进程的心跳状态机（[`Heartbeat`]），新会话接着用。
+    pub(super) hb: Heartbeat,
+    /// 旧会话最后一轮的 prompt 与它自己的 `parent_session_id`：敲 `/clear` 那条 `user_input`
+    /// 心跳还挂在旧会话上（`cap/auto-2.1.306-20261021-full/00485`）。
+    pub(super) prompt_id: String,
+    pub(super) parent_session_id: Option<String>,
     // tether 的两个锚点**不**从旧会话接：`/clear` 之后新会话的第一条主线程请求报
     // `create/no_continue_pointer`、`threadIdleMs: -1`、`anchorHasToolCall: false`
     // （`cap/auto-2.1.291-20261006-full/00356`，会话 `271f3652`）。
@@ -902,7 +1037,11 @@ impl State {
                 last_call_end: p.last_call_end,
                 started_wall: p.started_wall,
                 background_done: p.background_done,
+                ide_detect_done: p.ide_detect_done,
                 lucky_cerf_exposed: p.lucky_cerf_exposed.clone(),
+                hb: p.hb.clone(),
+                prompt_id: p.prompt_id.clone(),
+                parent_session_id: p.parent_session_id.clone(),
             })
         });
         let parent_session_id = cleared_from

@@ -49,7 +49,9 @@ pub(crate) use headers::{has_beta, uuid_v4};
 
 mod session_link;
 #[allow(unused_imports)]
-pub(crate) use session_link::{CcRequestKind, CcSessionKey, CcSessionLink, client_session_link};
+pub(crate) use session_link::{
+    CcRequestKind, CcSessionKey, CcSessionLink, ChainLane, client_session_link,
+};
 
 mod session_id;
 pub(crate) use session_id::incoming_session_id;
@@ -95,6 +97,7 @@ pub(crate) use rate_limit::{
 pub(crate) use usage_grace::note_eval_features;
 pub(crate) mod agent_summary_config;
 pub(crate) mod cache_keepalive;
+pub(crate) mod dapper_dawn;
 mod lucky_cerf;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,

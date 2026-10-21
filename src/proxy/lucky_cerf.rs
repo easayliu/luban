@@ -25,6 +25,10 @@
 //!
 //! 没见过这个号的 eval（刚加的号、重启后还没保活）时钉的是**暂定**快照：两个开关都按默认值算
 //! （[`unseen`]）；握手超时没等到 eval 的会话就一直用它。只存在内存里。
+//!
+//! **2.1.305 起客户端不再读 `tengu_lucky_cerf_text`**（可执行文件里那个开关连同取值函数都删了，cerf 那版
+//! 一律用内置正文，`cap/auto-2.1.305-20261021-full` 一条正文曝光都没有）；清单那个开关照旧读、照旧曝光。
+//! 所以正文与它的曝光都按出站版本取舍，见 [`reads_text`]。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +41,11 @@ pub(crate) const LUCKY_CERF_FEATURE: &str = "tengu_lucky_cerf";
 
 /// 说明正文那个开关的特性名，它那条曝光的 `experiment_metadata.feature_id`。
 pub(crate) const LUCKY_CERF_TEXT_FEATURE: &str = "tengu_lucky_cerf_text";
+
+/// 这个版本的客户端还读不读 `tengu_lucky_cerf_text`：2.1.305 起不读。
+pub(crate) fn reads_text(version: &str) -> bool {
+    crate::proxy::parse_version(version).is_none_or(|v| v < (2, 1, 305))
+}
 
 /// 会话快照多久没人用就作废：会话本身早就过期了，同一个会话 id 再来（模拟会话的槽位会复用）
 /// 就是一场新对话，按号现在的分组重新钉。
@@ -89,9 +98,12 @@ pub(crate) enum AgentDesc {
     Cerf(Option<Arc<str>>),
 }
 
-fn agent_desc_of(snap: &Snapshot, model: &str) -> AgentDesc {
+fn agent_desc_of(snap: &Snapshot, model: &str, version: &str) -> AgentDesc {
     if !uses_cerf(snap, model) {
         return AgentDesc::Plain;
+    }
+    if !reads_text(version) {
+        return AgentDesc::Cerf(None);
     }
     AgentDesc::Cerf(snap.as_ref().unwrap_or_else(|| unseen()).text.clone())
 }
@@ -212,8 +224,8 @@ impl FirstRequest {
     /// 握手之后、首条请求发出之前调：用这个号现在的分组（握手刚拉的 eval）确认这个会话的快照
     /// ——不论原先钉的是暂定值还是旧缓存，实验名、分组、清单、正文或撤销都照这次的。返回这个模型的
     /// `Agent` 说明是否因此改变，改变了调用方要重新整形。eval 没到、或已有请求没等到确认就照
-    /// 原先那份发了（快照锁住），都不改、返回 `false`。
-    pub(crate) fn settle(self, model: &str) -> bool {
+    /// 原先那份发了（快照锁住），都不改、返回 `false`。`version` 是出站自称的版本，见 [`agent_desc`]。
+    pub(crate) fn settle(self, model: &str, version: &str) -> bool {
         let mut pinned = PINNED.lock();
         let Some(pin) = pinned.get_mut(&(self.cred_id, self.session.clone())) else { return false };
         if !pin.pending.as_ref().is_some_and(|n| Arc::ptr_eq(n, &self.notify)) {
@@ -224,7 +236,8 @@ impl FirstRequest {
             && let Some(real) = CERF.read().get(&self.cred_id).cloned()
         {
             let real = Some(real);
-            changed = agent_desc_of(&pin.snap, model) != agent_desc_of(&real, model);
+            changed =
+                agent_desc_of(&pin.snap, model, version) != agent_desc_of(&real, model, version);
             pin.snap = real;
         }
         pin.at = Instant::now();
@@ -293,12 +306,13 @@ async fn wait_settled_for(cred_id: i64, session: &str, wait: Duration) {
 /// 这个号、这个会话、这个模型的 `Agent` 说明用不用 cerf 那一版。
 #[cfg(test)]
 pub(crate) fn agent_uses_cerf_text(cred_id: i64, session: &str, model: &str) -> bool {
-    agent_desc(cred_id, session, model) != AgentDesc::Plain
+    agent_desc(cred_id, session, model, "2.1.303") != AgentDesc::Plain
 }
 
-/// 这个号、这个会话、这个模型的 `Agent` 说明用哪一版（清单命中与否 + 下发的正文）。
-pub(crate) fn agent_desc(cred_id: i64, session: &str, model: &str) -> AgentDesc {
-    agent_desc_of(&session_snapshot(cred_id, session), model)
+/// 这个号、这个会话、这个模型的 `Agent` 说明用哪一版（清单命中与否 + 下发的正文）。`version` 是出站
+/// 自称的版本：2.1.305 起不看下发的正文（[`reads_text`]）。
+pub(crate) fn agent_desc(cred_id: i64, session: &str, model: &str, version: &str) -> AgentDesc {
+    agent_desc_of(&session_snapshot(cred_id, session), model, version)
 }
 
 /// 一条实验曝光（`GrowthbookExperimentEvent`）。
@@ -313,8 +327,8 @@ pub(crate) struct Exposure {
 /// 这个号、这个会话、这个模型拼 `Agent` 说明时该发的实验曝光，按客户端读开关的先后：先读清单
 /// （只在精简提示词的模型上读，[`config::cc_model_lean_prompt`]——不论模型在不在清单里，opus-5-5 的
 /// 会话同样读），清单命中才再读正文。读到的值来自实验（号在实验里）才曝光。一个进程每个实验只发
-/// 一次，由遥测那边按 `feature` 记。
-pub(crate) fn exposures(cred_id: i64, session: &str, model: &str) -> Vec<Exposure> {
+/// 一次，由遥测那边按 `feature` 记。2.1.305 起不读正文，也就没有正文那条（[`reads_text`]）。
+pub(crate) fn exposures(cred_id: i64, session: &str, model: &str, version: &str) -> Vec<Exposure> {
     if !config::cc_model_lean_prompt(model) {
         return Vec::new();
     }
@@ -325,6 +339,7 @@ pub(crate) fn exposures(cred_id: i64, session: &str, model: &str) -> Vec<Exposur
         out.push(Exposure { key: key.clone(), var: *var, feature: LUCKY_CERF_FEATURE });
     }
     if uses_cerf(&snap, model)
+        && reads_text(version)
         && let Some((key, var)) = &a.text_exposure
     {
         out.push(Exposure { key: key.clone(), var: *var, feature: LUCKY_CERF_TEXT_FEATURE });
@@ -351,7 +366,7 @@ mod tests {
 
     /// 清单那条曝光（实验名, 分组）。
     fn exposure(id: i64, s: &str, model: &str) -> Option<(String, i64)> {
-        exposures(id, s, model)
+        exposures(id, s, model, "2.1.303")
             .into_iter()
             .find(|e| e.feature == LUCKY_CERF_FEATURE)
             .map(|e| (e.key, e.var))
@@ -359,7 +374,7 @@ mod tests {
 
     /// 正文那条曝光（实验名, 分组）。
     fn text_exposure(id: i64, s: &str, model: &str) -> Option<(String, i64)> {
-        exposures(id, s, model)
+        exposures(id, s, model, "2.1.303")
             .into_iter()
             .find(|e| e.feature == LUCKY_CERF_TEXT_FEATURE)
             .map(|e| (e.key, e.var))
@@ -383,25 +398,47 @@ mod tests {
     fn unseen_account_takes_the_default_values() {
         let id = -91_001;
         // 默认清单：清单里的模型用 cerf 那版、内置正文；清单外的照旧。
-        assert_eq!(agent_desc(id, S, "claude-sonnet-5-5"), AgentDesc::Cerf(None));
-        assert_eq!(agent_desc(id, S, "claude-opus-5-5"), AgentDesc::Plain);
+        assert_eq!(agent_desc(id, S, "claude-sonnet-5-5", "2.1.303"), AgentDesc::Cerf(None));
+        assert_eq!(agent_desc(id, S, "claude-opus-5-5", "2.1.303"), AgentDesc::Plain);
         // 不在任何实验里：一条曝光都不发。
         for model in ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"] {
-            assert!(exposures(id, S, model).is_empty(), "{model}");
+            assert!(exposures(id, S, model, "2.1.303").is_empty(), "{model}");
         }
     }
+    /// 2.1.305 起客户端不读正文开关：号下发了正文也用内置的、不发正文曝光；清单那条照旧。
+    #[test]
+    fn text_is_ignored_from_2_1_305() {
+        let id = -91_025;
+        note_eval(
+            id,
+            &features(&IN_V4.replace(
+                r#""source":"defaultValue","experiment":null,"experimentResult":null"#,
+                r#""source":"experiment","experiment":{"key":"tengu_lucky_cerf_experiment_v3"},
+                "experimentResult":{"inExperiment":true,"variationId":1}"#,
+            )),
+        );
+        assert_eq!(agent_desc(id, "a", "claude-sonnet-5-5", "2.1.305"), AgentDesc::Cerf(None));
+        assert_eq!(
+            agent_desc(id, "a", "claude-sonnet-5-5", "2.1.303"),
+            AgentDesc::Cerf(Some("New text.".into()))
+        );
+        let ex = exposures(id, "a", "claude-sonnet-5-5", "2.1.305");
+        assert_eq!(ex.iter().map(|e| e.feature).collect::<Vec<_>>(), vec![LUCKY_CERF_FEATURE]);
+        assert!(reads_text("2.1.304") && !reads_text("2.1.305") && !reads_text("2.1.310"));
+    }
+
     /// 正文开关：下发了就换（去首尾空白），清单命中才读、才曝光；空串或没下发用内置的、不曝光。
     #[test]
     fn follows_the_accounts_text() {
         let id = -91_020;
         note_eval(id, &features(IN_V4));
         assert_eq!(
-            agent_desc(id, "a", "claude-sonnet-5-5"),
+            agent_desc(id, "a", "claude-sonnet-5-5", "2.1.303"),
             AgentDesc::Cerf(Some("New text.".into()))
         );
-        assert_eq!(agent_desc(id, "a", "claude-opus-5-5"), AgentDesc::Plain);
+        assert_eq!(agent_desc(id, "a", "claude-opus-5-5", "2.1.303"), AgentDesc::Plain);
         assert_eq!(
-            exposures(id, "a", "claude-sonnet-5-5"),
+            exposures(id, "a", "claude-sonnet-5-5", "2.1.303"),
             vec![Exposure {
                 key: "tengu_lucky_cerf_experiment_v4".into(),
                 var: 1,
@@ -409,7 +446,7 @@ mod tests {
             }],
             "清单是默认值：只有正文那条"
         );
-        assert!(exposures(id, "a", "claude-opus-5-5").is_empty(), "opus-5-5 不读正文");
+        assert!(exposures(id, "a", "claude-opus-5-5", "2.1.303").is_empty(), "opus-5-5 不读正文");
 
         // 第 0 组：正文是空串——用内置的、照样曝光（分组 0）。
         note_eval(
@@ -420,7 +457,7 @@ mod tests {
                 "experimentResult":{"inExperiment":true,"variationId":0}}}}"#,
             ),
         );
-        assert_eq!(agent_desc(id, "b", "claude-sonnet-5-5"), AgentDesc::Cerf(None));
+        assert_eq!(agent_desc(id, "b", "claude-sonnet-5-5", "2.1.303"), AgentDesc::Cerf(None));
         assert_eq!(text_exposure(id, "b", "claude-sonnet-5-5").map(|e| e.1), Some(0));
 
         // 两个都在实验里：先清单、后正文。
@@ -434,12 +471,12 @@ mod tests {
                 "experimentResult":{"inExperiment":true,"variationId":1}}}}"#,
             ),
         );
-        let ex = exposures(id, "c", "claude-sonnet-5-5");
+        let ex = exposures(id, "c", "claude-sonnet-5-5", "2.1.303");
         assert_eq!(
             ex.iter().map(|e| e.feature).collect::<Vec<_>>(),
             [LUCKY_CERF_FEATURE, LUCKY_CERF_TEXT_FEATURE]
         );
-        assert_eq!(exposures(id, "c", "claude-opus-5-5").len(), 1, "opus-5-5 只读清单");
+        assert_eq!(exposures(id, "c", "claude-opus-5-5", "2.1.303").len(), 1, "opus-5-5 只读清单");
     }
 
     /// 首条请求确认时正文变了也算说明变了，要重新整形。
@@ -449,9 +486,9 @@ mod tests {
         note_eval(id, &features(IN_V4));
         let first = begin_first_request(id, S);
         note_eval(id, &features(&IN_V4.replace("New text.", "Other text.")));
-        assert!(first.settle("claude-sonnet-5-5"));
+        assert!(first.settle("claude-sonnet-5-5", "2.1.303"));
         assert_eq!(
-            agent_desc(id, S, "claude-sonnet-5-5"),
+            agent_desc(id, S, "claude-sonnet-5-5", "2.1.303"),
             AgentDesc::Cerf(Some("Other text.".into()))
         );
     }
@@ -505,7 +542,7 @@ mod tests {
             ),
         );
         assert!(
-            exposures(id, S, "claude-sonnet-5-5").is_empty(),
+            exposures(id, S, "claude-sonnet-5-5", "2.1.303").is_empty(),
             "钉住的仍是暂定那份（不曝光），没换成第 0 组"
         );
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
@@ -519,7 +556,7 @@ mod tests {
         let first = begin_first_request(id, S);
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "暂定：按抓包那组");
         note_eval(id, &features(V0));
-        assert!(first.settle("claude-sonnet-5-5"), "第 0 组：说明变了");
+        assert!(first.settle("claude-sonnet-5-5", "2.1.303"), "第 0 组：说明变了");
         assert!(!agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
         assert_eq!(exposure(id, S, "claude-sonnet-5-5").map(|e| e.1), Some(0));
         note_eval(id, &features(IN_V1));
@@ -528,7 +565,7 @@ mod tests {
         // eval 没到：不改、不必重新整形。
         let id = -91_009;
         let first = begin_first_request(id, S);
-        assert!(!first.settle("claude-sonnet-5-5"));
+        assert!(!first.settle("claude-sonnet-5-5", "2.1.303"));
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
 
         // 分组不改变这个模型的说明（opus-5-5 两组都是老的那版）：换快照，但不必重新整形。
@@ -536,7 +573,7 @@ mod tests {
         let first = begin_first_request(id, S);
         assert!(!agent_uses_cerf_text(id, S, "claude-opus-5-5"));
         note_eval(id, &features(V0));
-        assert!(!first.settle("claude-opus-5-5"));
+        assert!(!first.settle("claude-opus-5-5", "2.1.303"));
         assert_eq!(exposure(id, S, "claude-opus-5-5").map(|e| e.1), Some(0), "曝光跟真分组");
     }
 
@@ -548,14 +585,14 @@ mod tests {
         let first = begin_first_request(id, S);
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "先按旧缓存的第 1 组");
         note_eval(id, &features(V0));
-        assert!(first.settle("claude-sonnet-5-5"));
+        assert!(first.settle("claude-sonnet-5-5", "2.1.303"));
         assert!(!agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
         assert_eq!(exposure(id, S, "claude-sonnet-5-5").map(|e| e.1), Some(0));
 
         // 同一个号的下一个新会话：撤掉开关（eval 里没有这一项）——不换说明、不曝光。
         let first = begin_first_request(id, "next");
         note_eval(id, &features(r#"{"features":{}}"#));
-        first.settle("claude-sonnet-5-5");
+        first.settle("claude-sonnet-5-5", "2.1.303");
         assert!(!agent_uses_cerf_text(id, "next", "claude-sonnet-5-5"));
         assert_eq!(exposure(id, "next", "claude-sonnet-5-5"), None);
         assert_eq!(exposure(id, S, "claude-sonnet-5-5").map(|e| e.1), Some(0), "旧会话不受影响");
@@ -570,7 +607,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished(), "首条没确认：等着");
         note_eval(id, &features(V0));
-        assert!(first.settle("claude-sonnet-5-5"));
+        assert!(first.settle("claude-sonnet-5-5", "2.1.303"));
         waiter.await.unwrap();
         assert!(!agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "等来的是第 0 组");
     }
@@ -583,10 +620,10 @@ mod tests {
         wait_settled_for(id, S, Duration::from_millis(10)).await;
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "超时：照暂定那份发");
         note_eval(id, &features(V0));
-        assert!(!first.settle("claude-sonnet-5-5"), "已有请求照暂定发了：不改");
+        assert!(!first.settle("claude-sonnet-5-5", "2.1.303"), "已有请求照暂定发了：不改");
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
         assert!(
-            exposures(id, S, "claude-sonnet-5-5").is_empty(),
+            exposures(id, S, "claude-sonnet-5-5", "2.1.303").is_empty(),
             "曝光同那份：暂定的不曝光，没换成第 0 组"
         );
     }
@@ -598,7 +635,7 @@ mod tests {
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "抢先那条照暂定的发了");
         let first = begin_first_request(id, S);
         note_eval(id, &features(V0));
-        assert!(!first.settle("claude-sonnet-5-5"));
+        assert!(!first.settle("claude-sonnet-5-5", "2.1.303"));
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
     }
 
@@ -611,10 +648,10 @@ mod tests {
         let first = begin_first_request(id, S);
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"), "放行那条照暂定的整形");
         note_eval(id, &features(V0));
-        assert!(!first.settle("claude-sonnet-5-5"));
+        assert!(!first.settle("claude-sonnet-5-5", "2.1.303"));
         assert!(agent_uses_cerf_text(id, S, "claude-sonnet-5-5"));
         assert!(
-            exposures(id, S, "claude-sonnet-5-5").is_empty(),
+            exposures(id, S, "claude-sonnet-5-5", "2.1.303").is_empty(),
             "钉住的仍是暂定那份（不曝光），没换成第 0 组"
         );
     }

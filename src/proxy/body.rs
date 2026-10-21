@@ -519,8 +519,12 @@ pub(crate) fn rewrite_body_out_parsed(
     // 落点都与官方一致（`preserve_order` 下 `insert` 对已有键不动位置）。
     let streamed = force_stream && set_stream_true(&mut v);
     // 剥掉官方不发的顶层字段。放在最后：前面几步只增不减，剥这一步与它们无交集，
-    // 摆在队尾就不必操心谁先谁后。
-    let stripped = flags.strip_extra_fields && !billing_only && strip_extra_fields(&mut v);
+    // 摆在队尾就不必操心谁先谁后。**真实 CC 不剥**：它发什么就是官方形态（WebSearch 子调用就带
+    // `tool_choice: auto`，见 [`strip_extra_fields`]）。`client` 取自已经改写过的出站 UA，模拟路径也有值，
+    // 所以真实 CC 要认「有 client 且不走模拟」：模拟路径照旧剥。
+    let real_cc = client.is_some() && sim.is_none();
+    let stripped =
+        flags.strip_extra_fields && !billing_only && !real_cc && strip_extra_fields(&mut v);
     // 来访已有的顶层字段仍可能带着第三方客户端的键序。模拟路径既然已在整体
     // 替换客户端形态，就在所有增删之后对齐整个顶层对象，不只安排 luban 新增的键。
     let top_level_ordered = !billing_only

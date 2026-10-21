@@ -11,7 +11,7 @@
 /// `temperature` / `top_p`、不足 1024 的 `budget_tokens`、强制工具配手动预算 thinking、fable
 /// 族的 `thinking: disabled` 之类，原样发出，由上游回官方的 400。
 ///
-/// 1. **`tool_choice`**：官方两份抓包里这个键**压根不存在**。但只删**等价于默认值**的那一种
+/// 1. **`tool_choice`**：官方主线程不发这个键（上面两份抓包）。但只删**等价于默认值**的那一种
 ///    （恰好只有 `{"type":"auto"}` 一个键）——`{"type":"tool", "name":…}`/`{"type":"any"}`
 ///    是客户端在强制选工具，`disable_parallel_tool_use` 也是它要的行为，删了就是改语义。
 ///    删掉的那种对模型零影响：`auto` 本来就是缺省。
@@ -24,7 +24,9 @@
 ///    beta 的配对另由 [`fill_thinking_display`](crate::proxy::fill_thinking_display) /
 ///    [`thinking_display_explicit`](super::thinking_display_explicit) 管。
 ///
-/// **对真实 CC**：官方不发 `tool_choice`，这里是空操作。
+/// **不给真实 CC 用**（调用方按来访自报的 CC 身份跳过）：官方的 WebSearch 子调用带着
+/// `tool_choice: {"type":"auto"}`（`cap/auto-2.1.306-20261021-full/00062`），真实 CC 发什么就是
+/// 官方形态，删了反而对不上。
 pub(crate) fn strip_extra_fields(v: &mut serde_json::Value) -> bool {
     let Some(obj) = v.as_object_mut() else { return false };
     if obj.get("tool_choice").is_some_and(is_default_tool_choice) {

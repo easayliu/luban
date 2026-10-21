@@ -1,6 +1,7 @@
 //! 分叉请求（猜下一句、侧问、压缩、离开回顾、代理摘要）与子代理的收尾。
 
 use super::*;
+use crate::telemetry::files::MAIN_READER;
 
 impl EventBuilder<'_> {
     /// 猜下一句：被新输入顶掉的，与跑完的。
@@ -131,6 +132,18 @@ impl EventBuilder<'_> {
         // （`cap/auto-2.1.285-20260930` 08:00:19.400–.401）；压缩是 stop hook、turn、turn_end、
         // fork 统计（`reactive-compact`，链另起、深度 -1），再是缓存逐出提示与压缩命令收尾
         // （07:57:42.737–.756）。
+        // 心跳：敲 `/compact`（提交前一秒上下）、提交即转入 `compacting`（`cap/auto-2.1.305-20261021-full` A18：
+        // .459 / .446）。这两下不看压缩成没成——官方开始时就切进 `compacting`，压缩收尾（`finally`）才切出来；
+        // 失败或被取消就在收尾后回到闲着，只有成功才在下面报 `compaction` 并清场。敲字那条挂上一轮 prompt
+        // （A18：.459 的 `user_input` 是上一轮的 id，同秒的 `compacting` 才是这一轮的）。
+        if kind == Kind::Compact {
+            let t0 = env.t0;
+            self.beat_before_prompt(ms(t0, -1_000), heartbeat::Trigger::UserInput);
+            self.beat(ms(t0, -6), heartbeat::Trigger::Run(Some(heartbeat::COMPACTING)));
+            if failed || aborted {
+                self.beat(ms(t_end, 2), heartbeat::Trigger::Run(None));
+            }
+        }
         if matches!(kind, Kind::SideQuestion | Kind::Compact) && !failed && !aborted {
             let t1 = ms(t_end, 1);
             let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
@@ -180,7 +193,15 @@ impl EventBuilder<'_> {
             if compact {
                 self.push(t2, "tengu_turn_end", env.turn_end("completed", elapsed, None));
                 self.push(ms(t2, 1), "tengu_fork_agent_query", fork);
-                let t3 = ms(t2, 17);
+                let restored = self.emit_compact_restore(t2);
+                let t3 = ms(t2, 23);
+                // 心跳：压缩成功，收尾与逐出提示同一毫秒报 `compaction` 并清场（A18：.382 / .382）。
+                self.beat(t3, heartbeat::Trigger::Reset("compaction"));
+                // 压缩收尾同一刻依次是 `compact_reactive`、`reactive_compact_succeeded`、逐出提示与 `compaction`
+                // 心跳；命令那三条晚 2ms（`cap/auto-2.1.305-20261021-full` A0：.382 / .384）。
+                self.push_dd(t3, "tengu_feature_ok", feature("compact_reactive"));
+                self.emit_compact_succeeded(t3, restored);
+                self.files.compacted(MAIN_READER);
                 self.push(
                     t3,
                     "tengu_cache_eviction_hint",
@@ -189,11 +210,12 @@ impl EventBuilder<'_> {
                         "last_request_id": prev_main_request_id.as_deref().unwrap_or("")
                     }),
                 );
-                for name in ["compact_reactive", "cmd_compact", "cmd_dispatch"] {
-                    self.push_dd(t3, "tengu_feature_ok", feature(name));
+                let t4 = ms(t3, 2);
+                for name in ["cmd_compact", "cmd_dispatch"] {
+                    self.push_dd(t4, "tengu_feature_ok", feature(name));
                 }
                 self.push(
-                    t3,
+                    t4,
                     "tengu_input_command",
                     json!({ "input": "compact", "invocation_trigger": "user-slash" }),
                 );

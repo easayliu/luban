@@ -99,6 +99,39 @@ fn fills_thinking_display_for_cc_fable_requests() {
     assert!(v["thinking"].get("display").is_none(), "merge_beta 关着就不补: {v}");
 }
 
+/// 字段剥离只豁免真实 CC：模拟路径的出站 UA 也是改写过的 CC 身份（`client` 有值），照样要剥掉官方不发的
+/// 缺省 `tool_choice: auto`；真实 CC（有 `client`、不走模拟）发什么留什么。
+#[test]
+fn strip_extra_fields_spares_only_real_cc() {
+    let raw = r#"{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"x","description":"d","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto"}}"#;
+    let body = Bytes::from(raw.to_string());
+    let client = Some(crate::proxy::CcClient { version: "2.1.306", entrypoint: "cli" });
+    let run = |sim: Option<&crate::proxy::Simulation>| {
+        let out = crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            all_on(),
+            sim,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            client,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0;
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let sim = sim_for(raw);
+    assert!(run(Some(&sim)).get("tool_choice").is_none(), "模拟路径照旧剥");
+    assert_eq!(run(None)["tool_choice"], serde_json::json!({"type": "auto"}), "真实 CC 不剥");
+}
+
 /// 回归 2026-09-02 的 400：`claude-vscode, agent-sdk/0.3.258` 发来的 fable-5-1 请求，
 /// beta 串没有 `advisor-tool`，`merge_beta` 不给它补 `thinking-display-updates`，
 /// body 却被写了 `display:"updates"`，上游回 `Input should be 'summarized', 'omitted'`。
@@ -1717,6 +1750,28 @@ fn strip_extra_fields_is_wired_and_switchable() {
     let off = store::ForwardFlags { strip_extra_fields: false, ..only_strip };
     let out = rewrite_body(&Bytes::from(&body[..]), &test_cred(), "fp", off, None, None);
     assert_eq!(out.as_ref(), &body[..], "关掉后必须逐字节透传");
+
+    // 真实 CC 不剥：官方 WebSearch 子调用就带 `tool_choice: auto`
+    // （`cap/auto-2.1.306-20261021-full/00062`）。
+    let out = crate::proxy::rewrite_body_out(
+        &Bytes::from(&body[..]),
+        &test_cred(),
+        "fp",
+        only_strip,
+        None,
+        None,
+        None,
+        false,
+        None,
+        true,
+        false,
+        Some(crate::proxy::CcClient { version: "2.1.306", entrypoint: "cli" }),
+        None,
+        crate::proxy::CcRequestKind::Auxiliary,
+        None,
+    )
+    .0;
+    assert!(String::from_utf8_lossy(&out).contains("\"tool_choice\""), "真实 CC 原样保留");
 }
 
 // 真实 CC 抓包形态：字段顺序 device_id → account_uuid → session_id。
@@ -1829,6 +1884,25 @@ fn refusal_fallbacks_are_chosen_per_family_and_gated() {
 
 /// [`client_supplied_fallbacks`]：客户端带了数组（哪怕是空数组）算它自己的；字符串
 /// `"default"`、缺失都不算——那两种出站的是 luban 的字面量。
+/// 去掉 fallback 重试时，客户端自带的字符串 `"default"` 一并去掉：留着会被归一成与被拒计划
+/// 相同的官方数组（fable）。数组形态与没有这个字段的不动。
+#[test]
+fn retry_without_fallbacks_drops_the_client_string() {
+    let strip = |b: &str| crate::proxy::body::without_string_fallbacks(&Bytes::from(b.to_string()));
+    let out = strip(r#"{"model":"claude-fable-5-1","fallbacks":"default","messages":[]}"#).unwrap();
+    assert_eq!(out.as_ref(), br#"{"model":"claude-fable-5-1","messages":[]}"#);
+    // 思考块保留原件的转义写法（`\/`、`\u` 经 serde 往返会被归一）。
+    let out = strip(
+        r#"{"model":"m","fallbacks":"default","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"\u4e2d","signature":"a\/b"}]}]}"#,
+    )
+    .unwrap();
+    let out = String::from_utf8(out.to_vec()).unwrap();
+    assert!(out.contains(r#""thinking":"\u4e2d","signature":"a\/b""#), "{out}");
+    assert!(!out.contains("fallbacks"), "{out}");
+    assert!(strip(r#"{"model":"m","fallbacks":[{"model":"x"}]}"#).is_none());
+    assert!(strip(r#"{"model":"m"}"#).is_none());
+}
+
 #[test]
 fn client_supplied_fallbacks_means_any_non_string_field() {
     let body = |f: serde_json::Value| {
@@ -3667,7 +3741,7 @@ fn agent_description_follows_the_lucky_cerf_model_list() {
     }
     // 没见过 eval 的号按抓包那个号的分组（默认清单、v4 第 1 组的正文）。
     const UNSEEN: i64 = -92_001;
-    let cerf_of = |id, model| crate::proxy::lucky_cerf::agent_desc(id, "s", model);
+    let cerf_of = |id, model| crate::proxy::lucky_cerf::agent_desc(id, "s", model, "2.1.303");
     let opus = config::cc_profile(MainOpus);
     let plain = crate::proxy::cc_tools_core(opus, false);
     let cerf = crate::proxy::cc_tools_core_for(opus, &cerf_of(UNSEEN, "claude-sonnet-5-5"), false);
@@ -4771,7 +4845,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 303)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 306)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -4792,6 +4866,12 @@ fn reads_the_cc_entrypoint_from_the_user_agent() {
     );
     assert_eq!(e("claude-cli/2.1.251"), None, "没有括号");
     assert_eq!(e("claude-cli/2.1.251 (external)"), None, "只有一段");
+    assert_eq!(e("claude-cli/2.1.305 (external, local_projects)"), Some("local_projects"));
+    assert_eq!(
+        e("claude-cli/2.1.305 (external, acme_desk-2)"),
+        Some("acme_desk-2"),
+        "桌面 3P 自定义名"
+    );
     assert_eq!(e("claude-cli/2.1.251 (external, Bad;Value)"), None, "不规矩的段不收");
     assert_eq!(e("python-httpx/0.27.0 (external, cli)"), None, "非 CC 客户端");
 }

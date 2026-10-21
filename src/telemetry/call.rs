@@ -65,6 +65,10 @@ pub struct ApiCall {
     /// 响应里出现过思考块（`redacted_thinking` 与空思考块都算），决定要不要报
     /// `thinkingContentLength`。
     pub saw_thinking: bool,
+    /// 流式回复里除 `ping` 外的 SSE 事件数（2.1.305 起 `tengu_api_success` 的 `streamEventCount`：客户端
+    /// 逐事件累加、跳过 ping，`cap/auto-2.1.305-20261021-full` 165 条都是事件总数减一个 ping）；
+    /// 非流式为 `None`，官方回退到非流式时也不报。
+    pub stream_events: Option<u32>,
     /// 响应里每个工具的入参 JSON 字符数（工具名 → 之和，按首次出现排序），
     /// 即 `toolUseContentLengths`。
     pub tool_use_lens: Vec<(String, usize)>,
@@ -81,6 +85,51 @@ pub struct ApiCall {
     /// 这条主线程回复接替了一条续命成功过的缓存保活记录：收尾时补
     /// `tengu_feature_ok{api_cache_keepalive}`（见 [`crate::proxy`] 的 `cache_keepalive`）。
     pub cache_keepalive_ok: bool,
+    /// 实际出站的 `anthropic-dispatch-id`（真实客户端透传它自己的，模拟路径恒为 `v2d`，额度探测不带）。
+    pub dispatch: Option<String>,
+    /// 同一请求在这一条之前失败过的那几次（客户端自己重发的），按先后。转发路径交过来时总是空的，
+    /// 遥测把扣住的失败接到最终那一次上时才填（见 `Telemetry::process` 的重试链）。
+    pub prior_attempts: Vec<PriorAttempt>,
+}
+
+/// 同一请求先前失败的一次尝试：重发事件（`tengu_dispatch_header_fallback` / `tengu_api_retry`）与最终那条的
+/// `attempt`、含重试的总时长都从它们算。
+#[derive(Debug, Clone)]
+pub struct PriorAttempt {
+    pub started_at: SystemTime,
+    /// 那一次出站的 `anthropic-dispatch-id`，见 [`ApiCall::dispatch`]。
+    pub dispatch: Option<String>,
+    pub total_ms: u64,
+    pub status: Option<u16>,
+    pub error_type: Option<String>,
+    pub message: String,
+    pub in_band: bool,
+    pub request_id: Option<String>,
+}
+
+impl ApiCall {
+    /// 这个逻辑请求最早那次尝试发出的时刻：客户端自己重发过的（[`Self::prior_attempts`]）取头一次，否则就是这条。
+    /// 提交、`api_query` 这些请求前缀的事件挂在它上面，首字与收尾仍按最终这次算。
+    pub fn logical_start(&self) -> SystemTime {
+        self.prior_attempts.first().map_or(self.started_at, |a| a.started_at)
+    }
+}
+
+impl PriorAttempt {
+    /// 从一次失败的尝试取下要用的几样（没有失败信息的当连接层失败）。
+    pub(crate) fn of(c: &ApiCall) -> Self {
+        let f = c.failure.as_ref();
+        PriorAttempt {
+            started_at: c.started_at,
+            dispatch: c.dispatch.clone(),
+            total_ms: c.total_ms,
+            status: f.and_then(|f| f.status),
+            error_type: f.and_then(|f| f.error_type.clone()),
+            message: f.map(|f| f.message.clone()).unwrap_or_default(),
+            in_band: f.is_some_and(|f| f.in_band),
+            request_id: c.request_id.clone(),
+        }
+    }
 }
 
 /// 回复里的一个工具调用。下一条请求把它的结果带回来时，那串工具事件（入参字节数、Bash 的
@@ -123,6 +172,8 @@ pub struct Capture {
     pub session_header: Option<String>,
     /// 实际发出的 `x-client-request-id`。
     pub client_request_id: Option<String>,
+    /// 实际发出的 `anthropic-dispatch-id`。
+    pub dispatch: Option<String>,
     pub agent: AgentHeaders,
     pub organization_id: Option<String>,
     pub started_at: SystemTime,
@@ -175,6 +226,7 @@ impl Capture {
             reply_input_chars: 0,
             thinking_chars: 0,
             saw_thinking: false,
+            stream_events: None,
             tool_use_lens: Vec::new(),
             tool_calls: Vec::new(),
             cost_usd: None,
@@ -182,6 +234,8 @@ impl Capture {
             failure: Some(failure),
             aborted: false,
             cache_keepalive_ok: false,
+            dispatch: self.dispatch,
+            prior_attempts: Vec::new(),
         });
     }
 }

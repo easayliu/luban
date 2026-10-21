@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod files;
 mod finish;
 mod forks;
 mod prompt;
@@ -17,9 +18,11 @@ pub(crate) fn build_events(
     shape: &RequestShape,
     f: &TurnFacts,
     file_sizes: &mut HashMap<String, usize>,
+    hb: &mut Heartbeat,
+    files: &mut Files,
 ) -> BuiltEvents {
     let env = EventEnv::new(call, shape, f);
-    let mut b = EventBuilder::new(&env, file_sizes);
+    let mut b = EventBuilder::new(&env, file_sizes, hb, files);
     b.emit_startup();
     b.emit_background();
     b.emit_rejected_tools();
@@ -28,6 +31,7 @@ pub(crate) fn build_events(
     b.emit_tool_steps();
     b.emit_pre_request();
     b.emit_request();
+    b.emit_retries();
     b.emit_first_token();
     b.emit_success();
     b.emit_failure();
@@ -48,6 +52,11 @@ pub(super) struct BuiltEvents {
     pub(super) dd: Vec<Value>,
     /// `--continue` 接上旧会话时，挂在启动探测那个临时会话上的那一串。
     pub(super) probe_side: Option<(Identity, TplOutput)>,
+    /// 见 [`EventBuilder::loc`] / [`EventBuilder::decisions`]。
+    pub(super) loc: Vec<(usize, usize)>,
+    pub(super) decisions: Vec<EditDecision>,
+    /// 压缩成功时，压完之后上下文里还在的附件（按类型计数），见 [`EventBuilder::emit_compact_succeeded`]。
+    pub(super) post_compact_attachments: Option<Vec<(String, u32)>>,
 }
 
 /// [`Telemetry::build_events`](crate::telemetry::build_events) 各段共用的只读输入：这条调用、前半段推出的 [`TurnFacts`]，以及
@@ -78,6 +87,8 @@ pub(super) struct EventEnv<'a> {
     pub(super) classifier_held: bool,
     pub(super) req_hash: u32,
     pub(super) retry_pad: u32,
+    /// 同一请求先前几次失败的概况，见 [`RetryView`]。
+    pub(super) retry: RetryView,
     pub(super) body_chars: usize,
     pub(super) gzip_skip: &'static str,
     /// 失败那条的 `errorType`，`turn_end{api_error}` 的 `error_kind` 也用它；成功为空。
@@ -100,7 +111,10 @@ impl<'a> EventEnv<'a> {
             ref version,
             ..
         } = *f;
-        let t0: DateTime<Utc> = call.started_at.into();
+        // 请求前缀（提交、`api_query` 之类）挂在逻辑请求的头一次尝试上，首字与收尾按最终这次尝试算
+        // （`cap/auto-2.1.306-20261021-retry` R1：`api_query` 在被拒的那次之前，成功在重发之后）。
+        let t0: DateTime<Utc> = call.logical_start().into();
+        let attempt_start: DateTime<Utc> = call.started_at.into();
         let ttft = call.ttft_ms.unwrap_or(call.total_ms.min(1_500)) as i64;
         let total = call.total_ms as i64;
         let build_age_mins = {
@@ -170,8 +184,8 @@ impl<'a> EventEnv<'a> {
             t0,
             ttft,
             total,
-            t_first: ms(t0, ttft),
-            t_end: ms(t0, total),
+            t_first: ms(attempt_start, ttft),
+            t_end: ms(attempt_start, total),
             build_age_mins,
             query_source,
             builtin_agent: call.agent.agent_type.as_deref().filter(|t| *t != "custom"),
@@ -187,10 +201,31 @@ impl<'a> EventEnv<'a> {
             classifier_held,
             req_hash,
             retry_pad: req_hash % 5,
+            retry: RetryView::of(&call.prior_attempts, call.dispatch.as_deref()),
             body_chars,
             gzip_skip,
             error_kind_name: call.failure.as_ref().map(error_kind).unwrap_or_default(),
             fork_messages,
+        }
+    }
+
+    /// 这条请求实际出站的 `anthropic-dispatch-id`（头一次 5xx 之后客户端换成 `v2p` 重发，之后的重试都是它，
+    /// `cap/auto-2.1.306-20261021-retry`）；没记到的按 [`config::CC_DISPATCH_ID`]。
+    pub(super) fn dispatch(&self) -> &str {
+        self.call.dispatch.as_deref().unwrap_or(config::CC_DISPATCH_ID)
+    }
+
+    /// `durationMsIncludingRetries`：从头一次尝试发出算到这条收尾（R2：首次 .465 发出、最终 43.264 收尾，报 1808）；
+    /// 没重发过的照旧是这条自己的时长上下。
+    pub(super) fn duration_including_retries(&self) -> i64 {
+        match self.call.prior_attempts.first() {
+            Some(first) => {
+                let start: DateTime<Utc> = first.started_at.into();
+                (self.t_end - start).num_milliseconds().max(self.total)
+                    + 1
+                    + i64::from(self.retry_pad)
+            }
+            None => self.total + 1 + i64::from(self.retry_pad),
         }
     }
 
@@ -206,6 +241,17 @@ impl<'a> EventEnv<'a> {
             prompt_id: &self.f.prompt_id,
             uptime_secs: self.uptime(dt),
         }
+    }
+
+    /// 同 [`Self::ctx`]，挂到**上一轮** prompt 上：提交前的事件客户端还没换 prompt（提交前敲字的
+    /// `user_input` 心跳，`cap/auto-2.1.305-20261021-full` B1 / A18 都是上一轮的 id，提交后的
+    /// `work_start` 才换）。会话里还没有上一轮的就用这一轮的。
+    pub(super) fn ctx_prev_prompt(&self, dt: DateTime<Utc>) -> EventCtx<'a> {
+        let mut c = self.ctx(dt);
+        if !self.f.prev_prompt_id.is_empty() {
+            c.prompt_id = &self.f.prev_prompt_id;
+        }
+        c
     }
 
     /// 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
@@ -361,6 +407,9 @@ impl<'a> EventEnv<'a> {
             tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
             lucky_cerf: f.lucky_cerf.clone(),
+            git: f.identity.vcs.is_some(),
+            seed: self.req_hash,
+            tracked_files: 0,
         }
     }
 }
@@ -398,13 +447,53 @@ pub(super) struct EventBuilder<'a> {
     pub(super) tpl_events: Vec<(DateTime<Utc>, Value)>,
     pub(super) tpl_dd: Vec<Value>,
     pub(super) probe_side: Option<(Identity, TplOutput)>,
+    /// 会话的心跳状态机与这条调用登记的触发（[`Self::beat`]），收尾时一并折算。
+    pub(super) hb: &'a mut Heartbeat,
+    /// 标签：这处触发报出来的事件挂在哪份身份与 prompt 上（[`BeatAt`]）。
+    pub(super) beats: Vec<(DateTime<Utc>, heartbeat::Trigger, BeatAt)>,
+    /// 这一条是 `/clear` 之后新会话的头一条时，清场那几刻的身份（[`ClearIds`]）。
+    pub(super) cleared: Option<ClearIds>,
+    /// 正在补报上一轮的事（[`Self::emit_rejected_tools`]）：这期间 `push*` 发的事件挂上一轮 prompt。
+    pub(super) prev_prompt_scope: bool,
+    /// 会话的文件账本（[`Files`]）。
+    pub(super) files: &'a mut Files,
+    /// 这条调用里改动的行数与编辑类工具的权限决定，进 OTel 指标（`lines_of_code.count` /
+    /// `code_edit_tool.decision`）。
+    pub(super) loc: Vec<(usize, usize)>,
+    pub(super) decisions: Vec<EditDecision>,
+    /// 见 [`BuiltEvents::post_compact_attachments`]。
+    pub(super) post_compact_attachments: Option<Vec<(String, u32)>>,
+}
+
+/// 一次编辑类工具（Edit / Write / NotebookEdit）的权限决定，`code_edit_tool.decision` 的一个计数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditDecision {
+    pub(crate) decision: &'static str,
+    pub(crate) source: &'static str,
+    pub(crate) tool: String,
+    pub(crate) language: Option<String>,
 }
 
 impl<'a> EventBuilder<'a> {
-    pub(super) fn new(env: &'a EventEnv<'a>, file_sizes: &'a mut HashMap<String, usize>) -> Self {
+    pub(super) fn new(
+        env: &'a EventEnv<'a>,
+        file_sizes: &'a mut HashMap<String, usize>,
+        hb: &'a mut Heartbeat,
+        files: &'a mut Files,
+    ) -> Self {
+        let mut subst = env.subst();
+        subst.tracked_files = files.tracked();
         EventBuilder {
             env,
-            subst: env.subst(),
+            subst,
+            hb,
+            beats: Vec::new(),
+            cleared: None,
+            prev_prompt_scope: false,
+            files,
+            loc: Vec::new(),
+            decisions: Vec::new(),
+            post_compact_attachments: None,
             file_sizes,
             events: Vec::with_capacity(16),
             dd: Vec::with_capacity(6),
@@ -415,20 +504,27 @@ impl<'a> EventBuilder<'a> {
         }
     }
 
+    /// `push*` 用的上下文：补报上一轮的那段挂上一轮 prompt（[`Self::prev_prompt_scope`]）。
+    fn ctx_at(&self, dt: DateTime<Utc>) -> EventCtx<'a> {
+        if self.prev_prompt_scope { self.env.ctx_prev_prompt(dt) } else { self.env.ctx(dt) }
+    }
+
     /// 发一条事件。服务端下发的抽样配置在这里统一过一遍（[`sample_event`]），抽掉的不发。
     pub(super) fn push(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
         if !sample_event(name, &env.f.version, &mut extra) {
             return;
         }
-        self.events.push((dt, env.f.identity.event(name, dt, &env.ctx(dt), extra)));
+        let ctx = self.ctx_at(dt);
+        self.events.push((dt, env.f.identity.event(name, dt, &ctx, extra)));
     }
 
     /// 同一条事件同时进事件链与 Datadog，两边是同一份 meta。
     pub(super) fn push_dd(&mut self, dt: DateTime<Utc>, name: &str, extra: Value) {
         let env = self.env;
         self.push(dt, name, extra.clone());
-        self.dd.push(env.f.identity.dd_entry(name, &env.ctx(dt), &env.f.dd_model, extra));
+        let ctx = self.ctx_at(dt);
+        self.dd.push(env.f.identity.dd_entry(name, &ctx, &env.f.dd_model, extra));
     }
 
     /// 同上，Datadog 那份是 [`snake_flat`] 扁平化过的字段。
@@ -436,7 +532,8 @@ impl<'a> EventBuilder<'a> {
         let env = self.env;
         let flat = snake_flat(&extra);
         self.push(dt, name, extra);
-        self.dd.push(env.f.identity.dd_entry(name, &env.ctx(dt), &env.f.dd_model, flat));
+        let ctx = self.ctx_at(dt);
+        self.dd.push(env.f.identity.dd_entry(name, &ctx, &env.f.dd_model, flat));
     }
 
     pub(super) fn take_tpl(&mut self, tpl: &[TplEvent], anchor: DateTime<Utc>) {
@@ -453,12 +550,116 @@ impl<'a> EventBuilder<'a> {
         self.tpl_dd.extend(d);
     }
 
+    /// 登记一处心跳触发（只在主线程那条时间线上：子代理自己的请求不是主循环，也不改界面运行态，
+    /// 调用方自己挑）。
+    pub(super) fn beat(&mut self, dt: DateTime<Utc>, trigger: heartbeat::Trigger) {
+        self.beats.push((dt, trigger, BeatAt::Turn));
+    }
+
+    /// 同 [`Self::beat`]，但这处触发在这一轮提交之前，报出来的事件挂上一轮 prompt
+    /// （[`EventEnv::ctx_prev_prompt`]）。
+    pub(super) fn beat_before_prompt(&mut self, dt: DateTime<Utc>, trigger: heartbeat::Trigger) {
+        self.beats.push((dt, trigger, BeatAt::PrevPrompt));
+    }
+
+    /// `/clear` 那几处触发，挂在清场时的身份上（[`ClearIds`]）。
+    pub(super) fn beat_at(&mut self, dt: DateTime<Utc>, trigger: heartbeat::Trigger, at: BeatAt) {
+        self.beats.push((dt, trigger, at));
+    }
+
+    /// 按给定身份与阶段发一条事件（`/clear` 前后那几条，不走这一轮的会话身份）。`dd` 为真时
+    /// Datadog 那份同发。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn push_as(
+        &mut self,
+        dt: DateTime<Utc>,
+        name: &str,
+        identity: &Identity,
+        stage: MetaStage,
+        prompt_id: &str,
+        dd: bool,
+        mut extra: Value,
+    ) {
+        let env = self.env;
+        if !sample_event(name, &env.f.version, &mut extra) {
+            return;
+        }
+        let ctx = EventCtx { prompt_id, ..env.ctx(dt) };
+        if dd {
+            self.dd.push(identity.dd_entry_at(stage, name, &ctx, &env.f.dd_model, extra.clone()));
+        }
+        self.events.push((dt, identity.event_at(stage, name, dt, &ctx, extra)));
+    }
+
     pub(super) fn finish(mut self) -> BuiltEvents {
+        // 心跳挂在主会话身份上。排序稳定：同一毫秒里清场那几条（`session_end` / `compaction` /
+        // `conversation_clear`）排在同刻的 `cache_eviction_hint` 之后，其余排在同刻事件之前
+        // （`main_request` 在 `api_success` 之前，`cap/auto-2.1.305-20261021-full`）。
+        let env = self.env;
+        let beats = std::mem::take(&mut self.beats);
+        let mut front = Vec::new();
+        for (dt, meta, at) in self.hb.fold_tagged(beats) {
+            let tail = matches!(
+                meta["kind"].as_str(),
+                Some("session_end" | "compaction" | "conversation_clear")
+            );
+            let (identity, ctx) = match (at, &self.cleared) {
+                (BeatAt::PrevPrompt, _) => (&env.f.base_identity, env.ctx_prev_prompt(dt)),
+                (BeatAt::ClearInput, Some(c)) => {
+                    (&c.old, EventCtx { prompt_id: &c.old_prompt, ..env.ctx(dt) })
+                }
+                (BeatAt::Clearing, Some(c)) => {
+                    (&c.clearing, EventCtx { prompt_id: &c.clear_prompt, ..env.ctx(dt) })
+                }
+                _ => (&env.f.base_identity, env.ctx(dt)),
+            };
+            let ev = identity.event("tengu_cache_heartbeat_shadow", dt, &ctx, meta);
+            if tail {
+                self.events.push((dt, ev));
+            } else {
+                front.push((dt, ev));
+            }
+        }
+        if !front.is_empty() {
+            front.append(&mut self.events);
+            self.events = front;
+        }
         self.events.extend(self.tpl_events);
         self.events.extend(self.main_side);
         self.dd.extend(self.tpl_dd);
-        BuiltEvents { events: self.events, dd: self.dd, probe_side: self.probe_side }
+        BuiltEvents {
+            events: self.events,
+            dd: self.dd,
+            probe_side: self.probe_side,
+            loc: self.loc,
+            decisions: self.decisions,
+            post_compact_attachments: self.post_compact_attachments,
+        }
     }
+}
+
+/// 一处心跳触发报出来的事件挂在哪：
+#[derive(Clone, Copy)]
+pub(super) enum BeatAt {
+    /// 这一轮的会话与 prompt。
+    Turn,
+    /// 这一轮的会话、上一轮的 prompt（提交前敲字）。
+    PrevPrompt,
+    /// 敲 `/clear` 那下：还是旧会话、旧会话最后一轮的 prompt（[`ClearIds::old`]）。
+    ClearInput,
+    /// 清场那一刻（[`ClearIds::clearing`]）。
+    Clearing,
+}
+
+/// `/clear` 前后的身份。官方先给 `/clear` 这次提交换一个 prompt、再把 `parent_session_id`
+/// 设成旧会话，下一毫秒才换 `session_id`：清场那一刻的逐出提示、`conversation_clear` 心跳与
+/// `shell_set_cwd` 是「旧会话 id + parent 指向自己 + `/clear` 的 prompt」，`session_start`
+/// 起才是新会话，且到下一次提交之前不带 `cc_prompt_id`（`cap/auto-2.1.306-20261021-full/00485`）。
+pub(super) struct ClearIds {
+    pub(super) old: Identity,
+    pub(super) old_prompt: String,
+    pub(super) clearing: Identity,
+    pub(super) clear_prompt: String,
 }
 
 /// `dt` 往后挪 `d` 毫秒（负数往前）。

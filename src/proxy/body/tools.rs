@@ -177,7 +177,8 @@ static CC_TOOLS_CORE_TRIM: std::sync::LazyLock<Vec<serde_json::Value>> =
     std::sync::LazyLock::new(|| trimmed(&CC_TOOLS_CORE));
 
 /// cerf 那版 `Agent` 说明里客户端内置的「何时用」正文（可执行文件里的 `vHt`，2.1.296 与 2.1.299
-/// 逐字相同）。服务端 `tengu_lucky_cerf_text` 下发了非空正文时整段换成那一段，见 [`cerf_desc`]。
+/// 逐字相同，2.1.305 也是这一段）。服务端 `tengu_lucky_cerf_text` 下发了非空正文时整段换成那一段，见
+/// [`cerf_desc`]；2.1.305 起客户端不再读那个开关。
 const CC_AGENT_CERF_BUILTIN: &str = "A fresh agent costs more than it looks.";
 const CC_AGENT_CERF_BUILTIN_END: &str =
     "you do not understand the task well enough to hand it off.";
@@ -288,7 +289,7 @@ pub(crate) fn cc_tools_core(
 
 /// 实际注进出站体的那份声明：[`cc_tools_core`] 再挑 `Agent` 说明——`desc` 是这个会话钉住的分组里
 /// 这个模型用哪一版（[`crate::proxy::lucky_cerf::agent_desc`]）：清单命中就用 cerf 那版
-/// （[`CC_TOOLS_CORE_CERF`]），号下发了正文就换上那段（[`cerf_with_text`]）。haiku-4.5 不走精简提示词、
+/// （[`CC_TOOLS_CORE_CERF`]），号下发了正文就换上那段（[`cerf_with_text`]，2.1.305 起不换）。haiku-4.5 不走精简提示词、
 /// 客户端根本不读这两个开关，不受影响。工具名与先后几份相同，只看名字的地方仍用 [`cc_tools_core`]。
 pub(crate) fn cc_tools_core_for(
     profile: &config::CcProfile,
@@ -500,7 +501,8 @@ pub(super) fn inject_cc_tools(
     let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) else {
         return false;
     };
-    let desc = crate::proxy::lucky_cerf::agent_desc(who.cred_id, who.session, &model);
+    let desc =
+        crate::proxy::lucky_cerf::agent_desc(who.cred_id, who.session, &model, profile.version);
     let stubs = cc_tools_core_for(profile, &desc, trim);
     let official_names: Vec<&str> =
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
