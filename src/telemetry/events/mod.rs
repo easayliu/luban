@@ -175,8 +175,8 @@ impl<'a> EventEnv<'a> {
         let gzip_skip = if body_chars < 4096 { "below_min_size" } else { "proxy" };
         // fork 统计里的 `messageCount` 是分叉查询回来的内容块数：思考块 + 正文，只有正文就是 1
         // （`cap/2.1.285`：haiku 摘要带思考两条都是 2，离开回顾一条纯文本 1、一条带思考 2；
-        // `cap/2.1.280` 的猜下一句同样 1 与 2 都有）。
-        let fork_messages = 1 + u32::from(call.saw_thinking);
+        // `cap/2.1.280` 的猜下一句同样 1 与 2 都有）。没出建议、只有思考的报 1，不是 2（见 [`reply_messages`]）。
+        let fork_messages = reply_messages(call);
         EventEnv {
             call,
             shape,

@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.306.dcf; cc_entrypoint=cli;"),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.307.b43; cc_entrypoint=cli;"),
         "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
              按 `000` 算）: {s}"
     );
@@ -478,7 +478,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
         sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.306.dcf; cc_entrypoint=cli; cch="
+            "x-anthropic-billing-header: cc_version=2.1.307.b43; cc_entrypoint=cli; cch="
         ),
         "{v}"
     );
@@ -1627,11 +1627,11 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.306-20261021-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.307-20261022-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
 /// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00469` 是中断后重开那轮；
-/// `00278`、`00425`、`00380` 是各自首轮）；
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00468` 是中断后重开那轮；
+/// `00281`、`00424`、`00378` 是各自首轮）；
 /// fable 只有 auto 模式的（`00606`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
 /// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
@@ -1641,16 +1641,16 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_306_captures() {
-    let dir = format!("{}/cap/auto-2.1.306-20261021-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_307_captures() {
+    let dir = format!("{}/cap/auto-2.1.307-20261022-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.306-20261021-full not present");
+        eprintln!("skipped: cap/auto-2.1.307-20261022-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
     // 清单是默认值；正文照 2.1.303 抓包那个号的 v4 第 1 组那段喂进去（`assets/cc_agent_cerf_text_v4.txt`）——
-    // 2.1.305 起不再读这个开关，出站的 cerf 说明必须仍是内置正文、与抓包一致。用独立的号喂进去，不动别的
-    // 用例共用的测试凭证。
+    // 2.1.305 起不再读这个开关，出站的 cerf 说明必须仍是内置正文、与抓包一致；2.1.307 起清单也不读，清单外的
+    // opus-5-5 一样用 cerf 那版。用独立的号喂进去，不动别的用例共用的测试凭证。
     let cred = crate::credentials::Credential { id: 9_300, ..test_cred() };
     let eval = serde_json::json!({"features": {
         "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
@@ -1663,7 +1663,7 @@ fn simulated_main_threads_match_the_2_1_306_captures() {
             "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
     crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00469", false), ("00278", false), ("00425", false), ("00380", false), ("00606", true)]
+        [("00468", false), ("00281", false), ("00424", false), ("00378", false), ("00606", true)]
     {
         let path = files
             .iter()
@@ -1718,7 +1718,7 @@ fn simulated_main_threads_match_the_2_1_306_captures() {
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
 
-        // `thread`：2.1.306 五个主线程首轮都是 `create`，模拟出站与之一致。
+        // `thread`：2.1.307 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
         // 顶层键序：官方键里去掉模拟不造的 safeguards，再与出站共有键比先后。
         let skip = ["safeguards", "stream"];
@@ -1750,7 +1750,7 @@ fn simulated_main_threads_match_the_2_1_306_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.306."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.307."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1759,7 +1759,7 @@ fn simulated_main_threads_match_the_2_1_306_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/7318c955-8994-4b9d-95f1-2b37d5e6188e/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/937e8c67-6eb0-4226-b026-3b94e9e94539/scratchpad/calc",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -1783,9 +1783,8 @@ fn simulated_main_threads_match_the_2_1_306_captures() {
             "{model}: 第四块按抓包机的环境回填后逐字节相同"
         );
 
-        // 工具：注入的 14 个内建工具与官方那 14 个逐字节相同（顺序是官方的名字序）；sonnet-5-5、
-        // haiku-5-5、fable-5-1 的 `Agent` 是 cerf 那版、正文是上面喂的那份 eval 里 v4 第 1 组那段
-        // （[`crate::proxy::cc_tools_core_for`]）。
+        // 工具：注入的 14 个内建工具与官方那 14 个逐字节相同（顺序是官方的名字序）；opus-5-5、sonnet-5-5、
+        // haiku-5-5、fable-5-1 的 `Agent` 是 cerf 那版、内置正文（[`crate::proxy::cc_tools_core_for`]）。
         let tools = v["tools"].as_array().unwrap();
         let otools = official["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 14, "{model}");
@@ -2049,6 +2048,95 @@ fn every_api_key_mode_request_passes_through() {
 /// **API 密钥模式的 helper**，不靠抓包目录：按 `cap/auto-2.1.293-20261008-api/00045` 造一条（主模型、
 /// `[billing, 身份句]`、`tools: []`、无 thinking、`max_tokens` 128000、`effort: medium`、API 密钥那串
 /// beta），认作官方 helper；差一项都不认。
+#[test]
+fn helper_without_scope_is_recognized_only_from_2_1_307() {
+    use super::is_official_helper_request;
+    let beta = |s: &str| s.split(',').map(str::to_string).collect::<Vec<_>>();
+    // `cap/auto-2.1.307-20261022-baseurl/v307/00006` 那串：与 2.1.306 那条（`v306/00006`）只差 `prompt-caching-scope`。
+    let b307 = beta(
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+         per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+         inline-tools-2026-09-15,advisor-tool-2026-03-01,effort-2025-11-24,\
+         dangerous-tool-use-2026-09-03",
+    );
+    let helper = |billing: &str| {
+        serde_json::json!({
+            "max_tokens": 128000,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "\nWeb page content:\n---\nExample Domain"}]}],
+            "metadata": {"user_id": "{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\",\"account_uuid\":\"7766686b-9614-4e43-a874-0e1c11b9f180\",\"session_id\":\"0159be3f-ccb3-4c2a-899b-6a0a232b27d2\"}"},
+            "model": "claude-opus-5-5",
+            "output_config": {"effort": "medium"},
+            "stream": true,
+            "system": [
+                {"type": "text", "text": billing},
+                {"type": "text", "text": config::CC_SYSTEM_IDENTITY}
+            ],
+            "tools": []
+        })
+    };
+    let v307 = helper("x-anthropic-billing-header: cc_version=2.1.307.9c3; cc_entrypoint=cli;");
+    assert!(is_official_helper_request(&v307, &b307));
+    // 2.1.306 一直带这一项：自报 2.1.306 却没带的不认，带上才认。
+    let v306 = helper("x-anthropic-billing-header: cc_version=2.1.306.80a; cc_entrypoint=cli;");
+    assert!(!is_official_helper_request(&v306, &b307));
+    let mut b306 = b307.clone();
+    b306.insert(6, config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
+    assert!(is_official_helper_request(&v306, &b306));
+    // 读不出版本（字段名不对）照旧要这一项。
+    let odd = helper("x-anthropic-billing-header: not_cc_version=2.1.307.9c3; cc_entrypoint=cli;");
+    assert!(!is_official_helper_request(&odd, &b307));
+    // 只放掉这一项：别的 beta 少一项照旧不认。
+    let mut no_effort = b307.clone();
+    no_effort.retain(|b| !b.starts_with("effort-"));
+    assert!(!is_official_helper_request(&v307, &no_effort));
+    // body 与 system 的判据一项不放。
+    for (k, val) in [
+        ("thinking", serde_json::json!({"type": "adaptive"})),
+        ("max_tokens", serde_json::json!(4096)),
+        ("tools", serde_json::json!([{"name": "x", "input_schema": {"type": "object"}}])),
+    ] {
+        let mut v = v307.clone();
+        v[k] = val;
+        assert!(!is_official_helper_request(&v, &b307), "{k}");
+    }
+    let mut three = v307.clone();
+    three["system"].as_array_mut().unwrap().push(serde_json::json!({"type": "text", "text": "x"}));
+    assert!(!is_official_helper_request(&three, &b307), "system 多一块就不是 helper");
+    // 认作官方辅助调用：beta 只补 `oauth`，外加按直连位置补回 `prompt-caching-scope`（见 `merge_beta_for`）。
+    let kind = crate::proxy::CcRequestKind::of(&v307, &b307);
+    assert!(
+        crate::proxy::BetaCtx::of(kind, v307.to_string().as_bytes(), Some(&v307), &b307).only_oauth
+    );
+
+    // 整条走一遍：不进模拟、新设备上也不当一次性会话探针。
+    let mut headers = crate::proxy::HeaderMap::new();
+    headers
+        .insert(header::USER_AGENT, HeaderValue::from_static("claude-cli/2.1.307 (external, cli)"));
+    headers.insert("anthropic-beta", HeaderValue::from_str(&b307.join(",")).unwrap());
+    assert!(crate::proxy::simulation_reason(Some(&v307), &headers, true, all_on()).is_none());
+    let probe = futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
+        Some(&v307),
+        crate::proxy::extract_device_id(Some(&v307)).as_deref(),
+        &b307,
+        true,
+        false,
+        async { false },
+    ))
+    .expect("probe_signature does no IO here");
+    assert!(probe.is_none(), "{probe:?}");
+    let probe = futures_util::FutureExt::now_or_never(crate::proxy::probe_signature(
+        Some(&v306),
+        crate::proxy::extract_device_id(Some(&v306)).as_deref(),
+        &b307,
+        true,
+        false,
+        async { false },
+    ))
+    .expect("probe_signature does no IO here");
+    assert!(probe.is_some(), "对照：自报 2.1.306 又没带的还是当探针");
+}
+
 #[test]
 fn api_key_mode_helper_is_recognized() {
     use super::is_official_helper_request;

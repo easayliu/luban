@@ -346,7 +346,7 @@ impl Telemetry {
         let mut st = self.0.state.lock();
         // 扣住太久的重试链：客户端没再重发，最后一次就是最终失败（见 [`HeldRetry`]）。
         let retry_hold = Duration::from_secs(config::TELEMETRY_RETRY_HOLD_SECS);
-        let given_up: Vec<(i64, String)> = st
+        let given_up: Vec<(i64, String, RetryLane)> = st
             .held_retries
             .iter()
             .filter(|(_, h)| now.duration_since(h.at) >= retry_hold)
@@ -385,11 +385,11 @@ impl Telemetry {
                 // 补处理时就认不出 `/clear` 来历了。
                 .filter(|(k, s)| {
                     now.duration_since(s.last_seen) >= idle
-                        && !st.held_retries.contains_key(*k)
+                        && !st.held_retries.keys().any(|(c, sid, _)| (c, sid) == (&k.0, &k.1))
                         && !st
                             .held_retries
                             .iter()
-                            .any(|((c, _), h)| *c == k.0 && h.device_id == s.device_id)
+                            .any(|((c, _, _), h)| *c == k.0 && h.device_id == s.device_id)
                 })
                 .map(|(k, _)| k.clone())
                 .collect();

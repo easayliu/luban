@@ -4,15 +4,15 @@
 /// 这些请求原先不带任何 UA——一个持有订阅 refresh_token 却没有 UA 的客户端非常显眼。
 /// 转发 `/v1/*` 时以来访客户端自己的 UA 为准（转发头覆盖此默认值）。
 ///
-/// 取最近一次抓到的官方版本（`cap/auto-2.1.306-20261021-full`）。落后不致命——真实用户升级也有先后——
+/// 取最近一次抓到的官方版本（`cap/auto-2.1.307-20261022-full`）。落后不致命——真实用户升级也有先后——
 /// 但落得太多就成了「一个几个月没升级过的客户端在不停刷 token」。
 ///
 /// 动这里必须同时动 [`CC_VERSION_BASE`]（billing header 里的 `cc_version`）、
 /// [`KEEPALIVE_USER_AGENT`](super::KEEPALIVE_USER_AGENT) 与 [`CC_BUILD_TIMES`]（遥测里的构建时间），还有
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
-/// 同一个客户端不会一边自称 2.1.306、一边报另一个版本的 cc_version、构建时间、上一版的
+/// 同一个客户端不会一边自称 2.1.307、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.306 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.307 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -124,7 +124,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.306";
+pub const CC_VERSION_BASE: &str = "2.1.307";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -137,10 +137,10 @@ pub const CC_VERSION_BASE: &str = "2.1.306";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.306-20261021-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
-/// UA `claude-cli/2.1.306`）。
+/// 依据：`cap/auto-2.1.307-20261022-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
+/// UA `claude-cli/2.1.307`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.306";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.307";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -322,6 +322,11 @@ pub const CC_MODEL_IDENTITIES: &[(&str, &str, &str)] = &[
     ("claude-sonnet-4-6", "Sonnet 4.6", "August 2025"),
 ];
 
+/// 直连官方的订阅端客户端的「小快模型」（2.1.307 `lS()`：没设 `ANTHROPIC_SMALL_FAST_MODEL` /
+/// `ANTHROPIC_DEFAULT_HAIKU_MODEL` 时取模型表的默认 haiku），标题生成用的就是它（2.1.293 起
+/// haiku-5-5）。进度摘要器的 `writer` 只有等于它才换（`tengu_agent_summary_stopped.writer_model`）。
+pub const CC_SMALL_FAST_MODEL: &str = "claude-haiku-5-5";
+
 // ---------- 官方 CC 工具名白名单 ----------
 
 /// 官方 Claude Code 客户端声明过的全部工具名（含 deferred 展开后的名字与老版本的旧名）。
@@ -479,6 +484,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.306-20261021-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致。
     ("2.1.306", "2026-10-21T00:58:51Z"),
+    // `cap/auto-2.1.307-20261022-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.307", "2026-10-21T19:40:02Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

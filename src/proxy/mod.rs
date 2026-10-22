@@ -99,6 +99,7 @@ pub(crate) mod agent_summary_config;
 pub(crate) mod cache_keepalive;
 pub(crate) mod dapper_dawn;
 mod lucky_cerf;
+pub(crate) mod snoopy_creek;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,
 };

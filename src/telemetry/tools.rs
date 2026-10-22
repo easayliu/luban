@@ -898,6 +898,91 @@ pub(super) fn auto_mode_decision_v300(v: &mut Value) {
     );
 }
 
+/// 2.1.307 的 `tengu_auto_mode_decision` 在 `classifierSource` 之后多 `skippedOnAllowRule`
+/// （`cap/auto-2.1.307-20261022-full` 走分类器的 28 条都是 `false`）。acceptEdits 快路径那种（带
+/// `serverClassifierNoVerdict`）是另一个调用点，不带它。
+pub(super) fn auto_mode_decision_v307(v: &mut Value) {
+    if v.get("serverClassifierNoVerdict").is_none() {
+        insert_after(v, "classifierSource", vec![("skippedOnAllowRule", json!(false))]);
+    }
+}
+
+/// 工具是谁拒的：2.1.307 `tengu_safety_event` 的类别、来源与判据那几项按它填（官方 `NMn` 读的那份判定记录，
+/// `PU` 拼、`_Yr` 归类）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Denial {
+    /// 用户在权限弹框上拒的：类别 `user_rejected`、来源 `user_reject`、判据码 `unknown`，弹过框所以没有
+    /// `reason_type`（`cap/auto-2.1.307-20261022-full` B1）。
+    UserReject,
+    /// 调用方的 canUseTool 不问人直接拒：「猜下一句」分叉一律拒（官方 `M` 返回 `deny` 与 `{type: "other"}`），
+    /// 类别 `other`、来源 `config`，`reason_type` 与判据码都是 `other`（同一抓包 A19 那条 Bash）。
+    Config,
+}
+
+/// 2.1.307 的 `tengu_safety_event`（官方 `NMn` → `HMn`）：工具被拒那一刻报，不进 Datadog。没有规则来源、
+/// 授权范围、熔断、分类器那几项；沙箱没开，违规数 0。服务端开关 `tengu_snoopy_creek` 关着的号不报
+/// （[`crate::proxy::snoopy_creek`]），调用方先判。
+pub(super) fn safety_event(
+    denial: Denial,
+    tool: &str,
+    tool_use_id: &str,
+    permission_mode: &str,
+) -> Value {
+    let mut v = match denial {
+        Denial::UserReject => json!({
+            "category": "user_rejected",
+            "decision": "reject",
+            "decision_source": "user_reject",
+            "reason_code": "unknown"
+        }),
+        Denial::Config => json!({
+            "category": "other",
+            "decision": "reject",
+            "decision_source": "config",
+            "reason_type": "other",
+            "reason_code": "other"
+        }),
+    };
+    let (tool_class, tool_name, tool_source) = safety_tool_fields(tool);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("tool_class".into(), json!(tool_class));
+        o.insert("tool_name".into(), json!(tool_name));
+        o.insert("tool_source".into(), json!(tool_source));
+        o.insert("permission_mode".into(), json!(permission_mode));
+        o.insert("tool_use_id".into(), json!(tool_use_id));
+        o.insert("sandbox_violation_count".into(), json!(0));
+        o.insert("sandbox_enabled".into(), json!(false));
+    }
+    v
+}
+
+/// `tengu_safety_event` 里工具的三项（2.1.307 `WMn` / `BMn` / `nhn`）：类别按名字分（Bash、Monitor 是
+/// `bash`，读写搜文件的六个是 `file`，WebFetch / WebSearch 是 `web`，MCP 是 `mcp`，其余 `other`）；名字
+/// 内建工具报原名，MCP 报 `mcp_tool`，认不出的按 `skill_tool` / `dynamic_tool` / `other_tool` 归；来源
+/// 内建是 `builtin`、MCP 是 `mcp`。
+fn safety_tool_fields(name: &str) -> (&'static str, String, &'static str) {
+    if name.starts_with("mcp__") {
+        return ("mcp", "mcp_tool".into(), "mcp");
+    }
+    let class = match name {
+        "Bash" | "Monitor" => "bash",
+        "PowerShell" => "powershell",
+        "Read" | "Edit" | "Write" | "NotebookEdit" | "Glob" | "Grep" => "file",
+        "WebFetch" | "WebSearch" => "web",
+        _ => "other",
+    };
+    let tool_name = if crate::config::CC_TOOL_NAMES.contains(&name) {
+        name.to_string()
+    } else if name.starts_with("skill__") {
+        "skill_tool".into()
+    } else if name.contains("__") {
+        "dynamic_tool".into()
+    } else {
+        "other_tool".into()
+    };
+    (class, tool_name, "builtin")
+}
+
 /// 路径的扩展名（不带点）；没有的为空。
 pub(super) fn file_ext(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
@@ -931,6 +1016,28 @@ pub(super) fn read_content_bytes(result: &str) -> usize {
 /// 一条调用结束的时刻。
 pub(super) fn this_end_wall(call: &ApiCall) -> SystemTime {
     call.started_at + Duration::from_millis(call.total_ms)
+}
+
+/// 子代理的这条请求就是它的收尾：没出错、没被取消，回复不再调工具（`end_turn`），或调的是 `SubagentHandback`
+/// （客户端就地执行、不再发请求）。
+pub(super) fn ends_agent(call: &ApiCall) -> bool {
+    let turn_over = call.stop_reason.as_deref().is_none_or(|s| s != "tool_use");
+    let handback = call.tool_calls.iter().any(|c| c.name == "SubagentHandback");
+    call.failure.is_none() && !call.aborted && (turn_over || handback)
+}
+
+/// 一条回复在客户端拆成几条消息：每个内容块一条（思考、正文、工具调用）。分叉的 fork 统计报的
+/// `messageCount` 是分叉里攒下的消息（官方 `at.length`）：`cap/auto-2.1.303~307-*-full` 的猜下一句
+/// 只有正文或只有思考的报 1、两样都有报 2，一个块都没有的（307 `00621` 那条）报 0。
+pub(super) fn reply_messages(call: &ApiCall) -> u32 {
+    u32::from(call.saw_thinking) + u32::from(call.text_chars > 0) + call.tool_calls.len() as u32
+}
+
+/// 「猜下一句」分叉接着发之前攒进去的消息：每个被拒工具一条拒绝结果，再加这一步算出来的那条
+/// `total_tokens_reminder` 附件（`cap/auto-2.1.307-20261022-full` A19：Bash、拒绝、附件、思考共 4 条）。
+/// 分叉头一条没有。
+pub(super) fn suggestion_resumed_messages(shape: &RequestShape) -> u32 {
+    if shape.suggestion_step == 0 { 0 } else { shape.tool_uses.len() as u32 + 1 }
 }
 
 /// 挂着的建议被用户的下一次输入顶掉：`tengu_prompt_suggestion{outcome: ignored}`，报在提交那一刻

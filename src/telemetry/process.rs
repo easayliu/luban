@@ -95,7 +95,7 @@ impl Telemetry {
             st.presession.entry((call.cred_id, session_id)).or_default().push((call, now));
             return;
         }
-        // 主线程的重试链（[`HeldRetry`]）。官方遇到可重试的失败自己重发，重试途中只报重发事件，最终成功或
+        // 主线程与进度摘要的重试链（[`HeldRetry`]）。官方遇到可重试的失败自己重发，重试途中只报重发事件，最终成功或
         // 失败才收尾；luban 每次尝试都看得到，单看一次失败分不出是不是最后一次，所以先扣住：
         // - 扣着一串、这条还是同一请求：接上（这条也是可重试的失败就继续扣，否则带着前面几次往下处理）；
         // - 扣着一串、这条换了请求：前面那串最后一次就是最终失败，先把它补报，再处理这条；
@@ -105,10 +105,38 @@ impl Telemetry {
         // 被当成闲置退出（[`Telemetry::gc`] 也跳过有扣着的会话）。
         let key = (call.cred_id, session_id.clone());
         let mut call = call;
-        if allow_defer && classify_kind(&call, &shape, is_agent) == Kind::Main {
-            let sig: RetrySig = (shape.cc_prompt_id.clone(), shape.messages_len, shape.tools_count);
+        let kind = classify_kind(&call, &shape, is_agent);
+        // 子代理这条一收尾，摘要器跟着停：它那条线上扣着的失败等不来重发了，先当最终失败补处理，收尾那条摘要统计
+        // 才算得进去（官方 `calls` 在发出时就记了，补处理晚于收尾就改不回已经报出去的那条）。
+        if kind == Kind::Subagent && ends_agent(&call) {
+            let lane = RetryLane::AgentSummary(agent_key.clone());
+            if let Some(held) = st.held_retries.remove(&(call.cred_id, session_id.clone(), lane)) {
+                Self::finish_retry_chain(st, held);
+            }
+        }
+        // 进度摘要每个子代理一条线（与主线程、子代理本身同时在跑，[`RetryLane`]），是后台请求：过载不重发。同一次
+        // 调用按模型与消息内容认（[`RequestShape::summary_digest`]）：两次调用之间笔记可能等长、模型也可能换。
+        let lane = match kind {
+            Kind::Main => Some((
+                RetryLane::Main,
+                (shape.cc_prompt_id.clone(), shape.messages_len, shape.tools_count),
+                false,
+            )),
+            Kind::AgentSummary | Kind::AgentSummaryShort => Some((
+                RetryLane::AgentSummary(agent_key.clone()),
+                (
+                    shape.summary_digest.clone().or_else(|| shape.cc_prompt_id.clone()),
+                    shape.messages_len,
+                    shape.input_text_chars,
+                ),
+                true,
+            )),
+            _ => None,
+        };
+        if allow_defer && let Some((lane, sig, background)) = lane {
+            let hold_key = (call.cred_id, session_id.clone(), lane);
             let mut prior: Vec<PriorAttempt> = Vec::new();
-            if let Some(held) = st.held_retries.remove(&key) {
+            if let Some(held) = st.held_retries.remove(&hold_key) {
                 if held.sig == sig && held.prior.len() < config::TELEMETRY_RETRY_CHAIN_MAX {
                     prior = held.prior;
                     prior.push(PriorAttempt::of(&held.last));
@@ -116,14 +144,14 @@ impl Telemetry {
                     Self::finish_retry_chain(st, held);
                 }
             }
-            let retryable =
-                !call.aborted && call.failure.as_ref().is_some_and(|f| is_retryable(f.status));
+            let retryable = !call.aborted
+                && call.failure.as_ref().is_some_and(|f| retried_by_client(f, background));
             if retryable {
                 if let Some(sess) = st.sessions.get_mut(&key) {
                     sess.last_seen = now;
                 }
                 st.held_retries.insert(
-                    key,
+                    hold_key,
                     HeldRetry { prior, last: call, sig, at: now, device_id: device_id.clone() },
                 );
                 return;
@@ -154,7 +182,6 @@ impl Telemetry {
         // 会话级的那份（待发批次、退出收尾、启动模板用）不带支线号。
         let base_identity = Identity { agent_id: None, ..identity.clone() };
 
-        let kind = classify_kind(&call, &shape, is_agent);
         if kind.runs_in_default_mode() {
             shape.permission_mode = "default";
         }
@@ -253,12 +280,18 @@ impl Telemetry {
         // 子代理支线：首条请求建档（链、起点、拉起它的那条主线程请求），之后每条读它。
         // 摘要请求只读不推进。
         let agent = kind.is_agent().then(|| sess.agent_view(&call, &shape, &agent_key, kind));
+        // 「猜下一句」分叉里接着发的那条：链、深度、上一条都接着分叉自己的（[`SuggestionFork`]）。分叉头一条
+        // 另起；接着发的那条要是没赶上前一条（状态丢了），也只能另起。
+        let suggestion_fork = (kind == Kind::Suggestion && shape.suggestion_step > 0)
+            .then(|| sess.suggestion_fork.clone())
+            .flatten();
         let previous_request_id = kind
             .has_chain()
             .then(|| {
-                shape.cc_prev_req.clone().or_else(|| match &agent {
-                    Some(a) => a.last_request_id.clone(),
-                    None => sess.last_main_request_id.clone(),
+                shape.cc_prev_req.clone().or_else(|| match (&agent, &suggestion_fork) {
+                    (Some(a), _) => a.last_request_id.clone(),
+                    (None, Some(f)) => f.request_id.clone(),
+                    (None, None) => sess.last_main_request_id.clone(),
                 })
             })
             .flatten();
@@ -270,10 +303,11 @@ impl Telemetry {
         // 续轮 19.458−12.019=7439、猜下一句 21.385−19.458=1927，全部对上；用「这条开始」算
         // 的话并发的标题与主线程会出负数、续轮只剩工具执行那一秒。
         let (this_end, prev_end, time_since_last) = sess.note_end(&call, prev_end_override);
-        let message_tokens = match &agent {
-            Some(a) => a.prev_total,
-            None if kind.has_chain() => sess.prev_total_input,
-            None => 0,
+        let message_tokens = match (&agent, &suggestion_fork) {
+            (Some(a), _) => a.prev_total,
+            (None, Some(f)) => f.total_tokens,
+            (None, None) if kind.has_chain() => sess.prev_total_input,
+            (None, None) => 0,
         };
         if kind == Kind::Main && !sess.main_model_seen {
             sess.main_model_seen = true;
@@ -308,7 +342,60 @@ impl Telemetry {
         // 它的摘要请求恒为 3、链另起（两份抓包 7 条都是）。
         // 主线程当前的链：猜下一句的 fork 统计里引用的是这条父链。
         let main_chain = sess.chain_id.clone();
-        let (chain_id, query_depth) = sess.chain_for(kind, agent.as_ref());
+        let (chain_id, query_depth) = match &suggestion_fork {
+            Some(f) => (f.chain_id.clone(), f.depth + 1),
+            None => sess.chain_for(kind, agent.as_ref()),
+        };
+        // 分叉的回复调了工具：客户端会带着拒绝结果接着发，记下到这条为止的分叉。不再调工具（收尾）、失败、
+        // 被取消，分叉就到此为止——会被重发的失败除外：客户端原样重发这一条，分叉还接着（重发那条照旧接这份）。
+        // 猜下一句是后台请求，过载不重发。
+        let retrying = failed && call.failure.as_ref().is_some_and(|f| retried_by_client(f, true));
+        if kind == Kind::Suggestion && !retrying {
+            sess.suggestion_fork = (!turn_over && !failed && !aborted).then(|| {
+                let prev = suggestion_fork.as_ref();
+                let mut usage = prev.map_or([0; 4], |f| f.usage);
+                for (t, v) in usage.iter_mut().zip([
+                    call.input_tokens,
+                    call.output_tokens,
+                    call.cache_read_tokens,
+                    call.cache_creation_tokens,
+                ]) {
+                    *t += v;
+                }
+                SuggestionFork {
+                    chain_id: chain_id.clone(),
+                    depth: query_depth,
+                    request_id: call.request_id.clone(),
+                    total_tokens: call.input_tokens
+                        + call.cache_read_tokens
+                        + call.cache_creation_tokens
+                        + call.output_tokens,
+                    started: prev.map_or(call.logical_start(), |f| f.started),
+                    usage,
+                    messages: prev.map_or(0, |f| f.messages)
+                        + suggestion_resumed_messages(&shape)
+                        + reply_messages(&call),
+                    first_request_id: prev
+                        .map_or_else(|| call.request_id.clone(), |f| f.first_request_id.clone()),
+                    candidate_chars: prev
+                        .map(|f| f.candidate_chars)
+                        .filter(|c| *c > 0)
+                        .unwrap_or(call.text_chars),
+                }
+            });
+        }
+        // 出了建议：分叉收尾时挑整个分叉里头一个非空正文（[`SuggestionFork::candidate_chars`]），挂着等用户下一次
+        // 输入报 `ignored`；`generationRequestId` 是分叉头一条（官方 `M` 取分叉里头一条回复的）。
+        if kind == Kind::Suggestion && turn_over && !failed && !aborted {
+            let (request_id, chars) = match &suggestion_fork {
+                Some(f) if f.candidate_chars > 0 => (f.first_request_id.clone(), f.candidate_chars),
+                Some(f) => (f.first_request_id.clone(), call.text_chars),
+                None => (call.request_id.clone(), call.text_chars),
+            };
+            if chars > 0 {
+                sess.shown_suggestion = Some((request_id.unwrap_or_default(), this_end, chars));
+            }
+        }
         let turn_started: DateTime<Utc> =
             sess.turn_started.unwrap_or(call.started_at - Duration::from_millis(15)).into();
         let first_text_in_turn = is_main && call.text_chars > 0 && !sess.turn_text_seen;
@@ -361,6 +448,11 @@ impl Telemetry {
         let v305 = version_at_least(&version, "2.1.305");
         // 2.1.306：失败 Bash 的错误栈指纹换了（`cap/auto-2.1.306-20261021-full` 三条）。
         let v306 = version_at_least(&version, "2.1.306");
+        // 2.1.307：进度摘要器收尾多 writer 三项、auto 判决多 `skippedOnAllowRule`、压缩尝试多 `keepNoRound`，
+        // 工具被拒多一条 `tengu_safety_event`（`cap/auto-2.1.307-20261022-full`），失败 Bash 的错误栈指纹又换了
+        // （`cap/auto-2.1.307-20261022-bash`）。
+        let v307 = version_at_least(&version, "2.1.307");
+        let safety_events = v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -570,6 +662,9 @@ impl Telemetry {
             v303,
             v305,
             v306,
+            v307,
+            safety_events,
+            suggestion_fork,
             lucky_cerf,
             main_effort: sess.main_effort.clone(),
             // 主线程的工具锚点单独记（只在本会话里算），子代理看它自己那条支线上一条回复。
@@ -1116,6 +1211,9 @@ impl Session {
         if a.agent_type.is_none() {
             a.agent_type = call.agent.agent_type.clone().filter(|t| !t.is_empty());
         }
+        if kind == Kind::Subagent && a.model.is_none() {
+            a.model = Some(shape.model.clone());
+        }
         if a.chain_id.is_empty() {
             a.chain_id = uuid_v4();
             a.started = Some(call.started_at);
@@ -1260,10 +1358,11 @@ impl Session {
             else {
                 continue;
             };
+            // 子代理与「猜下一句」分叉的附件在它们自己的消息表里，不进主线程那份。
             if meta
                 .get("query_source")
                 .and_then(|q| q.as_str())
-                .is_some_and(|q| q.starts_with("agent:"))
+                .is_some_and(|q| q.starts_with("agent:") || q == "prompt_suggestion")
             {
                 continue;
             }
@@ -1349,8 +1448,6 @@ impl Session {
             self.last_message_id = call.message_id.clone();
             self.last_message_end = Some(this_end);
         }
-        // 「猜下一句」出的建议：有正文就挂着，等用户下一次输入（或 `/compact`、`/btw` 这类斜杠
-        // 命令）时报 ignored；这条输入把它消费掉。
         let usage_before = self.usage_totals;
         if !failed && !aborted {
             for (t, v) in self.usage_totals.iter_mut().zip([
@@ -1362,16 +1459,14 @@ impl Session {
                 *t += v;
             }
         }
+        // 「猜下一句」出的建议（分叉收尾时挂上，见 [`Session::shown_suggestion`]）：用户下一次输入（或 `/compact`、
+        // `/btw` 这类斜杠命令）时报 ignored，这条输入把它消费掉。
         let ignored_suggestion =
             if (new_prompt && user_turn) || matches!(kind, Kind::Compact | Kind::SideQuestion) {
                 self.shown_suggestion.take()
             } else {
                 None
             };
-        if kind == Kind::Suggestion && !failed && !aborted && call.text_chars > 0 {
-            self.shown_suggestion =
-                Some((call.request_id.clone().unwrap_or_default(), this_end, call.text_chars));
-        }
         let interrupted_message_id =
             if new_prompt { self.interrupted_message_id.take() } else { None };
         if is_main && aborted {
@@ -1482,28 +1577,54 @@ impl Session {
             && let Some(a) = self.agents.get_mut(agent_key)
         {
             a.summaries += 1;
+            // 计时器触发那一刻读配置、发头一次；中途重发过的（[`RetryLane::AgentSummary`]，前面几次已经并进
+            // 这一条）按头一次算。
+            let sent = call.logical_start();
             // 摘要器每次按当时的模式发：short 走侧查询，full 从子代理分叉。官方 `calls_kept_on_full`
             // 数的是「发这一条时配置是 short、却按 full 发」的次数（每次计时器触发都重读配置），所以逐条
             // 按**发出那一刻**号的 eval（[`crate::proxy::agent_summary_config::config_at`]）判——遥测在
             // 回复完成后才处理，那时的配置可能已经换过；也不在收尾时拿最后的配置回算。这一条本身是
             // short 就说明那一刻配置必是 short，不必再看。
             let short = kind == Kind::AgentSummaryShort;
+            // 2.1.307：short 摘要的模型与子代理不同，就是换了 writer。换上了，客户端的小快模型就是它；没换、
+            // writer 也没失败过，那一刻配着的 writer（有的话）就不是小快模型（收尾那条按这两样推 `fe()`）。
+            let writer = a.model.as_deref().is_some_and(|m| m != shape.model);
             if short {
                 a.summaries_short += 1;
+                if writer {
+                    a.small_fast = Some(shape.model.clone());
+                } else if !a.summary_writer_failed {
+                    let cfg = crate::proxy::agent_summary_config::config_at(
+                        call.cred_id,
+                        model_family(&a.session_model),
+                        sent,
+                    );
+                    let family = model_family(a.model.as_deref().unwrap_or_default());
+                    if let Some(w) = cfg.writer_for(family)
+                        && !a.not_small_fast.iter().any(|x| x == w)
+                    {
+                        a.not_small_fast.push(w.to_string());
+                    }
+                }
             } else if crate::proxy::agent_summary_config::config_at(
                 call.cred_id,
                 model_family(&a.session_model),
-                call.started_at,
+                sent,
             )
             .short
             {
                 a.summaries_kept_on_full += 1;
             }
             a.summary_last_short = Some(short);
-            a.summary_last_sent = Some(call.started_at);
+            a.summary_last_sent = Some(sent);
             a.summary_last_end = Some(this_end_wall(call));
             if failed {
+                // 走到这里的是整次调用的最终失败：可重试的失败先扣着，客户端重发成功就并进成功那条。
                 a.summaries_failed += 1;
+                // 换了 writer 的 short 摘要失败了：摘要器记下，之后不再换。
+                if short && writer {
+                    a.summary_writer_failed = true;
+                }
             } else if (1..=100).contains(&call.text_chars) {
                 a.summaries_accepted += 1;
             }
@@ -1530,7 +1651,7 @@ impl Session {
             }
             // `end_turn` 收尾就是子代理跑完了：收尾事件要它的全程统计，档案随之删掉。以
             // SubagentHandback 工具收尾的也是（客户端就地执行、不再发请求）。
-            if (turn_over || handback.is_some()) && !failed && !aborted {
+            if ends_agent(call) {
                 agent_done = self.agents.remove(agent_key);
             }
         }

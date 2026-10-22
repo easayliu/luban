@@ -546,7 +546,8 @@ fn has_cc_base_prompt(v: &serde_json::Value) -> bool {
 /// 4. 其余 body 取值与官方 Helper 一致（[`is_official_helper_shape`]：haiku 全名、`tools: []`、
 ///    `thinking.type=disabled`、`max_tokens=32000`、流式）；
 /// 5. 来访 `anthropic-beta` 里带齐 Helper profile 的每一项 beta
-///    （[`config::CcProfileKind::HelperSubagentHaiku`]，[`has_profile_betas`]）。
+///    （[`config::CcProfileKind::HelperSubagentHaiku`]，[`has_profile_betas`]）；billing header 自报 2.1.307 及以上的
+///    不要求 `prompt-caching-scope`（[`helper_optional_betas`]）。
 ///
 /// 曾经只看第 2 条那个标记，于是任何请求在 billing header 里加一句 `cc_is_subagent=true` 就能
 /// 免掉基座要求、把一条并不完整的 CC 请求送去透传——已知设备或多轮消息还不命中探针判定。
@@ -567,11 +568,37 @@ pub(crate) fn is_official_helper_request(v: &serde_json::Value, beta: &[String])
     let subagent = text(0).contains("cc_is_subagent=true");
     let identity =
         if subagent { config::CC_SDK_AGENT_IDENTITY } else { config::CC_SYSTEM_IDENTITY };
+    let optional = helper_optional_betas(text(0));
     text(0).starts_with("x-anthropic-billing-header:")
         && text(1) == identity
         && is_official_helper_shape(v)
-        && (has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku)
-            || API_KEY_HELPER_BETAS.iter().all(|b| has_beta(beta, b)))
+        && (has_profile_betas(beta, config::CcProfileKind::HelperSubagentHaiku, optional)
+            || API_KEY_HELPER_BETAS
+                .iter()
+                .filter(|b| !optional.contains(b))
+                .all(|b| has_beta(beta, b)))
+}
+
+/// 认 helper 时可以不带的 beta。2.1.307 起经自定义 `ANTHROPIC_BASE_URL` 的客户端（luban 的真实来访都是）不再发
+/// `prompt-caching-scope`——官方只在直连 `api.anthropic.com` 时发；同一条 helper，2.1.306 带、2.1.307 不带，其余
+/// 逐项相同（`cap/auto-2.1.307-20261022-baseurl` 两组的 `00006`）。只按 billing header 自报的版本放掉这一项：
+/// 2.1.307 以下的一直带，照旧要求；别的 beta 与 system、body 判据一概不放。
+fn helper_optional_betas(billing: &str) -> &'static [&'static str] {
+    if billing_cc_version(billing).is_some_and(|v| v >= (2, 1, 307)) {
+        &[config::CC_BETA_PROMPT_CACHING_SCOPE]
+    } else {
+        &[]
+    }
+}
+
+/// billing header 里 `cc_version` 自报的版本（`2.1.307.9c3` 读前三段）。字段按 `;` 拆、名字精确比对，同
+/// [`is_billing_line`]；不是 billing header 或读不出为 `None`。
+fn billing_cc_version(text: &str) -> Option<(u64, u64, u64)> {
+    let fields = text.trim_start_matches('\u{feff}').strip_prefix(BILLING_KEY)?;
+    let value = fields.split(';').find_map(|f| {
+        f.split_once('=').filter(|(k, _)| k.trim() == "cc_version").map(|(_, v)| v.trim())
+    })?;
+    crate::proxy::parse_version(value)
 }
 
 /// API 密钥模式下官方 helper 的 beta（`cap/auto-2.1.293-20261008-api/00045`、`00096`，2.1.291 的 `00206`
@@ -595,9 +622,15 @@ const API_KEY_HELPER_BETAS: &[&str] = &[
 /// （`cap/2.1.285/00125`）去掉了 2.1.260 那行的 `server-side-fallback` / `fallback-credit`。只认
 /// 某一版，另一版的官方请求就会被当成仿冒——此前只认 2.1.260 那行，2.1.285 的 helper 被送进
 /// 模拟（`no_base_prompt`），新设备上还会被当一次性会话探针拒掉。
-fn has_profile_betas(beta: &[String], kind: config::CcProfileKind) -> bool {
+///
+/// `optional` 里的几项不作数（见 [`helper_optional_betas`]）。
+fn has_profile_betas(beta: &[String], kind: config::CcProfileKind, optional: &[&str]) -> bool {
     config::cc_profile_rows(kind).any(|p| {
-        p.beta.split(',').map(str::trim).filter(|b| !b.is_empty()).all(|b| has_beta(beta, b))
+        p.beta
+            .split(',')
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && !optional.contains(b))
+            .all(|b| has_beta(beta, b))
     })
 }
 

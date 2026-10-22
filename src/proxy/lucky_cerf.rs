@@ -29,6 +29,10 @@
 //! **2.1.305 起客户端不再读 `tengu_lucky_cerf_text`**（可执行文件里那个开关连同取值函数都删了，cerf 那版
 //! 一律用内置正文，`cap/auto-2.1.305-20261021-full` 一条正文曝光都没有）；清单那个开关照旧读、照旧曝光。
 //! 所以正文与它的曝光都按出站版本取舍，见 [`reads_text`]。
+//!
+//! **2.1.307 起清单那个开关也不读了**：可执行文件里 `tengu_lucky_cerf`、模型表的 `lucky_cerf` 能力与短版
+//! 「何时用」正文一起删了，精简提示词的模型一律拼 cerf 那版、不分号也不分模型（`cap/auto-2.1.307-20261022-full`
+//! 里 opus-5-5 由短版换成与 sonnet-5-5 逐字节相同的那版），也就没有任何曝光，见 [`reads_list`]。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +49,11 @@ pub(crate) const LUCKY_CERF_TEXT_FEATURE: &str = "tengu_lucky_cerf_text";
 /// 这个版本的客户端还读不读 `tengu_lucky_cerf_text`：2.1.305 起不读。
 pub(crate) fn reads_text(version: &str) -> bool {
     crate::proxy::parse_version(version).is_none_or(|v| v < (2, 1, 305))
+}
+
+/// 这个版本的客户端还读不读 `tengu_lucky_cerf`（模型清单）：2.1.307 起不读，精简提示词的模型一律用 cerf 那版。
+pub(crate) fn reads_list(version: &str) -> bool {
+    crate::proxy::parse_version(version).is_none_or(|v| v < (2, 1, 307))
 }
 
 /// 会话快照多久没人用就作废：会话本身早就过期了，同一个会话 id 再来（模拟会话的槽位会复用）
@@ -99,6 +108,13 @@ pub(crate) enum AgentDesc {
 }
 
 fn agent_desc_of(snap: &Snapshot, model: &str, version: &str) -> AgentDesc {
+    if !reads_list(version) {
+        return if config::cc_model_lean_prompt(model) {
+            AgentDesc::Cerf(None)
+        } else {
+            AgentDesc::Plain
+        };
+    }
     if !uses_cerf(snap, model) {
         return AgentDesc::Plain;
     }
@@ -327,9 +343,10 @@ pub(crate) struct Exposure {
 /// 这个号、这个会话、这个模型拼 `Agent` 说明时该发的实验曝光，按客户端读开关的先后：先读清单
 /// （只在精简提示词的模型上读，[`config::cc_model_lean_prompt`]——不论模型在不在清单里，opus-5-5 的
 /// 会话同样读），清单命中才再读正文。读到的值来自实验（号在实验里）才曝光。一个进程每个实验只发
-/// 一次，由遥测那边按 `feature` 记。2.1.305 起不读正文，也就没有正文那条（[`reads_text`]）。
+/// 一次，由遥测那边按 `feature` 记。2.1.305 起不读正文，也就没有正文那条（[`reads_text`]）；2.1.307 起
+/// 清单也不读，一条都没有（[`reads_list`]）。
 pub(crate) fn exposures(cred_id: i64, session: &str, model: &str, version: &str) -> Vec<Exposure> {
-    if !config::cc_model_lean_prompt(model) {
+    if !config::cc_model_lean_prompt(model) || !reads_list(version) {
         return Vec::new();
     }
     let snap = session_snapshot(cred_id, session);
@@ -425,6 +442,33 @@ mod tests {
         let ex = exposures(id, "a", "claude-sonnet-5-5", "2.1.305");
         assert_eq!(ex.iter().map(|e| e.feature).collect::<Vec<_>>(), vec![LUCKY_CERF_FEATURE]);
         assert!(reads_text("2.1.304") && !reads_text("2.1.305") && !reads_text("2.1.310"));
+    }
+
+    /// 2.1.307 起清单也不读：精简提示词的模型不论在不在这个号的清单里都用 cerf 那版、内置正文（opus-5-5
+    /// 由短版换过来，`cap/auto-2.1.307-20261022-full`），完整提示词的照旧；号在两个实验里也一条曝光都不发。
+    #[test]
+    fn list_is_ignored_from_2_1_307() {
+        let id = -91_030;
+        note_eval(
+            id,
+            &features(
+                r#"{"features":{"tengu_lucky_cerf":{"value":["claude-sonnet-5-5"],
+                "experiment":{"key":"tengu_lucky_cerf_experiment_v3"},
+                "experimentResult":{"inExperiment":true,"variationId":1}},
+                "tengu_lucky_cerf_text":{"value":"T","experiment":{"key":"tengu_lucky_cerf_experiment_v4"},
+                "experimentResult":{"inExperiment":true,"variationId":1}}}}"#,
+            ),
+        );
+        assert_eq!(agent_desc(id, "a", "claude-opus-5-5", "2.1.306"), AgentDesc::Plain);
+        assert!(!exposures(id, "a", "claude-opus-5-5", "2.1.306").is_empty());
+        for model in
+            ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]
+        {
+            assert_eq!(agent_desc(id, "b", model, "2.1.307"), AgentDesc::Cerf(None), "{model}");
+            assert!(exposures(id, "b", model, "2.1.307").is_empty(), "{model}");
+        }
+        assert_eq!(agent_desc(id, "b", "claude-haiku-4-5", "2.1.307"), AgentDesc::Plain);
+        assert!(reads_list("2.1.306") && !reads_list("2.1.307") && !reads_list("2.1.310"));
     }
 
     /// 正文开关：下发了就换（去首尾空白），清单命中才读、才曝光；空串或没下发用内置的、不曝光。

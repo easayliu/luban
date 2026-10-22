@@ -162,8 +162,11 @@ pub(super) struct RequestShape {
     /// 体里有没有任何 `cache_control`（标题那类没有 → `cachingEnabled: false`）。
     pub(super) has_cache_control: bool,
     pub(super) api_system_messages: usize,
-    /// 末条用户消息以 `[SUGGESTION MODE:` 开头。
+    /// 末条用户消息以 `[SUGGESTION MODE:` 开头，或是它之后被拒工具的结果（见 [`Self::suggestion_step`]）。
     pub(super) suggestion: bool,
+    /// 「猜下一句」分叉里这是接着发的第几条：0 是头一条；回复调了工具（分叉一律拒）客户端带着拒绝结果
+    /// 接着发，每多一对「调工具 → 拒绝结果」+1（`cap/auto-2.1.307-20261022-full/00188` 是 1）。
+    pub(super) suggestion_step: u32,
     /// 末条用户消息是离开回顾那句固定提示（见 [`Kind::AwaySummary`]）。
     pub(super) away_summary: bool,
     /// system 里有会话标题生成的指令。
@@ -176,6 +179,10 @@ pub(super) struct RequestShape {
     pub(super) web_fetch_page: bool,
     /// system 是 2.1.303 子代理摘要 short 模式那句固定指令，见 [`Kind::AgentSummaryShort`]。
     pub(super) agent_summary_short: bool,
+    /// 进度摘要（full / short，末条用户消息里有官方那句「most recent action in 3-5 words」）的模型与消息内容
+    /// 摘要：摘要器扣重试时凭它认同一次调用（重发逐字相同；两次调用之间笔记或上下文必变，可能等长、模型也可能
+    /// 换）。别的请求不算。
+    pub(super) summary_digest: Option<String>,
     /// 有 `system`、无工具、`max_tokens: 1`：`/model` 选完模型后的「Hi」探测，见
     /// [`Kind::ModelValidation`]。额度探测没有 `system`，另见 `quota_probe`。
     pub(super) model_validation: bool,
@@ -655,7 +662,8 @@ pub(super) fn error_message_hash(
 }
 
 /// 这个构建里 API 错误那条栈的固定三样（`error_constructor` / `error_stack_hash` / `error_top_frame`）：压缩后的类名与
-/// 打包块名随构建变，只登记抓到过的。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值）。
+/// 打包块名随构建变，只登记抓到过的。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值），2.1.307 的
+/// 5xx（`cap/auto-2.1.307-20261022-retry` 三条同值：摘要没变，类名与块名换了）。
 pub(super) fn error_trace(
     version: &str,
     status: Option<u16>,
@@ -663,6 +671,9 @@ pub(super) fn error_trace(
     match (version, status) {
         ("2.1.306", Some(s)) if s >= 500 => {
             Some(("Yzt", "5b32b751db51", "chunk-75zwyap8.js:11:1510"))
+        }
+        ("2.1.307", Some(s)) if s >= 500 => {
+            Some(("WVt", "5b32b751db51", "chunk-2f0n1d7c.js:11:1510"))
         }
         _ => None,
     }
@@ -674,6 +685,14 @@ pub(super) fn is_retryable(status: Option<u16>) -> bool {
         None => true,
         Some(s) => matches!(s, 401 | 403 | 404 | 407 | 413 | 429) || s >= 500,
     }
+}
+
+/// 客户端会不会原样重发这次失败（[`is_retryable`]）。`background` 是后台那类请求：`querySource` 不在官方前台名单
+/// 里（`yTe`：`agent:` 开头的与 `$b`，进度摘要、猜下一句都不在），遇到过载（529 / 流内 `overloaded_error`，官方
+/// `X2`）不重发，报一条 `tengu_api_529_background_dropped` 就整次失败。
+pub(super) fn retried_by_client(f: &CallFailure, background: bool) -> bool {
+    let overloaded = f.status == Some(529) || f.error_type.as_deref() == Some("overloaded_error");
+    is_retryable(f.status) && !(background && overloaded)
 }
 
 /// 一条消息的粗估 token 数：逐块 `round(长度 / 4)` 相加（长度按 UTF-16 计），text 取正文、
@@ -887,6 +906,34 @@ pub(super) const INTERRUPTED_FOR_TOOL_USE: &str = "[Request interrupted by user 
 /// 用户在权限弹框上拒绝后，那个 `tool_result` 的开头。
 pub(super) const USER_REJECTED_TOOL_USE: &str =
     "The user doesn't want to proceed with this tool use.";
+
+/// 「猜下一句」分叉里接着发的那条（[`RequestShape::suggestion_step`]）：从末尾往回跳过「助手调工具 → 用户回
+/// 结果」那几对，落到的那条用户消息就是猜下一句的提示词，返回跳过了几对。头一条（末条就是提示词）与其余形态
+/// 返回 `None`。分叉不进会话记录（官方 `skipTranscript`），主线程里不会有这句提示词。
+pub(super) fn suggestion_step_of(messages: &[Value]) -> Option<u32> {
+    fn role(m: &Value) -> Option<&str> {
+        m.get("role").and_then(|r| r.as_str())
+    }
+    let mut it = messages.iter().rev().filter(|m| role(m) != Some("system"));
+    let mut step = 0;
+    loop {
+        let user = it.next().filter(|m| role(m) == Some("user"))?;
+        let blocks = user.get("content").and_then(|c| c.as_array());
+        let results = blocks.is_some_and(|b| {
+            b.iter().any(|x| x.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        });
+        if !results {
+            let text = match user.get("content") {
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => blocks?.iter().rev().find_map(|x| x.get("text").and_then(|t| t.as_str())),
+            }?;
+            return (step > 0 && text.trim_start().starts_with("[SUGGESTION MODE:"))
+                .then_some(step);
+        }
+        it.next().filter(|m| role(m) == Some("assistant"))?;
+        step += 1;
+    }
+}
 
 pub(super) fn last_is_new_prompt(messages: &[Value]) -> (bool, usize) {
     let (_, Some(last)) = last_two_non_system(messages) else { return (true, 0) };
@@ -1256,6 +1303,21 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
             if shape.compact {
                 shape.compact_stats = Some(super::compact::compact_stats_of(msgs));
             }
+            // 进度摘要（官方 `di()` 那句提示：short 跟在笔记后头，full 单独一条）。
+            if text.is_some_and(|t| t.contains("most recent action in 3-5 words")) {
+                let mut buf = shape.model.clone().into_bytes();
+                buf.push(0);
+                if serde_json::to_writer(&mut buf, msgs).is_ok() {
+                    shape.summary_digest = Some(sha256_hex(&buf)[..16].to_string());
+                }
+            }
+        }
+        // 分叉里调了工具、带着拒绝结果接着发的那条：末条是工具结果，提示词在更前面。
+        if !shape.suggestion
+            && let Some(step) = suggestion_step_of(msgs)
+        {
+            shape.suggestion = true;
+            shape.suggestion_step = step;
         }
         if msgs.len() == 1
             && shape.tools_count == 0

@@ -105,9 +105,13 @@ pub const CC_BETA_REDACT_THINKING: &str = "redact-thinking-2026-02-12";
 pub const CC_BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 
 /// `prompt-caching-scope-2026-01-05`：`cache_control.scope: "global"` 的准入条件，
-/// [`crate::proxy::align_system_shape`] 给基座标 global 时依赖它。
-/// 四份 raw 抓包里客户端自己都带，实际很少真的需要补。
+/// [`crate::proxy::align_system_shape`] 给基座标 global 时依赖它。直连官方的位置恒在
+/// [`CC_BETA_CONTEXT_MANAGEMENT`] 之后。2.1.306 及以前客户端自己都带；2.1.307 起只在直连 `api.anthropic.com`
+/// 时发，经自定义 `ANTHROPIC_BASE_URL` 来的（luban 的来访）不带，由 [`crate::proxy::merge_beta_for`] 补回。
 pub const CC_BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
+
+/// `context-management-2025-06-27`：补 [`CC_BETA_PROMPT_CACHING_SCOPE`] 时的锚点（直连官方紧跟其后）。
+pub const CC_BETA_CONTEXT_MANAGEMENT: &str = "context-management-2025-06-27";
 
 /// `message-threads-2026-08-12`：2.1.270 新增（`cap/2.1.270/00017`、`00025` sonnet 主线程，
 /// `00024` 标题生成），配 body 顶层的 `thread`（首轮 `{"type":"create"}`，续轮

@@ -111,6 +111,8 @@ pub(super) struct Session {
     /// 别的，下一次输入时报 `tengu_prompt_suggestion{outcome: ignored}`（`cap/auto-2.1.285-20260930`
     /// 20 条）。
     pub(super) shown_suggestion: Option<(String, SystemTime, usize)>,
+    /// 「猜下一句」分叉还没跑完：回复里调了工具，客户端会带着拒绝结果接着发（见 [`SuggestionFork`]）。
+    pub(super) suggestion_fork: Option<SuggestionFork>,
     /// 上一轮主线程被按 Esc 打断时那条回复的 `message.id`：下一次输入的 `tengu_input_prompt`
     /// 带 `interrupted_message_id`（`00264`）。
     pub(super) interrupted_message_id: Option<String>,
@@ -214,6 +216,32 @@ pub(super) struct AgentView {
     pub(super) last_end: Option<SystemTime>,
 }
 
+/// 跑到一半的「猜下一句」分叉。分叉自己的 canUseTool 一律拒（官方 `M`），回复里调了工具的，客户端带着
+/// 拒绝结果在同一条链上接着发、深度 +1，直到回复不再调工具（`cap/auto-2.1.307-20261022-full` A19：00186
+/// 深度 3 调 Bash，00188 深度 4 收尾）。收尾那条的 turn_end 与 fork 统计报整个分叉：时长从头一条发出算，
+/// 用量与消息数是几条的合计（官方 4146ms、`messageCount: 4`、输入 506 + 45）。
+#[derive(Clone, Debug)]
+pub(super) struct SuggestionFork {
+    pub(super) chain_id: String,
+    /// 上一条的 queryDepth：接着发的那条报它 + 1。
+    pub(super) depth: u32,
+    /// 上一条的 request-id（接着发的那条的 `previousRequestId`）。
+    pub(super) request_id: Option<String>,
+    /// 上一条的 token 总量（接着发的那条的 `messageTokens`）。
+    pub(super) total_tokens: i64,
+    /// 分叉头一条发出的时刻。
+    pub(super) started: SystemTime,
+    /// 到上一条为止的用量：输入、输出、缓存读、缓存写。
+    pub(super) usage: [i64; 4],
+    /// 到上一条为止分叉里攒下的消息：每条回复的内容块，加上接着发时补进去的拒绝结果与附件。
+    pub(super) messages: u32,
+    /// 分叉头一条的 request-id：出了建议，`generationRequestId` 报它（官方取分叉里头一条回复的）。
+    pub(super) first_request_id: Option<String>,
+    /// 到上一条为止头一个非空正文的字数，没有是 0。官方收尾时把分叉里每条回复的正文都当候选、挑头一个用得上的
+    /// （`q()`）：调工具那条回复里带的正文也算，最后那条只回了思考也照样出建议。
+    pub(super) candidate_chars: usize,
+}
+
 /// 一个子代理（会话里的一条支线）跨请求要记住的东西。字段取值见 `cap/2.1.280` Explore
 /// 子代理 a51764… 的 6 条请求与它的 1 条摘要请求。
 #[derive(Default)]
@@ -274,6 +302,17 @@ pub(super) struct AgentState {
     /// 子代理拉起时会话的主模型（展示名）：摘要器启动那一刻读的当前主模型，收尾那条摘要器统计按它的族
     /// 挑开关。按子代理首条请求的发出时刻查（[`Session::main_model_at`]），之后主线程换模型不影响它。
     pub(super) session_model: String,
+    /// 子代理自己请求体里的模型：2.1.307 起 short 摘要可以改由服务端配置的 `writer` 写，摘要请求的模型
+    /// 与它不同就是换了 writer。子代理首条请求记下。
+    pub(super) model: Option<String>,
+    /// 换了 writer 的 short 摘要失败过（官方 `le`）：摘要器之后不再换，收尾报 `writer_failed: true`。
+    pub(super) summary_writer_failed: bool,
+    /// short 摘要换上过的 writer（请求模型与子代理不同）。官方只在配的 writer 等于客户端的小快模型时换
+    /// （`fe()`），而小快模型由环境变量与 provider 定（`lS()`），会话里不变：换上过一次就确认了，之后没换的
+    /// 那几条（配置改成了别的）不推翻它。
+    pub(super) small_fast: Option<String>,
+    /// 发 short 摘要那一刻配着 writer、却没换上（writer 没失败过）：这些 writer 不是客户端的小快模型。
+    pub(super) not_small_fast: Vec<String>,
 }
 
 /// 一条线程（主线程，或某个子代理）上一条**完整**请求的形态。
@@ -642,6 +681,13 @@ pub(super) struct TurnFacts {
     pub(super) v303: bool,
     pub(super) v305: bool,
     pub(super) v306: bool,
+    pub(super) v307: bool,
+    /// 工具被拒时报 `tengu_safety_event`：2.1.307 起，且号的服务端开关 `tengu_snoopy_creek` 没关
+    /// （[`crate::proxy::snoopy_creek`]，官方每次报之前现读，这里按这条请求处理时读一次）。
+    pub(super) safety_events: bool,
+    /// 这条是「猜下一句」分叉里接着发的那条（[`RequestShape::suggestion_step`] > 0）：分叉到上一条为止的
+    /// 状态。收尾的 fork 统计报整个分叉的合计（见 [`SuggestionFork`]）。
+    pub(super) suggestion_fork: Option<SuggestionFork>,
     /// 这一轮要发的 `tengu_lucky_cerf` / `tengu_lucky_cerf_text` 实验曝光。客户端头一次给精简提示词
     /// 的模型拼 `Agent` 说明时读这两个开关、各记一次曝光：会话从 haiku-4.5 / sonnet-5 这类完整提示词
     /// 模型开头、中途切到 sonnet-5-5 时，曝光落在切过去之后那次输入上，不只在首轮；从 opus-5-5（不在
@@ -751,9 +797,19 @@ pub(super) struct State {
     /// 同一进程里 `/clear`；探测之后冒出来的是之前见过的会话 id → 新进程 `--continue` 接上了它
     /// （探测带的是进程启动时那个临时 id）。
     pub(super) process_starts: HashMap<(i64, String), (String, SystemTime)>,
-    /// 主线程请求遇到可重试的失败、还不知道客户端会不会重发的那几次，按 `(凭证, session_id)` 记（会话可能还
-    /// 没建起来：`-p` 的头一条就失败）。见 [`HeldRetry`]。
-    pub(super) held_retries: HashMap<(i64, String), HeldRetry>,
+    /// 遇到可重试的失败、还不知道客户端会不会重发的那几次，按 `(凭证, session_id, 线)` 记（会话可能还
+    /// 没建起来：`-p` 的头一条就失败）。见 [`HeldRetry`] / [`RetryLane`]。
+    pub(super) held_retries: HashMap<(i64, String, RetryLane), HeldRetry>,
+}
+
+/// 扣重试的线：主线程一条；每个子代理的进度摘要各一条（摘要器与主线程、子代理本身同时在跑，各扣各的）。官方
+/// 摘要那次调用同样在里头重发（short 走 `uve` → `yte`），重发成功就是一次成功的调用：不算 `calls_failed`、不记
+/// writer 失败（官方 `le` 只在整次调用出错时才置）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum RetryLane {
+    Main,
+    /// 这个子代理（`agent-id`）的进度摘要。
+    AgentSummary(String),
 }
 
 /// 扣住的一串失败尝试：同一请求（同一 prompt、同样的消息与工具数）的连续几次，客户端还可能再发。官方
@@ -776,7 +832,8 @@ pub(super) struct HeldRetry {
 }
 
 /// 认同一请求的几样：prompt id、消息条数、工具数。重发的请求体逐字相同（`x-client-request-id` 每次换新、
-/// 重试计数头恒为 0，`cap/auto-2.1.306-20261021-retry` 的十次注入）。
+/// 重试计数头恒为 0，`cap/auto-2.1.306-20261021-retry` 的十次注入）。进度摘要那几条线第三项换成输入字数：short
+/// 那种恒是一条消息、没有工具，两次调用之间变的只是笔记（官方笔记没变就不发）。
 pub(super) type RetrySig = (Option<String>, usize, usize);
 
 /// [`Session::main_models`] 记多少条。
@@ -914,6 +971,7 @@ impl Session {
             git_repo: None,
             git_dirty: None,
             shown_suggestion: None,
+            suggestion_fork: None,
             interrupted_message_id: None,
             post_compact: false,
             last_main_end: None,

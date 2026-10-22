@@ -366,6 +366,9 @@ impl EventBuilder<'_> {
             if env.f.v300 {
                 auto_mode_decision_v300(&mut decision);
             }
+            if env.f.v307 {
+                auto_mode_decision_v307(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`
@@ -523,6 +526,7 @@ impl EventBuilder<'_> {
             v303,
             v305,
             v306,
+            v307,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -771,8 +775,12 @@ impl EventBuilder<'_> {
             // 又没有构造器名了。2.1.299（`cap/auto-2.1.299-20261014-full` 两条）、2.1.303
             // （`cap/auto-2.1.303-20261019-full` 两条）、2.1.305（`cap/auto-2.1.305-20261021-full` 两条）各换
             // 一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299，2.1.304 沿用 2.1.303。2.1.306
-            // （`cap/auto-2.1.306-20261021-full` 三条）只换了 chunk 名与摘要。
-            if v306 {
+            // （`cap/auto-2.1.306-20261021-full` 三条）只换了 chunk 名与摘要，2.1.307
+            // （`cap/auto-2.1.307-20261022-bash`，全量包里那次没有失败的 Bash）摘要、行列都换了。
+            if v307 {
+                err["error_stack_hash"] = json!("40e496cc06bc");
+                err["error_top_frame"] = json!("chunk-wvsyb4fb.js:3661:6043");
+            } else if v306 {
                 err["error_stack_hash"] = json!("c19e7dcf6637");
                 err["error_top_frame"] = json!("chunk-z4fyjkxt.js:3654:6164");
             } else if v305 {

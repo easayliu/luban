@@ -4,41 +4,74 @@ use super::*;
 use crate::telemetry::files::MAIN_READER;
 
 impl EventBuilder<'_> {
-    /// 猜下一句：被新输入顶掉的，与跑完的。
+    /// 猜下一句：被新输入顶掉的，与跑完的。分叉里调了工具的（一律被拒，客户端带着拒绝结果接着发）是几条
+    /// 请求，收尾在最后一条（见 [`SuggestionFork`]）。
     pub(super) fn emit_suggestion(&mut self) {
         let env = self.env;
-        let call = env.call;
+        let (call, shape) = (env.call, env.shape);
         let TurnFacts {
             kind,
             failed,
             aborted,
+            turn_over,
             prev_main_depth,
             ref main_chain,
+            ref chain_id,
+            query_depth,
+            ref suggestion_fork,
+            safety_events,
+            ref display_model,
             v277,
             v280,
             v285,
+            v296,
             ..
         } = *env.f;
-        let EventEnv { total, t_end, fork_messages, .. } = *env;
+        let EventEnv { t0, total, t_end, fork_messages, .. } = *env;
+        if kind != Kind::Suggestion {
+            return;
+        }
+        // 分叉里接着发的那条：客户端先把拒绝结果与这一步算出的附件攒进分叉再发（`cap/auto-2.1.307-20261022-full`
+        // A19 .431：只有 `total_tokens_reminder`，没有主线程续轮前后那两条 query 计数）。附件计算耗时那条官方
+        // 每个附件只抽 5%（`su`），不补。
+        if shape.suggestion_step > 0 {
+            let mut attachments = json!({ "attachment_types": ["total_tokens_reminder"] });
+            if v285 {
+                let query_source = env.query_source.as_str();
+                fill_attachment_estimates(&mut attachments, query_source, shape.sdk, display_model);
+            }
+            self.push(ms(t0, -4), "tengu_attachments", attachments);
+        }
+        // 整个分叉的时长从头一条发出算；前面几条的用量与消息数，加上接着发时攒进去的拒绝结果与附件。
+        let span = suggestion_fork.as_ref().map_or(total, |f| {
+            (t_end - DateTime::<Utc>::from(f.started)).num_milliseconds().max(total)
+        });
+        let (mut usage, mut messages) = suggestion_fork
+            .as_ref()
+            .map_or(([0; 4], 0), |f| (f.usage, f.messages + suggestion_resumed_messages(shape)));
+        let hit_rate = |u: &[i64; 4]| {
+            let total_in = u[0] + u[2] + u[3];
+            if total_in > 0 { json!(u[2] as f64 / total_in as f64) } else { json!(0) }
+        };
         // 猜下一句：自己就是一轮（`cap/2.1.260-2` 09:43:21），收尾多一条 fork 统计，没有 tips。
         // 失败的那条只有上面的错误串（fork 统计报的是这一发的用量，没有用量就没有它）。
-        // 猜下一句被新输入顶掉（`07:52:58.552`）：fork 统计（用量全 0）、`suppressed/aborted`、
-        // `turn_end{aborted_streaming}`，没有 stop hook。
-        if kind == Kind::Suggestion && aborted {
+        // 猜下一句被新输入顶掉（`07:52:58.552`）：fork 统计（这一发的用量全 0，多一条打断的消息）、
+        // `suppressed/aborted`、`turn_end{aborted_streaming}`，没有 stop hook。
+        if aborted {
             let fork = json!({
                 "forkLabel": "prompt_suggestion",
                 "querySource": "prompt_suggestion",
-                "durationMs": total,
-                "messageCount": 1,
+                "durationMs": span,
+                "messageCount": messages + 1,
                 "relayEligible": true,
-                "inputTokens": 0,
-                "outputTokens": 0,
-                "cacheReadInputTokens": 0,
-                "cacheCreationInputTokens": 0,
+                "inputTokens": usage[0],
+                "outputTokens": usage[1],
+                "cacheReadInputTokens": usage[2],
+                "cacheCreationInputTokens": usage[3],
                 "serviceTier": "standard",
                 "cacheCreationEphemeral1hTokens": 0,
                 "cacheCreationEphemeral5mTokens": 0,
-                "cacheHitRate": 0,
+                "cacheHitRate": hit_rate(&usage),
                 "queryChainId": &main_chain,
                 "queryDepth": prev_main_depth
             });
@@ -48,66 +81,108 @@ impl EventBuilder<'_> {
                 "tengu_prompt_suggestion",
                 json!({ "source": "cli", "outcome": "suppressed", "reason": "aborted", "prompt_id": "user_intent" }),
             );
-            self.push(t_end, "tengu_turn_end", env.turn_end("aborted_streaming", total, None));
+            self.push(t_end, "tengu_turn_end", env.turn_end("aborted_streaming", span, None));
         }
-        if kind == Kind::Suggestion && !failed && !aborted {
-            let t1 = ms(t_end, 1);
-            let total_in = call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
-            let hit_rate =
-                if total_in > 0 { call.cache_read_tokens as f64 / total_in as f64 } else { 0.0 };
-            let mut fork = json!({
-                "forkLabel": "prompt_suggestion",
-                "querySource": "prompt_suggestion",
-                "durationMs": total + 7,
-                "messageCount": fork_messages
-            });
-            // 2.1.277 起多一项 `relayEligible`（猜下一句恒 true，子代理摘要恒 false）。
-            if v277 {
-                fork["relayEligible"] = json!(true);
-            }
-            let rest = json!({
-                "inputTokens": call.input_tokens,
-                "outputTokens": call.output_tokens,
-                "cacheReadInputTokens": call.cache_read_tokens,
-                "cacheCreationInputTokens": call.cache_creation_tokens,
-                "serviceTier": "standard",
-                "cacheCreationEphemeral1hTokens": 0,
-                "cacheCreationEphemeral5mTokens": 0,
-                "cacheHitRate": hit_rate,
-                "queryChainId": &main_chain,
-                "queryDepth": prev_main_depth
-            });
-            if let (Some(o), Some(r)) = (fork.as_object_mut(), rest.as_object()) {
-                o.extend(r.clone());
-            }
-            // 2.1.280 的顺序是 stop hook、turn、turn_end、fork 统计，最后才是
-            // `prompt_suggestion_generate`（`cap/2.1.280` 三条逐条如此）；之前的版本三个
-            // feature 连着报在前头。
-            let names: &[&str] = if v280 {
-                &["hook_stop_handler", "turn"]
-            } else {
-                &["hook_stop_handler", "prompt_suggestion_generate", "turn"]
-            };
-            for name in names {
-                self.push_dd(t1, "tengu_feature_ok", feature(name));
-            }
-            if v280 {
-                self.push(t1, "tengu_turn_end", env.turn_end("completed", total + 7, None));
-                self.push(t1, "tengu_fork_agent_query", fork);
-                let name = "prompt_suggestion_generate";
-                self.push_dd(t1, "tengu_feature_ok", feature(name));
-                // 回来的正文是空的：没有建议可出（`07:50:09.353`，紧跟 `prompt_suggestion_generate`）。
-                if v285 && call.text_chars == 0 {
-                    self.push(
-                        t1,
-                        "tengu_prompt_suggestion",
-                        json!({ "source": "cli", "outcome": "suppressed", "reason": "empty", "prompt_id": "user_intent" }),
-                    );
+        if failed || aborted {
+            return;
+        }
+        // 回复里调了工具：分叉自己的 canUseTool 一律拒（官方 `M`：deny「No tools needed for suggestion」），每个
+        // 工具一条 `can_use_tool_rejected`（`deniedBy` 与 `decisionReasonType` 都是 `other`，深度与 request-id
+        // 是这条自己的），2.1.307 起紧跟一条配置拒绝的 `tengu_safety_event`；流式执行，都在这条的 api_success 之前
+        // （A19：.427 两条、.428 成功）。客户端接着发，收尾那串等最后一条。
+        if !turn_over {
+            let t_rej = ms(t_end, -1);
+            let message_id = call.message_id.as_deref().unwrap_or_default();
+            for c in &call.tool_calls {
+                let mut can_use = json!({
+                    "messageID": message_id,
+                    "toolName": &c.name,
+                    "deniedBy": "other",
+                    "decisionReasonType": "other"
+                });
+                if v296 {
+                    can_use["preToolHookDurationMs"] = json!(1);
+                    can_use["permissionDurationMs"] = json!(1);
                 }
-            } else {
-                self.push(t1, "tengu_fork_agent_query", fork);
-                self.push(t1, "tengu_turn_end", env.turn_end("completed", total + 7, None));
+                can_use["queryChainId"] = json!(chain_id);
+                can_use["queryDepth"] = json!(query_depth);
+                if let Some(r) = &call.request_id {
+                    can_use["requestId"] = json!(r);
+                }
+                self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
+                if safety_events {
+                    let safety =
+                        safety_event(Denial::Config, &c.name, &c.id, shape.permission_mode);
+                    self.push(t_rej, "tengu_safety_event", safety);
+                }
             }
+            return;
+        }
+        for (t, v) in usage.iter_mut().zip([
+            call.input_tokens,
+            call.output_tokens,
+            call.cache_read_tokens,
+            call.cache_creation_tokens,
+        ]) {
+            *t += v;
+        }
+        messages += fork_messages;
+        let t1 = ms(t_end, 1);
+        let mut fork = json!({
+            "forkLabel": "prompt_suggestion",
+            "querySource": "prompt_suggestion",
+            "durationMs": span + 7,
+            "messageCount": messages
+        });
+        // 2.1.277 起多一项 `relayEligible`（猜下一句恒 true，子代理摘要恒 false）。
+        if v277 {
+            fork["relayEligible"] = json!(true);
+        }
+        let rest = json!({
+            "inputTokens": usage[0],
+            "outputTokens": usage[1],
+            "cacheReadInputTokens": usage[2],
+            "cacheCreationInputTokens": usage[3],
+            "serviceTier": "standard",
+            "cacheCreationEphemeral1hTokens": 0,
+            "cacheCreationEphemeral5mTokens": 0,
+            "cacheHitRate": hit_rate(&usage),
+            "queryChainId": &main_chain,
+            "queryDepth": prev_main_depth
+        });
+        if let (Some(o), Some(r)) = (fork.as_object_mut(), rest.as_object()) {
+            o.extend(r.clone());
+        }
+        // 2.1.280 的顺序是 stop hook、turn、turn_end、fork 统计，最后才是
+        // `prompt_suggestion_generate`（`cap/2.1.280` 三条逐条如此）；之前的版本三个
+        // feature 连着报在前头。
+        let names: &[&str] = if v280 {
+            &["hook_stop_handler", "turn"]
+        } else {
+            &["hook_stop_handler", "prompt_suggestion_generate", "turn"]
+        };
+        for name in names {
+            self.push_dd(t1, "tengu_feature_ok", feature(name));
+        }
+        if v280 {
+            self.push(t1, "tengu_turn_end", env.turn_end("completed", span + 7, None));
+            self.push(t1, "tengu_fork_agent_query", fork);
+            let name = "prompt_suggestion_generate";
+            self.push_dd(t1, "tengu_feature_ok", feature(name));
+            // 回来的正文是空的：没有建议可出（`07:50:09.353`，紧跟 `prompt_suggestion_generate`）。看整个分叉：前面
+            // 调工具那条回复里带的正文也是候选（官方 `q()` 挑头一个非空的）。
+            let suggested = call.text_chars > 0
+                || suggestion_fork.as_ref().is_some_and(|f| f.candidate_chars > 0);
+            if v285 && !suggested {
+                self.push(
+                    t1,
+                    "tengu_prompt_suggestion",
+                    json!({ "source": "cli", "outcome": "suppressed", "reason": "empty", "prompt_id": "user_intent" }),
+                );
+            }
+        } else {
+            self.push(t1, "tengu_fork_agent_query", fork);
+            self.push(t1, "tengu_turn_end", env.turn_end("completed", span + 7, None));
         }
     }
 
@@ -357,6 +432,9 @@ impl EventBuilder<'_> {
                 if env.f.v300 {
                     auto_mode_decision_v300(&mut decision);
                 }
+                if env.f.v307 {
+                    auto_mode_decision_v307(&mut decision);
+                }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
             let tg = ms(t_end, -3);
@@ -528,6 +606,35 @@ impl EventBuilder<'_> {
                         "calls",
                         vec![("calls_kept_on_full", json!(done.summaries_kept_on_full))],
                     );
+                    // 2.1.307 在 `agent_model` 与 `agent_model_swapped` 之间多 writer 三项
+                    // （`cap/auto-2.1.307-20261022-full` 六条都没配：`writer_model` 同 `agent_model`、
+                    // `writer_failed` false、`config_writer` 不出现）。官方 `he` / `fe`：writer 按子代理的族取
+                    // （只有 fable / opus），收尾是 short、配了、换过的没失败过、且等于客户端的小快模型才算换了；
+                    // `config_writer` 报配的那项（官方 `wt`：认不出的名字报 `nonconforming`）。客户端的小快模型
+                    // 可以被 `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` 改掉，代理看不到：short
+                    // 摘要换上过 writer 的，小快模型就是它（[`AgentState::small_fast`]）；没换上过的按默认的小快模型
+                    // 猜，除非它在配着时没换上（[`AgentState::not_small_fast`]）。
+                    if env.f.v307 {
+                        let config_writer = cfg.writer_for(agent_family);
+                        let is_small_fast = |w: &str| match done.small_fast.as_deref() {
+                            Some(s) => w == s,
+                            None => {
+                                w == crate::config::CC_SMALL_FAST_MODEL
+                                    && !done.not_small_fast.iter().any(|x| x == w)
+                            }
+                        };
+                        let writer = config_writer.filter(|w| {
+                            mode_short && !done.summary_writer_failed && is_small_fast(w)
+                        });
+                        let writer_model = writer.unwrap_or(display_model.as_str());
+                        let mut keys =
+                            vec![("writer_model", json!(telemetry_model_name(writer_model)))];
+                        if let Some(w) = config_writer {
+                            keys.push(("config_writer", json!(telemetry_model_name(w))));
+                        }
+                        keys.push(("writer_failed", json!(done.summary_writer_failed)));
+                        insert_after(&mut stopped, "agent_model", keys);
+                    }
                 }
                 self.push(t2, "tengu_agent_summary_stopped", stopped);
             }
@@ -572,6 +679,56 @@ impl EventBuilder<'_> {
             for name in ["melodic_wolf", "task_local_agent", "subagent_complete"] {
                 self.push_dd(t3, "tengu_feature_ok", feature(name));
             }
+        }
+    }
+}
+
+/// 遥测里报模型名的写法（官方 `wt`）：合 `^[A-Za-z0-9._:[\]-]{1,100}$`，或是 `名字@八位日期` 后面可带
+/// `[1m]` 这类上下文后缀（名字 1~91 个同样的字符），就原样报，否则报 `nonconforming`。
+fn telemetry_model_name(name: &str) -> &str {
+    let plain = |s: &str, max: usize| {
+        (1..=max).contains(&s.len())
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:[]-".contains(&b))
+    };
+    let dated = || {
+        let Some((head, tail)) = name.split_once('@') else { return false };
+        // 先认八位数字，再切：前八个字节都是 ASCII 数字，第八字节处必是字符边界。
+        if tail.len() < 8 || !tail.as_bytes()[..8].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let rest = &tail[8..];
+        let window = |r: &str| {
+            let Some(inner) = r.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+                return false;
+            };
+            let digits = inner.trim_end_matches(['m', 'M']);
+            inner.len() == digits.len() + 1
+                && (1..=3).contains(&digits.len())
+                && digits.bytes().all(|b| b.is_ascii_digit())
+        };
+        plain(head, 91) && (rest.is_empty() || window(rest))
+    };
+    if plain(name, 100) || dated() { name } else { "nonconforming" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::telemetry_model_name as name;
+
+    /// 官方 `wt`：合规的模型名原样报（含 `@日期` 与 `[1m]` 后缀那种），其余报 `nonconforming`。
+    #[test]
+    fn model_names_follow_the_official_patterns() {
+        for ok in [
+            "claude-haiku-5-5",
+            "claude-opus-5-5[1m]",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4@20250514",
+            "claude-sonnet-4@20250514[1m]",
+        ] {
+            assert_eq!(name(ok), ok);
+        }
+        for bad in ["", "claude haiku", "模型", &"x".repeat(101), "a@2025051", "a@20250514[1x]"] {
+            assert_eq!(name(bad), "nonconforming", "{bad}");
         }
     }
 }

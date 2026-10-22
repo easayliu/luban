@@ -2790,7 +2790,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.306."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.307."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -3877,8 +3877,13 @@ fn agent_cerf_text_replaces_the_builtin_paragraphs() {
 #[test]
 fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     let profile = config::cc_profile(config::CcProfileKind::MainOpus);
-    let official = crate::proxy::cc_tools_core(profile, false);
-    let expected = serde_json::to_string(official).unwrap();
+    // 2.1.307 起精简提示词的模型一律用 cerf 那版 `Agent` 说明，opus-5-5 也是（`lucky_cerf::reads_list`）。
+    let official = crate::proxy::cc_tools_core_for(
+        profile,
+        &crate::proxy::lucky_cerf::AgentDesc::Cerf(None),
+        false,
+    );
+    let expected = serde_json::to_string(&*official).unwrap();
     // 倒序声明，并把第一条（Write）的键序打乱：input_schema 提到 name 之前。
     let mut declared: Vec<serde_json::Value> = official.iter().rev().cloned().collect();
     let scrambled = {
@@ -3897,7 +3902,7 @@ fn official_tools_are_emitted_in_asset_order_and_byte_exact() {
     );
     declared[0] = scrambled;
     declared.push(serde_json::json!({"name": "my_tool", "input_schema": {"type": "object"}}));
-    // opus-5-5 不在 `tengu_lucky_cerf` 清单里，用的就是资产原样那份。
+    // 声明的就是 2.1.307 下 opus-5-5 那份（cerf 版说明），只是次序与键序不对。
     let mut v = serde_json::json!({"model": "claude-opus-5-5", "messages": [], "tools": declared});
     assert!(super::cc_tools_to_inject(&v, profile, false, false).is_empty(), "一个都不缺");
     assert!(super::inject_cc_tools(&mut v, profile, false, false, who()), "次序与键序都要改");
@@ -4898,7 +4903,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 306)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 307)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

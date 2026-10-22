@@ -134,19 +134,20 @@ impl EventBuilder<'_> {
             );
             self.push_dd(submit, "tengu_feature_ok", feature("prompt_submit"));
             let groups = shape.assistant_messages + 2;
-            self.push(
-                ms(t0, -6),
-                "tengu_reactive_compact_attempt",
-                json!({
-                    "attempt": 1,
-                    "groupsToSummarize": groups - 1,
-                    "groupsToPreserve": 1,
-                    "messagesToSummarize": shape.content_blocks + 29,
-                    "strippedMedia": false,
-                    "splitKind": "round",
-                    "headTruncations": 0
-                }),
-            );
+            let mut attempt = json!({
+                "attempt": 1,
+                "groupsToSummarize": groups - 1,
+                "groupsToPreserve": 1,
+                "messagesToSummarize": shape.content_blocks + 29,
+                "strippedMedia": false,
+                "splitKind": "round",
+                "headTruncations": 0
+            });
+            // 2.1.307 末尾多 `keepNoRound`（`cap/auto-2.1.307-20261022-full` A18 那条是 `false`）。
+            if env.f.v307 {
+                attempt["keepNoRound"] = json!(false);
+            }
+            self.push(ms(t0, -6), "tengu_reactive_compact_attempt", attempt);
             let update = feature_with(
                 "update_detection",
                 json!({ "duration_ms": 0, "first_in_process": false, "installation_type": "native" }),

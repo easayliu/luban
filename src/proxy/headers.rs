@@ -27,7 +27,9 @@ use super::uuid_from_bytes;
 ///   （haiku）就插在 [`config::CC_BETA_ADVISOR_TOOL`] 之后（2.1.251 起 haiku 的官方串是
 ///   `…claude-code,advisor-tool,advanced-tool-use,server-side-fallback…`）；两个都没有
 ///   （2.1.220 的 haiku）才跟在客户端自有串之后。
-/// - [`config::CC_BETA_PROMPT_CACHING_SCOPE`]：四份抓包里客户端都自带，真缺时补在末尾。
+/// - [`config::CC_BETA_PROMPT_CACHING_SCOPE`]：补在 [`config::CC_BETA_CONTEXT_MANAGEMENT`] 之后（直连官方的位置），没有那一项
+///   才追加队尾。2.1.306 及以前客户端都自带；2.1.307 起经自定义 BASE_URL 来的不带，每条都走到这里，只补 `oauth`
+///   的辅助调用也一样补（只认自报 2.1.307 及以上的；`count_tokens` 官方不带，不补）。
 /// - [`config::CC_BETA_EXTENDED_CACHE_TTL`]：2.1.220 时官方恒为最后一项；2.1.251 起队尾是
 ///   [`config::CC_BETA_CACHE_DIAGNOSIS`]，它排在其前。故有 `cache-diagnosis` 就插它前面，
 ///   没有才追加队尾。
@@ -103,11 +105,23 @@ pub(crate) fn merge_beta_for(
     let has = |parts: &[String], beta: &str| has_beta(parts, beta);
     let pos = |parts: &[String], beta: &str| find_beta(parts, beta);
 
-    // 官方非主线程 profile：只保证 `oauth` 在，别的一项都不补。
+    // 官方非主线程 profile：只保证 `oauth` 在，别的一项都不补——2.1.307 起的 `prompt-caching-scope` 除外。
     if ctx.only_oauth || is_official_non_main_beta(&parts) {
         if !has(&parts, config::OAUTH_BETA_HEADER) {
             let at = usize::from(parts.first().is_some_and(|p| p == config::CC_BETA_CLAUDE_CODE));
             parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
+        }
+        // 2.1.307 起经自定义 BASE_URL 来的客户端不带它，直连官方带（紧跟 `context-management`，
+        // `cap/auto-2.1.307-20261022-full` 里带 `context-management` 的 `/v1/messages` 条条都有）：照直连补回同一
+        // 位置。只认自报 2.1.307 及以上的——更早的版本自己带，没带的那几类老辅助调用官方本来就不带；没有
+        // `context-management` 的（缓存保活的 touch）直连也不带。`count_tokens` 例外：带着 `context-management`
+        // 却不带它（同一抓包 00105–00142 共 38 条），认 `token-counting` 那项跳过。
+        if version.is_some_and(|v| v >= (2, 1, 307))
+            && !has(&parts, config::CC_BETA_PROMPT_CACHING_SCOPE)
+            && !has(&parts, config::CC_BETA_TOKEN_COUNTING)
+            && let Some(i) = pos(&parts, config::CC_BETA_CONTEXT_MANAGEMENT)
+        {
+            parts.insert(i + 1, config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
         }
         // SDK 子代理订阅端比 API-key 端多的不只 `oauth`：2.1.251 起的子代理带
         // `cache-diagnosis`（`cap/2.1.285/00120`、`00127`，排在 `message-threads` 之前），API-key
@@ -164,7 +178,8 @@ pub(crate) fn merge_beta_for(
         parts.insert(at, config::CC_BETA_ADVANCED_TOOL_USE.to_string());
     }
     if !has(&parts, config::CC_BETA_PROMPT_CACHING_SCOPE) {
-        parts.push(config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
+        let at = pos(&parts, config::CC_BETA_CONTEXT_MANAGEMENT).map_or(parts.len(), |i| i + 1);
+        parts.insert(at, config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
     }
     if modern {
         // 官方串里有这一项的族才补。2.1.260 的 opus 主线程整项不发了

@@ -185,6 +185,7 @@ impl EventBuilder<'_> {
             prev_main_depth,
             prev_end,
             v296,
+            safety_events,
             ..
         } = *env.f;
         let EventEnv { t0, .. } = *env;
@@ -242,6 +243,12 @@ impl EventBuilder<'_> {
                 can_use["queryDepth"] = json!(prev_main_depth);
                 can_use["requestId"] = json!(&prev_req);
                 self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
+                // 2.1.307 紧跟着一条 `tengu_safety_event`（`cap/auto-2.1.307-20261022-full` B1，同一毫秒）。
+                if safety_events {
+                    let safety =
+                        safety_event(Denial::UserReject, &c.name, &c.id, shape.permission_mode);
+                    self.push(t_rej, "tengu_safety_event", safety);
+                }
                 let mut rejected = json!({
                     "messageID": &prev_msg,
                     "isMcp": false,

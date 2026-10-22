@@ -136,6 +136,66 @@ fn merged_beta_matches_2_1_258_official_order() {
     assert!(!no_model.contains("thinking-display-updates"), "不知道族就不补: {no_model}");
 }
 
+/// 2.1.307 起经自定义 BASE_URL 来的客户端不带 `prompt-caching-scope`（`cap/auto-2.1.307-20261022-baseurl`）：
+/// 补回直连官方的位置，紧跟 `context-management`（`cap/auto-2.1.307-20261022-full` 的主线程 `00038`、标题 `00036`、
+/// 额度探测 `00021` 都是）。主线程那条路不分版本（老版本都自带，走不到）；只补 `oauth` 的辅助调用只认自报
+/// 2.1.307 及以上的，更早的原样不动；没有 `context-management` 的（缓存保活的 touch）不补。
+#[test]
+fn prompt_caching_scope_is_restored_after_context_management() {
+    use crate::proxy::{BetaCtx, merge_beta_for};
+    let scope = config::CC_BETA_PROMPT_CACHING_SCOPE;
+    let after_cm = |s: &str| {
+        let parts: Vec<&str> = s.split(',').collect();
+        let at = parts.iter().position(|p| *p == config::CC_BETA_CONTEXT_MANAGEMENT).unwrap();
+        parts[at + 1] == scope && parts.iter().filter(|p| **p == scope).count() == 1
+    };
+    // `v307/00003`：opus 主线程。
+    const MAIN_00003: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
+             context-management-2025-06-27,per-turn-control-2026-07-01,\
+             mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
+             advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,\
+             thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11";
+    let v307 = Some((2, 1, 307));
+    let main = merge_beta(Some(MAIN_00003), Some("claude-opus-5-5"), v307);
+    assert!(after_cm(&main), "{main}");
+    assert_eq!(merge_beta(Some(&main), Some("claude-opus-5-5"), v307), main, "补过的不再动");
+
+    // `v307/00006`：WebFetch 之后那条 helper，认作官方辅助调用只补 `oauth`（订阅登录本来就带），外加这一项。
+    const HELPER_00006: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+             thinking-token-count-2026-05-13,context-management-2025-06-27,\
+             per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+             inline-tools-2026-09-15,advisor-tool-2026-03-01,effort-2025-11-24,\
+             dangerous-tool-use-2026-09-03";
+    let aux = BetaCtx { only_oauth: true, ..BetaCtx::MAIN };
+    let opus = Some("claude-opus-5-5");
+    let want = HELPER_00006.replace(
+        "context-management-2025-06-27,",
+        "context-management-2025-06-27,prompt-caching-scope-2026-01-05,",
+    );
+    assert_eq!(merge_beta_for(Some(HELPER_00006), opus, v307, aux), want);
+    assert_eq!(merge_beta_for(Some(&want), opus, v307, aux), want, "带着的不重复补");
+    assert_eq!(
+        merge_beta_for(Some(HELPER_00006), opus, Some((2, 1, 306)), aux),
+        HELPER_00006,
+        "2.1.307 以下的辅助调用原样"
+    );
+    assert_eq!(merge_beta_for(Some(HELPER_00006), opus, None, aux), HELPER_00006, "读不出版本");
+    const TOUCH: &str = "oauth-2025-04-20,cache-keepalive-2026-09-03";
+    assert_eq!(merge_beta_for(Some(TOUCH), None, v307, aux), TOUCH, "touch 直连也不带");
+    // `count_tokens`（`cap/auto-2.1.307-20261022-full/00105` 等 38 条）带着 `context-management` 也不带它。
+    const COUNT_00105: &str = "claude-code-20250219,oauth-2025-04-20,\
+             interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01";
+    assert_eq!(
+        merge_beta_for(Some(COUNT_00105), opus, v307, aux),
+        COUNT_00105,
+        "count_tokens 原样"
+    );
+    let without_oauth = COUNT_00105.replace("oauth-2025-04-20,", "");
+    assert_eq!(merge_beta_for(Some(&without_oauth), opus, v307, aux), COUNT_00105, "只补 oauth");
+}
+
 /// 2.1.270 的**完整订阅端串**经 [`merge_beta_for`] 必须一个字不动。
 ///
 /// `cap/2.1.270/00017` / `00025`（sonnet-5 直连，同一会话首轮与续轮，beta 逐字相同）：
@@ -921,17 +981,17 @@ fn simulated_beta_matches_official() {
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
 }
 
-/// 2.1.306 的模拟主线程 beta 逐字对上 `cap/auto-2.1.299-20261014-full`（2.1.300 的
+/// 2.1.307 的模拟主线程 beta 逐字对上 `cap/auto-2.1.299-20261014-full`（2.1.300 的
 /// `cap/auto-2.1.300-20261015-full`、2.1.301 的 `cap/auto-2.1.301-20261016-full`、2.1.303 的
 /// `cap/auto-2.1.303-20261019-full`、2.1.305 的 `cap/auto-2.1.305-20261021-full`、2.1.306 的
-/// `cap/auto-2.1.306-20261021-full` 去掉按号下发的
+/// `cap/auto-2.1.306-20261021-full`、2.1.307 的 `cap/auto-2.1.307-20261022-full` 去掉按号下发的
 /// `cache-keepalive` 后逐字相同，见
 /// [`config::CC_PROFILES`]）：与 2.1.296 相比只少了 `mid-conversation-system`（转正不发头），haiku-5-5 那串里
 /// `claude-code` 因此紧跟 `prompt-caching-scope`。fable 只抓到 auto 模式（`00523`，多 `dangerous-tool-use` 与
 /// `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带 `safeguards`，那两项都不该出现。
 /// 没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_306() {
+fn simulated_beta_matches_2_1_307() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          thinking-token-count-2026-05-13,context-management-2025-06-27,\
          prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
@@ -962,7 +1022,7 @@ fn simulated_beta_matches_2_1_306() {
         ("00294", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.306");
+        assert_eq!(profile.version, "2.1.307");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1006,10 +1066,10 @@ fn profile_betas_match_the_2_1_277_captures() {
         assert_eq!(p.version, "2.1.277", "{kind:?}");
         assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
     }
-    // 2.1.306 的额度探测（`cap/auto-2.1.306-20261021-full/00022`，2.1.305 的 `00019`、2.1.303 的 `00017`、2.1.301 的 `00015`、2.1.300 的 `00012`、
-    // 2.1.299 的 `00014`、2.1.296 的 `00012`、2.1.293 的 `00017` 同）与 2.1.277 逐字相同。
+    // 2.1.307 的额度探测（`cap/auto-2.1.307-20261022-full/00021`，2.1.306 的 `00022`、2.1.305 的 `00019`、2.1.303 的 `00017`、
+    // 2.1.301 的 `00015`、2.1.300 的 `00012`、2.1.299 的 `00014`、2.1.296 的 `00012`、2.1.293 的 `00017` 同）与 2.1.277 逐字相同。
     let quota = config::cc_profile(QuotaProbe);
-    assert_eq!((quota.version, quota.beta), ("2.1.306", cases[2].2));
+    assert_eq!((quota.version, quota.beta), ("2.1.307", cases[2].2));
     // 2.1.291 的标题生成（默认模式下 13 条）与 2.1.277 逐字相同。
     let title = config::cc_profile_at(SessionTitleHaiku, Some((2, 1, 291)));
     assert_eq!((title.version, title.beta), ("2.1.291", cases[1].2));
@@ -1033,12 +1093,12 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.299（`cap/auto-2.1.299-20261014-full/00029`）只少 `mid-conversation-system`；2.1.300
     // （`cap/auto-2.1.300-20261015-full/00029`）、2.1.301（`cap/auto-2.1.301-20261016-full`）、2.1.303
     // （`cap/auto-2.1.303-20261019-full`）、2.1.305（`cap/auto-2.1.305-20261021-full`）、2.1.306
-    // （`cap/auto-2.1.306-20261021-full`）同串。
+    // （`cap/auto-2.1.306-20261021-full`）、2.1.307（`cap/auto-2.1.307-20261022-full/00036`）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.306",
+            "2.1.307",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,\

@@ -5,7 +5,9 @@
 //! `tengu_groovy_ember`、其余读 `tengu_composed_plum`；值是 `{mode, refreshSeconds, maxInputTokens}`，
 //! 逐项校验、不合法的项各自退回默认（整个不是对象则全取默认）：`mode` 只认 `full` / `short`（默认
 //! `full`），`maxInputTokens` 夹到 1000~8000（默认 2000），`refreshSeconds` 每项夹到 30~240 秒、1~16 项
-//! （默认 `[30]`）。没下发即 `source: fallback`、全取默认——`cap/auto-2.1.303-20261019-full` 那个号的 eval
+//! （默认 `[30]`）。2.1.307 多一项 `writer: {fable?, opus?}`（各是 1~100 字的模型名，不合法的那项丢掉，
+//! 整个不是对象即 `{}`）：子代理是 opus / fable 时 short 摘要改由这个模型写，见 [`SummaryConfig::writer_for`]。
+//! 没下发即 `source: fallback`、全取默认——`cap/auto-2.1.303-20261019-full` 那个号的 eval
 //! 三个都没有，六条都报 `fallback`。下发了就报 eval 里那项的 `source`（`experiment` / `force` /
 //! `defaultValue`）。只存在内存里，保活与会话握手拉 eval 时顺带记（[`note_eval`]）。
 //!
@@ -32,6 +34,9 @@ pub(crate) struct SummaryConfig {
     pub(crate) waits_ms: Vec<u64>,
     /// eval 里那项的 `source`，没下发是 `fallback`。
     pub(crate) source: String,
+    /// 2.1.307 的 `writer`：子代理是 fable / opus 时 short 摘要改由哪个模型写，没配是 `None`。
+    pub(crate) writer_fable: Option<String>,
+    pub(crate) writer_opus: Option<String>,
 }
 
 impl Default for SummaryConfig {
@@ -41,11 +46,22 @@ impl Default for SummaryConfig {
             max_input_tokens: 2_000,
             waits_ms: vec![30_000],
             source: "fallback".into(),
+            writer_fable: None,
+            writer_opus: None,
         }
     }
 }
 
 impl SummaryConfig {
+    /// 子代理是这个族时配的 writer（官方 `he`：只有 fable / opus 读，其余没有）。
+    pub(crate) fn writer_for(&self, agent_family: &str) -> Option<&str> {
+        match agent_family {
+            "fable" => self.writer_fable.as_deref(),
+            "opus" => self.writer_opus.as_deref(),
+            _ => None,
+        }
+    }
+
     /// 第 `calls` 次之后要等的毫秒数（官方 `se`）。
     pub(crate) fn wait_ms(&self, calls: u32) -> u64 {
         let i = (calls as usize).min(self.waits_ms.len().saturating_sub(1));
@@ -84,6 +100,17 @@ fn parse(feature: &serde_json::Value) -> SummaryConfig {
         && let Some(secs) = a.iter().map(|s| s.as_i64()).collect::<Option<Vec<_>>>()
     {
         cfg.waits_ms = secs.into_iter().map(|s| s.clamp(30, 240) as u64 * 1_000).collect();
+    }
+    // 2.1.307：`string().min(1).max(100)`，按 JS 的长度（UTF-16 码元）数。
+    if let Some(w) = v.get("writer").and_then(|w| w.as_object()) {
+        let pick = |k: &str| {
+            w.get(k)
+                .and_then(|s| s.as_str())
+                .filter(|s| (1..=100).contains(&s.encode_utf16().count()))
+                .map(str::to_owned)
+        };
+        cfg.writer_fable = pick("fable");
+        cfg.writer_opus = pick("opus");
     }
     cfg
 }
@@ -195,6 +222,28 @@ mod tests {
             SummaryConfig::default(),
             "没见过 eval"
         );
+    }
+
+    /// 2.1.307 的 `writer`：按族各取一项，空串、超过 100 字、不是字符串的那项丢掉；整个不是对象即没配。
+    #[test]
+    fn parses_the_writer_per_family() {
+        let long = "x".repeat(101);
+        let features = serde_json::json!({
+            "tengu_groovy_ember": {"value": {"mode": "short",
+                "writer": {"opus": "claude-haiku-5-5", "fable": "", "sonnet": "claude-haiku-5-5"}}},
+            "tengu_starry_wall": {"value": {"writer": {"fable": long, "opus": 3}}},
+            "tengu_composed_plum": {"value": {"writer": "claude-haiku-5-5"}},
+        });
+        note_eval(77_006, features.as_object().unwrap());
+        let opus = config_at(77_006, "opus", SystemTime::now());
+        assert_eq!(opus.writer_for("opus"), Some("claude-haiku-5-5"));
+        assert_eq!(opus.writer_for("fable"), None, "空串丢掉");
+        assert_eq!(opus.writer_for("sonnet"), None, "只有 fable / opus 两项");
+        let fable = config_at(77_006, "fable", SystemTime::now());
+        assert_eq!((fable.writer_for("fable"), fable.writer_for("opus")), (None, None));
+        let other = config_at(77_006, "haiku", SystemTime::now());
+        assert_eq!(other.writer_for("opus"), None, "不是对象即 {{}}");
+        assert_eq!(SummaryConfig::default().writer_for("opus"), None);
     }
 
     #[test]

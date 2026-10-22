@@ -615,7 +615,8 @@ fn a_session_waiting_for_a_retry_is_not_idle() {
     t.gc(now + Duration::from_secs(2));
     let st = t.0.state.lock();
     assert!(st.sessions.contains_key(&key()), "会话还在");
-    assert!(st.held_retries.contains_key(&key()), "还在等重发");
+    let main = (7, SESSION.to_string(), RetryLane::Main);
+    assert!(st.held_retries.contains_key(&main), "还在等重发");
 }
 
 /// 扣着的重试链只留最后一次的整份请求，前面几次只留概况。
@@ -637,7 +638,7 @@ fn held_retry_keeps_only_the_last_body() {
         t.ingest(f);
     }
     let st = t.0.state.lock();
-    let held = &st.held_retries[&key()];
+    let held = &st.held_retries[&(7, SESSION.to_string(), RetryLane::Main)];
     assert_eq!(held.prior.len(), 2);
     assert_eq!(held.last.request_id.as_deref(), Some("req_f2"));
 }
@@ -6735,6 +6736,680 @@ fn version_2_1_300_telemetry_shape() {
     );
 }
 
+/// 2.1.307（`cap/auto-2.1.307-20261022-full` / `-retry`）：工具在弹框上被拒，`can_use_tool_rejected` 之后同一刻多一条
+/// `tengu_safety_event`；auto 判决走分类器那种在 `classifierSource` 之后多 `skippedOnAllowRule: false`（快路径那种
+/// 不带）；`/compact` 的压缩尝试末尾多 `keepNoRound: false`；5xx 重试带 2.1.307 自己的栈三样。2.1.306 都没有。
+/// 主线程回复里的 Bash 在权限弹框上被用户拒了、接着敲了下一句：两条请求过完，按顺序的事件名与 meta。
+fn user_rejected_events(ua: &str, cred: i64) -> Vec<(String, Value)> {
+    let base = frozen_now() - Duration::from_secs(120);
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = ua.into();
+    first.cred_id = cred;
+    first.started_at = base;
+    first.tool_calls = vec![ToolCall {
+        id: "t1".into(),
+        name: "Bash".into(),
+        input: json!({"command": "rm x"}),
+        verdict: None,
+    }];
+    first.tool_use_lens = vec![("Bash".into(), 16)];
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_2)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm x"}}]});
+    body["messages"][2] = json!({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."},
+        {"type":"text","text":"[Request interrupted by user for tool use]\n"},
+        {"type":"text","text":"ok, keep it"}
+    ]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = ua.into();
+    second.cred_id = cred;
+    second.started_at = base + Duration::from_secs(30);
+    t.ingest(second);
+    let st = t.0.state.lock();
+    st.pending[&(cred, SESSION.to_string())]
+        .events
+        .iter()
+        .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+        .collect()
+}
+
+#[test]
+fn version_2_1_307_telemetry_shape() {
+    let base = frozen_now() - Duration::from_secs(120);
+    let rejected = |ua: &str| user_rejected_events(ua, 7);
+    let ev = rejected("claude-cli/2.1.307 (external, cli)");
+    let i = ev.iter().position(|(n, _)| n == "tengu_tool_use_can_use_tool_rejected").unwrap();
+    assert_eq!(ev[i + 1].0, "tengu_safety_event", "紧跟拒绝那条");
+    let s = &ev[i + 1].1;
+    let keys: Vec<&str> = s
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .skip_while(|k| *k != "category")
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "category",
+            "decision",
+            "decision_source",
+            "reason_code",
+            "tool_class",
+            "tool_name",
+            "tool_source",
+            "permission_mode",
+            "tool_use_id",
+            "sandbox_violation_count",
+            "sandbox_enabled"
+        ],
+        "{s}"
+    );
+    for (k, v) in [
+        ("category", json!("user_rejected")),
+        ("decision", json!("reject")),
+        ("decision_source", json!("user_reject")),
+        ("reason_code", json!("unknown")),
+        ("tool_class", json!("bash")),
+        ("tool_name", json!("Bash")),
+        ("tool_source", json!("builtin")),
+        ("tool_use_id", json!("t1")),
+        ("sandbox_violation_count", json!(0)),
+        ("sandbox_enabled", json!(false)),
+    ] {
+        assert_eq!(s[k], v, "{k}");
+    }
+    let old = rejected("claude-cli/2.1.306 (external, cli)");
+    assert!(old.iter().all(|(n, _)| n != "tengu_safety_event"));
+
+    let mut full = json!({"classifierQueueWaitMs": 0, "classifierSource": "server",
+        "classifierTotalWaitMs": 900});
+    super::tools::auto_mode_decision_v307(&mut full);
+    let keys: Vec<&str> = full.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "classifierQueueWaitMs",
+            "classifierSource",
+            "skippedOnAllowRule",
+            "classifierTotalWaitMs"
+        ]
+    );
+    assert_eq!(full["skippedOnAllowRule"], false);
+    let mut fast = json!({"classifierSource": "server",
+        "serverClassifierNoVerdict": "server_call_skipped", "classifierTotalWaitMs": 0});
+    let before = fast.clone();
+    super::tools::auto_mode_decision_v307(&mut fast);
+    assert_eq!(fast, before, "快路径那种不带");
+
+    let compact_attempt = |ua: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        first.ua_out = ua.into();
+        first.started_at = base;
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"text","text":"hi"}]},
+            {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30);
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_attempt")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let attempt = compact_attempt("claude-cli/2.1.307 (external, cli)");
+    let keys: Vec<&str> = attempt.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys[keys.len() - 2..], ["headTruncations", "keepNoRound"], "{attempt}");
+    assert_eq!(attempt["keepNoRound"], false);
+    assert!(compact_attempt("claude-cli/2.1.306 (external, cli)").get("keepNoRound").is_none());
+
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.307 (external, sdk-cli)");
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        assert_eq!(
+            (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("WVt"), &json!("5b32b751db51"), &json!("chunk-2f0n1d7c.js:11:1510")),
+            "{n}"
+        );
+    }
+}
+
+/// 「猜下一句」请求体：主线程上下文、一条回复、猜下一句的提示词；`denied` 是分叉里前面几步调过的工具（每步
+/// 一个，都被分叉拒了），接着发的那条末尾是拒绝结果与 total_tokens 附件那条 system 消息（`cap/auto-2.1.307-
+/// 20261022-full/00188` 的形态）。
+fn suggestion_body(denied: &[&str]) -> Vec<u8> {
+    let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+    let msgs = v["messages"].as_array_mut().unwrap();
+    msgs.push(json!({"role":"assistant","content":[{"type":"text","text":"done"}]}));
+    msgs.push(json!({"role":"user","content":"[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]\n\nReply with ONLY the suggestion, no quotes or explanation."}));
+    for id in denied {
+        msgs.push(json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Bash","input":{"command":"true"}}]}));
+        msgs.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"No tools needed for suggestion"}]}));
+        msgs.push(
+            json!({"role":"system","content":"<total_tokens>14944722 tokens left</total_tokens>"}),
+        );
+    }
+    v.to_string().into_bytes()
+}
+
+/// 主线程一轮之后的「猜下一句」分叉：头一条（10 秒发、2 秒）回复调了 Bash，客户端带着拒绝结果在 12.01 秒接着发
+/// （2.15 秒、只回了思考）。用量取 `cap/auto-2.1.307-20261022-full` A19 那两条。`retried` 时接着发的那条先吃
+/// 一次 503（12.01 秒发、0.2 秒），客户端在 12.4 秒原样重发、照样 14.16 秒收完。返回按时刻排好的事件。
+fn suggestion_fork_events(cred: i64, retried: bool) -> Vec<(DateTime<Utc>, String, Value)> {
+    let base = frozen_now() - Duration::from_secs(120);
+    let ua = "claude-cli/2.1.307 (external, cli)";
+    let t = Telemetry::default();
+    let mut main = call(cc_body(true), "req_main", "end_turn");
+    main.ua_out = ua.into();
+    main.cred_id = cred;
+    main.started_at = base;
+    t.ingest(main);
+    let skey = (cred, SESSION.to_string());
+    let main_attachments = t.0.state.lock().sessions[&skey].attachment_counts.clone();
+    let mut s1 = call(suggestion_body(&[]), "req_s1", "tool_use");
+    s1.ua_out = ua.into();
+    s1.cred_id = cred;
+    s1.started_at = base + Duration::from_secs(10);
+    s1.total_ms = 2_000;
+    s1.message_id = Some("msg_s1".into());
+    s1.text_chars = 0;
+    s1.tool_calls = vec![ToolCall {
+        id: "toolu_s1".into(),
+        name: "Bash".into(),
+        input: json!({"command": "true"}),
+        verdict: None,
+    }];
+    s1.tool_use_lens = vec![("Bash".into(), 52)];
+    (s1.input_tokens, s1.output_tokens, s1.cache_read_tokens, s1.cache_creation_tokens) =
+        (506, 74, 54_638, 60);
+    t.ingest(s1);
+    let mut s2 = call(suggestion_body(&["toolu_s1"]), "req_s2", "end_turn");
+    s2.ua_out = ua.into();
+    s2.cred_id = cred;
+    s2.started_at = base + Duration::from_millis(12_010);
+    s2.total_ms = 2_150;
+    if retried {
+        let mut first = call(suggestion_body(&["toolu_s1"]), "req_s2_503", "end_turn");
+        first.ua_out = ua.into();
+        first.cred_id = cred;
+        first.started_at = s2.started_at;
+        first.total_ms = 200;
+        t.ingest(failed(first, Some(503), "api_error", "upstream connect error"));
+        s2.started_at = base + Duration::from_millis(12_400);
+        s2.total_ms = 1_760;
+    }
+    s2.message_id = Some("msg_s2".into());
+    s2.text_chars = 0;
+    s2.saw_thinking = true;
+    (s2.input_tokens, s2.output_tokens, s2.cache_read_tokens, s2.cache_creation_tokens) =
+        (45, 91, 54_698, 580);
+    t.ingest(s2);
+    let st = t.0.state.lock();
+    assert!(st.sessions[&skey].suggestion_fork.is_none(), "收尾之后分叉清掉");
+    assert_eq!(
+        st.sessions[&skey].attachment_counts, main_attachments,
+        "分叉的附件不进主线程的账本（压缩收尾按它报）"
+    );
+    let mut ev: Vec<(DateTime<Utc>, String, Value)> = st.pending[&skey]
+        .events
+        .iter()
+        .map(|(dt, e)| (*dt, ev_name(e).to_string(), meta_of(e)))
+        .collect();
+    ev.sort_by_key(|(dt, _, _)| *dt);
+    ev
+}
+
+/// 「猜下一句」分叉里模型调了工具（`cap/auto-2.1.307-20261022-full` A19）：分叉自己的 canUseTool 一律拒，那条回复的
+/// api_success 之前报 `can_use_tool_rejected`（`other`）与配置拒绝的 `tengu_safety_event`，这条不收尾；带着拒绝
+/// 结果接着发的那条仍是猜下一句（同一条链、深度 +1、接上一条的 request-id 与 token 数，此前被当成无链的 helper），
+/// 收尾的 fork 统计报整个分叉的时长、用量与消息数。
+#[test]
+fn suggestion_fork_with_a_denied_tool_spans_two_requests() {
+    let ev = suggestion_fork_events(7, false);
+    let suggestion = |n: &str| -> Vec<&(DateTime<Utc>, String, Value)> {
+        ev.iter().filter(|(_, x, m)| x == n && m["querySource"] == "prompt_suggestion").collect()
+    };
+    let queries = suggestion("tengu_api_query");
+    assert_eq!(queries.len(), 2, "接着发的那条也是猜下一句");
+    assert!(ev.iter().all(|(_, n, m)| n != "tengu_api_query" || m["querySource"] != "compact"));
+    let (q1, q2) = (&queries[0].2, &queries[1].2);
+    assert_eq!(q1["queryChainId"], q2["queryChainId"]);
+    let depth = q1["queryDepth"].as_u64().unwrap();
+    assert_eq!(q2["queryDepth"], depth + 1);
+    assert_eq!(q2["previousRequestId"], "req_s1");
+    let successes = suggestion("tengu_api_success");
+    assert_eq!(successes.len(), 2);
+    assert_eq!(successes[1].2["messageTokens"], 506 + 74 + 54_638 + 60, "接上一条的 token 数");
+
+    let rejected: Vec<_> =
+        ev.iter().filter(|(_, n, _)| n == "tengu_tool_use_can_use_tool_rejected").collect();
+    assert_eq!(rejected.len(), 1);
+    let (t_rej, _, r) = rejected[0];
+    for (k, v) in [
+        ("messageID", json!("msg_s1")),
+        ("toolName", json!("Bash")),
+        ("deniedBy", json!("other")),
+        ("decisionReasonType", json!("other")),
+        ("preToolHookDurationMs", json!(1)),
+        ("permissionDurationMs", json!(1)),
+        ("queryChainId", q1["queryChainId"].clone()),
+        ("queryDepth", json!(depth)),
+        ("requestId", json!("req_s1")),
+    ] {
+        assert_eq!(r[k], v, "{k}");
+    }
+    assert!(*t_rej < successes[0].0, "流式执行：拒绝在那条的 api_success 之前");
+    let safety: Vec<_> = ev.iter().filter(|(_, n, _)| n == "tengu_safety_event").collect();
+    assert_eq!(safety.len(), 1);
+    assert_eq!(safety[0].0, *t_rej, "与拒绝同一刻");
+    let s = &safety[0].2;
+    let keys: Vec<&str> = s
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .skip_while(|k| *k != "category")
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "category",
+            "decision",
+            "decision_source",
+            "reason_type",
+            "reason_code",
+            "tool_class",
+            "tool_name",
+            "tool_source",
+            "permission_mode",
+            "tool_use_id",
+            "sandbox_violation_count",
+            "sandbox_enabled"
+        ],
+        "{s}"
+    );
+    for (k, v) in [
+        ("category", json!("other")),
+        ("decision", json!("reject")),
+        ("decision_source", json!("config")),
+        ("reason_type", json!("other")),
+        ("reason_code", json!("other")),
+        ("tool_class", json!("bash")),
+        ("tool_name", json!("Bash")),
+        ("tool_use_id", json!("toolu_s1")),
+    ] {
+        assert_eq!(s[k], v, "{k}");
+    }
+
+    let attachments: Vec<_> = ev
+        .iter()
+        .filter(|(_, n, m)| n == "tengu_attachments" && m["query_source"] == "prompt_suggestion")
+        .collect();
+    assert_eq!(attachments.len(), 1, "只有接着发的那条前面攒附件");
+    assert_eq!(attachments[0].2["attachment_types"], json!(["total_tokens_reminder"]));
+    assert!(attachments[0].0 < queries[1].0 && attachments[0].0 > successes[0].0);
+
+    let ends: Vec<_> = ev
+        .iter()
+        .filter(|(_, n, m)| n == "tengu_turn_end" && m["query_source"] == "prompt_suggestion")
+        .collect();
+    assert_eq!(ends.len(), 1, "调工具那条不收尾");
+    let forks: Vec<_> = ev
+        .iter()
+        .filter(|(_, n, m)| n == "tengu_fork_agent_query" && m["forkLabel"] == "prompt_suggestion")
+        .collect();
+    assert_eq!(forks.len(), 1);
+    let f = &forks[0].2;
+    // 10 秒发出到 12.01 + 2.15 秒收完，再加收尾那 7ms；消息是 Bash、拒绝、附件、思考四条。
+    assert_eq!(
+        ["durationMs", "messageCount", "inputTokens", "outputTokens"].map(|k| f[k].clone()),
+        [json!(4_167), json!(4), json!(551), json!(165)]
+    );
+    assert_eq!(
+        ["cacheReadInputTokens", "cacheCreationInputTokens"].map(|k| f[k].clone()),
+        [json!(109_336), json!(640)]
+    );
+    assert_eq!(ends[0].2["duration_ms"], 4_167);
+    // 分叉的结果只有收尾那一条（主线程那一轮收尾另有它自己的）。
+    let results: Vec<&Value> = ev
+        .iter()
+        .filter(|(dt, n, _)| n == "tengu_prompt_suggestion" && *dt > successes[0].0)
+        .map(|(_, _, m)| m)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        (&results[0]["outcome"], &results[0]["reason"]),
+        (&json!("suppressed"), &json!("empty"))
+    );
+}
+
+/// 接着发的那条先吃一次可重试的失败（503）、客户端原样重发：失败那次与重发那次都还在分叉上（同一条链、同一深度、
+/// 接着头一条），收尾的 fork 统计仍是整个分叉的合计（输入 / 输出 551 / 165，不是只剩重发那次的 45 / 91）。
+#[test]
+fn suggestion_fork_survives_a_retried_continuation() {
+    let ev = suggestion_fork_events(7, true);
+    let of = |n: &str| -> Vec<&Value> {
+        ev.iter()
+            .filter(|(_, x, m)| x == n && m["querySource"] == "prompt_suggestion")
+            .map(|(_, _, m)| m)
+            .collect()
+    };
+    let queries = of("tengu_api_query");
+    assert_eq!(queries.len(), 3, "头一条、失败那次、重发那次");
+    let chain = &queries[0]["queryChainId"];
+    let depth = queries[0]["queryDepth"].as_u64().unwrap();
+    for q in &queries[1..] {
+        assert_eq!(
+            (&q["queryChainId"], &q["queryDepth"], &q["previousRequestId"]),
+            (chain, &json!(depth + 1), &json!("req_s1"))
+        );
+    }
+    let errors = of("tengu_api_error");
+    assert_eq!(errors.len(), 1);
+    assert_eq!((&errors[0]["queryChainId"], &errors[0]["queryDepth"]), (chain, &json!(depth + 1)));
+    assert_eq!(of("tengu_api_success").last().unwrap()["messageTokens"], 506 + 74 + 54_638 + 60);
+    let forks: Vec<&Value> = ev
+        .iter()
+        .filter(|(_, n, m)| n == "tengu_fork_agent_query" && m["forkLabel"] == "prompt_suggestion")
+        .map(|(_, _, m)| m)
+        .collect();
+    assert_eq!(forks.len(), 1);
+    assert_eq!(
+        ["durationMs", "messageCount", "inputTokens", "outputTokens", "cacheReadInputTokens"]
+            .map(|k| forks[0][k].clone()),
+        [json!(4_167), json!(4), json!(551), json!(165), json!(109_336)]
+    );
+}
+
+/// 「猜下一句」是后台请求：接着发的那条过载（529）客户端不重发（官方 `X2 && !yTe`），分叉就此结束；503 会重发，
+/// 分叉留着等重发那条。
+#[test]
+fn suggestion_fork_ends_on_a_background_overload() {
+    for (status, kept) in [(529, false), (503, true)] {
+        let t = Telemetry::default();
+        let mut main = call(cc_body(true), "req_main", "end_turn");
+        main.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        t.ingest(main);
+        let mut s1 = call(suggestion_body(&[]), "req_s1", "tool_use");
+        s1.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        s1.tool_calls = vec![ToolCall {
+            id: "toolu_s1".into(),
+            name: "Bash".into(),
+            input: json!({"command": "true"}),
+            verdict: None,
+        }];
+        t.ingest(s1);
+        let mut s2 = call(suggestion_body(&["toolu_s1"]), "req_s2", "end_turn");
+        s2.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        let etype = if status == 529 { "overloaded_error" } else { "api_error" };
+        t.ingest(failed(s2, Some(status), etype, "x"));
+        let st = t.0.state.lock();
+        assert_eq!(st.sessions[&key()].suggestion_fork.is_some(), kept, "{status}");
+    }
+}
+
+/// 「猜下一句」的建议看整个分叉（官方 `q()` 逐个候选挑头一个非空正文）：头一条回复带了正文（「run the tests」）
+/// 又调了工具、第二条只调了工具、最后一条只回了思考，照样出了建议，不报 `suppressed/empty`；用户接着敲了别的，
+/// `ignored` 的 `generationRequestId` 是分叉头一条，字数是那段正文的，建议从分叉收尾那一刻算起挂着。
+#[test]
+fn suggestion_fork_takes_text_from_an_earlier_reply() {
+    let base = frozen_now() - Duration::from_secs(120);
+    let t = Telemetry::default();
+    let at = |c: &mut ApiCall, millis: u64| {
+        c.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        c.started_at = base + Duration::from_millis(millis);
+    };
+    let mut main = call(cc_body(true), "req_main", "end_turn");
+    at(&mut main, 0);
+    t.ingest(main);
+    let mut s1 = call(suggestion_body(&[]), "req_s1", "tool_use");
+    at(&mut s1, 10_000);
+    s1.total_ms = 2_000;
+    s1.text_chars = 13;
+    s1.tool_calls = vec![ToolCall {
+        id: "toolu_s1".into(),
+        name: "Bash".into(),
+        input: json!({"command": "true"}),
+        verdict: None,
+    }];
+    t.ingest(s1);
+    let mut s2 = call(suggestion_body(&["toolu_s1"]), "req_s2", "tool_use");
+    at(&mut s2, 12_010);
+    s2.total_ms = 1_000;
+    s2.text_chars = 0;
+    s2.tool_calls = vec![ToolCall {
+        id: "toolu_s2".into(),
+        name: "Bash".into(),
+        input: json!({"command": "true"}),
+        verdict: None,
+    }];
+    t.ingest(s2);
+    let mut s3 = call(suggestion_body(&["toolu_s1", "toolu_s2"]), "req_s3", "end_turn");
+    at(&mut s3, 13_020);
+    s3.total_ms = 1_140;
+    s3.text_chars = 0;
+    s3.saw_thinking = true;
+    t.ingest(s3);
+    let mut next = call(with_prompt(cc_body(true), PROMPT_2), "req_next", "end_turn");
+    at(&mut next, 30_000);
+    t.ingest(next);
+    let st = t.0.state.lock();
+    let results: Vec<(DateTime<Utc>, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_prompt_suggestion")
+        .map(|(dt, e)| (*dt, meta_of(e)))
+        .collect();
+    assert!(results.iter().all(|(_, m)| m["reason"] != "empty"), "{results:?}");
+    let ignored: Vec<&(DateTime<Utc>, Value)> =
+        results.iter().filter(|(_, m)| m["outcome"] == "ignored").collect();
+    assert_eq!(ignored.len(), 1, "{results:?}");
+    let (submit, m) = ignored[0];
+    assert_eq!(m["generationRequestId"], "req_s1");
+    assert_eq!(m["similarity"], json!(11.0 / 13.0), "敲的「hello there」÷ 那段正文");
+    let shown: DateTime<Utc> = (base + Duration::from_millis(14_160)).into();
+    assert_eq!(m["timeToIgnoreMs"], (*submit - shown).num_milliseconds());
+}
+
+/// 回放 `cap/auto-2.1.307-20261022-full` A19 的那个分叉（00186 调 Bash 被拒、00188 收尾），拒绝两条、续发那条与收尾
+/// 的 fork 统计逐项对官方 00191 批次。
+#[test]
+fn suggestion_fork_replay_matches_the_2_1_307_capture() {
+    let dir = "auto-2.1.307-20261022-full";
+    let (Some((b1, betas1)), Some((b2, betas2))) =
+        (cap_request(&format!("{dir}/00186_")), cap_request(&format!("{dir}/00188_")))
+    else {
+        eprintln!("skipped: cap/{dir} not present");
+        return;
+    };
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.307 (external, cli)";
+    let t = Telemetry::default();
+    let session = parse_shape(&b1).unwrap().session_id.unwrap();
+    let auxiliary = || AgentHeaders {
+        agent_id: None,
+        agent_type: None,
+        request_class: Some("auxiliary".into()),
+    };
+    let mut s1 = call(b1, "req_011CgGUpJb2rDMrUAuobQwT7", "tool_use");
+    s1.betas = betas1;
+    s1.ua_out = ua.into();
+    s1.agent = auxiliary();
+    s1.started_at = base;
+    s1.total_ms = 1_988;
+    s1.message_id = Some("msg_011CgGUpKBEsW5cn2GnVqtZs".into());
+    s1.text_chars = 0;
+    s1.tool_calls = vec![ToolCall {
+        id: "toolu_01Pyy9WP4UHvmEeZTDk6RP5B".into(),
+        name: "Bash".into(),
+        input: json!({"command": "true", "description": "No-op placeholder"}),
+        verdict: None,
+    }];
+    (s1.input_tokens, s1.output_tokens, s1.cache_read_tokens, s1.cache_creation_tokens) =
+        (506, 74, 54_638, 60);
+    t.ingest(s1);
+    let mut s2 = call(b2, "req_011CgGUpT4mESaLUzQ8hr3Lg", "end_turn");
+    s2.betas = betas2;
+    s2.ua_out = ua.into();
+    s2.agent = auxiliary();
+    s2.started_at = base + Duration::from_millis(1_995);
+    s2.total_ms = 2_144;
+    s2.message_id = Some("msg_011CgGUpThCwGTzLLwJqEuUc".into());
+    s2.text_chars = 0;
+    s2.saw_thinking = true;
+    (s2.input_tokens, s2.output_tokens, s2.cache_read_tokens, s2.cache_creation_tokens) =
+        (45, 91, 54_698, 580);
+    t.ingest(s2);
+    let st = t.0.state.lock();
+    let p = &st.pending[&(7, session)];
+    let metas = |n: &str| -> Vec<Value> {
+        p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+    };
+    // 去掉随阶段变的那几项，从官方批次照抄。
+    let strip = |m: &Value| -> Value {
+        let mut m = m.clone();
+        for k in ["renderer_mode", "subscription_type", "cc_prompt_id"] {
+            m.as_object_mut().unwrap().remove(k);
+        }
+        m
+    };
+    let rejected = metas("tengu_tool_use_can_use_tool_rejected");
+    assert_eq!(rejected.len(), 1);
+    let mut r = strip(&rejected[0]);
+    let chain = r.as_object_mut().unwrap().remove("queryChainId").unwrap();
+    let depth = r.as_object_mut().unwrap().remove("queryDepth").unwrap();
+    assert_eq!(
+        r,
+        json!({"messageID": "msg_011CgGUpKBEsW5cn2GnVqtZs", "toolName": "Bash", "deniedBy": "other",
+            "decisionReasonType": "other", "preToolHookDurationMs": 1, "permissionDurationMs": 1,
+            "requestId": "req_011CgGUpJb2rDMrUAuobQwT7"})
+    );
+    assert_eq!(
+        strip(&metas("tengu_safety_event")[0]),
+        json!({"category": "other", "decision": "reject", "decision_source": "config",
+            "reason_type": "other", "reason_code": "other", "tool_class": "bash", "tool_name": "Bash",
+            "tool_source": "builtin", "permission_mode": "default",
+            "tool_use_id": "toolu_01Pyy9WP4UHvmEeZTDk6RP5B", "sandbox_violation_count": 0,
+            "sandbox_enabled": false})
+    );
+    let queries = metas("tengu_api_query");
+    assert_eq!(queries.len(), 2);
+    assert_eq!((&queries[0]["queryChainId"], &queries[0]["queryDepth"]), (&chain, &depth));
+    let q2 = &queries[1];
+    assert_eq!(
+        ["querySource", "queryChainId", "queryDepth", "messagesLength", "previousRequestId"]
+            .map(|k| q2[k].clone()),
+        [
+            json!("prompt_suggestion"),
+            chain.clone(),
+            json!(depth.as_u64().unwrap() + 1),
+            json!(16),
+            json!("req_011CgGUpJb2rDMrUAuobQwT7")
+        ]
+    );
+    assert_eq!(metas("tengu_api_success")[1]["messageTokens"], 55_278);
+    assert_eq!(
+        strip(&metas("tengu_attachments")[0]),
+        json!({"attachment_types": ["total_tokens_reminder"], "attachment_token_estimates": ["23"],
+            "query_source": "prompt_suggestion"})
+    );
+    let f = &metas("tengu_fork_agent_query")[0];
+    assert_eq!(
+        ["messageCount", "inputTokens", "outputTokens", "cacheReadInputTokens"]
+            .map(|k| f[k].clone()),
+        [json!(4), json!(551), json!(165), json!(109_336)]
+    );
+    assert_eq!(f["cacheCreationInputTokens"], 640);
+    // 官方 0.9892243524206755；读回 meta 时的浮点解析会差最后一位。
+    assert!((f["cacheHitRate"].as_f64().unwrap() - 0.9892243524206755).abs() < 1e-12, "{f}");
+    assert_eq!(
+        strip(metas("tengu_prompt_suggestion").last().unwrap()),
+        json!({"source": "cli", "outcome": "suppressed", "reason": "empty", "prompt_id": "user_intent"})
+    );
+}
+
+/// 号的服务端开关 `tengu_snoopy_creek` 关了（官方 `$Mn()`，没下发按开）：用户在弹框上拒的、「猜下一句」分叉
+/// 拒的，都不报 `tengu_safety_event`，`can_use_tool_rejected` 照报；开着的号照报。
+#[test]
+fn safety_events_follow_the_accounts_snoopy_creek() {
+    let ua = "claude-cli/2.1.307 (external, cli)";
+    let eval = |on: bool| json!({"tengu_snoopy_creek": {"value": on, "source": "force"}});
+    let (off, on) = (93_307, 93_308);
+    crate::proxy::snoopy_creek::note_eval(off, eval(false).as_object().unwrap());
+    crate::proxy::snoopy_creek::note_eval(on, eval(true).as_object().unwrap());
+    let count = |names: Vec<String>, n: &str| names.iter().filter(|x| *x == n).count();
+    for (cred, want) in [(off, 0), (on, 1)] {
+        let user: Vec<String> =
+            user_rejected_events(ua, cred).into_iter().map(|(n, _)| n).collect();
+        let fork: Vec<String> =
+            suggestion_fork_events(cred, false).into_iter().map(|(_, n, _)| n).collect();
+        for names in [user, fork] {
+            assert_eq!(count(names.clone(), "tengu_tool_use_can_use_tool_rejected"), 1);
+            assert_eq!(count(names, "tengu_safety_event"), want, "cred {cred}");
+        }
+    }
+}
+
+/// fork 统计的 `messageCount` 是分叉里攒下的消息数（官方 `at.length`，回复的每个内容块一条）：猜下一句只回了
+/// 思考、没出建议的报 1（`cap/auto-2.1.303~307-*-full` 共 39 条），思考加正文 2，只有正文 1。
+#[test]
+fn suggestion_fork_message_count_follows_the_reply_blocks() {
+    for (thinking, text, want) in [(true, 0, 1), (true, 12, 2), (false, 12, 1)] {
+        let t = Telemetry::default();
+        let mut main = call(cc_body(true), "req_main", "end_turn");
+        main.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        t.ingest(main);
+        let mut s = call(suggestion_body(&[]), "req_s", "end_turn");
+        s.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+        s.started_at = frozen_now() - Duration::from_secs(1);
+        s.saw_thinking = thinking;
+        s.text_chars = text;
+        t.ingest(s);
+        let st = t.0.state.lock();
+        let fork = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_fork_agent_query")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(fork["messageCount"], want, "thinking {thinking}, text {text}");
+    }
+}
+
+/// 认「猜下一句」分叉里接着发的那条：末条是被拒工具的结果，往回跳过「调工具 → 拒绝结果」那几对，落到的是猜下一句
+/// 的提示词；主线程续轮（落到的是用户自己的话）不算。
+#[test]
+fn suggestion_continuations_are_recognized() {
+    let step = |body: Vec<u8>| {
+        let s = parse_shape(&body).unwrap();
+        (s.suggestion, s.suggestion_step, s.new_prompt, s.tool_uses.len())
+    };
+    assert_eq!(step(suggestion_body(&[])), (true, 0, true, 0));
+    assert_eq!(step(suggestion_body(&["a"])), (true, 1, false, 1));
+    assert_eq!(step(suggestion_body(&["a", "b"])), (true, 2, false, 1));
+    assert_eq!(step(cc_body(false)), (false, 0, false, 1), "主线程续轮");
+    let mut v: Value = serde_json::from_slice(&suggestion_body(&["a"])).unwrap();
+    let msgs = v["messages"].as_array_mut().unwrap();
+    let at = msgs.len() - 4;
+    msgs[at] = json!({"role":"user","content":"run the tests"});
+    assert!(!step(v.to_string().into_bytes()).0, "落到的是用户自己的话");
+}
+
 /// 2.1.305：`tengu_api_success` 在 `firstContentMs` 之后多 `streamEventCount`（除 ping 外的 SSE 事件数，
 /// `cap/auto-2.1.305-20261021-full` 165 条全有）；非流式不报；2.1.303 没有。
 #[test]
@@ -6824,6 +7499,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.307 (external, cli)", "40e496cc06bc", "chunk-wvsyb4fb.js:3661:6043"),
         ("claude-cli/2.1.306 (external, cli)", "c19e7dcf6637", "chunk-z4fyjkxt.js:3654:6164"),
         ("claude-cli/2.1.305 (external, cli)", "a4913bdffc8a", "chunk-h56h5ggw.js:3654:6164"),
         ("claude-cli/2.1.303 (external, cli)", "99830f66ede0", "chunk-jh3cvmqy.js:3614:6109"),
@@ -6943,6 +7619,183 @@ fn agent_summary_stopped_2_1_303_shape() {
     ] {
         assert_eq!(stopped[k], v, "{k}");
     }
+}
+
+/// 2.1.307 在 `agent_model` 与 `agent_model_swapped` 之间多 writer 几项（`cap/auto-2.1.307-20261022-full` 六条都
+/// 没配 writer：`writer_model` 同 `agent_model`、`writer_failed` 为 false、`config_writer` 不出现）。
+#[test]
+fn agent_summary_stopped_2_1_307_writer_keys() {
+    let stopped = summary_stopped_for("claude-cli/2.1.307 (external, cli)");
+    let keys: Vec<&str> = stopped
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .skip_while(|k| *k != "agent_model")
+        .take(4)
+        .collect();
+    assert_eq!(
+        keys,
+        ["agent_model", "writer_model", "writer_failed", "agent_model_swapped"],
+        "{stopped}"
+    );
+    assert_eq!(stopped["writer_model"], stopped["agent_model"]);
+    assert_eq!(stopped["writer_failed"], false);
+    let old = summary_stopped_for("claude-cli/2.1.306 (external, cli)");
+    assert!(old.get("writer_model").is_none() && old.get("writer_failed").is_none(), "{old}");
+}
+
+/// 2.1.307 的 writer：号给 opus 子代理配了小快模型、摘要按 short 发，收尾报 `writer_model` 是它、`config_writer`
+/// 报配的那项；换了 writer 的那条失败过，摘要器之后不再换，收尾报回子代理自己的模型、`writer_failed` 为 true。
+/// 客户端的小快模型可以被环境变量换掉：换上过的就是它（配的 sonnet 换上了就报 sonnet，之后配置改来改去、中间
+/// 有没换上的也不推翻），配着却没换上的不是它（配的 haiku 没换上就报子代理自己的），一条没发过才按默认的猜。
+#[test]
+fn agent_summary_writer_follows_the_config_and_failures() {
+    let base = frozen_now() - Duration::from_secs(200);
+    // `configs` 是号给 opus 配的 writer 及其生效时刻（秒）；`summaries` 是各条 short 摘要的发出时刻、实际用的
+    // 模型与各次尝试（隔一秒一次：`None` 成功，状态码是那次失败——503 客户端会重发，后台请求的 529 不会）。
+    // 子代理 5 秒起跑、150 秒发最后一条。
+    let run = |cred: i64, configs: &[(u64, &str)], summaries: &[(u64, &str, &[Option<u16>])]| {
+        for (secs, writer) in configs {
+            let cfg = json!({"tengu_groovy_ember": {"value": {"mode": "short",
+                "writer": {"opus": writer}}, "source": "experiment"}});
+            crate::proxy::agent_summary_config::note_eval_at(
+                cred,
+                cfg.as_object().unwrap(),
+                base + Duration::from_secs(*secs),
+            );
+        }
+        let t = Telemetry::default();
+        let at = |c: &mut ApiCall, secs: u64| {
+            c.ua_out = "claude-cli/2.1.307 (external, cli)".into();
+            c.cred_id = cred;
+            c.started_at = base + Duration::from_secs(secs);
+        };
+        let agent = |class: &str| AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("general-purpose".into()),
+            request_class: Some(class.into()),
+        };
+        let tool = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: json!({}),
+            verdict: None,
+        };
+        let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_m", "tool_use");
+        at(&mut main, 0);
+        main.tool_calls = vec![tool("t1", "Agent")];
+        t.ingest(main);
+        let mut s1 = call(body_for("claude-opus-5-5", Some("high"), true), "req_s1", "tool_use");
+        at(&mut s1, 5);
+        s1.agent = agent("subagent");
+        s1.tool_calls = vec![tool("t2", "Read")];
+        t.ingest(s1);
+        for (i, (secs, model, attempts)) in summaries.iter().enumerate() {
+            let meta: Value =
+                serde_json::from_slice::<Value>(&cc_body(true)).unwrap()["metadata"].clone();
+            // 每条笔记都不一样（等长：a.rs、b.rs……），官方笔记没变就不发。
+            let file = char::from(b'a' + i as u8);
+            let notes = format!(
+                "<recent_steps>\ndid: Read - {file}.rs\n</recent_steps>\n\nDescribe the agent's most recent action in 3-5 words using present tense (-ing)."
+            );
+            let short = json!({
+                "metadata": meta,
+                "model": model,
+                "max_tokens": 2108,
+                "system": [
+                    {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.307.abc; cc_entrypoint=cli; cch=00000;"},
+                    {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                    {"type":"text","text":"You write a 3-5 word progress label for a background agent, from short notes about what it is doing."}
+                ],
+                "messages": [{"role":"user","content":notes}],
+                "tools": []
+            });
+            for (j, status) in attempts.iter().enumerate() {
+                let rid = format!("req_sum{i}_{j}");
+                let mut c = call(short.to_string().into_bytes(), &rid, "end_turn");
+                at(&mut c, *secs + j as u64);
+                c.agent = agent("auxiliary");
+                c.text_chars = 18;
+                t.ingest(match status {
+                    None => c,
+                    Some(529) => failed(c, Some(529), "overloaded_error", "Overloaded"),
+                    Some(s) => failed(c, Some(*s), "api_error", "upstream connect error"),
+                });
+            }
+        }
+        let mut s2 = call(body_for("claude-opus-5-5", Some("high"), false), "req_s2", "end_turn");
+        at(&mut s2, 150);
+        s2.agent = agent("subagent");
+        t.ingest(s2);
+        let st = t.0.state.lock();
+        st.pending[&(cred, SESSION.to_string())]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
+            .map(|(_, e)| meta_of(e))
+            .expect("子代理收尾报一条")
+    };
+    let pick = |m: &Value| {
+        ["mode", "writer_model", "config_writer", "writer_failed"].map(|k| m[k].clone())
+    };
+    let (haiku, sonnet, opus) = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5");
+    assert_eq!(
+        pick(&run(9_307, &[(0, haiku)], &[(40, haiku, &[None])])),
+        [json!("short"), json!(haiku), json!(haiku), json!(false)]
+    );
+    let failed_once = run(9_308, &[(0, haiku)], &[(40, haiku, &[Some(529)])]);
+    assert_eq!(failed_once["writer_model"], failed_once["agent_model"], "退回子代理自己的模型");
+    assert_eq!(pick(&failed_once)[2..], [json!(haiku), json!(true)], "配的那项照报，失败过");
+    // 客户端把小快模型换成 sonnet、号也把 writer 配成 sonnet：摘要换成 sonnet 写，收尾报 sonnet。
+    assert_eq!(
+        pick(&run(9_309, &[(0, sonnet)], &[(40, sonnet, &[None])])),
+        [json!("short"), json!(sonnet), json!(sonnet), json!(false)]
+    );
+    // 配的是 haiku-5-5，客户端的小快模型却不是它：摘要仍由子代理自己的模型写，收尾报回它。
+    let kept = run(9_310, &[(0, haiku)], &[(40, opus, &[None])]);
+    assert_eq!(kept["writer_model"], kept["agent_model"]);
+    assert_eq!(pick(&kept)[2..], [json!(haiku), json!(false)]);
+    // 一条 short 摘要都没发：看不出客户端的小快模型，按默认的猜。
+    assert_eq!(run(9_311, &[(0, haiku)], &[])["writer_model"], haiku);
+    // 配 haiku 时换上过 haiku；50 秒改配 sonnet，80 秒那条没换（仍是 opus 写）；100 秒改回 haiku，收尾时摘要器
+    // 读到的是 haiku：小快模型早已确认是 haiku，中间没换上那条不推翻它，官方 `fe()` 此时就是 haiku。
+    let back = run(
+        9_312,
+        &[(0, haiku), (50, sonnet), (100, haiku)],
+        &[(40, haiku, &[None]), (80, opus, &[None])],
+    );
+    assert_eq!(pick(&back), [json!("short"), json!(haiku), json!(haiku), json!(false)]);
+    // 小快模型被环境变量换成 sonnet 时同样：换上过 sonnet，50 秒改配 haiku 没换上，改回 sonnet 收尾报 sonnet
+    // （不能退回按默认的 haiku 去猜）。
+    let back_sonnet = run(
+        9_314,
+        &[(0, sonnet), (50, haiku), (100, sonnet)],
+        &[(40, sonnet, &[None]), (80, opus, &[None])],
+    );
+    assert_eq!(pick(&back_sonnet), [json!("short"), json!(sonnet), json!(sonnet), json!(false)]);
+    // 同样的改法但收尾时还配着 sonnet：sonnet 在配着时没换上过，不是小快模型。
+    let still =
+        run(9_313, &[(0, haiku), (50, sonnet)], &[(40, haiku, &[None]), (80, opus, &[None])]);
+    assert_eq!(still["writer_model"], still["agent_model"]);
+    assert_eq!(still["config_writer"], sonnet);
+    // 换上 haiku 的那条先吃一次 503、客户端重发成功：一次成功的调用，不算失败、writer 也没失败过。
+    let retried = run(9_315, &[(0, haiku)], &[(40, haiku, &[Some(503), None])]);
+    assert_eq!(pick(&retried), [json!("short"), json!(haiku), json!(haiku), json!(false)]);
+    assert_eq!((&retried["calls"], &retried["calls_failed"]), (&json!(1), &json!(0)));
+    // 后台请求过载不重发（官方 `X2 && !yTe`）：529 就是整次失败。
+    assert_eq!((&failed_once["calls"], &failed_once["calls_failed"]), (&json!(1), &json!(1)));
+    let stats = |m: &Value| ["calls", "calls_failed", "writer_failed"].map(|k| m[k].clone());
+    // 503 之后没等来重发、子代理就收尾了：扣着的那次先当最终失败结算，再报收尾那条。
+    let exhausted = run(9_316, &[(0, haiku)], &[(40, haiku, &[Some(503)])]);
+    assert_eq!(stats(&exhausted), [json!(1), json!(1), json!(true)]);
+    assert_eq!(exhausted["writer_model"], exhausted["agent_model"]);
+    // 上一次（haiku）最终失败后，下一次笔记换成等长的 b.rs、改由子代理自己的 opus 写：是两次调用，不是重发。
+    let next = run(9_317, &[(0, haiku)], &[(40, haiku, &[Some(503)]), (80, opus, &[None])]);
+    assert_eq!(stats(&next), [json!(2), json!(1), json!(true)]);
+    // 模型没换、只是笔记等长地变了，同样是两次调用。
+    let same_model = run(9_318, &[], &[(40, opus, &[Some(503)]), (80, opus, &[None])]);
+    assert_eq!(stats(&same_model)[..2], [json!(2), json!(1)]);
 }
 
 /// 2.1.303 short 模式的子代理摘要：无工具、system 是那句固定指令的侧查询，带子代理的 `agent-id` 与
