@@ -507,6 +507,7 @@ impl Drop for ReqLog {
                 cache_creation_tokens: self.sniffer.cache_creation_tokens.unwrap_or(0),
                 cache_creation_5m_tokens: self.sniffer.cache_creation_5m,
                 cache_creation_1h_tokens: self.sniffer.cache_creation_1h,
+                iterations: self.sniffer.iterations.len(),
                 text_chars: self.sniffer.text_chars,
                 reply_input_chars: self.sniffer.reply_input_chars(),
                 thinking_chars: self.sniffer.thinking_chars,

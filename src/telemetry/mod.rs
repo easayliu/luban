@@ -58,6 +58,7 @@ pub use identity::*;
 use kind::*;
 pub use session::*;
 pub use shape::*;
+pub use template::sample_dd;
 use template::*;
 use tools::*;
 pub use upload::*;
@@ -291,12 +292,12 @@ impl Telemetry {
                     let extra = json!({ "feature_name": "internal_metrics_export" });
                     p.events.push((t, id.event("tengu_feature_ok", t, &ctx, extra.clone())));
                     p.events_since.get_or_insert(now);
-                    p.dd.push(id.dd_entry(
+                    p.extend_dd([id.dd_entry(
                         "tengu_feature_ok",
                         &ctx,
                         model.trim_end_matches("[1m]"),
                         extra,
-                    ));
+                    )]);
                     p.dd_since.get_or_insert(now);
                 }
             }
@@ -452,21 +453,24 @@ impl Telemetry {
             let mut events: Vec<(DateTime<Utc>, Value)> = Vec::with_capacity(16);
             let mut dd: Vec<Value> = Vec::with_capacity(6);
             // 进程起满 30 秒之后没再发过请求就退出的：那条 IDE 探测没赶上任何一条请求，在这里补
-            // （见 `Session::take_ide_detect`；时刻相对进程起点，排在退出那串前面）。
+            // （见 `Session::take_ide_detect`；时刻相对进程起点，排在退出那串前面）。Datadog 那份同发。
             if !s.ide_detect_done && version_at_least(&identity.version, "2.1.285") {
                 let jitter = session_id.bytes().map(u32::from).sum::<u32>() % 400;
                 let at =
                     start + chrono::Duration::milliseconds(IDE_DETECT_MS as i64 + jitter as i64);
                 if at <= t0 {
-                    let meta = json!({ "found": false, "feature_name": "ide_detect" });
-                    events.push((at, identity.event("tengu_feature_ok", at, &ctx(at), meta)));
+                    let meta = feature_with("ide_detect", json!({ "found": false }), v293);
+                    events
+                        .push((at, identity.event("tengu_feature_ok", at, &ctx(at), meta.clone())));
+                    dd.push(identity.dd_entry("tengu_feature_ok", &ctx(at), &dd_model, meta));
                 }
             }
             // 2.1.293 起退出走的是敲 `/exit`（`cap/auto-2.1.293-20261008-full` 起每份全量抓包 16 条 `cmd_exit`）：
             // 提交（`paste_text` / `prompt_submit`）→ `cmd_exit` → 2.6 秒后分派命令（`cmd_dispatch` +
             // `input_command{exit}`）→ 下面那串收尾 → 更新检查与输入历史落盘；这一批 Datadog 也是这几条，
-            // `lsp_shutdown` / `swarm_session_cleanup` 不再进 Datadog（2.1.291 时还在）。逐出提示离收尾那串
-            // 860 ~ 990ms（2.1.260 时 544）。时刻都相对收尾那串（`t0`），见 `cap/auto-2.1.305-20261021-full` C2。
+            // `lsp_shutdown` / `swarm_session_cleanup` 在服务端的 Datadog 抽样表里（[`sample_dd`]），2.1.293 起
+            // 只留百分之一。逐出提示离收尾那串 860 ~ 990ms（2.1.260 时 544）。时刻都相对收尾那串（`t0`），见
+            // `cap/auto-2.1.305-20261021-full` C2。
             let hint_off = if v293 { 960 } else { 544 };
             if v293 {
                 let tp = submit_at;
@@ -532,14 +536,7 @@ impl Telemetry {
             for (offset, name) in [(1, "lsp_shutdown"), (6, "swarm_session_cleanup")] {
                 let t = ms(offset);
                 events.push((t, identity.event("tengu_feature_ok", t, &ctx(t), feature(name))));
-                if !v293 {
-                    dd.push(identity.dd_entry(
-                        "tengu_feature_ok",
-                        &ctx(t),
-                        &dd_model,
-                        feature(name),
-                    ));
-                }
+                dd.push(identity.dd_entry("tengu_feature_ok", &ctx(t), &dd_model, feature(name)));
             }
             if v293 {
                 // `/exit` 也是一次提交：文件历史照样拍一张快照（上次备份后改过的先备份）。
@@ -625,7 +622,7 @@ impl Telemetry {
             p.started_wall = Some(s.started_wall);
             p.events.extend(events);
             p.events_since = Some(long_ago);
-            p.dd.extend(dd);
+            p.extend_dd(dd);
             p.dd_since = Some(long_ago);
             if !p.metrics.is_empty() {
                 p.metrics_since = Some(long_ago);

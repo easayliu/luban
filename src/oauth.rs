@@ -950,15 +950,18 @@ impl KeepaliveCtx {
         self.identity().dd_entry(message, &self.event_ctx(), model, extra)
     }
 
-    /// 模拟 idle 周期的 Datadog 日志条目（2 条，与 `cap/2.1.145/00066` 对齐）。
+    /// 模拟 idle 周期的 Datadog 日志条目（2 条，与 `cap/2.1.145/00066` 对齐）。`update_check` 在服务端的
+    /// Datadog 抽样表里，2.1.293 起只留百分之一（[`crate::telemetry::sample_dd`]）。
     fn dd_idle_entries(&self) -> Vec<serde_json::Value> {
-        vec![
+        let mut entries = vec![
             self.dd_entry(
                 "tengu_feature_ok",
                 serde_json::json!({"feature_name": "job_sweep_drafts"}),
             ),
             self.dd_entry("tengu_feature_ok", serde_json::json!({"feature_name": "update_check"})),
-        ]
+        ];
+        entries.retain_mut(crate::telemetry::sample_dd);
+        entries
     }
 
     /// eval 端点的请求体（Statsig 特性标志评估）。
@@ -1934,13 +1937,18 @@ impl HandshakeRunner {
 /// 取自 `cap/2.1.145/00066`（idle 周期，2 条 flat 格式日志）。
 /// `dd_client` 应为直连客户端（不走凭证代理——真实客户端的 Datadog 也是直连）。
 pub async fn keepalive_datadog_logs(dd_client: &wreq::Client, ctx: &KeepaliveCtx) -> bool {
+    // 抽完一条不剩就不发：官方攒不到条目时不会往 Datadog 发空批次。
+    let entries = ctx.dd_idle_entries();
+    if entries.is_empty() {
+        return true;
+    }
     let resp = axios(
         dd_client
             .post(config::DATADOG_INTAKE_URL)
             .header("Accept", config::AXIOS_ACCEPT)
             .header("DD-API-KEY", config::DATADOG_API_KEY)
             .header("User-Agent", config::DATADOG_USER_AGENT)
-            .json(&ctx.dd_idle_entries()),
+            .json(&entries),
         "datadog",
     )
     .send()

@@ -515,6 +515,7 @@ impl EventBuilder<'_> {
             is_main,
             ref chain_id,
             shell_snapshot_first,
+            v277,
             v285,
             v291,
             v293,
@@ -586,11 +587,12 @@ impl EventBuilder<'_> {
             if prompted && batch_prompted > 0 { 11 + batch_approval / batch_prompted } else { 11 };
         if tu.name == "Bash" {
             if first_bash {
-                let mut snap = feature("shell_snapshot_create");
+                let mut props = json!({});
                 // 2.1.291 起多报这次快照花了多久（`cap/auto-2.1.291-20261006-full`：1237、722ms）。
                 if let Some(snap_ms) = bash_timing.and_then(|t| t.snapshot) {
-                    snap["duration_ms"] = json!(snap_ms);
+                    props["duration_ms"] = json!(snap_ms);
                 }
+                let snap = feature_with("shell_snapshot_create", props, v293);
                 self.push_dd(ms(t_done, -40), "tengu_feature_ok", snap);
             }
             let backgrounded =
@@ -726,7 +728,7 @@ impl EventBuilder<'_> {
         if let (Some(obj), Some(rest)) = (success.as_object_mut(), rest.as_object()) {
             obj.extend(rest.clone());
         }
-        tool_success_extras(&mut success, tu, self.file_sizes);
+        tool_success_extras(&mut success, tu, self.file_sizes, v277, v285);
         success["queryChainId"] = json!(&chain_id);
         success["queryDepth"] = json!(prev_depth);
         success["requestId"] = json!(&prev_req);

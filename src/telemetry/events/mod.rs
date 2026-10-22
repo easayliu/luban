@@ -670,3 +670,20 @@ pub(super) fn ms(dt: DateTime<Utc>, d: i64) -> DateTime<Utc> {
 pub(super) fn feature(name: &str) -> Value {
     json!({ "feature_name": name })
 }
+
+/// 带字段的 `tengu_feature_ok`：2.1.293 起 `feature_name` 排在字段之后（`cap/auto-2.1.293-20261008-full`
+/// 起各版 shell_snapshot_create / subagent_model_resolve / lively_waffle / queued_message_delivered
+/// 都是最后一个键），更早的版本排在最前。
+pub(super) fn feature_with(name: &str, props: Value, v293: bool) -> Value {
+    let mut out = Map::new();
+    if !v293 {
+        out.insert("feature_name".into(), json!(name));
+    }
+    if let Value::Object(o) = props {
+        out.extend(o);
+    }
+    if v293 {
+        out.insert("feature_name".into(), json!(name));
+    }
+    Value::Object(out)
+}

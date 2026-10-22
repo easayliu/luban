@@ -425,6 +425,144 @@ pub(super) fn bash_mentioned_exts(command: &str) -> Vec<&'static str> {
     found
 }
 
+/// Bash 那条 `tengu_tool_use_success` 的 `fileExtension`（官方 `o8s`）：命令按 `&&` / `||` / `;` / `|`
+/// 切段，每段按空白切词，首词（去掉目录）是这几个文件命令之一时，后面不以 `-` 开头的参数各取扩展名
+/// （[`js_ext`]），去重后按出现先后用逗号连起来。`cap/auto-2.1.306-20261021-full`：`tail … README.md`
+/// 报 `md`。命令里没有 `.` 不报。
+pub(super) fn bash_command_file_ext(command: &str) -> Option<String> {
+    const FILE_CMDS: [&str; 17] = [
+        "rm", "mv", "cp", "touch", "mkdir", "chmod", "chown", "cat", "head", "tail", "sort",
+        "stat", "diff", "wc", "grep", "rg", "sed",
+    ];
+    if !command.contains('.') {
+        return None;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for seg in split_shell_ops(command) {
+        if seg.is_empty() {
+            continue;
+        }
+        let words = split_js_space(seg);
+        if words.len() < 2 {
+            continue;
+        }
+        let argv0 = words[0].rsplit('/').next().unwrap_or(words[0]);
+        if !FILE_CMDS.contains(&argv0) {
+            continue;
+        }
+        for w in &words[1..] {
+            if w.starts_with('-') {
+                continue;
+            }
+            if let Some(ext) = js_ext(w)
+                && !seen.contains(&ext)
+            {
+                seen.push(ext);
+            }
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join(","))
+}
+
+/// 官方 `\s*(?:&&|\|\||[;|])\s*` 切段：分隔符前后的空白都归分隔符。
+fn split_shell_ops(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    let b = command.as_bytes();
+    while i < b.len() {
+        let op = match b[i] {
+            b'&' if b.get(i + 1) == Some(&b'&') => 2,
+            b'|' if b.get(i + 1) == Some(&b'|') => 2,
+            b';' | b'|' => 1,
+            _ => 0,
+        };
+        if op == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(command[start..i].trim_end_matches(is_js_space));
+        let rest = &command[i + op..];
+        start = command.len() - rest.trim_start_matches(is_js_space).len();
+        i = start;
+    }
+    out.push(&command[start..]);
+    out
+}
+
+/// JS `split(/\s+/)`：一段连续空白切一刀，开头 / 结尾有空白时各留一个空串。
+fn split_js_space(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut in_ws) = (0, false);
+    for (i, c) in s.char_indices() {
+        if is_js_space(c) {
+            if !in_ws {
+                out.push(&s[start..i]);
+                in_ws = true;
+            }
+        } else if in_ws {
+            start = i;
+            in_ws = false;
+        }
+    }
+    out.push(if in_ws { "" } else { &s[start..] });
+    out
+}
+
+/// ECMAScript 正则 `\s` 的字符集合。
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
+/// 官方 `g6`：Node `path.extname` 小写后去掉点；没有扩展名不报，超过 10 个字符报 `other`。
+pub(super) fn js_ext(path: &str) -> Option<String> {
+    // Node posix `extname` 逐字移植：从后往前，跳过结尾的 `/`，记最后一个点与点前有没有别的字符。
+    let b = path.as_bytes();
+    let (mut start_dot, mut start_part, mut end) = (None::<usize>, 0usize, None::<usize>);
+    let (mut matched_slash, mut pre_dot) = (true, 0i8);
+    for i in (0..b.len()).rev() {
+        if b[i] == b'/' {
+            if !matched_slash {
+                start_part = i + 1;
+                break;
+            }
+            continue;
+        }
+        if end.is_none() {
+            matched_slash = false;
+            end = Some(i + 1);
+        }
+        if b[i] == b'.' {
+            if start_dot.is_none() {
+                start_dot = Some(i);
+            } else if pre_dot != 1 {
+                pre_dot = 1;
+            }
+        } else if start_dot.is_some() {
+            pre_dot = -1;
+        }
+    }
+    let (Some(dot), Some(end)) = (start_dot, end) else { return None };
+    if pre_dot == 0 || (pre_dot == 1 && dot + 1 == end && dot == start_part + 1) {
+        return None;
+    }
+    let ext = path[dot + 1..end].to_lowercase();
+    if ext.is_empty() {
+        return None;
+    }
+    // 官方按 UTF-16 长度比。
+    Some(if ext.encode_utf16().count() > 10 { "other".into() } else { ext })
+}
+
 /// 从 Read 的工具结果还原原文：每行去掉开头的 `行号\t`（老格式 `行号→`），行间一个 `\n`；末尾那个只有
 /// 行号的空行就是原文结尾的换行（`1\t# calc\n…\n4\t` → `# calc\n…\n`）。认不出行号格式的（图片、目录、
 /// 报错文案）返回 `None`。

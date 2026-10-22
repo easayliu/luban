@@ -219,6 +219,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             cache_creation_tokens: 8729,
             cache_creation_5m_tokens: None,
             cache_creation_1h_tokens: None,
+            iterations: 0,
             text_chars: 87,
             reply_input_chars: 87,
             thinking_chars: 0,
@@ -1298,6 +1299,16 @@ fn ide_detect_fires_once_thirty_seconds_after_startup() {
         (&got[0].1["found"], &got[0].1["feature_name"]),
         (&json!(false), &json!("ide_detect"))
     );
+    // Datadog 那份同发；2.1.293 起 `feature_name` 排在 `found` 后面。
+    let dd: Vec<&Value> =
+        st.pending[&key()].dd.iter().filter(|d| d["feature_name"] == "ide_detect").collect();
+    assert_eq!(dd.len(), 1, "{dd:?}");
+    let order = |m: &Value| -> Vec<String> {
+        let keys = m.as_object().unwrap().keys();
+        keys.filter(|k| matches!(k.as_str(), "found" | "feature_name")).cloned().collect()
+    };
+    assert_eq!(order(&got[0].1), ["found", "feature_name"]);
+    assert_eq!(order(dd[0]), ["found", "feature_name"]);
     let at: DateTime<Utc> = got[0].0.parse().unwrap();
     let base_dt: DateTime<Utc> = base.into();
     let off = (at - base_dt).num_milliseconds();
@@ -1328,6 +1339,63 @@ fn ide_detect_fires_once_thirty_seconds_after_startup() {
     let i = names.iter().position(|n| *n == "ide").expect("退出时补上");
     assert_eq!(names.iter().filter(|n| **n == "ide").count(), 1);
     assert!(i < names.iter().rposition(|n| *n == "tengu_paste_text").unwrap(), "在退出那串前面");
+    let dd = due.iter().flat_map(|f| f.dd.iter()).filter(|d| d["feature_name"] == "ide_detect");
+    assert_eq!(dd.count(), 1, "Datadog 那份也补上");
+}
+
+/// 带字段的 `tengu_feature_ok` 在 2.1.293 之前 `feature_name` 排最前，之后排最后：IDE 探测
+/// （`cap/auto-2.1.291-20261006-full` 7 条 `feature_name, found`）与 `/compact` 提交后那条更新检查都跟着版本走。
+#[test]
+fn feature_name_position_follows_the_version() {
+    for (v, leads) in [("2.1.291", true), ("2.1.305", false)] {
+        let ua = format!("claude-cli/{v} (external, cli)");
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(300);
+        let at = |secs: u64, id: &str, class: Option<&str>| {
+            let mut c = call(cc_body(true), id, "end_turn");
+            c.ua_out = ua.clone();
+            c.started_at = base + Duration::from_secs(secs);
+            c.agent = AgentHeaders {
+                agent_id: None,
+                agent_type: None,
+                request_class: class.map(str::to_string),
+            };
+            c
+        };
+        t.ingest(at(0, "req_1", None));
+        // 起满 30 秒后的下一条补 IDE 探测，再来一次 `/compact`。
+        t.ingest(at(40, "req_2", None));
+        t.ingest(at(50, "req_c", Some("compaction")));
+        let st = t.0.state.lock();
+        let compact_at: DateTime<Utc> = (base + Duration::from_secs(50)).into();
+        let (mut ide, mut compact_update) = (false, false);
+        for (_, e) in &st.pending[&key()].events {
+            if ev_name(e) != "tengu_feature_ok" {
+                continue;
+            }
+            let m = meta_of(e);
+            let name = m["feature_name"].as_str().unwrap_or("");
+            if !matches!(name, "ide_detect" | "update_detection") {
+                continue;
+            }
+            let keys: Vec<&str> = m
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .filter(|k| !matches!(*k, "renderer_mode" | "subscription_type" | "cc_prompt_id"))
+                .collect();
+            let expect = if leads { keys.first() } else { keys.last() };
+            assert_eq!(expect, Some(&"feature_name"), "{v} {name}: {keys:?}");
+            let ts: DateTime<Utc> = ev_ts(e).parse().unwrap();
+            ide |= name == "ide_detect";
+            compact_update |= name == "update_detection" && ts > compact_at;
+        }
+        assert!(
+            ide && compact_update,
+            "{v}: IDE 探测 {ide}，压缩提交后的更新检查 {compact_update}"
+        );
+    }
 }
 
 /// `/compact` 收尾：恢复文件之后重宣告两个池子（`messagesLength` 是保留的消息数），`compact_reactive` 之后、逐出提示
@@ -2222,7 +2290,7 @@ fn cache_heartbeat_follows_the_flag_as_it_changes() {
 
 /// 2.1.293 起退出走敲 `/exit`：提交、`cmd_exit`、分派命令，收尾之后是快照、更新检查与输入历史落盘，最后才是
 /// 逐出提示；Datadog 那批是 `prompt_submit` / `cmd_exit` / `cmd_dispatch` / `update_detection` / `history_save`，
-/// 不再有 `lsp_shutdown` / `swarm_session_cleanup`（`cap/auto-2.1.305-20261021-full` C2）。
+/// `lsp_shutdown` / `swarm_session_cleanup` 按服务端抽样表只留百分之一（`cap/auto-2.1.305-20261021-full` C2）。
 #[test]
 fn exit_goes_through_the_exit_command_from_2_1_293() {
     let t = Telemetry::default();
@@ -2265,7 +2333,12 @@ fn exit_goes_through_the_exit_command_from_2_1_293() {
             "tengu_cache_eviction_hint",
         ]
     );
-    let dd: Vec<&str> = f.dd.iter().filter_map(|d| d["feature_name"].as_str()).collect();
+    // 抽中的那百分之一带着 `sample_rate`（[`sample_dd`]），不带的才是每次都发的。
+    let dd: Vec<&str> =
+        f.dd.iter()
+            .filter(|d| d.get("sample_rate").is_none())
+            .filter_map(|d| d["feature_name"].as_str())
+            .collect();
     // 官方这一批同样以指标导出那条收尾。
     let tail = &dd[dd.len() - 6..];
     assert_eq!(
@@ -7269,6 +7342,90 @@ fn bash_mentions_follow_the_official_pattern() {
     // `.mdx`、`.jsonl`、`.htm` 不算；`.json.bak` 的 json 后面是点，算。
     assert_eq!(bash_mentioned_exts("cat a.mdx b.jsonl c.htm d.json.bak"), ["json"]);
     assert!(bash_mentioned_exts("ls -la").is_empty());
+}
+
+/// Bash 的 `fileExtension`（官方 `o8s` + `g6`）：期望值是 node 跑官方原函数的结果；抓包里全部 137 条
+/// Bash 命令也逐条对过。
+#[test]
+fn bash_file_ext_follows_the_official_o8s() {
+    use super::files::bash_command_file_ext as ext;
+    assert_eq!(ext("tail -20 README.md").as_deref(), Some("md"));
+    // 开头的空白让首词变成空串；`..`、`...`、点开头的文件都没有扩展名，超过 10 个字符记 other。
+    assert_eq!(ext("  cat a.py"), None);
+    assert_eq!(ext("cat .."), None);
+    assert_eq!(ext("cat ..."), None);
+    assert_eq!(ext("cat .bashrc x.TOOLONGEXTENSION1").as_deref(), Some("other"));
+    // 引号照留，按出现先后去重；结尾的 `/` 不影响。
+    assert_eq!(ext("rm -rf /tmp/a.b/ && mv x.Py y.py;cp 'q.md' z").as_deref(), Some("b,py,md'"));
+    assert_eq!(ext("grep -n foo a.rs|wc -l").as_deref(), Some("rs"));
+    assert_eq!(ext("head\u{a0}a.md").as_deref(), Some("md"));
+    assert_eq!(ext("/bin/cat dir/x.JSON -n b.c").as_deref(), Some("json,c"));
+    assert_eq!(ext("python3 calc.py"), None);
+}
+
+/// Bash 那条 `tengu_tool_use_success`：`fileExtension` 2.1.277 起就有（`cap/2.1.277` 的 `sed … .rs` 报 `rs`），
+/// `bashCommandFileExtensions` 2.1.285 起才有；两项都在 `toolInputSizeBytes` 与 `bashCommandLen` 之间。
+#[test]
+fn bash_success_extensions_follow_their_versions() {
+    let tu = |command: &str| ToolUse {
+        name: "Bash".into(),
+        input: json!({ "command": command }),
+        command_len: command.len(),
+        ..Default::default()
+    };
+    let keys = |command: &str, v277: bool, v285: bool| {
+        let mut success = json!({ "toolInputSizeBytes": 40 });
+        tool_success_extras(&mut success, &tu(command), &mut HashMap::new(), v277, v285);
+        let keys: Vec<String> = success.as_object().unwrap().keys().take(4).cloned().collect();
+        (keys, success)
+    };
+    let (k, s) = keys("tail -20 README.md", true, true);
+    assert_eq!(
+        k,
+        ["toolInputSizeBytes", "fileExtension", "bashCommandFileExtensions", "bashCommandLen"]
+    );
+    assert_eq!(
+        (&s["fileExtension"], &s["bashCommandFileExtensions"]),
+        (&json!("md"), &json!("md"))
+    );
+    let (k, s) = keys("sed -n 1,5p src/main.rs", true, false);
+    assert_eq!(k, ["toolInputSizeBytes", "fileExtension", "bashCommandLen", "bash_command_class"]);
+    assert_eq!(s["fileExtension"], "rs");
+    let (k, _) = keys("sed -n 1,5p src/main.rs", false, false);
+    assert_eq!(k[1], "bashCommandLen", "2.1.277 之前两项都没有");
+}
+
+/// Datadog 那份 `tengu_feature_ok` 按服务端抽样表（`tengu_agile_glade`）抽：2.1.293 起表里的只留掷中的百分之一，
+/// `sample_rate` 紧跟 `feature_name`、在 `user_bucket` 之前（`cap/auto-2.1.299-20261014-full/00139`）；表外的、
+/// 别的事件、更早的版本原样放行。
+#[test]
+fn datadog_feature_ok_follows_the_server_sampling_table() {
+    use super::template::sample_dd_at;
+    let ctx = EventCtx { model: "claude-opus-5", betas: "", prompt_id: "p", uptime_secs: 1.0 };
+    let entry = |version: &str, message: &str, extra: Value| {
+        let id = Identity { version: version.into(), ..identity() };
+        id.dd_entry(message, &ctx, "claude-opus-5", extra)
+    };
+    let ok = |version: &str, name: &str| {
+        let props = json!({ "delivery": "turn_end" });
+        entry(version, "tengu_feature_ok", feature_with(name, props, true))
+    };
+    assert!(!sample_dd_at(&mut ok("2.1.306", "queued_message_delivered"), 0.5), "没掷中不发");
+    let mut kept = ok("2.1.306", "queued_message_delivered");
+    assert!(sample_dd_at(&mut kept, 0.005));
+    let keys: Vec<&str> = kept.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys[keys.len() - 4..], ["delivery", "feature_name", "sample_rate", "user_bucket"]);
+    assert_eq!(kept["sample_rate"], json!(0.01));
+    // 表外的 feature、别的事件、2.1.291（那时客户端还不抽）：原样发。
+    for mut e in [
+        ok("2.1.306", "history_save"),
+        entry("2.1.306", "tengu_api_success", json!({ "model": "claude-opus-5" })),
+        ok("2.1.291", "queued_message_delivered"),
+    ] {
+        let before = e.to_string();
+        assert!(sample_dd_at(&mut e, 0.5), "{before}");
+        assert_eq!(e.to_string(), before);
+    }
 }
 
 /// `-p` 的一轮：新输入那条调三个工具（MCP、ToolSearch、Bash），续轮收尾。

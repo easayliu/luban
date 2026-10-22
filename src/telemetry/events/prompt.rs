@@ -165,13 +165,11 @@ impl EventBuilder<'_> {
             self.take_tpl(&tpl.background[background.clone()], started_wall.into());
         }
         if ide_detect {
-            // 找 IDE 那个循环从启动段某处起算 30 秒，落在首条事件后 30.4 ~ 30.8 秒。
+            // 找 IDE 那个循环从启动段某处起算 30 秒，落在首条事件后 30.4 ~ 30.8 秒。Datadog 那份同发
+            // （`cap/auto-2.1.285-20260930` 起每份抓包两边条数相同）。
             let dt = ms(started_wall.into(), IDE_DETECT_MS as i64 + (env.req_hash % 400) as i64);
-            self.push(
-                dt,
-                "tengu_feature_ok",
-                json!({ "found": false, "feature_name": "ide_detect" }),
-            );
+            let meta = feature_with("ide_detect", json!({ "found": false }), env.f.v293);
+            self.push_dd(dt, "tengu_feature_ok", meta);
         }
     }
 
@@ -293,15 +291,7 @@ impl EventBuilder<'_> {
             let base: DateTime<Utc> = prev_main_end.map_or(ms(t0, -2_000), DateTime::<Utc>::from);
             for (i, len) in notifications.iter().enumerate() {
                 let tn = ms(base, 17 + i as i64).min(ms(t0, -60));
-                let queued = json!({
-                    "feature_name": "queued_message_delivered",
-                    "delivery": "turn_end",
-                    "command_count": 1,
-                    "prompt_count": 0,
-                    "relay_count": 0,
-                    "artifact_comment_count": 0,
-                    "wait_ms": 3_655
-                });
+                let queued = queued_delivered(0, true, 3_655, env.f.v293);
                 self.push_dd(tn, "tengu_feature_ok", queued);
                 let mut input = json!({
                     "is_negative": false,
@@ -349,17 +339,7 @@ impl EventBuilder<'_> {
         let EventEnv { t0, tpl, ref effort, ref effort_value, .. } = *env;
         if new_prompt {
             if injected {
-                let mut queued = json!({
-                    "feature_name": "queued_message_delivered",
-                    "delivery": "turn_end",
-                    "command_count": 1,
-                    "prompt_count": u32::from(turn_origin == "peer")
-                });
-                if v285 {
-                    queued["relay_count"] = json!(0);
-                    queued["artifact_comment_count"] = json!(0);
-                }
-                queued["wait_ms"] = json!(6);
+                let queued = queued_delivered(u32::from(turn_origin == "peer"), v285, 6, v293);
                 self.push_dd(ms(t0, -12), "tengu_feature_ok", queued);
                 // 模板那段不套，工具搜索判定照有（`cap/2.1.285` 06:57:29.600）。
                 self.push(
@@ -535,4 +515,22 @@ impl EventBuilder<'_> {
             }
         }
     }
+}
+
+/// `tengu_feature_ok{queued_message_delivered}`：一条命令在上一轮收尾时送达。2.1.285 起多
+/// `relay_count` / `artifact_comment_count`，2.1.293 起再多 `monitor_event_count` / `monitor_event_chars`
+/// （官方无条件带，`cap/auto-2.1.293-20261008-full` 起各版 18/18）且 `feature_name` 排最后。
+fn queued_delivered(prompt_count: u32, v285: bool, wait_ms: u64, v293: bool) -> Value {
+    let mut props =
+        json!({ "delivery": "turn_end", "command_count": 1, "prompt_count": prompt_count });
+    if v285 {
+        props["relay_count"] = json!(0);
+        props["artifact_comment_count"] = json!(0);
+    }
+    if v293 {
+        props["monitor_event_count"] = json!(0);
+        props["monitor_event_chars"] = json!(0);
+    }
+    props["wait_ms"] = json!(wait_ms);
+    feature_with("queued_message_delivered", props, v293)
 }

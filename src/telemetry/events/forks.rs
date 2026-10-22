@@ -535,7 +535,7 @@ impl EventBuilder<'_> {
                 self.push_dd(t2, "tengu_feature_ok", feature("agent_handback_pointer_notice"));
             }
             if !v285 || handback.is_some() {
-                let lively = json!({ "feature_name": "lively_waffle", "flagged": false });
+                let lively = feature_with("lively_waffle", json!({ "flagged": false }), env.f.v293);
                 self.push_dd(t2, "tengu_feature_ok", lively);
             }
             self.push(

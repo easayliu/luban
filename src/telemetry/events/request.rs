@@ -107,15 +107,18 @@ impl EventBuilder<'_> {
             // 心跳里转入 `subagent_running` 那一下不在这里登记：子代理首条落地时主线程往往已经又完成了
             // 一两条，这里登记的时刻早于已折算过的会被当过时丢掉。改由拉起它的那条主线程请求登记，见
             // `finish.rs` 的 `delegated`。
-            let resolve = json!({
-                "feature_name": "subagent_model_resolve",
-                "source": "spawn",
-                "precedence": "frontmatter",
-                "requested_family": family,
-                "resolved_family": family,
-                "requested_model": family,
-                "resolved_model": &shape.model
-            });
+            let resolve = feature_with(
+                "subagent_model_resolve",
+                json!({
+                    "source": "spawn",
+                    "precedence": "frontmatter",
+                    "requested_family": family,
+                    "resolved_family": family,
+                    "requested_model": family,
+                    "resolved_model": &shape.model
+                }),
+                env.f.v293,
+            );
             self.push_dd(ts, "tengu_feature_ok", resolve);
         }
         // `/compact` 的提交与开头（`cap/auto-2.1.305-20261021-full` A18，2.1.296 / 2.1.303 同序）：提交两条
@@ -144,16 +147,12 @@ impl EventBuilder<'_> {
                     "headTruncations": 0
                 }),
             );
-            self.push_dd(
-                ms(t0, 19),
-                "tengu_feature_ok",
-                json!({
-                    "duration_ms": 0,
-                    "first_in_process": false,
-                    "installation_type": "native",
-                    "feature_name": "update_detection"
-                }),
+            let update = feature_with(
+                "update_detection",
+                json!({ "duration_ms": 0, "first_in_process": false, "installation_type": "native" }),
+                env.f.v293,
             );
+            self.push_dd(ms(t0, 19), "tengu_feature_ok", update);
             self.push_dd(ms(t0, 21), "tengu_feature_ok", feature("history_save"));
             let ts = ms(t0, 22);
             self.emit_snapshot_backups(ts);

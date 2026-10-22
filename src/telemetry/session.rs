@@ -695,7 +695,13 @@ impl Pending {
         self.events_since.get_or_insert(now);
         self.events.extend(events);
         self.dd_since.get_or_insert(now);
-        self.dd.extend(dd);
+        self.extend_dd(dd);
+    }
+
+    /// 追加 Datadog 条目，先按服务端的抽样表过一遍（[`sample_dd`]：2.1.293 起表里那些
+    /// `tengu_feature_ok` 只留百分之一）。进待发队列的 Datadog 条目都走这里。
+    pub(super) fn extend_dd(&mut self, dd: impl IntoIterator<Item = Value>) {
+        self.dd.extend(dd.into_iter().filter_map(|mut d| sample_dd(&mut d).then_some(d)));
     }
 
     /// 会话的头一条常是标题生成那种不带环境段的侧查询，那时还不知道工作目录是不是 git 仓库；

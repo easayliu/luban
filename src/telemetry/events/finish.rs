@@ -111,7 +111,9 @@ impl EventBuilder<'_> {
             //   `sentOnceTailTokensEst`，`plainInputExcessTokens` 扣掉它（32 − 32 = 0）；
             // - 其余带断点的：`none`，全 0，`plainInputExcessTokens` 等于 `inputTokens`。
             //
-            // 前三种不报 `plainInputExcessTokens`。
+            // 前三种不报 `plainInputExcessTokens`。2.1.291 起没有 `threaded_continue` 这一项（306 源码的
+            // 取值表里没有，291~306 抓包一条也没有），thread 续轮照 `none` 报。官方 `ffn` 另要求
+            // `usage.iterations` 不超过一轮、三项输入合计不少于 4096 才报 `plainInputExcessTokens`。
             if v285 {
                 let est = shape.tail_tokens_est;
                 let fork = matches!(
@@ -124,7 +126,7 @@ impl EventBuilder<'_> {
                 );
                 let (reason, tail, resent, sent_once) = if !shape.has_cache_control {
                     ("caching_off", shape.messages_len, 0, 0)
-                } else if shape.thread_type.as_deref() == Some("continue") {
+                } else if !v291 && shape.thread_type.as_deref() == Some("continue") {
                     ("threaded_continue", 0, 0, 0)
                 } else if fork {
                     ("fork_tail_skip_cache_write", shape.tail_messages.max(1), est, 0)
@@ -138,7 +140,12 @@ impl EventBuilder<'_> {
                 put("resentTailTokensEst", json!(resent));
                 put("sentOnceTailTokensEst", json!(sent_once));
                 put("unexcusedTailTokensEst", json!(0));
-                if matches!(reason, "none" | "sent_once_text") {
+                let input_total =
+                    call.input_tokens + call.cache_read_tokens + call.cache_creation_tokens;
+                if matches!(reason, "none" | "sent_once_text")
+                    && call.iterations <= 1
+                    && input_total >= 4096
+                {
                     put(
                         "plainInputExcessTokens",
                         json!((call.input_tokens.max(0) as u64).saturating_sub(sent_once)),

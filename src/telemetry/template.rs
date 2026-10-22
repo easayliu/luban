@@ -333,6 +333,103 @@ pub(super) fn sample_event(name: &str, version: &str, meta: &mut Value) -> bool 
     true
 }
 
+/// 服务端下发的 Datadog 抽样表（eval 的 `tengu_agile_glade`，`"source":"defaultValue"`，键是
+/// `tengu_feature_ok` 的 `feature_name`）：2.1.293 ~ 2.1.306 全量抓包里 184 份 eval 一字不差，60 项都是
+/// 0.01，`cap/auto-2.1.291-20261006-full/00017` 那时也已下发。
+///
+/// 客户端 2.1.293 起才照它抽（官方发 Datadog 前的 `re()`）：只抽 Datadog 那份，event_logging 照发；抽中的
+/// 那条在字段末尾、`user_bucket` 之前多一项 `sample_rate`。抓包里表中这些 feature 的 event_logging /
+/// Datadog 条数：2.1.291 1614 / 1614，2.1.293 1900 / 17，2.1.306 2004 / 13，DD 那几条都带 `0.01`。
+const DD_FEATURE_SAMPLING_2_1_293: &[(&str, f64)] = &[
+    ("api_request", 0.01),
+    ("tool_bash", 0.01),
+    ("hook_post_tool_use", 0.01),
+    ("hook_pre_tool_use", 0.01),
+    ("permission_auto_approve_config", 0.01),
+    ("git_bare_repo_gate", 0.01),
+    ("skill_load_dir", 0.01),
+    ("skills_sync_round", 0.01),
+    ("cmd_load", 0.01),
+    ("prompt_snapshot_tool_replay", 0.01),
+    ("mcp_list_tools", 0.01),
+    ("plugin_load_manifest", 0.01),
+    ("turn", 0.01),
+    ("plugin_load_settings", 0.01),
+    ("agent_proxy_request", 0.01),
+    ("workflow_discover", 0.01),
+    ("plugin_load_workflows", 0.01),
+    ("hook_stop_handler", 0.01),
+    ("skill_load_commands_dir", 0.01),
+    ("tool_read", 0.01),
+    ("artifact_live_subscribe", 0.01),
+    ("tool_mcp_tool", 0.01),
+    ("mcp_sdk_connect", 0.01),
+    ("ccr_partial_messages", 0.01),
+    ("ccr_task_status_publish", 0.01),
+    ("mcp_sdk_manifest", 0.01),
+    ("plugin_load_commands", 0.01),
+    ("plugin_load_skills", 0.01),
+    ("mcp_connect", 0.01),
+    ("ccr_no_subscriber_hold", 0.01),
+    ("queued_message_delivered", 0.01),
+    ("shoji_engine", 0.01),
+    ("plugin_function_hooks_load", 0.01),
+    ("bash_edit_diff", 0.01),
+    ("tool_edit", 0.01),
+    ("context_git_detect", 0.01),
+    ("plugin_load_agents", 0.01),
+    ("context_claude_md_load", 0.01),
+    ("remote_managed_settings_pull", 0.01),
+    ("plugin_load_all", 0.01),
+    ("hook_stop", 0.01),
+    ("ccr_worker_state_publish", 0.01),
+    ("output_style_load", 0.01),
+    ("tool_write", 0.01),
+    ("plugin_load_hooks", 0.01),
+    ("policy_limits_poll", 0.01),
+    ("startup_resolve_model", 0.01),
+    ("mcp_list_resources", 0.01),
+    ("swarm_session_cleanup", 0.01),
+    ("plugin_load_output_styles", 0.01),
+    ("lsp_init", 0.01),
+    ("lsp_diagnostics_register", 0.01),
+    ("agents_cross_session_inbox", 0.01),
+    ("lsp_config_load", 0.01),
+    ("update_check", 0.01),
+    ("api_midconv_cache_proxy", 0.01),
+    ("lsp_shutdown", 0.01),
+    ("hook_user_prompt_submit", 0.01),
+    ("api_bootstrap_fetch", 0.01),
+    ("prompt_suggestion_generate", 0.01),
+];
+
+/// 一条 Datadog 条目按 [`DD_FEATURE_SAMPLING_2_1_293`] 抽：`false` 即不发；抽中的补上 `sample_rate`。只看
+/// 条目自己带的 `message` / `feature_name` / `version`，别的事件、不在表里的、或版本早于 2.1.293 的原样放行。
+/// 进待发队列的 Datadog 条目（[`Pending::extend_dd`]）与保活那份都过这一道。
+pub fn sample_dd(entry: &mut Value) -> bool {
+    sample_dd_at(entry, rand::random())
+}
+
+/// [`sample_dd`] 的本体：`roll` 是掷出的 `[0, 1)` 随机数，小于抽样率才留（官方 `Sjr`）。
+pub(super) fn sample_dd_at(entry: &mut Value, roll: f64) -> bool {
+    let field = |k: &str| entry.get(k).and_then(|v| v.as_str());
+    if field("message") != Some("tengu_feature_ok")
+        || !field("version").is_some_and(|v| version_at_least(v, "2.1.293"))
+    {
+        return true;
+    }
+    let Some(&(_, rate)) = field("feature_name")
+        .and_then(|f| DD_FEATURE_SAMPLING_2_1_293.iter().find(|(n, _)| *n == f))
+    else {
+        return true;
+    };
+    if roll >= rate {
+        return false;
+    }
+    insert_before(entry, "user_bucket", vec![("sample_rate", json!(rate))]);
+    true
+}
+
 /// 模板占位符的取值。
 pub(super) struct Subst<'a> {
     pub(super) version: &'a str,
@@ -589,7 +686,23 @@ where
 {
     let mut events = Vec::with_capacity(tpl.len());
     let mut dd = Vec::new();
+    // 交互式模板（2.1.285 起各份）启动段那个 IDE 的 MCP 连接（`ws-ide`）：终端里跑的官方客户端没有它，
+    // 而同一会话启动 30 秒后又报 `ide_detect{found:false}`，自相矛盾；键也停在 2.1.285（缺 2.1.291 起的
+    // `processUptimeAtConnectStartMs` / `discoverSource`）。连同它的 `tools_listed` 与跟着的
+    // `mcp_connect` / `mcp_list_tools` 整组不发——这几份模板里这两条 feature_ok 只属于它。
+    let ide_mcp =
+        version_at_least(subst.version, "2.1.285") && tpl.iter().any(|e| is_ide_transport(&e.meta));
     for e in tpl {
+        if ide_mcp
+            && (is_ide_transport(&e.meta)
+                || (e.name == "tengu_feature_ok"
+                    && matches!(
+                        e.meta.get("feature_name").and_then(|f| f.as_str()),
+                        Some("mcp_connect" | "mcp_list_tools")
+                    )))
+        {
+            continue;
+        }
         let t = anchor + chrono::Duration::milliseconds(e.off);
         for _ in 0..e.repeat.unwrap_or(1).max(1) {
             if e.kind == "growth" {
@@ -728,6 +841,24 @@ where
                 o.shift_remove("default_output_match");
                 o.shift_remove("default_effort_match");
             }
+            // 2.1.301 起模型目录那条多三项比对（`cap/auto-2.1.301-20261016-full` 起每份 22/23，值恒为 true）；
+            // haiku-4.5 主模型那个会话三项都不带，同上。2.1.300 ~ 2.1.305 的模板都没补上。
+            if e.name == "tengu_model_catalog_compare"
+                && subst.tool_family != ToolFamily::HaikuLong
+                && version_at_least(subst.version, "2.1.301")
+                && meta.get("capabilities_match").is_none()
+            {
+                insert_after(
+                    &mut meta,
+                    "served_not_offered_count",
+                    vec![("capabilities_match", json!(true))],
+                );
+                insert_after(
+                    &mut meta,
+                    "haiku_match",
+                    vec![("context_window_match", json!(true)), ("max_output_match", json!(true))],
+                );
+            }
             // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
             // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关
             // 的四个会话正是这三个名字），关了哪个列哪个。
@@ -793,6 +924,11 @@ where
         }
     }
     (events, dd)
+}
+
+/// 模板事件是不是 IDE 那个 MCP 服务的（`transportType` 为 `ws-ide` / `sse-ide`）。
+fn is_ide_transport(meta: &Value) -> bool {
+    matches!(meta.get("transportType").and_then(|t| t.as_str()), Some("ws-ide" | "sse-ide"))
 }
 
 /// [`emit_template`] 的产物：带时间戳的事件与 Datadog 条目。

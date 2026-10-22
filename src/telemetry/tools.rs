@@ -648,6 +648,8 @@ pub(super) fn tool_success_extras(
     success: &mut Value,
     tu: &ToolUse,
     sizes: &mut HashMap<String, usize>,
+    v277: bool,
+    v285: bool,
 ) {
     let path = tu.input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
     let path_fields = |v: &mut Value| {
@@ -704,6 +706,19 @@ pub(super) fn tool_success_extras(
         "Edit" | "Write" if !path.is_empty() => path_fields(success),
         "Bash" => {
             let command = tu.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            // 命令里提到的文件，都在 `bashCommandLen` 前（`tail … README.md` 两项都是 `md`）：
+            // `fileExtension` 是文件命令的参数扩展名（官方 `o8s`；`cap/2.1.277` 那条 `sed … .rs` 报 `rs`，
+            // `cap/2.1.280/00176` 两条与复算逐字相同），`bashCommandFileExtensions` 是文档类扩展名（`hjr`；
+            // `cap/auto-2.1.285-20260930` 起才见到，更早的抓包里没有能判断的命令）。
+            if v277 && let Some(ext) = super::files::bash_command_file_ext(command) {
+                success["fileExtension"] = json!(ext);
+            }
+            if v285 {
+                let docs = super::files::bash_mentioned_exts(command);
+                if !docs.is_empty() {
+                    success["bashCommandFileExtensions"] = json!(docs.join(","));
+                }
+            }
             success["bashCommandLen"] = json!(tu.command_len);
             if !command.is_empty() {
                 let p = bash_profile(command);
