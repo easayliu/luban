@@ -1164,6 +1164,22 @@ pub(crate) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
     config::cc_profile(cc_profile_kind_for(model))
 }
 
+/// 官方主线程在 `version` 那一版、用 `model`（展示名，1M 会话带 `[1m]`）时出站头里的 `anthropic-beta`：按那一版的
+/// profile 拼，订阅登录带 `oauth`，1M 会话带 `context-1m`（位置同 [`super::simulated_beta`]）。每请求才带的那几项
+/// （auto 模式、按号下发的保活）不在里头。遥测还没见到会话的主线程请求时，拿它推主线程那份会话级 beta。
+pub(crate) fn cc_main_beta_at(model: &str, version: Option<(u64, u64, u64)>) -> String {
+    // 按字节切会切进多字节字符（来访模型名可以是任意 UTF-8），先确认在字符边界上。
+    let cut = model.len().checked_sub(4).filter(|&i| model.is_char_boundary(i));
+    let one_m = cut.is_some_and(|i| model[i..].eq_ignore_ascii_case("[1m]"));
+    let base = match cut {
+        Some(i) if one_m => &model[..i],
+        _ => model,
+    };
+    let profile = config::cc_profile_at(cc_profile_kind_for(base), version);
+    let beta = config::cc_model_beta(profile, base);
+    super::simulated_beta(&beta, one_m.then_some(config::CC_BETA_CONTEXT_1M))
+}
+
 /// 模型名 → 主线程 profile 的 kind。与版本无关，故 [`merge_beta_for`](crate::proxy::merge_beta_for) 也用它（再按来访自报的
 /// 版本经 [`config::cc_profile_at`] 取对应那一版的行）。
 pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {

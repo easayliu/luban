@@ -981,17 +981,18 @@ fn simulated_beta_matches_official() {
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
 }
 
-/// 2.1.307 的模拟主线程 beta 逐字对上 `cap/auto-2.1.299-20261014-full`（2.1.300 的
+/// 2.1.308 的模拟主线程 beta 逐字对上 `cap/auto-2.1.299-20261014-full`（2.1.300 的
 /// `cap/auto-2.1.300-20261015-full`、2.1.301 的 `cap/auto-2.1.301-20261016-full`、2.1.303 的
 /// `cap/auto-2.1.303-20261019-full`、2.1.305 的 `cap/auto-2.1.305-20261021-full`、2.1.306 的
-/// `cap/auto-2.1.306-20261021-full`、2.1.307 的 `cap/auto-2.1.307-20261022-full` 去掉按号下发的
+/// `cap/auto-2.1.306-20261021-full`、2.1.307 的 `cap/auto-2.1.307-20261022-full`、2.1.308 的
+/// `cap/auto-2.1.308-20261022-full` 去掉按号下发的
 /// `cache-keepalive` 后逐字相同，见
 /// [`config::CC_PROFILES`]）：与 2.1.296 相比只少了 `mid-conversation-system`（转正不发头），haiku-5-5 那串里
 /// `claude-code` 因此紧跟 `prompt-caching-scope`。fable 只抓到 auto 模式（`00523`，多 `dangerous-tool-use` 与
 /// `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带 `safeguards`，那两项都不该出现。
 /// 没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_307() {
+fn simulated_beta_matches_2_1_308() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          thinking-token-count-2026-05-13,context-management-2025-06-27,\
          prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
@@ -1022,7 +1023,7 @@ fn simulated_beta_matches_2_1_307() {
         ("00294", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.307");
+        assert_eq!(profile.version, "2.1.308");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1066,10 +1067,10 @@ fn profile_betas_match_the_2_1_277_captures() {
         assert_eq!(p.version, "2.1.277", "{kind:?}");
         assert_eq!(p.beta, *official, "{kind:?}（{cap}）");
     }
-    // 2.1.307 的额度探测（`cap/auto-2.1.307-20261022-full/00021`，2.1.306 的 `00022`、2.1.305 的 `00019`、2.1.303 的 `00017`、
+    // 2.1.308 的额度探测（`cap/auto-2.1.308-20261022-full/00021`，2.1.307 的 `00021`、2.1.306 的 `00022`、2.1.305 的 `00019`、2.1.303 的 `00017`、
     // 2.1.301 的 `00015`、2.1.300 的 `00012`、2.1.299 的 `00014`、2.1.296 的 `00012`、2.1.293 的 `00017` 同）与 2.1.277 逐字相同。
     let quota = config::cc_profile(QuotaProbe);
-    assert_eq!((quota.version, quota.beta), ("2.1.307", cases[2].2));
+    assert_eq!((quota.version, quota.beta), ("2.1.308", cases[2].2));
     // 2.1.291 的标题生成（默认模式下 13 条）与 2.1.277 逐字相同。
     let title = config::cc_profile_at(SessionTitleHaiku, Some((2, 1, 291)));
     assert_eq!((title.version, title.beta), ("2.1.291", cases[1].2));
@@ -1093,12 +1094,13 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.299（`cap/auto-2.1.299-20261014-full/00029`）只少 `mid-conversation-system`；2.1.300
     // （`cap/auto-2.1.300-20261015-full/00029`）、2.1.301（`cap/auto-2.1.301-20261016-full`）、2.1.303
     // （`cap/auto-2.1.303-20261019-full`）、2.1.305（`cap/auto-2.1.305-20261021-full`）、2.1.306
-    // （`cap/auto-2.1.306-20261021-full`）、2.1.307（`cap/auto-2.1.307-20261022-full/00036`）同串。
+    // （`cap/auto-2.1.306-20261021-full`）、2.1.307（`cap/auto-2.1.307-20261022-full/00036`）、2.1.308
+    // （`cap/auto-2.1.308-20261022-full/00036`）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.307",
+            "2.1.308",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,\

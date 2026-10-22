@@ -1,9 +1,9 @@
-//! 2.1.307 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.307 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.307 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.307 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.307 的 profile 表：2.1.307 来访的 beta 参照（[`cc_profile_at`]）。2.1.308 的表
+/// （[`CC_PROFILES`]）逐行同这张，只换版本号。
 ///
 /// **各行除版本号外与 2.1.306（[`CC_PROFILES_2_1_306`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.307-20261022-full`（场景同 2.1.306-full）：请求头除 UA 外逐字相同，
@@ -13,7 +13,7 @@ use super::*;
 /// 那版 `Agent` 说明（`proxy::lucky_cerf::reads_list`，opus 也由短版换成这一版）。另外
 /// `prompt-caching-scope` 改成只在直连官方（`ANTHROPIC_BASE_URL` 未设或就是 `api.anthropic.com`）时发，
 /// 模拟路径按直连官方的形态发，照旧带。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_307: &[CcProfile] = &[
     at_307(CC_PROFILES_2_1_306[0]),
     at_307(CC_PROFILES_2_1_306[1]),
     at_307(CC_PROFILES_2_1_306[2]),

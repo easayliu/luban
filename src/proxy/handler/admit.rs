@@ -10,7 +10,7 @@ use super::*;
 /// 闸门放行后，这条请求在换号重试之间不变的事实。字段与拆分前 `handle_inner` 里的同名局部
 /// 变量一一对应，说明见各自算出它的那段。
 pub(super) struct Inbound {
-    pub(super) started: std::time::Instant,
+    pub(super) started: ReqStart,
     pub(super) method: Method,
     pub(super) headers: HeaderMap,
     pub(super) path_and_query: String,
@@ -123,7 +123,7 @@ pub(super) async fn admit(
     body: axum::body::Body,
     log_state: &RequestLogState,
 ) -> Result<(Inbound, Guards), Response> {
-    let started = std::time::Instant::now();
+    let started = ReqStart::now();
     let client_request_id = client_request_id(&headers);
     let path_and_query =
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();

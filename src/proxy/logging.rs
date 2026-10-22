@@ -20,6 +20,25 @@ use super::upstream::{
 use super::{AppState, header_opt};
 
 /// 随响应流一起存活；流结束/断开时在 Drop 里输出一条转发日志（含 TTFT、总耗时与用量）并落库。
+/// 请求入站的时刻：单调钟与墙钟在 admit 时**同一刻**各取一次。耗时用前者；遥测的请求起点（[`crate::telemetry::Capture`]
+/// 的 `started_at`、发出时登记标题的 [`crate::telemetry::Telemetry::note_dispatch`]）都用后者——两处各自再取 `now`
+/// 推算会差出请求准备的那段，先后比较与登记清理就对不上。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReqStart {
+    pub(crate) at: std::time::Instant,
+    pub(crate) wall: std::time::SystemTime,
+}
+
+impl ReqStart {
+    pub(crate) fn now() -> Self {
+        Self { at: std::time::Instant::now(), wall: std::time::SystemTime::now() }
+    }
+
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        self.at.elapsed()
+    }
+}
+
 pub(crate) struct ReqLog {
     pub(super) started: std::time::Instant,
     pub(super) ttft_ms: Option<u128>,
@@ -746,7 +765,7 @@ pub(crate) fn record_early_failure(
     cred: &crate::credentials::Credential,
     upstream: &Upstream<'_>,
     sent: &Bytes,
-    started: std::time::Instant,
+    started: ReqStart,
     flags: store::ForwardFlags,
     billable: bool,
     up_request_id: Option<&str>,
@@ -793,7 +812,7 @@ pub(super) fn telemetry_capture(
     cred: &crate::credentials::Credential,
     upstream: &Upstream<'_>,
     sent: &Bytes,
-    started: std::time::Instant,
+    started: ReqStart,
     flags: store::ForwardFlags,
     billable: bool,
     organization_id: Option<String>,
@@ -815,9 +834,7 @@ pub(super) fn telemetry_capture(
             request_class: header_opt(&upstream.headers, "x-claude-code-request-class"),
         },
         organization_id,
-        started_at: std::time::SystemTime::now()
-            .checked_sub(started.elapsed())
-            .unwrap_or_else(std::time::SystemTime::now),
+        started_at: started.wall,
         cache_keepalive_ok: false,
     })
 }

@@ -485,11 +485,11 @@ impl EventBuilder<'_> {
                 }
                 self.beat(ms(t0, 5), heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
             }
-            if heron {
+            if let Some((len, from_client_data)) = heron {
                 self.push(
                     ms(t0, sdk_announce.map_or(-11, |off| off + 3)),
                     "tengu_heron_brook_applied",
-                    json!({ "len": 2790, "fromClientData": true }),
+                    json!({ "len": len, "fromClientData": from_client_data }),
                 );
             }
             // 每个模型头一次用于新输入时报一次（值恒为 growthbook / all）。
@@ -520,6 +520,13 @@ impl EventBuilder<'_> {
                     probe
                 });
             }
+        } else if let Some((len, from_client_data)) = heron {
+            // 压缩之后接着的续轮（不是新输入）：段缓存清了，发请求前组装 system 时报。
+            self.push(
+                ms(t0, -11),
+                "tengu_heron_brook_applied",
+                json!({ "len": len, "fromClientData": from_client_data }),
+            );
         }
     }
 }

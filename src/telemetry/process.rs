@@ -205,6 +205,9 @@ impl Telemetry {
             let this_end = call.started_at + Duration::from_millis(call.total_ms);
             sess.last_call_end = Some(prev_end.map_or(this_end, |e| e.max(this_end)));
             sess.recent_ends.push_back(this_end);
+            if kind == Kind::Title {
+                sess.waiting_titles.push((call.logical_start(), sleepy_key(&display_model)));
+            }
             sess.deferred.push((call, prev_end, now));
             return;
         }
@@ -237,6 +240,9 @@ impl Telemetry {
                 let this_end = c.started_at + Duration::from_millis(c.total_ms);
                 sess.last_call_end = Some(prev_end.map_or(this_end, |e| e.max(this_end)));
                 sess.recent_ends.push_back(this_end);
+                if let Some(m) = body_model(&c.body) {
+                    sess.waiting_titles.push((c.logical_start(), sleepy_key(&m)));
+                }
                 sess.deferred.push((c, prev_end, at));
             }
         }
@@ -452,6 +458,8 @@ impl Telemetry {
         // 工具被拒多一条 `tengu_safety_event`（`cap/auto-2.1.307-20261022-full`），失败 Bash 的错误栈指纹又换了
         // （`cap/auto-2.1.307-20261022-bash`）。
         let v307 = version_at_least(&version, "2.1.307");
+        // 2.1.308：失败 Bash 的错误栈只换了打包块名（`cap/auto-2.1.308-20261022-full` A0 那条）。
+        let v308 = version_at_least(&version, "2.1.308");
         let safety_events = v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
@@ -485,21 +493,47 @@ impl Telemetry {
             (v270 && kind.has_boundary()).then(|| sess.snapshot_for(kind, &agent_key, &shape));
         // 2.1.293 的标题生成那条也报（`cap/auto-2.1.293-20261008-full` 每个会话的标题请求前都有一条
         // `model: claude-haiku-5-5`；主线程也是 haiku-5-5 的会话里，主线程那次就不再报）。
+        // 官方按 `Mt(model).toLowerCase()` 去重（剥 `[1m]`），meta 报头一次实际调用的展示名：haiku-5-5\[1m] 主线程的
+        // 会话里，标题那条 `claude-haiku-5-5` 报了，主线程就不再报（`cap/auto-2.1.308-20261022-gaps` G2 只有一条）。
+        // 官方在请求**发起前**记首次应用（`Zmr`），归属按发起顺序定，不按 luban 收到回包、处理的顺序。主线程判的时候，
+        // 同模型、发起得更早（都按逻辑起点：重试链取首发那次）的标题还没处理，就让给它：
+        // - 还在路上（[`State::dispatched_titles`]，发出时登记，见 [`Telemetry::note_dispatch`]）——标题先发、主线程先
+        //   返回；
+        // - 已经返回、扣在队里（[`Session::waiting_titles`]）——标题被扣住晚处理。
+        let sleepy_k = sleepy_key(&display_model);
+        let logical_start = call.logical_start();
+        let earlier_title = |titles: &[(SystemTime, String)]| {
+            titles.iter().any(|(at, k)| *at <= logical_start && *k == sleepy_k)
+        };
+        let title_first = v293
+            && is_main
+            && (earlier_title(&sess.waiting_titles)
+                || st.dispatched_titles.get(&key).is_some_and(|t| earlier_title(t)));
         let sleepy = v280
             && (new_prompt || (v293 && kind == Kind::Title))
-            && !sess.sleepy_models.contains(&display_model);
+            && !title_first
+            && !sess.sleepy_models.contains(&sleepy_k);
         if sleepy {
-            sess.sleepy_models.push(display_model.clone());
+            sess.sleepy_models.push(sleepy_k.clone());
         }
-        // haiku-5-5 会话一条（`len: 2790`，`fromClientData: true`），官方落在会话头一条请求之前——
-        // 有标题请求时是标题那条，紧挨它的 `sleepy_snowflake_applied`。标题请求里看不出主线程是哪个
+        // 标题处理了就不再在路上：它这条（含重试的各次）发出时的登记去掉。
+        if kind == Kind::Title
+            && let Some(t) = st.dispatched_titles.get_mut(&key)
+        {
+            t.retain(|(at, k)| !(*k == sleepy_k && *at >= logical_start && *at <= call.started_at));
+            if t.is_empty() {
+                st.dispatched_titles.remove(&key);
+            }
+        }
+        // 服务端下发了 `tengu_heron_brook` 那段 system 文本才报（[`crate::proxy::heron_brook`]：2.1.293 / 296 时
+        // haiku-5-5 的 bootstrap 带 2790 字，`fromClientData: true`；2.1.299 起不再下发、也没有这条），官方落在会话头
+        // 一条请求之前——有标题请求时是标题那条，紧挨它的 `sleepy_snowflake_applied`。标题请求里看不出主线程是哪个
         // 模型（opus 会话的标题同样是 haiku-5-5，却没有这一条），这里挂在主线程的首次输入上。
-        let heron = v293
-            && is_main
-            && new_prompt
-            && !sess.heron_done
-            && crate::config::cc_haiku_is_5_5_family(&display_model);
-        if heron {
+        // 段缓存清掉（压缩成功）之后的下一条主线程请求也重新组装，不论是不是新输入（自动压缩后接着的是续轮）。
+        let heron = (v293 && is_main && (new_prompt || post_compaction) && !sess.heron_done)
+            .then(|| crate::proxy::heron_brook::applied(call.cred_id, &display_model))
+            .flatten();
+        if heron.is_some() {
             sess.heron_done = true;
         }
         // tether 只管主线程与子代理（摘要、猜下一句、标题这类辅助调用一条都没有），子代理
@@ -554,10 +588,11 @@ impl Telemetry {
         let session_cwd = sess.cwd.clone();
         let betas_full = call.betas.clone().unwrap_or_default();
         let betas_own = session_betas(&betas_full);
-        // 子代理支线上的事件顶层 `betas` 报**主线程**那份，只有它自己的 `api_query` /
-        // `api_success` / `agent_tool_completed` 报它这条请求的（`cap/2.1.285`：haiku 子代理 251
-        // 条事件里 226 条是主线程那份 `claude-code…mid-conversation-system`，那三类 25 条是
-        // haiku 的 `oauth,interleaved…`；`cap/2.1.280` 的 Explore 与主线程同模型，两份本来相同）。
+        // 子代理支线上的事件顶层 `betas` 报**主线程**那份；它自己的 `api_query` / `api_success` 报这条请求的
+        // 完整串（与 meta 同值），`agent_tool_selected` / `agent_tool_completed` 与它里面的 Bash 报它这条请求过滤出
+        // 的那份（`cap/2.1.285`：claude-code-guide 跑 haiku-4.5，API 事件是 11 项的完整串、收尾那条是
+        // `oauth,interleaved…` 6 项；`cap/auto-2.1.308-20261022-gaps` 跑 haiku-5-5 是 16 项与 6 项；Explore 与主线程
+        // 同模型，几份本来相同）。
         if is_main {
             sess.main_betas = betas_own.clone();
         }
@@ -571,8 +606,19 @@ impl Telemetry {
         } else {
             None
         };
-        let betas_session = if kind.is_agent() && !sess.main_betas.is_empty() {
+        // 非主线程的请求（子代理、标题、页面处理、猜下一句……）处理时报的事件，顶层同样是**主线程**那份：官方取会话主模型
+        // 的会话级 beta，只有 meta 里带了别的模型的那几条报那个模型的（`EventBuilder::own_betas_scope`；
+        // `cap/auto-2.1.308-20261022-full` / `-gaps`：标题那条处理时的 `session_title_generated` / `tool_schema_sizes` /
+        // `tool_search_mode_decision` 都是主线程那 7 项，只有 `sleepy_snowflake_applied` 是 haiku 那 6 项）。新会话里的标题
+        // 先扣住、等主线程那条处理完才补处理（[`State::presession`]），这时主线程那份已经有了；扣不住（主线程那条迟迟
+        // 不来）时按会话主模型（与顶层 `model` 同源）照这一版的 profile 推；会话主模型也只知道是这条自己的，就用它自己那份。
+        let betas_session = if is_main {
+            betas_own.clone()
+        } else if !sess.main_betas.is_empty() {
             sess.main_betas.clone()
+        } else if ctx_model != display_model {
+            let v = crate::proxy::parse_version(&version);
+            session_betas(&crate::proxy::cc_main_beta_at(&ctx_model, v))
         } else {
             betas_own.clone()
         };
@@ -663,6 +709,7 @@ impl Telemetry {
             v305,
             v306,
             v307,
+            v308,
             safety_events,
             suggestion_fork,
             lucky_cerf,
@@ -739,6 +786,7 @@ impl Telemetry {
             user_secs,
             v285,
             betas_session,
+            ctx_model,
             ..
         } = facts;
 
@@ -781,9 +829,10 @@ impl Telemetry {
         // 这三项是导出指标时那条 `tengu_feature_ok{internal_metrics_export}` 的上下文，
         // 代表的是「这个会话」。被一条标题生成（haiku + structured-outputs、且没有
         // `cc_prompt_id`）覆盖之后，导出事件报的就成了 haiku 与标题那套 beta——而同一批
-        // 指标里的 `model` 属性仍是会话主模型，自相矛盾。
+        // 指标里的 `model` 属性仍是会话主模型，自相矛盾。第一条就是侧查询时，`model` 也取会话主模型
+        // （设备记着的默认模型，与 `betas_session` 推 beta 的那个同源），不拿侧查询自己的。
         if is_main || pending.model.is_empty() {
-            pending.model = display_model.clone();
+            pending.model = ctx_model;
             pending.betas = betas_session.clone();
             pending.prompt_id = prompt_id.clone();
         }
@@ -842,12 +891,33 @@ impl Telemetry {
 
     /// 把某会话扣住的侧查询按顺序补发（主线程请求到了，或扣得太久）。
     pub(super) fn replay_deferred(st: &mut State, key: &(i64, String)) {
-        let deferred =
-            st.sessions.get_mut(key).map(|s| std::mem::take(&mut s.deferred)).unwrap_or_default();
+        let deferred = st
+            .sessions
+            .get_mut(key)
+            .map(|s| {
+                s.waiting_titles.clear();
+                std::mem::take(&mut s.deferred)
+            })
+            .unwrap_or_default();
         for (c, prev_end, _) in deferred {
             Self::process(st, c, false, prev_end);
         }
     }
+}
+
+/// `tengu_sleepy_snowflake_applied` 的去重键：官方 `Mt(model).toLowerCase()`，即剥掉 `[1m]` 再小写。
+pub(super) fn sleepy_key(model: &str) -> String {
+    let m = model.to_ascii_lowercase();
+    m.strip_suffix("[1m]").unwrap_or(&m).to_string()
+}
+
+/// 只取请求体的 `model`（扣住的标题建会话前没解析过形态）。
+fn body_model(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct M {
+        model: String,
+    }
+    serde_json::from_slice::<M>(body).ok().map(|m| m.model)
 }
 
 /// 这条请求的角色与收尾方式，[`Session::advance_turn`] / [`Session::record_call`] 共用。
@@ -1039,8 +1109,12 @@ impl Session {
         if post_compaction {
             self.snapshot_hash = None;
             self.prev_total_input = 0;
+            // 官方压缩成功调 `XEn("compaction")` 清掉系统提示词各段的缓存，下一次组装重新跑 heron 那段、再报一次
+            // `tengu_heron_brook_applied`。
+            self.heron_done = false;
         }
-        if kind == Kind::Compact && !failed {
+        // 用户取消的压缩不算：官方只在压缩成功时清系统段缓存、换快照。
+        if kind == Kind::Compact && !failed && !aborted {
             self.post_compact = true;
         }
         let turn_origin = self.turn_origin.clone();

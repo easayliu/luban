@@ -61,6 +61,10 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::dapper_dawn::note_eval(cred_id, features);
     // 2.1.307 的安全事件（`tengu_safety_event`）报不报，默认开。
     super::snoopy_creek::note_eval(cred_id, features);
+    // tether 固定按无状态发送的模型清单（遥测 `modelHeldStateless`），默认空串。
+    super::curious_tower::note_eval(cred_id, features);
+    // 拼进 system 的那段 `tengu_heron_brook`（bootstrap 的 `client_data` 优先，这里是兜底那份）。
+    super::heron_brook::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)
     };

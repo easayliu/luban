@@ -57,12 +57,15 @@ impl EventBuilder<'_> {
             );
             // 2.1.293 标题生成（haiku-5-5）头一次用这个模型：紧跟工具搜索判定（同一毫秒，
             // `cap/auto-2.1.293-20261008-full` B0 会话 -20ms 那组）。
+            // meta 报的是标题自己的模型，顶层 `betas` 跟着报它那份（haiku 那 6 项），不是主线程那份。
             if env.f.sleepy && kind == Kind::Title {
+                self.own_betas_scope = true;
                 self.push(
                     ms(t0, -1),
                     "tengu_sleepy_snowflake_applied",
                     json!({ "model": display_model, "source": "growthbook", "value": "all" }),
                 );
+                self.own_betas_scope = false;
             }
         }
         // 2.1.285：每条线程的头两条请求前，客户端把上下文宣告、提醒折叠、工具入参回显这几样
@@ -100,10 +103,13 @@ impl EventBuilder<'_> {
                 }
                 insert_after(&mut selected, "is_fork", pairs);
             }
-            self.main_side.push((
-                ts,
-                base_identity.event("tengu_agent_tool_selected", ts, &env.ctx(ts), selected),
-            ));
+            // 顶层 `betas` 是子代理这条请求自己那份（meta 的 `model` 是子代理的模型）：claude-code-guide 跑
+            // haiku-5-5 时是 haiku 那 6 项，不是主线程那份（`cap/auto-2.1.308-20261022-gaps`；Explore 跟主线程
+            // 同模型，两份本来相同）。
+            let mut ctx = env.ctx(ts);
+            ctx.betas = &env.f.betas_own;
+            self.main_side
+                .push((ts, base_identity.event("tengu_agent_tool_selected", ts, &ctx, selected)));
             // 心跳里转入 `subagent_running` 那一下不在这里登记：子代理首条落地时主线程往往已经又完成了
             // 一两条，这里登记的时刻早于已折算过的会被当过时丢掉。改由拉起它的那条主线程请求登记，见
             // `finish.rs` 的 `delegated`。

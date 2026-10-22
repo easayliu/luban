@@ -40,8 +40,9 @@ use super::learned_rules::{
     next_transient_backoff, remember_shape_rejection, replay_refusal, take_rejection_log_slot,
 };
 use super::logging::{
-    ReqLog, UsageSniffer, ban_context, capture_forensics_without_body, fill_shape_forensics,
-    inbound_headers_summary, inbound_shape_summary, record_early_failure, telemetry_capture,
+    ReqLog, ReqStart, UsageSniffer, ban_context, capture_forensics_without_body,
+    fill_shape_forensics, inbound_headers_summary, inbound_shape_summary, record_early_failure,
+    telemetry_capture,
 };
 use super::openai_marker::{find_openai_marker, remap_call_ids};
 use super::probe_detect::{
@@ -170,6 +171,16 @@ pub(crate) async fn handle_inner(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_large",
                 format!("request body exceeds {} MB", MAX_MESSAGES_BODY_BYTES / (1024 * 1024)),
+            );
+        }
+        // 发出时就登记标题（遥测按发起顺序定 `sleepy_snowflake_applied` 的归属，见 `Telemetry::note_dispatch`）。起点用入站
+        // 时刻的墙钟，与这条请求 `Capture::started_at` 同一个值（见 [`ReqStart`]）。
+        if inb.billable && inb.flags.api_telemetry && inb.probe_prewarm.is_none() {
+            state.telemetry.note_dispatch(
+                pick.cred.id,
+                &attempt.upstream.headers,
+                &attempt.sent,
+                inb.started.wall,
             );
         }
         let resp = attempt.upstream.send(attempt.sent.clone()).await;

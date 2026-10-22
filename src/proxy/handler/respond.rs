@@ -202,7 +202,7 @@ async fn relay_ok(
     let sys_relocated = sent_bits.sys_relocated;
     fill_shape_forensics(&mut forensics, sent_bits);
     let mut rl = ReqLog {
-        started,
+        started: started.at,
         ttft_ms: None,
         method: method.to_string(),
         path: path_and_query.clone(),
@@ -918,7 +918,7 @@ fn unreachable(
             client_ua,
             model: req_model.clone(),
             device_id: logged_device,
-            started,
+            started: started.at,
             request_id,
             upstream_request_id: None,
             status: StatusCode::BAD_GATEWAY,

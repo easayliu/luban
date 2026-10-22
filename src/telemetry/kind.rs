@@ -323,17 +323,28 @@ pub(super) fn snapshot_hash_of(shape: &RequestShape) -> String {
     sha256_hex(format!("snapshot:{}", shape.dynamic_hash).as_bytes())[..12].to_string()
 }
 
-/// tether 引擎把模型固定成无状态发送的几个模型（`sentThreadType: "none"`）：
+/// tether 引擎有没有把这个模型固定成无状态发送（`modelHeldStateless`，为真时 `sentThreadType: "none"`）。
 ///
-/// - `cap/2.1.277`：fable-5-1 为 true、opus-5 为 false；
-/// - `cap/2.1.280`：fable-5-1 与 opus-5-5**\[1m]** 为 true，sonnet / haiku 为 false；
-/// - `cap/2.1.285`（11 个模型）：只有 fable-5-1 为 true——fable-5 为 false，**不带 \[1m] 的**
-///   opus-5-5 也是 false（那条实际建了线程，`00030` 体里 `thread: create`）。
+/// 官方看服务端开关 `tengu_curious_tower_stateless_models` 的模型清单（[`crate::proxy::curious_tower`]），
+/// `listed` 是这个号 eval 里的清单，按官方的匹配规则判。没见过这个号的 eval 时按版本兜底：
 ///
-/// 故按具体模型判：fable-5-1，与 1M 上下文的 opus-5-5。`model` 是带 `[1m]` 后缀的展示名。
-pub(super) fn model_held_stateless(model: &str) -> bool {
-    model.starts_with("claude-fable-5-1")
-        || (model.starts_with("claude-opus-5-5") && model.ends_with("[1m]"))
+/// - 2.1.291 起报 false：`cap/auto-2.1.291-20261006-full` 直到 `cap/auto-2.1.308-20261022-full` 的清单都是空串，
+///   fable-5-1 与 opus-5-5\[1m] 一律 false，fable 照常 `thread: create` / `continue`
+///   （`cap/auto-2.1.308-20261022-gaps` 的 `00037` / `00039`）；
+/// - 更早的沿用当时按抓包定的规则——fable-5-1 与 1M 上下文的 opus-5-5 为 true：`cap/2.1.277` fable-5-1 true、
+///   opus-5 false；`cap/2.1.280`（清单 `fable-5-1, opus-5-`）fable-5-1 与 opus-5-5\[1m] true，sonnet / haiku false；
+///   `cap/2.1.285`（清单 `fable-5-1`）只有 fable-5-1 true，不带 \[1m] 的 opus-5-5 false。
+///
+/// `model` 是带 `[1m]` 后缀的展示名。
+pub(super) fn model_held_stateless(model: &str, listed: Option<&str>, v291: bool) -> bool {
+    match listed {
+        Some(list) => crate::proxy::curious_tower::lists_model(list, model),
+        None if v291 => false,
+        None => {
+            model.starts_with("claude-fable-5-1")
+                || (model.starts_with("claude-opus-5-5") && model.ends_with("[1m]"))
+        }
+    }
 }
 
 /// 按上一条请求判这条的 tether 决策，规则取自 `cap/2.1.277`（主线程 11 条、子代理 26 条）

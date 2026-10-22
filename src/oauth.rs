@@ -1304,6 +1304,15 @@ pub async fn keepalive_bootstrap(
     .send()
     .await;
     match resp {
+        // 成功时读体：`client_data` 里的 `tengu_heron_brook` 决定遥测报不报那条
+        // `heron_brook_applied`（[`crate::proxy::heron_brook`]）。体几百字节，读不出来就当没拉到。
+        Ok(r) if r.status().is_success() => {
+            let status = r.status().as_u16();
+            if let Ok(body) = r.bytes().await {
+                crate::proxy::heron_brook::note_bootstrap(ctx.cred_id, model, &body);
+            }
+            KeepaliveResult::from_status(status)
+        }
         Ok(r) => KeepaliveResult::from_response(r, "bootstrap").await,
         Err(_) => KeepaliveResult::Failed,
     }

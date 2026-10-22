@@ -172,6 +172,9 @@ pub(super) struct Session {
     /// 被用于新输入时报一次（`cap/2.1.280` opus/fable/sonnet/haiku 各一条，再切回来不报）；
     /// 2.1.293 起标题生成（haiku-5-5）头一次也报，与主线程共用这张表。
     pub(super) sleepy_models: Vec<String>,
+    /// 扣在 [`Self::deferred`] 里、还没处理的标题：`(逻辑起点, sleepy 去重键)`。主线程判 sleepy 时让给更早发起的同模型
+    /// 标题；补处理时清空。
+    pub(super) waiting_titles: Vec<(SystemTime, String)>,
     /// 本会话已经报过 `tengu_heron_brook_applied`（haiku-5-5 主线程会话一条）。
     pub(super) heron_done: bool,
     /// 主线程的 tether 线程状态，见 [`TetherThread`]；子代理的各记在 [`AgentState`] 里。
@@ -682,6 +685,7 @@ pub(super) struct TurnFacts {
     pub(super) v305: bool,
     pub(super) v306: bool,
     pub(super) v307: bool,
+    pub(super) v308: bool,
     /// 工具被拒时报 `tengu_safety_event`：2.1.307 起，且号的服务端开关 `tengu_snoopy_creek` 没关
     /// （[`crate::proxy::snoopy_creek`]，官方每次报之前现读，这里按这条请求处理时读一次）。
     pub(super) safety_events: bool,
@@ -711,8 +715,9 @@ pub(super) struct TurnFacts {
     pub(super) first_main: bool,
     pub(super) snapshot: Option<(&'static str, String)>,
     pub(super) sleepy: bool,
-    /// 这条前面报一条 `tengu_heron_brook_applied`（2.1.293 haiku-5-5 会话的首次输入）。
-    pub(super) heron: bool,
+    /// 这条前面报一条 `tengu_heron_brook_applied`：服务端下发的那段文本的 `(len, fromClientData)`
+    /// （[`crate::proxy::heron_brook`]），会话首次输入一条。
+    pub(super) heron: Option<(usize, bool)>,
     pub(super) tether: Option<Tether>,
     pub(super) usage_before: [i64; 4],
     pub(super) ignored_suggestion: Option<(String, SystemTime, usize)>,
@@ -777,6 +782,9 @@ pub(super) struct State {
     /// `artifact_disabled_session`）再也补不上。先扣在这里，等这个会话第一条主线程请求把会话建好
     /// 再补发；扣太久（[`config::TELEMETRY_SIDE_QUERY_HOLD_SECS`]）没等到就照旧按它自己建会话。
     pub(super) presession: HashMap<(i64, String), Vec<(ApiCall, Instant)>>,
+    /// 已经发出、还没处理的标题：`(凭证, session_id)` → `(发起时刻, sleepy 去重键)`，见 [`Telemetry::note_dispatch`]。
+    /// 处理时去掉；回包一直没来的由 [`Telemetry::gc`] 按 [`config::TELEMETRY_DISPATCHED_TITLE_SECS`] 清。
+    pub(super) dispatched_titles: HashMap<(i64, String), Vec<(SystemTime, String)>>,
     /// 待发批次按 `(凭证, session_id)` 分开攒：真实客户端一个进程一个会话，各自往上报，
     /// **一个批次里只会有一个 `session_id` / `device_id`**。同一张凭证被几台设备同时用时，
     /// 合在一个 POST 里就是官方不会产生的混合批次。
@@ -949,6 +957,7 @@ impl Session {
             deferred: Vec::new(),
             snapshot_hash: None,
             sleepy_models: Vec::new(),
+            waiting_titles: Vec::new(),
             heron_done: false,
             tether_main: None,
             thread_bases: HashMap::new(),

@@ -2260,3 +2260,36 @@ async fn a_new_conversation_in_a_reused_slot_starts_a_fresh_session(pool: sqlx::
     assert!(!billing.contains("cc_prev_req="), "{billing}");
     assert!(billing.contains("cc_prompt_index=1;"), "{billing}");
 }
+
+/// 遥测的请求起点只有一个来源：入站那一刻的墙钟（[`ReqStart::wall`](crate::proxy::logging::ReqStart)）。`Capture::started_at`
+/// 照它报，发出时登记标题（`Telemetry::note_dispatch`）也传它——中间隔着请求准备的耗时，两边各自再取 `now` 推算
+/// 就会差出这一段，sleepy 的先后与登记清理全对不上。
+#[sqlx::test]
+async fn telemetry_capture_reports_the_inbound_wall_clock(pool: sqlx::PgPool) {
+    let (store, state, ids) = setup(pool, 1, "http://127.0.0.1:9").await;
+    let cred = store.get(ids[0]).await.unwrap().unwrap();
+    let wall = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+    let start = crate::proxy::logging::ReqStart { at: std::time::Instant::now(), wall };
+    // 准备耗时。
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let upstream = crate::proxy::connectivity::prewarm_upstream(
+        wreq::Client::new(),
+        "http://127.0.0.1:9/v1/messages".into(),
+        &cred,
+        "tok-0",
+        "claude-haiku-5-5",
+    );
+    let flags = store::ForwardFlags { api_telemetry: true, ..Default::default() };
+    let cap = crate::proxy::logging::telemetry_capture(
+        &state,
+        &cred,
+        &upstream,
+        &Bytes::new(),
+        start,
+        flags,
+        true,
+        None,
+    )
+    .expect("telemetry on");
+    assert_eq!(cap.started_at, wall);
+}

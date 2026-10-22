@@ -781,18 +781,21 @@ impl EventBuilder<'_> {
         }
     }
 
-    /// 子代理自己那几类事件的顶层 `betas` 换回它这条请求的。
+    /// 子代理收尾那条 `tengu_agent_tool_completed` 的顶层 `betas` 换成它这条请求自己那份会话级 beta。
+    ///
+    /// 它自己的 `tengu_api_query` / `tengu_api_success` 不在这里换：API 事件的顶层报这条请求的**完整**
+    /// beta 串，与 meta 里那份同值，生成时已经跟着 meta 走了（`cap/2.1.285` 起直到
+    /// `cap/auto-2.1.308-20261022-gaps`，各版子代理 API 事件顶层与 meta 都相同：claude-code-guide 跑 haiku-4.5
+    /// 时 11 项、跑 haiku-5-5 时 16 项）。此前在这里一并换成过滤后那份（6 项），是错的。
     pub(super) fn emit_agent_own_betas(&mut self) {
         let env = self.env;
         let TurnFacts { kind, ref betas_own, ref betas_session, .. } = *env.f;
         // `take_tpl` 借着 `self.tpl_events`/`self.tpl_dd`，到这里已经不再用它，可以并进主队列。
         if kind.is_agent() && betas_session != betas_own {
             for (_, e) in self.events.iter_mut() {
-                let own = matches!(
-                    e["event_data"]["event_name"].as_str(),
-                    Some("tengu_api_query" | "tengu_api_success" | "tengu_agent_tool_completed")
-                );
-                if own && let Some(d) = e.get_mut("event_data").and_then(|d| d.as_object_mut()) {
+                if e["event_data"]["event_name"].as_str() == Some("tengu_agent_tool_completed")
+                    && let Some(d) = e.get_mut("event_data").and_then(|d| d.as_object_mut())
+                {
                     d.insert("betas".into(), json!(&betas_own));
                 }
             }

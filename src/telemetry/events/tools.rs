@@ -527,6 +527,7 @@ impl EventBuilder<'_> {
             v305,
             v306,
             v307,
+            v308,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -618,6 +619,9 @@ impl EventBuilder<'_> {
             if v299 {
                 bash_meta_v299(&mut bash, command, &tu.result_head, &shape.model, false);
             }
+            // meta 带着这条请求的模型（2.1.299 起）：顶层 `betas` 按这个模型取，子代理跑 haiku 时是 haiku 那份
+            // （`cap/auto-2.1.308-20261022-gaps` claude-code-guide 里那条 Bash，事件与 Datadog 都是 6 项）。
+            self.own_betas_scope = bash.get("model").is_some();
             if bash_failed {
                 // 非零退出（`cap/auto-2.1.285-20260930` 07:58:12.123）：同一份画像报
                 // `command_failed`，退出码取结果开头的 `Exit code N`，没有 `was_backgrounded`；
@@ -627,6 +631,7 @@ impl EventBuilder<'_> {
                     o.insert("exit_code".into(), json!(exit_code_of(&tu.result_head)));
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_failed", bash);
+                self.own_betas_scope = false;
                 let mut sad =
                     json!({ "feature_name": "tool_bash", "error_code": "tool_shell_error" });
                 // 2.1.293 末尾多一项实验标记（`tengu_started` 也多了同一项）。
@@ -636,6 +641,7 @@ impl EventBuilder<'_> {
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
+                self.own_betas_scope = false;
                 self.emit_bash_mentions(command, t_done, prev_msg);
                 self.push_dd(t_done, "tengu_feature_ok", feature("tool_bash"));
             }
@@ -776,8 +782,12 @@ impl EventBuilder<'_> {
             // （`cap/auto-2.1.303-20261019-full` 两条）、2.1.305（`cap/auto-2.1.305-20261021-full` 两条）各换
             // 一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299，2.1.304 沿用 2.1.303。2.1.306
             // （`cap/auto-2.1.306-20261021-full` 三条）只换了 chunk 名与摘要，2.1.307
-            // （`cap/auto-2.1.307-20261022-bash`，全量包里那次没有失败的 Bash）摘要、行列都换了。
-            if v307 {
+            // （`cap/auto-2.1.307-20261022-bash`，全量包里那次没有失败的 Bash）摘要、行列都换了，2.1.308
+            // （`cap/auto-2.1.308-20261022-full` A0 那条）只换了 chunk 名。
+            if v308 {
+                err["error_stack_hash"] = json!("40e496cc06bc");
+                err["error_top_frame"] = json!("chunk-a1cg2ptw.js:3661:6043");
+            } else if v307 {
                 err["error_stack_hash"] = json!("40e496cc06bc");
                 err["error_top_frame"] = json!("chunk-wvsyb4fb.js:3661:6043");
             } else if v306 {

@@ -211,7 +211,8 @@ pub(super) static TEMPLATE_2_1_303_SDK: std::sync::LazyLock<Template> =
 /// 与 2.1.305-full 比，luban 发的事件 meta 键都没变（零星几条多出的键是场景分支，两版 JS 逐字相同）。
 /// 2.1.307 同样沿用：`cap/auto-2.1.307-20261022-full` 与 2.1.306-full 比，模板里那些事件的键与常量都没变，
 /// 变的几处（摘要器收尾的 writer、auto 判决的 `skippedOnAllowRule`、压缩尝试的 `keepNoRound`、拒绝时的
-/// `tengu_safety_event`）都在按请求现算的事件里，见 `TurnFacts::v307`。
+/// `tengu_safety_event`）都在按请求现算的事件里，见 `TurnFacts::v307`。2.1.308 也沿用：两版内嵌 JS 除版本号 /
+/// 构建时间外逐字相同，`cap/auto-2.1.308-20261022-full` 与 2.1.307-full 比多出的几个键都是场景分支。
 pub(super) static TEMPLATE_2_1_305: std::sync::LazyLock<Template> =
     std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_305.json"))
@@ -225,7 +226,7 @@ pub(super) static TEMPLATE_2_1_305_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_305_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306、2.1.307）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306 ~ 2.1.308）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {

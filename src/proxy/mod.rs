@@ -97,7 +97,9 @@ pub(crate) use rate_limit::{
 pub(crate) use usage_grace::note_eval_features;
 pub(crate) mod agent_summary_config;
 pub(crate) mod cache_keepalive;
+pub(crate) mod curious_tower;
 pub(crate) mod dapper_dawn;
+pub(crate) mod heron_brook;
 mod lucky_cerf;
 pub(crate) mod snoopy_creek;
 pub(crate) use lucky_cerf::{
@@ -1044,10 +1046,10 @@ pub(crate) use session_id::session_plan;
 pub(crate) use session_link::{CC_SESSIONS, ThreadState};
 #[allow(unused_imports)]
 pub(crate) use simulation::{
-    MAX_SYSTEM_BLOCKS, billing_header_text, cc_identity_well_formed, cc_profile_for,
-    cc_system_rest, cc_version_suffix, client_env, has_cc_tool_profile, is_official_helper_request,
-    is_official_thread_continuation, merge_system_blocks, render_system_rest, simulate_system,
-    simulated_billing_header_text,
+    MAX_SYSTEM_BLOCKS, billing_header_text, cc_identity_well_formed, cc_main_beta_at,
+    cc_profile_for, cc_system_rest, cc_version_suffix, client_env, has_cc_tool_profile,
+    is_official_helper_request, is_official_thread_continuation, merge_system_blocks,
+    render_system_rest, simulate_system, simulated_billing_header_text,
 };
 #[allow(unused_imports)]
 pub(crate) use thinking::retry_demoted_thinking;

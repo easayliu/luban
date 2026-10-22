@@ -663,7 +663,8 @@ pub(super) fn error_message_hash(
 
 /// 这个构建里 API 错误那条栈的固定三样（`error_constructor` / `error_stack_hash` / `error_top_frame`）：压缩后的类名与
 /// 打包块名随构建变，只登记抓到过的。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值），2.1.307 的
-/// 5xx（`cap/auto-2.1.307-20261022-retry` 三条同值：摘要没变，类名与块名换了）。
+/// 5xx（`cap/auto-2.1.307-20261022-retry` 三条同值：摘要没变，类名与块名换了），2.1.308 的 5xx
+/// （`cap/auto-2.1.308-20261022-retry` 三条同值：只换了块名，行列与类名都没变）。
 pub(super) fn error_trace(
     version: &str,
     status: Option<u16>,
@@ -674,6 +675,9 @@ pub(super) fn error_trace(
         }
         ("2.1.307", Some(s)) if s >= 500 => {
             Some(("WVt", "5b32b751db51", "chunk-2f0n1d7c.js:11:1510"))
+        }
+        ("2.1.308", Some(s)) if s >= 500 => {
+            Some(("WVt", "5b32b751db51", "chunk-zht3j5ev.js:11:1510"))
         }
         _ => None,
     }

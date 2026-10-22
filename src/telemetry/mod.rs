@@ -180,6 +180,50 @@ impl Telemetry {
     }
 
     /// 某凭证最近一次响应头里的 `anthropic-organization-id`（保活事件的 `auth` 块用）。
+    /// 一条请求**发出时**登记：只认标题生成（带 `structured-outputs` beta、体里有官方那句起名提示），记下它的发起时刻
+    /// 与模型。官方在请求发起前记某个模型的首次应用（`tengu_sleepy_snowflake_applied`，`Zmr`），而 luban 要等回包才处理；
+    /// 标题先发、却比后发的主线程晚返回时，主线程处理时靠这份登记知道该让给它（见 `process` 判 `sleepy` 处）。
+    ///
+    /// 其余请求一律不看体：先按 beta 头筛，主线程那种几 MB 的体不会被扫。
+    pub fn note_dispatch(
+        &self,
+        cred_id: i64,
+        headers: &axum::http::HeaderMap,
+        body: &[u8],
+        at: SystemTime,
+    ) {
+        let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !beta.contains("structured-outputs-") {
+            return;
+        }
+        const TITLE_PROMPT: &[u8] = b"You are naming a coding session";
+        if !body.windows(TITLE_PROMPT.len()).any(|w| w == TITLE_PROMPT) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(body) else { return };
+        if v.get("tools").and_then(|t| t.as_array()).is_some_and(|t| !t.is_empty()) {
+            return;
+        }
+        let Some(model) = v.get("model").and_then(|m| m.as_str()) else { return };
+        let session = v
+            .pointer("/metadata/user_id")
+            .and_then(|u| u.as_str())
+            .and_then(|u| serde_json::from_str::<Value>(u).ok())
+            .and_then(|u| u.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
+            .or_else(|| {
+                headers
+                    .get("x-claude-code-session-id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            });
+        let Some(session) = session else { return };
+        let mut st = self.0.state.lock();
+        st.dispatched_titles
+            .entry((cred_id, session))
+            .or_default()
+            .push((at, process::sleepy_key(model)));
+    }
+
     pub fn org_uuid(&self, cred_id: i64) -> Option<String> {
         self.0.state.lock().org_uuid.get(&cred_id).cloned()
     }
@@ -357,11 +401,20 @@ impl Telemetry {
                 Self::finish_retry_chain(&mut st, h);
             }
         }
-        // 扣住太久的侧查询：没等到主线程请求，按会话现有的 prompt id 补发。
+        // 扣住太久的侧查询：没等到主线程请求，按会话现有的 prompt id 补发。主线程那条正扣在重试链里的不算：它迟早会落地
+        // （重发成功，或上面按最终失败补处理，最多 [`config::TELEMETRY_RETRY_HOLD_SECS`]），侧查询跟着等，等到了才拿得到
+        // 新一轮的 prompt id 与主线程那份会话级 beta。
         let hold = Duration::from_secs(config::TELEMETRY_SIDE_QUERY_HOLD_SECS);
+        let main_held: std::collections::HashSet<(i64, String)> = st
+            .held_retries
+            .keys()
+            .filter(|(_, _, lane)| *lane == RetryLane::Main)
+            .map(|(c, sid, _)| (*c, sid.clone()))
+            .collect();
         let stale: Vec<(i64, String)> = st
             .sessions
             .iter()
+            .filter(|(k, _)| !main_held.contains(*k))
             .filter(|(_, s)| s.deferred.iter().any(|(_, _, at)| now.duration_since(*at) >= hold))
             .map(|(k, _)| k.clone())
             .collect();
@@ -371,12 +424,20 @@ impl Telemetry {
         let stale_pre: Vec<(i64, String)> = st
             .presession
             .iter()
+            .filter(|(k, _)| !main_held.contains(*k))
             .filter(|(_, v)| v.iter().any(|(_, at)| now.duration_since(*at) >= hold))
             .map(|(k, _)| k.clone())
             .collect();
         for k in stale_pre {
             Self::replay_presession(&mut st, &k);
         }
+        // 发出后一直没回来的标题不再挡着主线程。
+        let keep = Duration::from_secs(config::TELEMETRY_DISPATCHED_TITLE_SECS);
+        let wall = SystemTime::now();
+        st.dispatched_titles.retain(|_, t| {
+            t.retain(|(at, _)| wall.duration_since(*at).unwrap_or_default() < keep);
+            !t.is_empty()
+        });
         let expired: Vec<((i64, String), Session)> = {
             let keys: Vec<(i64, String)> = st
                 .sessions

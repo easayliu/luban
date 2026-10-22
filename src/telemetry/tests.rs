@@ -1399,6 +1399,95 @@ fn feature_name_position_follows_the_version() {
     }
 }
 
+/// 服务端下发了 heron 文本的会话：首次输入报一条；压缩成功后官方清掉系统段缓存（`XEn("compaction")`），下一条主线程
+/// 请求重新组装再报一条——哪怕它是工具结果续轮；之后不再报。
+#[test]
+fn heron_is_reported_again_after_a_successful_compaction() {
+    const CRED: i64 = -3_081;
+    let boot = json!({ "client_data": { "tengu_heron_brook": "x".repeat(2790) } }).to_string();
+    crate::proxy::heron_brook::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
+    let t = Telemetry::default();
+    let ua = "claude-cli/2.1.308 (external, cli)";
+    let base = frozen_now() - Duration::from_secs(120);
+    let send = |body: Vec<u8>, id: &str, stop: &str, at: u64, compact: bool| {
+        let mut c = call(body, id, stop);
+        c.cred_id = CRED;
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(at);
+        if compact {
+            c.agent = AgentHeaders {
+                agent_id: None,
+                agent_type: None,
+                request_class: Some("compaction".into()),
+            };
+        }
+        t.ingest(c);
+    };
+    let herons = || {
+        let st = t.0.state.lock();
+        st.pending[&(CRED, SESSION.to_string())]
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_heron_brook_applied")
+            .count()
+    };
+    send(cc_body(true), "req_1", "end_turn", 0, false);
+    assert_eq!(herons(), 1);
+    send(cc_body(false), "req_2", "end_turn", 10, false);
+    assert_eq!(herons(), 1, "段缓存还在，续轮不报");
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"] = json!([
+        {"role":"user","content":[{"type":"text","text":"hello there"}]},
+        {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+    ]);
+    send(body.to_string().into_bytes(), "req_c", "end_turn", 20, true);
+    send(cc_body(false), "req_3", "tool_use", 30, false);
+    assert_eq!(herons(), 2, "压缩后的下一条主线程请求重新组装");
+    send(cc_body(false), "req_4", "end_turn", 40, false);
+    assert_eq!(herons(), 2);
+}
+
+/// 用户取消的 `/compact`（没有失败、只是取消）不清系统段缓存：之后的主线程请求不再报 heron。
+#[test]
+fn a_cancelled_compaction_does_not_report_heron_again() {
+    const CRED: i64 = -3_082;
+    let boot = json!({ "client_data": { "tengu_heron_brook": "x".repeat(2790) } }).to_string();
+    crate::proxy::heron_brook::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let send = |body: Vec<u8>, id: &str, stop: &str, at: u64, compact: bool| {
+        let mut c = call(body, id, stop);
+        c.cred_id = CRED;
+        c.ua_out = "claude-cli/2.1.308 (external, cli)".into();
+        c.started_at = base + Duration::from_secs(at);
+        if compact {
+            c.agent = AgentHeaders {
+                agent_id: None,
+                agent_type: None,
+                request_class: Some("compaction".into()),
+            };
+            c.aborted = true;
+        }
+        t.ingest(c);
+    };
+    send(cc_body(true), "req_1", "end_turn", 0, false);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"] = json!([
+        {"role":"user","content":[{"type":"text","text":"hello there"}]},
+        {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+    ]);
+    send(body.to_string().into_bytes(), "req_c", "end_turn", 20, true);
+    send(cc_body(false), "req_3", "tool_use", 30, false);
+    send(cc_body(true), "req_4", "end_turn", 40, false);
+    let st = t.0.state.lock();
+    let herons = st.pending[&(CRED, SESSION.to_string())]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_heron_brook_applied")
+        .count();
+    assert_eq!(herons, 1);
+}
+
 /// `/compact` 收尾：恢复文件之后重宣告两个池子（`messagesLength` 是保留的消息数），`compact_reactive` 之后、逐出提示
 /// 之前一条 `reactive_compact_succeeded`（键序照官方：分组与保留、token、用量、上下文统计、百分比）；压缩完主线程的
 /// 读状态清空，再读不算重读。
@@ -5370,19 +5459,22 @@ fn version_2_1_291_telemetry_shape() {
 }
 
 /// 一个 2.1.293 会话的首轮（模型、出站 beta 由调用方给）：返回事件链（名字 + meta + 顶层 betas）。
+/// 号是 `cred_id`：`tengu_heron_brook` 按号记（[`crate::proxy::heron_brook`]），各测试别共用。
 fn first_turn_2_1_293(
+    cred_id: i64,
     model: &str,
     effort: Option<&str>,
     betas: &str,
 ) -> Vec<(String, Value, Value)> {
     let t = Telemetry::default();
     let mut c = call(body_for(model, effort, true), "req_293", "end_turn");
+    c.cred_id = cred_id;
     c.ua_out = "claude-cli/2.1.293 (external, cli)".into();
     c.betas = Some(betas.into());
     c.resp_model = Some(model.into());
     t.ingest(c);
     let st = t.0.state.lock();
-    let p = st.pending.get(&key()).expect("queued");
+    let p = st.pending.get(&(cred_id, SESSION.to_string())).expect("queued");
     p.events
         .iter()
         .map(|(_, e)| {
@@ -5423,9 +5515,20 @@ fn version_2_1_293_telemetry_shape() {
         advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,thinking-binding-controls-2026-08-01,\
         thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
         cache-diagnosis-2026-04-07,message-threads-2026-08-12";
-    let opus = first_turn_2_1_293("claude-opus-5-5", Some("high"), opus_betas);
-    let h55 = first_turn_2_1_293("claude-haiku-5-5", Some("high"), h55_betas);
-    let h45 = first_turn_2_1_293("claude-haiku-4-5-20251001", None, h45_betas);
+    // 那时 haiku-5-5 的 bootstrap 带着 2790 字的 `client_data.tengu_heron_brook`（`00291`），opus / haiku-4.5 的没有。
+    const CRED: i64 = -2_931;
+    let heron_text = "x".repeat(2790);
+    for (model, client_data) in [
+        ("claude-haiku-5-5", json!({ "tengu_heron_brook": heron_text })),
+        ("claude-opus-5-5", json!({})),
+        ("claude-haiku-4-5", json!({})),
+    ] {
+        let boot = json!({ "client_data": client_data }).to_string();
+        crate::proxy::heron_brook::note_bootstrap(CRED, model, boot.as_bytes());
+    }
+    let opus = first_turn_2_1_293(CRED, "claude-opus-5-5", Some("high"), opus_betas);
+    let h55 = first_turn_2_1_293(CRED, "claude-haiku-5-5", Some("high"), h55_betas);
+    let h45 = first_turn_2_1_293(CRED, "claude-haiku-4-5-20251001", None, h45_betas);
     let has = |ev: &[(String, Value, Value)], n: &str| ev.iter().any(|(x, ..)| x == n);
     let meta = |ev: &[(String, Value, Value)], n: &str| {
         ev.iter().find(|(x, ..)| x == n).map(|(_, m, _)| m.clone()).unwrap_or(Value::Null)
@@ -5465,7 +5568,14 @@ fn version_2_1_293_telemetry_shape() {
     assert!(has(&h55, "tengu_heron_brook_applied"));
     assert!(!has(&opus, "tengu_heron_brook_applied") && !has(&h45, "tengu_heron_brook_applied"));
     let heron = h55.iter().position(|(n, ..)| n == "tengu_heron_brook_applied").unwrap();
+    assert_eq!(
+        (&h55[heron].1["len"], &h55[heron].1["fromClientData"]),
+        (&json!(2790), &json!(true))
+    );
     assert_eq!(h55[heron + 1].0, "tengu_sleepy_snowflake_applied", "紧挨在 sleepy 前");
+    // 服务端没下发（2.1.299 起的 bootstrap、或这个号还没拉过）就没有这一条。
+    let undelivered = first_turn_2_1_293(-2_932, "claude-haiku-5-5", Some("high"), h55_betas);
+    assert!(!has(&undelivered, "tengu_heron_brook_applied"));
 
     let catalog = |ev: &[(String, Value, Value)]| meta(ev, "tengu_model_catalog_compare");
     assert!(catalog(&opus).get("default_output_match").is_some());
@@ -6879,13 +6989,19 @@ fn version_2_1_307_telemetry_shape() {
     assert_eq!(attempt["keepNoRound"], false);
     assert!(compact_attempt("claude-cli/2.1.306 (external, cli)").get("keepNoRound").is_none());
 
-    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.307 (external, sdk-cli)");
-    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
-        assert_eq!(
-            (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
-            (&json!("WVt"), &json!("5b32b751db51"), &json!("chunk-2f0n1d7c.js:11:1510")),
-            "{n}"
-        );
+    for (ua, frame) in [
+        ("claude-cli/2.1.307 (external, sdk-cli)", "chunk-2f0n1d7c.js:11:1510"),
+        // 2.1.308 只换了块名（`cap/auto-2.1.308-20261022-retry` 三条同值）。
+        ("claude-cli/2.1.308 (external, sdk-cli)", "chunk-zht3j5ev.js:11:1510"),
+    ] {
+        let ev = retried_sdk_turn(4, false, ua);
+        for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+            assert_eq!(
+                (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
+                (&json!("WVt"), &json!("5b32b751db51"), &json!(frame)),
+                "{ua} {n}"
+            );
+        }
     }
 }
 
@@ -7499,6 +7615,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.308 (external, cli)", "40e496cc06bc", "chunk-a1cg2ptw.js:3661:6043"),
         ("claude-cli/2.1.307 (external, cli)", "40e496cc06bc", "chunk-wvsyb4fb.js:3661:6043"),
         ("claude-cli/2.1.306 (external, cli)", "c19e7dcf6637", "chunk-z4fyjkxt.js:3654:6164"),
         ("claude-cli/2.1.305 (external, cli)", "a4913bdffc8a", "chunk-h56h5ggw.js:3654:6164"),
@@ -8714,4 +8831,536 @@ fn an_unrecognized_tool_failure_is_not_a_success() {
     );
     let err = ev.iter().find(|(n, _)| n == "tengu_tool_use_error").map(|(_, m)| m).unwrap();
     assert_eq!((&err["toolName"], &err["error"]), (&json!("WebFetch"), &json!("Error")));
+}
+
+/// `cap/auto-2.1.308-20261022-gaps` 里的一条：文件编号、停止原因、回复里的工具调用（工具名 → 入参字符数）。
+type GapStep = (&'static str, &'static str, &'static [(&'static str, usize)]);
+
+/// `cap/auto-2.1.308-20261022-gaps` 里的一条请求照抓包做成 [`ApiCall`]（停止原因与工具调用由调用方给）；抓包目录
+/// 不在就是 `None`。
+fn gaps_call(step: &GapStep, cred_id: i64, at: SystemTime) -> Option<ApiCall> {
+    let (f, stop, tools) = *step;
+    let rel = format!("auto-2.1.308-20261022-gaps/{f}_");
+    let (body, betas) = cap_request(&rel)?;
+    let shape = parse_shape(&body).unwrap();
+    let mut c = call(body, &format!("req_{f}"), stop);
+    c.cred_id = cred_id;
+    c.betas = betas;
+    c.ua_out = "claude-cli/2.1.308 (external, cli)".into();
+    c.resp_model = Some(shape.model.clone());
+    c.message_id = Some(format!("msg_{f}"));
+    c.started_at = at;
+    c.tool_use_lens = tools.iter().map(|(n, l)| (n.to_string(), *l)).collect();
+    c.client_request_id = cap_header(&rel, "x-client-request-id");
+    c.agent = AgentHeaders {
+        agent_id: cap_header(&rel, "x-claude-code-agent-id"),
+        agent_type: cap_header(&rel, "x-claude-code-agent-type"),
+        request_class: cap_header(&rel, "x-claude-code-request-class"),
+    };
+    Some(c)
+}
+
+/// 回放 `cap/auto-2.1.308-20261022-gaps` 里一段会话（各条的停止原因与工具调用由调用方给），返回会话 id。
+fn replay_2_1_308_gaps(t: &Telemetry, cred_id: i64, steps: &[GapStep]) -> Option<String> {
+    let base = frozen_now() - Duration::from_secs(600);
+    let mut session = None;
+    for (i, step) in steps.iter().enumerate() {
+        let c = gaps_call(step, cred_id, base + Duration::from_secs(10 * i as u64))?;
+        session = parse_shape(&c.body).unwrap().session_id;
+        t.ingest(c);
+    }
+    session
+}
+
+/// `modelHeldStateless` 跟服务端清单 `tengu_curious_tower_stateless_models` 走（`cap/auto-2.1.308-20261022-gaps`
+/// 的 fable-5-1 默认权限模式：`00037` 首轮调 Read、`00039` 续轮）：
+/// - 没见过这个号的 eval：2.1.291 起按空串（这一版起抓包里一律是空串），两条都是 false，首轮 `create`、续轮
+///   `continue`——官方就是这样，此前写死「fable-5-1 一律 true」与实际建线程自相矛盾；
+/// - 号的 eval 里清单列了 fable-5-1：照官方报 true；清单是空串时即使是 2.1.285 这种老版本也报 false。
+#[test]
+fn model_held_stateless_follows_the_server_list() {
+    const STEPS: &[GapStep] =
+        &[("00037", "tool_use", &[("Read", 135)]), ("00039", "end_turn", &[])];
+    let decisions = |cred_id: i64| -> Option<Vec<(Value, Value, Value)>> {
+        let t = Telemetry::default();
+        let session = replay_2_1_308_gaps(&t, cred_id, STEPS)?;
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(cred_id, session)).expect("queued");
+        let metas = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let dec = metas("tengu_tether_decision");
+        let live = metas("tengu_tether_live_outcome");
+        assert_eq!((dec.len(), live.len()), (2, 2));
+        Some(
+            dec.iter()
+                .zip(&live)
+                .map(|(d, l)| {
+                    assert_eq!(d["modelHeldStateless"], l["modelHeldStateless"]);
+                    (
+                        d["modelHeldStateless"].clone(),
+                        d["decision"].clone(),
+                        l["sentThreadType"].clone(),
+                    )
+                })
+                .collect(),
+        )
+    };
+    let Some(unseen) = decisions(7) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    assert_eq!(
+        unseen,
+        [
+            (json!(false), json!("create"), json!("create")),
+            (json!(false), json!("continue"), json!("continue"))
+        ]
+    );
+    let listed = 9_308_001;
+    crate::proxy::note_eval_features(
+        listed,
+        br#"{"features":{"tengu_curious_tower_stateless_models":{"value":"fable-5-1"}}}"#,
+    );
+    assert!(decisions(listed).unwrap().iter().all(|(held, _, _)| held == &json!(true)));
+    // 版本兜底只在没见过 eval 时用：清单是空串的号，老版本照样报 false。
+    let empty = 9_308_002;
+    crate::proxy::note_eval_features(empty, br#"{"features":{}}"#);
+    assert!(!super::kind::model_held_stateless("claude-fable-5-1", Some(""), false));
+    assert!(
+        super::kind::model_held_stateless("claude-fable-5-1", None, false),
+        "2.1.291 之前沿用旧规则"
+    );
+    assert!(!super::kind::model_held_stateless("claude-fable-5-1", None, true));
+    // 清单按规范名写、请求带 provider id 的也算（官方 `O8e` 还比 `qe()` 映射后的规范名）。
+    assert!(super::kind::model_held_stateless(
+        "claude-sonnet-4-20250514",
+        Some("claude-sonnet-4-0"),
+        true
+    ));
+    assert!(decisions(empty).unwrap().iter().all(|(held, _, _)| held == &json!(false)));
+}
+
+/// 子代理事件顶层 `betas` 按事件类别取（`cap/auto-2.1.308-20261022-gaps`：opus 主线程 `00116` 派 claude-code-guide、
+/// `00118` 收尾；子代理跑 haiku-5-5，`00119` 调 WebFetch、`00123` 跑 Bash、`00124` 收尾）：
+/// - 它自己的 `api_query` / `api_success` 是这条请求完整的 beta 串（16 项，与 meta 同值）；
+/// - `agent_tool_selected` / `agent_tool_completed` 与它里面那条 Bash（事件与 Datadog）是它自己那份会话级 beta
+///   （haiku 那 6 项）；
+/// - 支线上其余事件是主线程那份（opus 的 7 项）。
+#[test]
+fn subagent_event_betas_follow_the_event_kind() {
+    const STEPS: &[GapStep] = &[
+        ("00116", "tool_use", &[("Agent", 270)]),
+        ("00118", "end_turn", &[]),
+        ("00119", "tool_use", &[("WebFetch", 257)]),
+        ("00123", "tool_use", &[("Bash", 416)]),
+        ("00124", "end_turn", &[]),
+    ];
+    const OWN: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
+        thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+    const MAIN: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+        redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+        prompt-caching-scope-2026-01-05";
+    let t = Telemetry::default();
+    let Some(session) = replay_2_1_308_gaps(&t, 7, STEPS) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let full: Vec<String> = ["00119", "00123", "00124"]
+        .iter()
+        .map(|f| cap_request(&format!("auto-2.1.308-20261022-gaps/{f}_")).unwrap().1.unwrap())
+        .collect();
+    assert_eq!(full[0].split(',').count(), 16);
+    let agent = cap_header("auto-2.1.308-20261022-gaps/00119_", "x-claude-code-agent-id").unwrap();
+    let st = t.0.state.lock();
+    let p = st.pending.get(&(7, session)).expect("queued");
+    let top = |e: &Value| e["event_data"]["betas"].as_str().unwrap_or_default().to_string();
+    let of_agent = |e: &Value| e["event_data"]["agent_id"] == agent.as_str();
+
+    for n in ["tengu_api_query", "tengu_api_success"] {
+        let got: Vec<String> = p
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == n && of_agent(e))
+            .map(|(_, e)| top(e))
+            .collect();
+        assert_eq!(got, full, "{n}：完整请求串");
+        for (_, e) in p.events.iter().filter(|(_, e)| ev_name(e) == n && of_agent(e)) {
+            assert_eq!(meta_of(e)["betas"].as_str().unwrap(), top(e), "{n}：顶层与 meta 同值");
+        }
+    }
+    let one = |n: &str| -> Value {
+        p.events
+            .iter()
+            .find(|(_, e)| ev_name(e) == n)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_else(|| panic!("{n}"))
+    };
+    assert_eq!(top(&one("tengu_agent_tool_selected")), OWN);
+    assert_eq!(top(&one("tengu_agent_tool_completed")), OWN);
+    assert_eq!(top(&one("tengu_bash_tool_command_executed")), OWN);
+    let dd_bash = p.dd.iter().find(|d| d["message"] == "tengu_bash_tool_command_executed").unwrap();
+    assert_eq!(dd_bash["betas"], OWN, "Datadog 那条同样是它自己那份");
+    // 支线上其余事件：主线程那份。
+    let tool_ok: Vec<String> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_tool_use_success" && of_agent(e))
+        .map(|(_, e)| top(e))
+        .collect();
+    assert!(!tool_ok.is_empty() && tool_ok.iter().all(|b| b == MAIN), "{tool_ok:?}");
+}
+
+/// 主线程（fable）那 7 项与 haiku-5-5 自己那 6 项会话级 beta。
+const GAPS_MAIN_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+    redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+    prompt-caching-scope-2026-01-05";
+const GAPS_HAIKU_BETAS: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+    redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,\
+    prompt-caching-scope-2026-01-05";
+
+/// 一个会话里某几条事件的（顶层 `model`，顶层 `betas`）。
+fn top_model_betas(p: &Pending, name: &str) -> Vec<(String, String)> {
+    p.events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == name)
+        .map(|(_, e)| {
+            let d = &e["event_data"];
+            (
+                d["model"].as_str().unwrap_or_default().into(),
+                d["betas"].as_str().unwrap_or_default().into(),
+            )
+        })
+        .collect()
+}
+
+/// 标题这类侧查询处理时报的事件，顶层是主线程那份会话级 beta（`cap/auto-2.1.308-20261022-gaps` G0：haiku-5-5 的标题
+/// `00036` 先到、被扣住，fable 主线程 `00037` 处理完才补处理）：`session_title_generated` / `tool_schema_sizes` /
+/// `tool_search_mode_decision` 都是主线程那 7 项；meta 报标题自己模型的 `sleepy_snowflake_applied` 是 haiku 那 6 项。
+#[test]
+fn side_query_events_report_the_main_session_betas() {
+    const STEPS: &[GapStep] = &[
+        ("00036", "end_turn", &[]),
+        ("00037", "tool_use", &[("Read", 135)]),
+        ("00039", "end_turn", &[]),
+    ];
+    let t = Telemetry::default();
+    let Some(session) = replay_2_1_308_gaps(&t, 7, STEPS) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let st = t.0.state.lock();
+    let p = st.pending.get(&(7, session)).expect("queued");
+    for n in [
+        "tengu_session_title_generated",
+        "tengu_tool_schema_sizes",
+        "tengu_tool_search_mode_decision",
+    ] {
+        let got = top_model_betas(p, n);
+        assert!(!got.is_empty() && got.iter().all(|(_, b)| b == GAPS_MAIN_BETAS), "{n}: {got:?}");
+    }
+    let sleepy: Vec<(String, String)> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_sleepy_snowflake_applied")
+        .map(|(_, e)| {
+            let b = e["event_data"]["betas"].as_str().unwrap_or_default();
+            (meta_of(e)["model"].as_str().unwrap_or_default().to_string(), b.to_string())
+        })
+        .collect();
+    assert!(sleepy.contains(&("claude-haiku-5-5".into(), GAPS_HAIKU_BETAS.into())), "{sleepy:?}");
+    assert!(sleepy.contains(&("claude-fable-5-1".into(), GAPS_MAIN_BETAS.into())), "{sleepy:?}");
+}
+
+/// 主线程那条一直没来、扣满时限的标题（`cap/auto-2.1.308-20261022-gaps` 的 `00115`，单独处理）：按会话主模型推
+/// 主线程那份——设备记得默认模型（先处理过同一台机器上 fable 那个会话的 `00037`）就按它，顶层 `model` 与 `betas`
+/// 都是 fable；设备也没见过、会话由标题自己建的，两样都只能用标题自己的（haiku）。
+#[test]
+fn a_lone_title_falls_back_to_the_session_main_model() {
+    let titles = |seed: bool| -> Option<Vec<(String, String)>> {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(600);
+        if seed {
+            t.ingest(gaps_call(&("00037", "tool_use", &[("Read", 135)]), 7, base)?);
+        }
+        let title = gaps_call(&("00115", "end_turn", &[]), 7, base + Duration::from_secs(60))?;
+        let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+        t.ingest(title);
+        let hold = Duration::from_secs(crate::config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1);
+        t.gc(std::time::Instant::now() + hold);
+        let st = t.0.state.lock();
+        Some(top_model_betas(
+            st.pending.get(&(7, session)).expect("queued"),
+            "tengu_session_title_generated",
+        ))
+    };
+    let Some(seeded) = titles(true) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    assert_eq!(seeded, [("claude-fable-5-1".to_string(), GAPS_MAIN_BETAS.to_string())]);
+    assert_eq!(
+        titles(false).unwrap(),
+        [("claude-haiku-5-5".to_string(), GAPS_HAIKU_BETAS.to_string())]
+    );
+}
+
+/// 孤立标题扣满时限补处理之后，指标导出那条 `tengu_feature_ok{internal_metrics_export}` 的顶层 `model` 与 `betas`
+/// 同源：设备默认主模型是 fable（先处理过 `00037`），两样都报 fable 那份，不能一个 haiku（标题自己的）一个 fable。
+#[test]
+fn a_lone_title_exports_metrics_with_the_session_main_model() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let Some(seed) = gaps_call(&("00037", "tool_use", &[("Read", 135)]), 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    t.ingest(seed);
+    let title = gaps_call(&("00115", "end_turn", &[]), 7, base + Duration::from_secs(60)).unwrap();
+    let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+    t.ingest(title);
+    let hold = Duration::from_secs(crate::config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1);
+    let now = std::time::Instant::now() + hold;
+    t.gc(now);
+    let later = now + Duration::from_secs(crate::config::TELEMETRY_METRICS_FLUSH_SECS + 1);
+    let exports: Vec<(String, String)> = t
+        .take_due(later)
+        .iter()
+        .filter(|f| f.session_id == session)
+        .flat_map(|f| f.events.iter())
+        .filter(|e| {
+            ev_name(e) == "tengu_feature_ok"
+                && meta_of(e)["feature_name"] == "internal_metrics_export"
+        })
+        .map(|e| {
+            let d = &e["event_data"];
+            (
+                d["model"].as_str().unwrap_or_default().into(),
+                d["betas"].as_str().unwrap_or_default().into(),
+            )
+        })
+        .collect();
+    assert_eq!(exports, [("claude-fable-5-1".to_string(), GAPS_MAIN_BETAS.to_string())]);
+}
+
+/// 来访模型名可以是任意 UTF-8：一个 `claude-模型` 的主线程请求（400）被记成设备默认模型后，同设备只有标题的新会话
+/// 扣满时限补处理，按它推主线程那份 beta（[`crate::proxy::cc_main_beta_at`]）不能切进多字节字符 panic——那会让
+/// 生产里的发送任务退出。
+#[test]
+fn a_lone_title_survives_a_non_ascii_device_default_model() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let Some(mut seed) = gaps_call(&("00037", "end_turn", &[]), 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let body = String::from_utf8(seed.body.to_vec()).unwrap();
+    assert!(body.contains("\"claude-fable-5-1\""));
+    seed.body = Bytes::from(body.replace("\"claude-fable-5-1\"", "\"claude-模型\""));
+    seed.resp_model = Some("claude-模型".into());
+    t.ingest(failed(seed, Some(400), "invalid_request_error", "model: 模型"));
+    let title = gaps_call(&("00115", "end_turn", &[]), 7, base + Duration::from_secs(60)).unwrap();
+    let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+    t.ingest(title);
+    let hold = Duration::from_secs(crate::config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1);
+    t.gc(std::time::Instant::now() + hold);
+    let st = t.0.state.lock();
+    let got = top_model_betas(
+        st.pending.get(&(7, session)).expect("queued"),
+        "tengu_session_title_generated",
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, "claude-模型");
+}
+
+/// 2.1.308 haiku-5-5\[1m] 会话（`cap/auto-2.1.308-20261022-gaps` G3：标题 `00078` 先发、主线程 `00079` 随后）只有一条
+/// `tengu_sleepy_snowflake_applied`，`model` 是标题那条的 `claude-haiku-5-5`：官方剥 `[1m]` 去重。标题被扣住、主线程先
+/// 处理，主线程也不能抢走这个键。
+#[test]
+fn sleepy_dedups_haiku_1m_against_its_earlier_title() {
+    const STEPS: &[GapStep] = &[
+        ("00078", "end_turn", &[]),
+        ("00079", "tool_use", &[("Read", 135)]),
+        ("00081", "end_turn", &[]),
+    ];
+    let t = Telemetry::default();
+    let Some(session) = replay_2_1_308_gaps(&t, 7, STEPS) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let st = t.0.state.lock();
+    let p = st.pending.get(&(7, session)).expect("queued");
+    let sleepy: Vec<Value> = p
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_sleepy_snowflake_applied")
+        .map(|(_, e)| meta_of(e)["model"].clone())
+        .collect();
+    assert_eq!(sleepy, [json!("claude-haiku-5-5")]);
+}
+
+/// 转发路径发出这条请求时的登记（[`Telemetry::note_dispatch`]）。生产里登记与 `ApiCall::started_at`（经
+/// `Capture::started_at`）取的都是这条请求入站那一刻的墙钟（`proxy::ReqStart::wall`），故这里传 `c.started_at`。
+fn dispatch(t: &Telemetry, c: &ApiCall) {
+    let mut h = axum::http::HeaderMap::new();
+    if let Some(b) = &c.betas {
+        h.insert("anthropic-beta", b.parse().unwrap());
+    }
+    t.note_dispatch(c.cred_id, &h, &c.body, c.started_at);
+}
+
+/// 一个会话所有 `tengu_sleepy_snowflake_applied` 的 `model`（已刷出的批次加上还在待发队列里的）。
+fn sleepy_models_of(t: &Telemetry, flushed: &[Flush], session: &str) -> Vec<Value> {
+    let st = t.0.state.lock();
+    flushed
+        .iter()
+        .filter(|f| f.session_id == session)
+        .flat_map(|f| f.events.iter())
+        .chain(
+            st.pending
+                .get(&(7, session.to_string()))
+                .into_iter()
+                .flat_map(|p| p.events.iter().map(|(_, e)| e)),
+        )
+        .filter(|e| ev_name(e) == "tengu_sleepy_snowflake_applied")
+        .map(|e| meta_of(e)["model"].clone())
+        .collect()
+}
+
+/// 同一个 G3 会话，回包顺序反过来：标题 `00078` 先发、却比主线程 `00079` 晚返回。官方在发起前记首次应用，仍只有标题
+/// 那条 `claude-haiku-5-5`——标题发出时登记过，主线程处理时让给它；哪怕主线程那批先刷出去、标题 45 秒后才回来也一样。
+#[test]
+fn sleepy_goes_to_the_earlier_title_even_when_it_returns_later() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let Some(mut title) = gaps_call(&("00078", "end_turn", &[]), 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    title.total_ms = 45_000;
+    let main =
+        gaps_call(&("00079", "tool_use", &[("Read", 135)]), 7, base + Duration::from_secs(1));
+    let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+    dispatch(&t, &title);
+    t.ingest(main.unwrap());
+    // 主线程那批先刷出去（事件 30 秒一批）。
+    let later = Instant::now() + Duration::from_secs(config::TELEMETRY_EVENT_FLUSH_SECS + 1);
+    let flushed = t.take_due(later);
+    t.ingest(title);
+    t.ingest(gaps_call(&("00081", "end_turn", &[]), 7, base + Duration::from_secs(50)).unwrap());
+    assert_eq!(sleepy_models_of(&t, &flushed, &session), [json!("claude-haiku-5-5")]);
+    assert!(t.0.state.lock().dispatched_titles.is_empty(), "标题处理完登记就去掉");
+}
+
+/// 生产时序：标题 0ms 入站、20ms（准备完）才发出，主线程 10ms 入站、30ms 发出，主线程先返回。登记用入站时刻（与
+/// `ApiCall::started_at` 同源），不是发出那一刻：标题仍算先发，sleepy 归它；它处理完登记也正好清掉，不残留。
+#[test]
+fn sleepy_ordering_uses_the_inbound_start_not_the_send_time() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let Some(title) = gaps_call(&("00078", "end_turn", &[]), 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let main =
+        gaps_call(&("00079", "tool_use", &[("Read", 135)]), 7, base + Duration::from_millis(10))
+            .unwrap();
+    let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+    // 20ms 时标题发出：登记的是它的入站时刻（0ms），不是 20ms。
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("anthropic-beta", title.betas.as_deref().unwrap().parse().unwrap());
+    t.note_dispatch(7, &h, &title.body, title.started_at);
+    t.ingest(main);
+    t.ingest(title);
+    t.ingest(gaps_call(&("00081", "end_turn", &[]), 7, base + Duration::from_secs(10)).unwrap());
+    assert_eq!(sleepy_models_of(&t, &[], &session), [json!("claude-haiku-5-5")]);
+    assert!(t.0.state.lock().dispatched_titles.is_empty(), "登记与 started_at 同源，处理完即清");
+}
+
+/// 主线程首发 529（`t0`）、标题随后发出（`t1`）、主线程重发成功（`t5`）先处理：首次应用按逻辑起点属于 `t0` 的主线程，
+/// 留主线程那条 `claude-haiku-5-5[1m]`，晚到的标题不报。
+#[test]
+fn sleepy_stays_with_a_main_request_that_started_before_the_title_and_retried() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let main: GapStep = ("00079", "tool_use", &[("Read", 135)]);
+    let Some(first) = gaps_call(&main, 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let mut first = failed(first, Some(529), "overloaded_error", "Overloaded");
+    first.total_ms = 8;
+    let session = parse_shape(&first.body).unwrap().session_id.unwrap();
+    t.ingest(first);
+    let title = gaps_call(&("00078", "end_turn", &[]), 7, base + Duration::from_secs(1)).unwrap();
+    dispatch(&t, &title);
+    let mut retry = gaps_call(&main, 7, base + Duration::from_secs(5)).unwrap();
+    retry.dispatch = Some("v2p".into());
+    t.ingest(retry);
+    t.ingest(title);
+    t.ingest(gaps_call(&("00081", "end_turn", &[]), 7, base + Duration::from_secs(20)).unwrap());
+    assert_eq!(sleepy_models_of(&t, &[], &session), [json!("claude-haiku-5-5[1m]")]);
+}
+
+/// 主线程那条正扣在重试链里（`00116` 头一次 529）时，扣住的标题（`00115`）跟着等，不到时限就放；重发成功后先处理
+/// 主线程那条，标题随后补处理，报主线程那份会话级 beta。
+#[test]
+fn a_title_waits_for_a_main_request_held_in_retry() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(600);
+    let main: GapStep = ("00116", "tool_use", &[("Agent", 270)]);
+    let Some(title) = gaps_call(&("00115", "end_turn", &[]), 7, base) else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-gaps not present");
+        return;
+    };
+    let session = parse_shape(&title.body).unwrap().session_id.unwrap();
+    t.ingest(title);
+    let mut first = failed(
+        gaps_call(&main, 7, base + Duration::from_secs(1)).unwrap(),
+        Some(529),
+        "overloaded_error",
+        "Overloaded",
+    );
+    first.total_ms = 8;
+    t.ingest(first);
+    let hold = Duration::from_secs(crate::config::TELEMETRY_SIDE_QUERY_HOLD_SECS + 1);
+    t.gc(std::time::Instant::now() + hold);
+    assert!(
+        t.0.state.lock().presession.contains_key(&(7, session.clone())),
+        "主线程还扣在重试里，标题接着等"
+    );
+    let mut retry = gaps_call(&main, 7, base + Duration::from_secs(2)).unwrap();
+    retry.dispatch = Some("v2p".into());
+    t.ingest(retry);
+    let st = t.0.state.lock();
+    assert!(!st.presession.contains_key(&(7, session.clone())));
+    let got = top_model_betas(
+        st.pending.get(&(7, session)).expect("queued"),
+        "tengu_session_title_generated",
+    );
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, GAPS_MAIN_BETAS);
+}
+
+/// 按会话主模型推出来的主线程那份会话级 beta（[`crate::proxy::cc_main_beta_at`] 再过 [`session_betas`]）与
+/// `cap/auto-2.1.308-20261022-full` 各族真实主线程请求头过滤出来的逐字相同：opus `00469`、sonnet `00280`、
+/// haiku-4.5 `00423`、haiku-5-5 `00380`、fable `00613`（auto 模式，多出的两项不进会话级）、opus\[1m] `00237`。
+#[test]
+fn derived_main_session_betas_match_the_2_1_308_captures() {
+    for (f, model) in [
+        ("00469", "claude-opus-5-5"),
+        ("00280", "claude-sonnet-5-5"),
+        ("00423", "claude-haiku-4-5"),
+        ("00380", "claude-haiku-5-5"),
+        ("00613", "claude-fable-5-1"),
+        ("00237", "claude-opus-5-5[1m]"),
+    ] {
+        let Some((_, Some(official))) = cap_request(&format!("auto-2.1.308-20261022-full/{f}_"))
+        else {
+            eprintln!("skipped: cap/auto-2.1.308-20261022-full not present");
+            return;
+        };
+        let derived = crate::proxy::cc_main_beta_at(model, Some((2, 1, 308)));
+        assert_eq!(session_betas(&derived), session_betas(&official), "{model}（{f}）");
+    }
 }

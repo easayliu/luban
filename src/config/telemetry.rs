@@ -55,6 +55,10 @@ pub const TELEMETRY_SESSION_IDLE_SECS: u64 = 30 * 60;
 /// 请求比主线程那条早 4ms 发出，cc_prompt_id 却是新一轮的）。等不到就按会话现有的 id 发。
 pub const TELEMETRY_SIDE_QUERY_HOLD_SECS: u64 = 10;
 
+/// 发出后一直没处理的标题（[`crate::telemetry::Telemetry::note_dispatch`] 登记的那条）留多久：过了就当它不会回来了，
+/// 主线程不再为它让出 `sleepy_snowflake_applied`。标题生成是几秒的小请求，十分钟足够覆盖慢回包与重试。
+pub const TELEMETRY_DISPATCHED_TITLE_SECS: u64 = 600;
+
 /// 主线程请求遇到可重试的失败（5xx、429、连接层……）先扣多久等客户端重发：官方的重试间隔指数增长
 /// （`cap/auto-2.1.306-20261021-retry` 里 0.6s、1.15s，默认最多 10 次、单次封顶 32 秒上下），等不到就当它是最终
 /// 失败补报。每来一次重发重新计时。

@@ -105,6 +105,7 @@ impl<'a> EventEnv<'a> {
             prev_main_depth,
             prompt_seq,
             v285,
+            v291,
             ref agent,
             ref identity,
             ref display_model,
@@ -153,10 +154,11 @@ impl<'a> EventEnv<'a> {
         } else {
             (shape.messages_len, 0)
         };
-        // 三条 tether 事件共用的「无状态」判定：模型被固定成无状态发送，或 auto 模式的分类器
-        // 在跑（`cap/2.1.280`：auto 的三条 true，切回 default 的四条 false）。两者任一为真，
+        // 三条 tether 事件共用的「无状态」判定：模型被固定成无状态发送（服务端清单，按号记），或 auto 模式的
+        // 分类器在跑（`cap/2.1.280`：auto 的三条 true，切回 default 的四条 false）。两者任一为真，
         // 这条实际就不走线程（`sentThreadType: "none"`）。
-        let model_held = model_held_stateless(display_model);
+        let listed = crate::proxy::curious_tower::stateless_models(call.cred_id);
+        let model_held = model_held_stateless(display_model, listed.as_deref(), v291);
         // 2.1.285 起 auto 模式不再钉成无状态：前三轮 auto 的 `classifierHeldStateless` 全是
         // false，请求照带 `message-threads` 并建线程（`cap/2.1.285/00030`、`00040` 批次）。
         let classifier_held = !v285 && shape.permission_mode == "auto";
@@ -455,6 +457,13 @@ pub(super) struct EventBuilder<'a> {
     pub(super) cleared: Option<ClearIds>,
     /// 正在补报上一轮的事（[`Self::emit_rejected_tools`]）：这期间 `push*` 发的事件挂上一轮 prompt。
     pub(super) prev_prompt_scope: bool,
+    /// 正在发 meta 里 `model` 是这条请求自己模型的事件（子代理里的 Bash）：这期间 `push*` 的顶层 `betas`
+    /// （事件与 Datadog 两边）报这条请求自己那份会话级 beta（`TurnFacts::betas_own`），不是主线程那份。
+    /// 官方事件的顶层 `betas` 跟 meta 的 `model` 走：带了就按那个模型取，没带才是主线程的
+    /// （`cap/auto-2.1.307-20261022-full` / `cap/auto-2.1.308-20261022-full` / `-gaps` 里 meta 是 haiku 的非
+    /// API 事件全是 haiku 那 6 项：子代理的 `agent_tool_selected` / `agent_tool_completed`、子代理里的
+    /// `bash_tool_command_executed`，以及 `sleepy_snowflake_applied`）。
+    pub(super) own_betas_scope: bool,
     /// 会话的文件账本（[`Files`]）。
     pub(super) files: &'a mut Files,
     /// 这条调用里改动的行数与编辑类工具的权限决定，进 OTel 指标（`lines_of_code.count` /
@@ -490,6 +499,7 @@ impl<'a> EventBuilder<'a> {
             beats: Vec::new(),
             cleared: None,
             prev_prompt_scope: false,
+            own_betas_scope: false,
             files,
             loc: Vec::new(),
             decisions: Vec::new(),
@@ -504,9 +514,15 @@ impl<'a> EventBuilder<'a> {
         }
     }
 
-    /// `push*` 用的上下文：补报上一轮的那段挂上一轮 prompt（[`Self::prev_prompt_scope`]）。
+    /// `push*` 用的上下文：补报上一轮的那段挂上一轮 prompt（[`Self::prev_prompt_scope`]），meta 带这条请求
+    /// 自己模型的那段报它自己的会话级 beta（[`Self::own_betas_scope`]）。
     fn ctx_at(&self, dt: DateTime<Utc>) -> EventCtx<'a> {
-        if self.prev_prompt_scope { self.env.ctx_prev_prompt(dt) } else { self.env.ctx(dt) }
+        let env = self.env;
+        let mut ctx = if self.prev_prompt_scope { env.ctx_prev_prompt(dt) } else { env.ctx(dt) };
+        if self.own_betas_scope {
+            ctx.betas = &env.f.betas_own;
+        }
+        ctx
     }
 
     /// 发一条事件。服务端下发的抽样配置在这里统一过一遍（[`sample_event`]），抽掉的不发。
