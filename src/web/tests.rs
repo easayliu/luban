@@ -1206,12 +1206,16 @@ async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
     let theirs =
         store.insert("c-admin", None, "t", "r-admin", 0, None, None, admin.id).await.unwrap().id;
     // 同一来访会话，模拟会话各不相同（辅助请求与主请求就是这样）：上下文仍要连得上。
-    for (cred, rid, key) in [(mine, "req_mine", "lb:v2:a"), (theirs, "req_theirs", "lb:v2:b")] {
+    for (cred, rid, key, tag) in
+        [(mine, "req_mine", "lb:v2:a", "Mine"), (theirs, "req_theirs", "lb:v2:b", "Theirs")]
+    {
         store
             .insert_usage_log(&store::UsageRecord {
                 cred_id: Some(cred),
                 status: 400,
                 request_id: Some(rid.into()),
+                upstream_request_id: Some(format!("req_011Cmock{tag}")),
+                message_id: Some(format!("msg_011Cmock{tag}")),
                 forensics: store::Forensics {
                     simulated: true,
                     error_message: Some("boom".into()),
@@ -1287,6 +1291,16 @@ async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
     let v = json_of(get(&admin_key, "req_theirs").await.unwrap()).await;
     let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
     assert_eq!(found["earlier_in_session"][0]["request_id"], "req_mine", "同一会话之前的那条");
+    // 上游 request-id、Message id 查到的是同一条。
+    for id in ["req_011CmockMine", "msg_011CmockMine"] {
+        let v = json_of(get(&admin_key, id).await.unwrap()).await;
+        let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
+        assert_eq!(found["requests"][0]["request_id"], "req_mine", "{id}");
+        assert_eq!(found["requests"][0]["message_id"], "msg_011CmockMine", "{id}");
+    }
+    let v = json_of(get(&admin_key, "msg_011Cnope").await.unwrap()).await;
+    assert_eq!(v["result"]["isError"], true);
+    assert!(text(&v).contains("try the request's request-id"), "{}", text(&v));
 
     // 用户只查得到自己的号，取证字段按号主口径抹掉；别人的号当查不到。
     let v = json_of(get(&user_key, "req_mine").await.unwrap()).await;
@@ -1297,14 +1311,17 @@ async fn mcp_only_accepts_mcp_keys_and_scopes_lookups(pool: sqlx::PgPool) {
             && f.get("error_message").is_none()
             && f.get("session_id_in").is_none()
     );
-    let v = json_of(get(&user_key, "req_theirs").await.unwrap()).await;
-    assert_eq!(v["result"]["isError"], true);
+    for id in ["req_theirs", "msg_011CmockTheirs"] {
+        let v = json_of(get(&user_key, id).await.unwrap()).await;
+        assert_eq!(v["result"]["isError"], true, "{id}");
+    }
 
     let search = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": "search_requests", "arguments": {"session_id": "sess-1", "limit": 1}}});
     let v = json_of(rpc(&admin_key, search, None).await.unwrap()).await;
     let found: serde_json::Value = serde_json::from_str(&text(&v)).unwrap();
     assert_eq!(found["requests"][0]["request_id"], "req_theirs");
+    assert_eq!(found["requests"][0]["message_id"], "msg_011CmockTheirs", "列表行也带");
     assert!(found["next_before_id"].is_i64(), "满一页给下一页的锚点");
 }
 

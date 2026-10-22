@@ -27,8 +27,9 @@ import { RequestIdChip, statusVariant } from '@/components/usage-shared'
  * 按请求 id 查一条流水。
  *
  * 排查路径：New API 日志里的 `upstream_request_id`（就是 luban 回在 `X-Oneapi-Request-Id`
- * 上的那个 `req_…`），贴进来直接看到它走的是哪个账号、模型、状态、用量与花费。
- * 不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
+ * 上的那个 `req_…`），贴进来直接看到它走的是哪个账号、模型、状态、用量与花费。上游的
+ * request-id（`req_011C…`）与回复的 Message id（`msg_…`）同样认——Claude Code 对话记录里
+ * 只有这两个。不限账号——拿着 id 来的人不知道它落在哪个号上，这正是要查的东西。
  */
 /**
  * 点进流水时带的筛选：某个模型、某个账号，或某条会话，取最近几小时。
@@ -77,7 +78,7 @@ export function RequestLookupDialog({
     queryFn: () => {
       // 贴进来的是 uuid 就按**会话 id** 查（出站与来访两侧任一命中，见后端 session_id_in）：
       // 走模拟路径时上游看到的会话 id 与客户端自己那个不是同一个，而来查的人手里通常只有
-      // 客户端那个。其余按请求 id 精确查。
+      // 客户端那个。其余按请求 id 精确查（luban 的、上游 request-id、Message id 后端都认）。
       if (!filter) {
         return looksLikeUuid(submitted)
           ? listUsage({ session_id: submitted, limit: 50 })
@@ -121,8 +122,8 @@ export function RequestLookupDialog({
             {filter
               ? drillTitle
               : <ClampedDescription text={t(
-                  '粘贴 luban 在响应头 X-Request-Id / X-Oneapi-Request-Id 中返回的请求 ID（New API 日志中称为 upstream_request_id，报错信息中称为 luban request id），即可查看该请求的流水。也可粘贴会话 ID（uuid），查看该会话的全部请求；客户端自身的会话 ID 与上游看到的会话 ID 均可识别。',
-                  'Paste the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages) to find its record here. You can also paste a session ID (uuid) to list all of that session\'s requests; both the client\'s own session ID and the one upstream sees are recognized.',
+                  '粘贴请求的任一 ID 即可查看其流水：luban 在响应头 X-Request-Id / X-Oneapi-Request-Id 中返回的请求 ID（New API 日志中称为 upstream_request_id，报错信息中称为 luban request id）、上游的 request-id（形如 req_011C…，即 Claude Code 对话记录中的 requestId），或回复的消息 ID（形如 msg_…）。也可粘贴会话 ID（uuid），查看该会话的全部请求；客户端自身的会话 ID 与上游看到的会话 ID 均可识别。',
+                  'Paste any of a request\'s IDs to find its record: the request ID luban returned in the X-Request-Id / X-Oneapi-Request-Id response header (upstream_request_id in New API logs, "luban request id" in error messages), the upstream request-id (req_011C…, requestId in Claude Code transcripts), or the reply\'s message ID (msg_…). You can also paste a session ID (uuid) to list all of that session\'s requests; both the client\'s own session ID and the one upstream sees are recognized.',
                 )} />}
           </DialogDescription>
         </DialogHeader>
@@ -130,7 +131,7 @@ export function RequestLookupDialog({
           {!filter && <Form onSubmit={(e) => { e.preventDefault(); submit() }}>
             <Field>
               <FieldLabel htmlFor="request-lookup-id">
-                {t('请求 ID 或会话 ID', 'Request ID or session ID')}
+                {t('请求 ID、消息 ID 或会话 ID', 'Request, message or session ID')}
               </FieldLabel>
               <Group className="w-full">
                 <Input
@@ -154,7 +155,12 @@ export function RequestLookupDialog({
                       '按会话 ID 查询：同时匹配客户端自报的会话 ID 与上游看到的会话 ID，列出该会话最近 50 条请求。',
                       'Looking up by session ID: matches both the client-reported and the upstream-visible session ID, listing the session\'s latest 50 requests.',
                     )
-                  : t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
+                  : draft.trim().startsWith('msg_')
+                    ? t(
+                        '按消息 ID 查询：较早的流水未记录消息 ID，查不到时请改用 request-id。',
+                        'Looking up by message ID. Older records carry no message ID; if nothing is found, try the request-id instead.',
+                      )
+                    : t('精确匹配；流水只保留最近 30 天。', 'Exact match; logs are retained for 30 days.')}
               </FieldDescription>
             </Field>
           </Form>}
@@ -174,8 +180,8 @@ export function RequestLookupDialog({
                 <EmptyTitle className="text-base">{filter ? t('所选时间范围内没有请求', 'No requests in this period') : t('未找到该请求', 'No request found')}</EmptyTitle>
                 <EmptyDescription>
                   {t(
-                    '请确认 ID 完整（请求 ID 形如 req_ 加 16 位随机字符，会话 ID 为 uuid）；超过 30 天的流水已被清理。0.3.139 之前的记录没有客户端侧会话 ID，只能用上游看到的会话 ID 查询。',
-                    'Check that the ID is complete (request IDs look like req_ plus 16 random characters; a session ID is a uuid). Records older than 30 days have been pruned. Records from before 0.3.139 have no client-side session ID; look those up with the upstream one.',
+                    '请确认 ID 完整（luban 请求 ID 形如 req_ 加 16 位随机字符，上游 request-id 形如 req_011C…，消息 ID 形如 msg_…，会话 ID 为 uuid）；超过 30 天的流水已被清理。0.3.139 之前的记录没有客户端侧会话 ID，只能用上游看到的会话 ID 查询。',
+                    'Check that the ID is complete (luban request IDs look like req_ plus 16 random characters, upstream request-ids like req_011C…, message IDs like msg_…, and a session ID is a uuid). Records older than 30 days have been pruned. Records from before 0.3.139 have no client-side session ID; look those up with the upstream one.',
                   )}
                 </EmptyDescription>
               </EmptyHeader>
@@ -249,6 +255,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         {full && <Fact label={t('设备（出站）', 'Device (outbound)')}><Hint label={log.device_id_out}><span className="font-mono">{log.device_id_out?.slice(0, 8) ?? '—'}</span></Hint></Fact>}
         <Fact label={t('请求 ID', 'Request ID')}><RequestIdChip id={log.request_id} full /></Fact>
         <Fact label={t('上游 request-id', 'Upstream request-id')}><RequestIdChip id={log.upstream_request_id} full /></Fact>
+        <Fact label={t('消息 ID', 'Message ID')}><RequestIdChip id={log.message_id} full /></Fact>
         <Fact label={t('路径', 'Path')}><Hint label={log.path}><span className="font-mono">{log.path}</span></Hint></Fact>
         {full && (<>
         <Fact label={t('会话（入站 → 出站）', 'Session (inbound → outbound)')}>

@@ -195,12 +195,16 @@ fn initialize(params: &Value, state: &AppState, host: &str) -> Value {
         "serverInfo": { "name": "luban", "title": title, "version": env!("CARGO_PKG_VERSION") },
         "instructions": format!(
             "This server is {identity}. It gives read-only access to that instance's request log, \
-             which keeps the last 30 days. Request ids look like `req_…`; luban returns them in the \
-             `X-Oneapi-Request-Id` header and in error bodies, and New API records them as \
-             `upstream_request_id`. A request is only found on the instance that served it, so if \
-             several luban servers are connected and an id is not found here, try the others. \
-             Name the instance when reporting results. Start with get_request; use search_requests \
-             to browse a conversation, an account or a model."
+             which keeps the last 30 days. A request can be looked up by any of its three ids: \
+             luban's request id (`req_` + 16 characters; returned in the `X-Request-Id` / \
+             `X-Oneapi-Request-Id` headers and in error bodies, and recorded by New API as \
+             `upstream_request_id`), Anthropic's request id (`req_011C…`; the `request-id` header, \
+             `request_id` in upstream error bodies, `requestId` in Claude Code transcripts) or the \
+             reply's message id (`msg_…`; `message.id` in Claude Code transcripts). A request is \
+             only found on the instance that served it, so if several luban servers are connected \
+             and an id is not found here, try the others. Name the instance when reporting \
+             results. Start with get_request; use search_requests to browse a conversation, an \
+             account or a model."
         ),
     })
 }
@@ -213,14 +217,16 @@ fn tool_specs() -> Value {
         {
             "name": "get_request",
             "title": "Get request",
-            "description": "Fetch a request from luban's log by its luban request id (`req_…`). \
-                Returns the full record — status, account, model, latency, tokens, cost, rate-limit \
-                headers, upstream error, simulation and rewrite details, inbound headers and body \
-                shape — together with the preceding requests of the same conversation.",
+            "description": "Fetch a request from luban's log by any of its ids: luban's request \
+                id (`req_` + 16 characters), Anthropic's request id (`req_011C…`) or the reply's \
+                message id (`msg_…`). Returns the full record — status, account, model, latency, \
+                tokens, cost, rate-limit headers, upstream error, simulation and rewrite details, \
+                inbound headers and body shape — together with the preceding requests of the same \
+                conversation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "request_id": { "type": "string", "description": "luban request id, e.g. req_Q3k9ZpL2mNv7Xb1c" },
+                    "request_id": { "type": "string", "description": "luban request id (e.g. req_Q3k9ZpL2mNv7Xb1c), Anthropic request id (req_011C…) or message id (msg_…)" },
                     "context": {
                         "type": "integer", "minimum": 0, "maximum": CONTEXT_MAX,
                         "description": format!("Number of preceding requests from the same conversation to include (default {CONTEXT_DEFAULT})")
@@ -326,8 +332,14 @@ async fn get_request(state: &AppState, actor: &Actor, args: &Value) -> ToolResul
         .await
         .map_err(query_failed)?;
     let Some(first) = hits.first() else {
+        // Message id 是后来才落库的（迁移 0014），更早的流水按它查不到，按 request-id 还查得到。
         return Err(format!(
-            "no request with id {request_id} (the log keeps 30 days{})",
+            "no request with id {request_id} (the log keeps 30 days{}{})",
+            if request_id.starts_with("msg_") {
+                "; older records carry no message id, so try the request's request-id instead"
+            } else {
+                ""
+            },
             if owner.is_some() { "; only your own accounts are visible" } else { "" }
         ));
     };
@@ -425,6 +437,7 @@ fn compact(l: &UsageLog) -> Value {
         "time": local_time(l.ts),
         "request_id": l.request_id,
         "upstream_request_id": l.upstream_request_id,
+        "message_id": l.message_id,
         "cred_id": l.cred_id,
         "cred_label": l.cred_label,
         "model": l.model,

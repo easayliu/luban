@@ -806,7 +806,7 @@ fn is_forwardable(name: &HeaderName, value: &HeaderValue) -> bool {
     )
 }
 
-/// 响应头是否可回传：跳过由框架管理的分帧类头。
+/// 响应头是否可回传：跳过由框架管理的分帧类头，以及号的归属头。
 ///
 /// `content-encoding` 保留转发，但正常情况下它**根本不会出现**——wreq 解码后会把它连同
 /// `content-length` 一起摘掉，我们回给客户端的是未压缩内容。只有上游用了我们没开的编码时
@@ -814,9 +814,21 @@ fn is_forwardable(name: &HeaderName, value: &HeaderValue) -> bool {
 ///
 /// 客户端向 luban 声明了 `accept-encoding` 却收到未压缩内容，这在 HTTP 里完全合法
 /// （accept-encoding 是偏好不是要求）。代价是 luban→客户端这一腿不再压缩。
+///
+/// `anthropic-organization-id` / `anthropic-workspace-id` 是这个号所在的组织与工作区，上游每条
+/// 回包都带。回给下游，等于让它认出自己落在哪个号上、前后两次是不是同一个号，号池里的号就被
+/// 逐个认了出来。luban 自己要用的（遥测的组织 id、额度原文）在拼回包之前就从上游响应读走了，
+/// 不受影响；探针的本地应答本来就不带这两个头（见 `probe_detect::upstream_like_headers`）。
 pub(super) fn is_resp_forwardable(name: &HeaderName) -> bool {
     let n = name.as_str().to_ascii_lowercase();
-    !matches!(n.as_str(), "content-length" | "transfer-encoding" | "connection")
+    !matches!(
+        n.as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "anthropic-organization-id"
+            | "anthropic-workspace-id"
+    )
 }
 
 #[cfg(test)]

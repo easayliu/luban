@@ -22,8 +22,9 @@ pub(super) struct UsageQuery {
     /// 理由见 [`store::UsageLogQuery`]。
     #[serde(default)]
     pub(super) until: Option<i64>,
-    /// 只看这一个请求 id（luban 回在 `X-Oneapi-Request-Id` 上的那个，New API 日志里的
-    /// `upstream_request_id`）。精确匹配，空白视同不筛。
+    /// 只看这一条请求：luban 回在 `X-Oneapi-Request-Id` 上的那个（New API 日志里的
+    /// `upstream_request_id`）、上游 request-id、Message id 任一命中即算（见
+    /// [`store::UsageLogQuery::request_id`]）。精确匹配，空白视同不筛。
     #[serde(default)]
     pub(super) request_id: Option<String>,
     /// 只看这个模型（精确匹配）；趋势对话框的拆分表点进来带的。

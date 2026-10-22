@@ -284,9 +284,17 @@ async fn none_out_of_pool(store: &CredentialStore, ids: &[i64]) -> bool {
 }
 
 /// 一发成功的流式回复原样转回客户端，上游收到的是号的 token，流水记到这个号上、带用量。
+///
+/// 回包头里号的归属（组织、工作区）不回给下游，上游 `request-id` 照传；三种 id（luban 的、
+/// 上游 request-id、Message id）都进流水。
 #[sqlx::test]
 async fn a_successful_stream_is_relayed_and_logged(pool: sqlx::PgPool) {
-    let mock = MockUpstream::start(vec![sse_ok("waves fold into foam")]).await;
+    let reply = sse_ok("waves fold into foam").with_headers(&[
+        ("request-id", "req_011CmockStreamOk".into()),
+        ("anthropic-organization-id", "6e6debaf-d767-41df-bd11-9b41f5ded8d5".into()),
+        ("anthropic-workspace-id", "wrkspc_0189SBiWvo9rHawcoyfpjo9J".into()),
+    ]);
+    let mock = MockUpstream::start(vec![reply]).await;
     let (store, state, ids) = setup(pool.clone(), 1, &mock.base).await;
 
     let (status, headers, body) = send(&state, cc_request(serde_json::json!({}))).await;
@@ -296,6 +304,9 @@ async fn a_successful_stream_is_relayed_and_logged(pool: sqlx::PgPool) {
         headers.get(header::CONTENT_TYPE).unwrap().to_str().unwrap().contains("text/event-stream")
     );
     assert!(String::from_utf8_lossy(&body).contains("waves fold into foam"));
+    assert_eq!(headers.get("request-id").unwrap(), "req_011CmockStreamOk");
+    assert!(headers.get("anthropic-organization-id").is_none(), "号的组织不回给下游");
+    assert!(headers.get("anthropic-workspace-id").is_none(), "号的工作区不回给下游");
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].token, "tok-0");
@@ -306,6 +317,14 @@ async fn a_successful_stream_is_relayed_and_logged(pool: sqlx::PgPool) {
     assert_eq!(rows[0].status, 200);
     assert_eq!(rows[0].cred_id, Some(ids[0]));
     assert!(rows[0].has_usage, "SSE 里的用量要嗅出来");
+    assert_eq!(
+        rows[0].request_id.as_deref(),
+        headers.get("x-request-id").and_then(|v| v.to_str().ok())
+    );
+    assert_eq!(rows[0].upstream_request_id.as_deref(), Some("req_011CmockStreamOk"));
+    assert_eq!(rows[0].message_id.as_deref(), Some("msg_mock"), "取自 message_start");
+    let raw = rows[0].ratelimit_raw.as_deref().unwrap_or_default();
+    assert!(raw.contains("anthropic-organization-id="), "流水里照记：{raw}");
 }
 
 /// 401 账号级错误（token 作废）：停用这个号，换一个号重发，客户端拿到的是第二个号的 200。
@@ -1170,6 +1189,7 @@ async fn a_probe_is_sent_as_a_prewarm_and_an_empty_reply_gets_ok(pool: sqlx::PgP
         rows[0].forensics.rewrites.as_deref(),
         Some("probe_prewarm:ping,probe_reply_filled")
     );
+    assert_eq!(rows[0].message_id.as_deref(), Some("msg_01upstream"), "非流式取顶层 id");
 }
 
 /// 来访要流式就把上游那段整段 JSON 展成 SSE；旧一代模型回的那一个字原样交回，不补「OK」。

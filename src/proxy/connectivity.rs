@@ -1125,6 +1125,7 @@ fn log_probe_usage(
         cost_usd,
         request_id: Some(request_id.clone()),
         upstream_request_id: upstream_request_id.map(str::to_string),
+        message_id: sniffer.message_id.clone(),
         // 连通性测试整条都是照官方形态造的（见 `probe`），故 simulated 恒为 true；
         // 非 2xx 时把上游文案与第三方判定一并记下，与转发路径同口径。
         forensics: {

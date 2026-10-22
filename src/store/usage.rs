@@ -59,6 +59,12 @@ pub struct UsageRecord {
     pub request_id: Option<String>,
     /// 上游**最后一次**响应头里的 `request-id`，对 Anthropic 工单用。
     pub upstream_request_id: Option<String>,
+    /// 回复的 Message id（`msg_…`：流式取自 `message_start`，非流式取自顶层 `id`）。报错、
+    /// 本地拒绝、`count_tokens` 这类没有回复的为 `None`。
+    ///
+    /// 与上面两个 id 一样能直接查（[`UsageLogQuery::request_id`]）：下游手里常常只有它和上游
+    /// request-id——Claude Code 本地对话记录里每条回复存的就是 `message.id` 与 `requestId`。
+    pub message_id: Option<String>,
     /// 取证字段，见 [`Forensics`]。
     pub forensics: Forensics,
 }
@@ -194,6 +200,8 @@ pub struct UsageLog {
     pub request_id: Option<String>,
     /// 见 [`UsageRecord::upstream_request_id`]。
     pub upstream_request_id: Option<String>,
+    /// 见 [`UsageRecord::message_id`]；加列（迁移 0014）之前的旧记录为 `None`。
+    pub message_id: Option<String>,
     /// 取证字段，见 [`Forensics`]。0.3.76 之前的旧记录全部为空/false。
     #[serde(flatten)]
     pub forensics: Forensics,
@@ -219,7 +227,13 @@ pub struct UsageLogQuery {
     pub offset: i64,
     /// 最多返回条数。调用方负责收敛，这里不设默认上限。
     pub limit: i64,
-    /// 只看这一个请求 id（精确匹配，见 [`UsageRecord::request_id`]）；空白视同 `None`。
+    /// 只看这一条请求：luban 的请求 id、上游 request-id、Message id **任一命中**即算（精确匹配，
+    /// 见 [`UsageRecord::request_id`]、[`UsageRecord::upstream_request_id`]、
+    /// [`UsageRecord::message_id`]）；空白视同 `None`。
+    ///
+    /// 三种一起认，来查的人就不必分清手里是哪一种：New API 日志里记的是 luban 的，Claude Code
+    /// 本地对话记录里是后两种，上游报错体里是上游 request-id。luban 生成的 `req_` + 16 位、上游的
+    /// `req_011C…`（28 位）与 `msg_…` 形态各异，互不误中。三列各有索引，PG 走 BitmapOr。
     pub request_id: Option<String>,
     /// 只看这个模型（精确匹配 `model` 列）；空白视同 `None`。趋势对话框的拆分表点进来用。
     pub model: Option<String>,
@@ -267,7 +281,8 @@ pub(super) const USAGE_LOG_COLS: &str =
         cost_usd, rl_overage_in_use, ua, ua_out, sse_aggregated,
         request_id, upstream_request_id,
         proxy, simulated, shape, session_id, error_type, error_message, third_party, rewrites,
-        device_id_out, response_excerpt, sim_reason, session_key, session_id_in, inbound_headers, inbound_shape";
+        device_id_out, response_excerpt, sim_reason, session_key, session_id_in, inbound_headers, inbound_shape,
+        message_id";
 
 /// 按字符截断（不是按字节：文案里有中文，按字节切会切在多字节中间）。
 pub(super) fn head_chars(s: &str, n: usize) -> String {
@@ -299,6 +314,7 @@ macro_rules! opt_texts {
             &$($m)? $r.ratelimit_raw,
             &$($m)? $r.request_id,
             &$($m)? $r.upstream_request_id,
+            &$($m)? $r.message_id,
             &$($m)? $r.forensics.proxy,
             &$($m)? $r.forensics.sim_reason,
             &$($m)? $r.forensics.shape,
@@ -366,9 +382,13 @@ pub(super) fn where_clause(q: &UsageLogQuery) -> Result<(String, PgArguments)> {
         let n = push(&mut args, u)?;
         clauses.push(format!("id <= ${n}"));
     }
+    // 三种 id 任一命中，理由见 [`UsageLogQuery::request_id`]。三个分支各有自己的索引（后两条是
+    // 部分索引，`col = $n` 蕴含 `col IS NOT NULL`，用得上），PG 走 BitmapOr。
     if let Some(r) = q.request_id.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
         let n = push(&mut args, r.to_string())?;
-        clauses.push(format!("request_id = ${n}"));
+        clauses.push(format!(
+            "(request_id = ${n} OR upstream_request_id = ${n} OR message_id = ${n})"
+        ));
     }
     if let Some(m) = q.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         let n = push(&mut args, m.to_string())?;
@@ -428,11 +448,11 @@ const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
          request_id, upstream_request_id,
          proxy, simulated, shape, session_id, error_type, error_message, third_party,
          rewrites, device_id_out, response_excerpt, sim_reason, session_key,
-         session_id_in, inbound_headers, inbound_shape)
+         session_id_in, inbound_headers, inbound_shape, message_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
              $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29,
              $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44,
-             $45, $46, $47)";
+             $45, $46, $47, $48)";
 
 /// 流水事务的提交方式，见 [`CredentialStore::insert_usage_log_at`]：`$1` 为 `'off'` 即本事务
 /// 不等 WAL 落盘，为 NULL 即照库的当前设置（原样写回，等于不改）。
@@ -629,6 +649,7 @@ impl CredentialStore {
             .bind(&rec.forensics.session_id_in)
             .bind(&rec.forensics.inbound_headers)
             .bind(&rec.forensics.inbound_shape)
+            .bind(&rec.message_id)
             .execute(&mut *tx)
             .await?;
         // 落账与费用汇总。cred_id 为空的流水（还没选到凭证就失败的请求）无处归属、号已删掉的
@@ -863,6 +884,7 @@ pub(super) fn usage_log_from_row(r: &PgRow) -> Result<UsageLog> {
         sse_aggregated: r.try_get::<i64, _>(30)? != 0,
         request_id: r.try_get(31)?,
         upstream_request_id: r.try_get(32)?,
+        message_id: r.try_get(48)?,
         forensics: Forensics {
             proxy: r.try_get(33)?,
             simulated: r.try_get::<i64, _>(34)? != 0,
@@ -1100,7 +1122,7 @@ pub(super) mod tests {
         assert_eq!(store.usage_log_stats(only_a).await.unwrap().total, 5, "不带锚点才看得到新记录");
     }
 
-    /// 请求 id 落库、可精确查。
+    /// 请求 id 落库、可精确查：luban 的、上游 request-id、Message id 三种任一都查得到同一条。
     ///
     /// SQLite 版还用 EXPLAIN QUERY PLAN 钉住了「按号翻页走 (cred_id, id)、按请求 id 走
     /// request_id 索引、按模型走 (model, ts) 覆盖索引、按号统计走覆盖索引」；PG 的计划随统计
@@ -1109,46 +1131,53 @@ pub(super) mod tests {
     async fn usage_logs_are_searchable_by_request_id_using_indexes(pool: sqlx::PgPool) {
         let (store, ids) = store_with(pool, &["a", "b"]).await;
         let (a, b) = (ids[0], ids[1]);
-        let log = async |cred: i64, rid: &str, up: Option<&str>| {
+        let log = async |cred: i64, rid: &str, up: Option<&str>, msg: Option<&str>| {
             store
                 .insert_usage_log(&UsageRecord {
                     cred_id: Some(cred),
                     request_id: Some(rid.into()),
                     upstream_request_id: up.map(Into::into),
+                    message_id: msg.map(Into::into),
                     ..Default::default()
                 })
                 .await
                 .unwrap()
         };
-        log(a, "lb-1", Some("req_up_1")).await;
-        log(a, "lb-2", None).await;
-        log(b, "lb-3", Some("req_up_3")).await;
+        log(a, "lb-1", Some("req_up_1"), Some("msg_1")).await;
+        log(a, "lb-2", None, None).await;
+        log(b, "lb-3", Some("req_up_3"), Some("msg_3")).await;
 
         let by = |rid: &str| UsageLogQuery {
             request_id: Some(rid.into()),
             limit: 10,
             ..Default::default()
         };
-        let hit = store.query_usage_logs(by("lb-3")).await.unwrap();
-        assert_eq!(hit.len(), 1);
-        assert_eq!(hit[0].cred_id, Some(b));
-        assert_eq!(hit[0].upstream_request_id.as_deref(), Some("req_up_3"));
-        assert_eq!(
-            store.usage_log_stats(by("lb-3")).await.unwrap().total,
-            1,
-            "统计与取页同一套条件"
-        );
+        for id in ["lb-3", "req_up_3", "msg_3", " msg_3 "] {
+            let hit = store.query_usage_logs(by(id)).await.unwrap();
+            assert_eq!(hit.len(), 1, "{id}");
+            assert_eq!(hit[0].request_id.as_deref(), Some("lb-3"), "{id}");
+            assert_eq!(hit[0].cred_id, Some(b));
+            assert_eq!(hit[0].upstream_request_id.as_deref(), Some("req_up_3"));
+            assert_eq!(hit[0].message_id.as_deref(), Some("msg_3"));
+            assert_eq!(
+                store.usage_log_stats(by(id)).await.unwrap().total,
+                1,
+                "统计与取页同一套条件"
+            );
+        }
         assert!(store.query_usage_logs(by("nope")).await.unwrap().is_empty());
         // 空白视同不筛。
         assert_eq!(store.query_usage_logs(by("   ")).await.unwrap().len(), 3);
-        // 与按号筛叠加。
-        let both = UsageLogQuery {
-            cred_id: Some(a),
-            request_id: Some("lb-3".into()),
-            limit: 10,
-            ..Default::default()
-        };
-        assert!(store.query_usage_logs(both).await.unwrap().is_empty(), "lb-3 是 b 的");
+        // 与按号筛叠加：三选一的 OR 得整个括起来，否则后两支会越过号的限制。
+        for id in ["lb-3", "req_up_3", "msg_3"] {
+            let both = UsageLogQuery {
+                cred_id: Some(a),
+                request_id: Some(id.into()),
+                limit: 10,
+                ..Default::default()
+            };
+            assert!(store.query_usage_logs(both).await.unwrap().is_empty(), "{id} 是 b 的");
+        }
         // 按模型 + 起点（拆分表点进来）带不带锚点都能跑通。
         for until_id in [None, Some(100)] {
             let q = UsageLogQuery {

@@ -376,6 +376,7 @@ impl Drop for ReqLog {
             cost_usd,
             request_id: Some(self.request_id.clone()),
             upstream_request_id: self.upstream_request_id.clone(),
+            message_id: self.sniffer.message_id.clone(),
             forensics: std::mem::take(&mut self.forensics),
         };
         spawn_usage_log(self.store.clone(), rec);
@@ -1229,7 +1230,8 @@ pub(crate) struct UsageSniffer {
     /// 响应的 `message.id`（`msg_…`）、最终 `stop_reason`，以及正文里 text / thinking 的
     /// 字符数。都是逐请求遥测（`tengu_api_success` / `tengu_turn_first_text` /
     /// `tengu_prompt_cache_diagnosis_received`）要的量，顺着已经在做的逐行解析记下来。
-    message_id: Option<String>,
+    /// `message.id` 另外落进流水，按它能查到这条请求（[`store::UsageRecord::message_id`]）。
+    pub(super) message_id: Option<String>,
     stop_reason: Option<String>,
     /// `stop_details.category`（非流式顶层 / `message_delta.delta`）：拒答时分类器给的类别
     /// （`cyber`、`bio`、…）。**为空的拒答是模型自己拒的**（官方：分类器拦截与模型拒绝都走

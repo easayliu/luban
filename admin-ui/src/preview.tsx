@@ -1065,6 +1065,7 @@ const previewUsageLogs: UsageLog[] = Array.from({ length: 12 }, (_, index) => ({
   cost_usd: index === 9 ? null : 0.0184 + index * 0.0027,
   request_id: index === 11 ? null : `req_Q3k9ZpL2mNv7${String(index).padStart(2, '0')}Xb`,
   upstream_request_id: index % 3 === 0 ? null : `req_01${String(index).padStart(2, '0')}HXk3M9pQ2rT`,
+  message_id: index % 3 === 0 ? null : `msg_01${String(index).padStart(2, '0')}HXk3NbR7sV4`,
   proxy: index % 3 === 0 ? 'socks5h://u:***@exit-sg-01.example:1080' : null,
   simulated: index % 4 === 0,
   shape: '{"keys":["model","messages","system","tools","metadata","max_tokens","stream"],"system":{"blocks":[{"len":10682,"cache":true},{"len":2210,"cache":true}],"sha":"3f9a1c2b4d5e6f70"},"tools":{"count":18,"sha":"a1b2c3d4e5f60718","names":["Bash","Read","Edit"]},"messages":{"count":21,"last_role":"user","blocks":{"text":30,"tool_use":9,"tool_result":9}},"max_tokens":32000,"stream":true}',

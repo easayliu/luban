@@ -318,6 +318,11 @@ export interface UsageLog {
   request_id: string | null
   /** 上游最后一次响应头里的 `request-id`，对 Anthropic 工单用。 */
   upstream_request_id: string | null
+  /**
+   * 回复的 Message id（`msg_…`）；报错、本地拒绝等没有回复的为 null，加列（迁移 0014）
+   * 之前的旧记录也为 null。
+   */
+  message_id: string | null
   // ---- 取证列（0.3.76 起；旧记录为 null / false）----
   /** 这一发实际走的出站代理（密码已打码）；null 为直连。 */
   proxy: string | null
@@ -535,7 +540,10 @@ export async function listCredentialUsage(
   return data
 }
 
-/** 全部账号的流水（按时间倒序）；`request_id` 精确匹配，用于按请求 id 查一条。 */
+/**
+ * 全部账号的流水（按时间倒序）；`request_id` 精确匹配，用于按请求 id 查一条——luban 的请求 id、
+ * 上游 request-id、Message id 三种任一命中即算。
+ */
 export async function listUsage(params: UsageListParams = {}): Promise<UsagePage> {
   const { data } = await api.get<UsagePage>('/usage', { params })
   return data
