@@ -10,6 +10,28 @@ services:
       - POSTGRES_DB=luban
     # 默认 64MB 的 /dev/shm 不够并行查询用，大一点的统计查询会报 shared memory 错误。
     shm_size: 256mb
+    # PG 默认 shared_buffers 只有 128MB，流水表几 GB 时缓存命中率掉到六成、额度统计秒级。
+    # 取值按官方文档（Server Configuration）与 wiki「Tuning Your PostgreSQL Server」：
+    # shared_buffers 取内存 1/4，effective_cache_size 取 3/4，加大 shared_buffers 时同步加大
+    # max_wal_size；SSD 上 random_page_cost 取 1.1、effective_io_concurrency 取数百。
+    # 随内存变的几项由 install.sh 按本机内存算好写进 .env，这里的缺省值按 4GB 内存取。
+    # 改完要重启 postgres：docker compose up -d postgres。
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - max_wal_size=${PG_MAX_WAL_SIZE:-2GB}
+      - -c
+      - min_wal_size=${PG_MIN_WAL_SIZE:-512MB}
+      - -c
+      - random_page_cost=${PG_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - effective_io_concurrency=${PG_EFFECTIVE_IO_CONCURRENCY:-200}
     volumes:
       # 数据库文件持久化到宿主机 ./pgdata。备份别直接拷这个目录（运行中拷出来的不一致），
       # 用 pg_dump，见 install.sh 结尾的说明。

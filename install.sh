@@ -78,8 +78,56 @@ main() {
     ok "已生成数据库密码并写入 $ENV_PATH"
   fi
 
+  # ---------- .env（PG 内存参数）----------
+  # 按本机内存套官方建议：shared_buffers 1/4、effective_cache_size 3/4、maintenance_work_mem
+  # 1/16（封顶 1GB），max_wal_size 随 shared_buffers 同步放大。.env 里已有的项不覆盖，
+  # 手调过的值重装也保留；读不到 /proc/meminfo 时一项不写，compose 用自带的缺省值。
+  local MEM_KB
+  MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  if [[ -n "$MEM_KB" ]]; then
+    local MEM_MB=$((MEM_KB / 1024))
+    local SB_MB=$((MEM_MB / 4))
+    local MWM_MB=$((MEM_MB / 16))
+    ((MWM_MB > 1024)) && MWM_MB=1024
+    ((MWM_MB < 64)) && MWM_MB=64
+    local WAL_MB=$((SB_MB > 1024 ? SB_MB : 1024))
+    local -a PG_PARAMS=(
+      "PG_SHARED_BUFFERS=${SB_MB}MB"
+      "PG_EFFECTIVE_CACHE_SIZE=$((MEM_MB * 3 / 4))MB"
+      "PG_MAINTENANCE_WORK_MEM=${MWM_MB}MB"
+      "PG_MAX_WAL_SIZE=${WAL_MB}MB"
+      "PG_MIN_WAL_SIZE=$((WAL_MB / 4))MB"
+    )
+    if [[ -s "$ENV_PATH" && -n "$(tail -c 1 "$ENV_PATH")" ]]; then
+      echo >> "$ENV_PATH"
+    fi
+    local kv
+    for kv in "${PG_PARAMS[@]}"; do
+      if ! grep -q "^${kv%%=*}=" "$ENV_PATH"; then
+        echo "$kv" >> "$ENV_PATH"
+      fi
+    done
+    ok "已按本机内存 ${MEM_MB}MB 写入 PG 参数（${ENV_PATH}，已有的项不改）"
+  fi
+
   # ---------- docker-compose.yml ----------
   local COMPOSE_PATH="$INSTALL_DIR/docker-compose.yml"
+  # 重装时沿用已有 compose 里 postgres 的端口映射：模板默认不对外开放数据库，有人手动加过
+  # （外部程序要直连库）的话，重写 compose 不能把它悄悄删掉。只认 postgres 服务块里
+  # `ports:` 下紧跟的那几行 `- ...`。
+  local PG_PORTS=""
+  if [[ -f "$COMPOSE_PATH" ]]; then
+    PG_PORTS="$(awk '
+      /^  [^ #]/ { in_pg = ($0 ~ /^  postgres:/); grab = 0; next }
+      in_pg && /^    ports:/ { grab = 1; print; next }
+      in_pg && grab && /^      - / { print; next }
+      { grab = 0 }
+    ' "$COMPOSE_PATH")"
+    if [[ -n "$PG_PORTS" ]]; then
+      PG_PORTS=$'\n'"$PG_PORTS"
+      info "沿用已有的 postgres 端口映射：$(echo "$PG_PORTS" | awk '/- /{print $2}' | xargs)"
+    fi
+  fi
   # \${POSTGRES_PASSWORD} 原样写进文件，由 compose 从 .env 取值，密码不落在 compose 文件里。
   cat > "$COMPOSE_PATH" <<EOF
 services:
@@ -90,7 +138,23 @@ services:
       - POSTGRES_USER=luban
       - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD}
       - POSTGRES_DB=luban
-    shm_size: 256mb
+    shm_size: 256mb${PG_PORTS}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=\${PG_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=\${PG_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - maintenance_work_mem=\${PG_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - max_wal_size=\${PG_MAX_WAL_SIZE:-2GB}
+      - -c
+      - min_wal_size=\${PG_MIN_WAL_SIZE:-512MB}
+      - -c
+      - random_page_cost=\${PG_RANDOM_PAGE_COST:-1.1}
+      - -c
+      - effective_io_concurrency=\${PG_EFFECTIVE_IO_CONCURRENCY:-200}
     volumes:
       - ./pgdata/:/var/lib/postgresql/data/
     healthcheck:
