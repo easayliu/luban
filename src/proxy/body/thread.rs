@@ -574,15 +574,19 @@ pub(in crate::proxy) fn thread_msg_of(m: &serde_json::Value) -> ThreadMsg {
 
 /// 一条消息的线程指纹：去掉 `cache_control`，且字符串形态的 `content` 与等价的单个 `text` 块
 /// 同指纹——[`align_message_shape`] 给末条消息补断点时会把字符串改成块数组，同一条消息在上一轮
-/// 是末条（块数组）、这一轮不是（仍是字符串），不能因此判成历史变了。
+/// 是末条（块数组）、这一轮不是（仍是字符串），不能因此判成历史变了。键序同样不进指纹，见
+/// [`hash_json`]。
 fn message_fingerprint(m: &serde_json::Value) -> u64 {
     use std::hash::{Hash, Hasher};
     let Some(obj) = m.as_object() else { return fingerprint_without_cache_control(m) };
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for (k, x) in obj {
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    for k in keys {
         if k == "cache_control" {
             continue;
         }
+        let x = &obj[k];
         k.hash(&mut h);
         match (k.as_str(), x) {
             ("content", serde_json::Value::String(s)) => hash_without_cache_control(
@@ -660,6 +664,11 @@ fn fingerprint_without_cache_control(v: &serde_json::Value) -> u64 {
 /// 按结构哈希一个 JSON 值，跳过 `cache_control` 键：断点每轮都挪到最后一条消息上，同一条
 /// 消息这轮有、下轮没有，不能因此判成历史变了。
 ///
+/// 对象按**键名排序**后逐个喂，键序不进指纹：上游按解析后的内容渲染提示词，键序不影响缓存，
+/// 中转却常把末条消息解成 map 再写回（`{"text":…,"type":…}`），同一条消息发出时与进历史后键序
+/// 不同。按原序哈希会把它判成历史变了，每轮退回 `create`、历史提醒补不回原位，缓存从 system
+/// 之后整段重写（线上 10-23，第 N 轮末条 `text[text,type]` 对第 N+1 轮 `text[type,text]`）。
+///
 /// 只跳过 API 认断点的那几层（消息、内容块、工具定义，见 [`cache_slots`]）。`tool_use.input`
 /// 与工具的 `input_schema` 里叫 `cache_control` 的是业务数据：客户端改了历史里某次调用的这个
 /// 参数，跳过它就认不出历史变了，续轮把改过的那条切掉，上游接着用旧的。进了这两个键就整棵
@@ -693,12 +702,14 @@ fn hash_json<H: std::hash::Hasher>(v: &serde_json::Value, h: &mut H, strip: bool
         }
         serde_json::Value::Object(o) => {
             5u8.hash(h);
-            for (k, x) in o {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            for k in keys {
                 if strip && k == "cache_control" {
                     continue;
                 }
                 k.hash(h);
-                hash_json(x, h, strip && !matches!(k.as_str(), "input" | "input_schema"));
+                hash_json(&o[k], h, strip && !matches!(k.as_str(), "input" | "input_schema"));
             }
             6u8.hash(h);
         }

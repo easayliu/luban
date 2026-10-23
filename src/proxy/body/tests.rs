@@ -7859,3 +7859,28 @@ fn block_shapes_never_include_message_text() {
     assert!(s.contains("|thinking[type,thinking,signature]:"), "键名照列: {s}");
     assert!(super::block_shapes(&serde_json::json!(secret)).starts_with("string:"));
 }
+
+/// 线程指纹不看键序（[`super::thread_msg_of`]）：中转把末条消息解成 map 再写回，块里的键变成
+/// 字母序（`{"text":…,"type":…}`），进历史后又是客户端原样（`{"type":…,"text":…}`）。同一条消息
+/// 必须同指纹，否则每轮都被判成历史变了；内容一变照样不同。
+#[test]
+fn thread_fingerprint_ignores_key_order() {
+    let official = serde_json::json!({"role": "system", "content": [
+        {"type": "text", "text": "<total_tokens>14999000 tokens left</total_tokens>",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    ]});
+    let resorted = serde_json::json!({"content": [
+        {"cache_control": {"ttl": "1h", "type": "ephemeral"},
+         "text": "<total_tokens>14999000 tokens left</total_tokens>", "type": "text"}
+    ], "role": "system"});
+    let in_history = serde_json::json!({"role": "system", "content": [
+        {"type": "text", "text": "<total_tokens>14999000 tokens left</total_tokens>"}
+    ]});
+    let changed = serde_json::json!({"role": "system", "content": [
+        {"type": "text", "text": "<total_tokens>14998000 tokens left</total_tokens>"}
+    ]});
+    let fp = |m: &serde_json::Value| super::thread_msg_of(m).fp;
+    assert_eq!(fp(&official), fp(&resorted), "键序不同、内容相同");
+    assert_eq!(fp(&resorted), fp(&in_history), "去掉断点进历史");
+    assert_ne!(fp(&in_history), fp(&changed), "内容变了");
+}
