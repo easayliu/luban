@@ -467,7 +467,9 @@ impl EventBuilder<'_> {
                     )),
                 );
                 if let Some((ctor, stack, top)) = error_trace(&env.f.version, a.status) {
-                    m.insert("error_constructor".into(), json!(ctor));
+                    if let Some(ctor) = ctor {
+                        m.insert("error_constructor".into(), json!(ctor));
+                    }
                     m.insert("error_stack_hash".into(), json!(stack));
                     m.insert("error_top_frame".into(), json!(top));
                 }
@@ -540,7 +542,9 @@ impl EventBuilder<'_> {
                     )),
                 );
                 if let Some((ctor, stack, top)) = error_trace(&env.f.version, fail.status) {
-                    put("error_constructor", json!(ctor));
+                    if let Some(ctor) = ctor {
+                        put("error_constructor", json!(ctor));
+                    }
                     put("error_stack_hash", json!(stack));
                     put("error_top_frame", json!(top));
                 }

@@ -12,7 +12,7 @@
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
 /// 同一个客户端不会一边自称 2.1.308、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.308 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.309 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -124,7 +124,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.308";
+pub const CC_VERSION_BASE: &str = "2.1.309";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -140,7 +140,7 @@ pub const CC_VERSION_BASE: &str = "2.1.308";
 /// 依据：`cap/auto-2.1.308-20261022-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
 /// UA `claude-cli/2.1.308`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.308";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.309";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -490,6 +490,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.308-20261022-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致。
     ("2.1.308", "2026-10-22T03:28:37Z"),
+    // `cap/auto-2.1.309-20261023-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.309", "2026-10-22T16:51:07Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

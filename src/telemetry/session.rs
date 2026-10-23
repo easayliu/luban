@@ -686,6 +686,7 @@ pub(super) struct TurnFacts {
     pub(super) v306: bool,
     pub(super) v307: bool,
     pub(super) v308: bool,
+    pub(super) v309: bool,
     /// 工具被拒时报 `tengu_safety_event`：2.1.307 起，且号的服务端开关 `tengu_snoopy_creek` 没关
     /// （[`crate::proxy::snoopy_creek`]，官方每次报之前现读，这里按这条请求处理时读一次）。
     pub(super) safety_events: bool,

@@ -661,23 +661,31 @@ pub(super) fn error_message_hash(
     sha256_hex(super::tools::scrub_error_message(&raw).as_bytes())[..12].to_string()
 }
 
-/// 这个构建里 API 错误那条栈的固定三样（`error_constructor` / `error_stack_hash` / `error_top_frame`）：压缩后的类名与
-/// 打包块名随构建变，只登记抓到过的。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值），2.1.307 的
+/// 这个构建里 API 错误那条栈的固定几样（`error_constructor` / `error_stack_hash` / `error_top_frame`）：压缩后的类名与
+/// 打包块名随构建变，只登记抓到过的；`error_constructor` 可能缺省（返回 `None`，官方按构造名能否过
+/// `/^[A-Z][a-zA-Z]{0,63}$/` 决定发不发）。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值），2.1.307 的
 /// 5xx（`cap/auto-2.1.307-20261022-retry` 三条同值：摘要没变，类名与块名换了），2.1.308 的 5xx
-/// （`cap/auto-2.1.308-20261022-retry` 三条同值：只换了块名，行列与类名都没变）。
+/// （`cap/auto-2.1.308-20261022-retry` 三条同值：只换了块名，行列与类名都没变），2.1.309 的 5xx
+/// （`cap/auto-2.1.309-20261023-retry` 两条同值：块名换了、不再带 `error_constructor`）。
 pub(super) fn error_trace(
     version: &str,
     status: Option<u16>,
-) -> Option<(&'static str, &'static str, &'static str)> {
+) -> Option<(Option<&'static str>, &'static str, &'static str)> {
     match (version, status) {
         ("2.1.306", Some(s)) if s >= 500 => {
-            Some(("Yzt", "5b32b751db51", "chunk-75zwyap8.js:11:1510"))
+            Some((Some("Yzt"), "5b32b751db51", "chunk-75zwyap8.js:11:1510"))
         }
         ("2.1.307", Some(s)) if s >= 500 => {
-            Some(("WVt", "5b32b751db51", "chunk-2f0n1d7c.js:11:1510"))
+            Some((Some("WVt"), "5b32b751db51", "chunk-2f0n1d7c.js:11:1510"))
         }
         ("2.1.308", Some(s)) if s >= 500 => {
-            Some(("WVt", "5b32b751db51", "chunk-zht3j5ev.js:11:1510"))
+            Some((Some("WVt"), "5b32b751db51", "chunk-zht3j5ev.js:11:1510"))
+        }
+        // 2.1.309 的 5xx 类压缩后首字母小写（`xqt`），过不了官方对构造名的校验
+        // （`/^[A-Z][a-zA-Z]{0,63}$/`），这一版**不带 `error_constructor`**；栈哈希不变，
+        // 顶帧只换打包块名（`cap/auto-2.1.309-20261023-retry` R1/R2 实测）。
+        ("2.1.309", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-t24ds32q.js:11:1510"))
         }
         _ => None,
     }

@@ -28,9 +28,8 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.308.084; cc_entrypoint=cli;"),
-        "模拟路径的 cc_version 取 profile 的版本，后缀按首句派生（`hi` 取不到第 4/7/20 位，\
-             按 `000` 算）: {s}"
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.309."),
+        "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
     // （cap/2.1.277/00023），2.1.285 起再跟会话里的第几轮（cap/2.1.285/00030）。几条用例
@@ -477,9 +476,10 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
     assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
     assert_eq!(v["output_config"], serde_json::json!({"effort": "high"}), "{v}");
     assert!(
-        sys[0]["text"].as_str().unwrap().starts_with(
-            "x-anthropic-billing-header: cc_version=2.1.308.084; cc_entrypoint=cli; cch="
-        ),
+        sys[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.309."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1641,17 +1641,17 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_308_captures() {
-    let dir = format!("{}/cap/auto-2.1.308-20261022-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_309_captures() {
+    let dir = format!("{}/cap/auto-2.1.309-20261023-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.308-20261022-full not present");
+        eprintln!("skipped: cap/auto-2.1.309-20261023-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
     // 清单是默认值；正文照 2.1.303 抓包那个号的 v4 第 1 组那段喂进去（`assets/cc_agent_cerf_text_v4.txt`）——
     // 2.1.305 起不再读这个开关，出站的 cerf 说明必须仍是内置正文、与抓包一致；2.1.307 起清单也不读，清单外的
     // opus-5-5 一样用 cerf 那版。用独立的号喂进去，不动别的用例共用的测试凭证。
-    let cred = crate::credentials::Credential { id: 9_300, ..test_cred() };
+    let cred = crate::credentials::Credential { id: 9_309, ..test_cred() };
     let eval = serde_json::json!({"features": {
         "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
             "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
@@ -1663,7 +1663,7 @@ fn simulated_main_threads_match_the_2_1_308_captures() {
             "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
     crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
     for (n, auto_mode) in
-        [("00469", false), ("00280", false), ("00423", false), ("00380", false), ("00613", true)]
+        [("00472", false), ("00274", false), ("00332", false), ("00423", false), ("00610", true)]
     {
         let path = files
             .iter()
@@ -1750,7 +1750,7 @@ fn simulated_main_threads_match_the_2_1_308_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.308."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.309."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1759,7 +1759,7 @@ fn simulated_main_threads_match_the_2_1_308_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/79b18cff-7859-413c-b748-3987686e3889/scratchpad/calc",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/076f87aa-74c6-4c32-8e99-c5dc7f1b939b/scratchpad/cal2",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。

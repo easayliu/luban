@@ -5613,6 +5613,8 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
         ("2.1.300", 14299, 14269, 14770),
         ("2.1.301", 14297, 14267, 14768),
         ("2.1.303", 15457 - 1152, 15427 - 1152, 15928 - 1152),
+        // 2.1.309 Artifact `root` 说明改写 +45（交互式各族一律 15457→15502；Bash 的 `@name` 句不进估算）。
+        ("2.1.309", 15502 - 1152, 15472 - 1152, 15973 - 1152),
     ] {
         assert_eq!(ctx(ver, opus, false), (34, o), "{ver} opus");
         assert_eq!(ctx(ver, h55, false), (33, h), "{ver} haiku-5-5");
@@ -5620,6 +5622,33 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
     }
     assert_eq!(ctx("2.1.301", opus, true), (26, 6573));
     assert_eq!(ctx("2.1.303", opus, true), (26, 7742 - 1152));
+    // `-p` 不带 Artifact，2.1.309 的 +45 不落到它头上（Bash 的 `@name` 也不进）：仍是 2.1.303 的值。
+    assert_eq!(ctx("2.1.309", opus, true), (26, 7742 - 1152));
+
+    // 关掉 Artifact（带官方工具集 Agent+Read，留着 ListAgents / SendFeedback，只少 Artifact 一组）时，
+    // `artifact_schema_delta` 不加（`!off.artifact` 为假），连 Artifact 的 schema 一起减：opus 主线程
+    // 34/13942 + 83(READ) − 6111(Artifact 一组) = 31 / 7914，**2.1.309 的 +45 不落下来**，与 2.1.308 同值。
+    let ctx_off_artifact = |ver: &str| {
+        let t = Telemetry::default();
+        let body = body_with_tools(&["Agent", "Read", "Bash", "ListAgents", "SendFeedback"]);
+        let mut c = call(body, "req_ctx_off", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let m = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        (m["non_mcp_tools_count"].as_u64().unwrap(), m["non_mcp_tools_tokens"].as_u64().unwrap())
+    };
+    assert_eq!(ctx_off_artifact("2.1.309"), (31, 7914), "309 关 Artifact：+45 不落下来");
+    assert_eq!(
+        ctx_off_artifact("2.1.309"),
+        ctx_off_artifact("2.1.308"),
+        "关 Artifact 时 309 == 308"
+    );
 }
 
 /// 开关 `sim_trim_tools` 的遥测侧：正文里有官方工具却没有 Artifact / ListAgents / SendFeedback
@@ -7003,6 +7032,18 @@ fn version_2_1_307_telemetry_shape() {
             );
         }
     }
+
+    // 2.1.309 的 5xx 不带 `error_constructor`（压缩后的 5xx 类名 `xqt` 首字母小写，过不了官方对
+    // 构造名的校验），栈哈希不变、顶帧换了块名（`cap/auto-2.1.309-20261023-retry` 两条同值）。
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.309 (external, sdk-cli)");
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        assert!(m.get("error_constructor").is_none(), "2.1.309 {n} 不带 error_constructor");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-t24ds32q.js:11:1510")),
+            "2.1.309 {n}"
+        );
+    }
 }
 
 /// 「猜下一句」请求体：主线程上下文、一条回复、猜下一句的提示词；`denied` 是分叉里前面几步调过的工具（每步
@@ -7615,6 +7656,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.309 (external, cli)", "1a36b34122c0", "chunk-kang00hq.js:3682:5744"),
         ("claude-cli/2.1.308 (external, cli)", "40e496cc06bc", "chunk-a1cg2ptw.js:3661:6043"),
         ("claude-cli/2.1.307 (external, cli)", "40e496cc06bc", "chunk-wvsyb4fb.js:3661:6043"),
         ("claude-cli/2.1.306 (external, cli)", "c19e7dcf6637", "chunk-z4fyjkxt.js:3654:6164"),

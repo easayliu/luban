@@ -454,6 +454,7 @@ pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'stat
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
     CC_PROFILES
         .iter()
+        .chain(CC_PROFILES_2_1_308)
         .chain(CC_PROFILES_2_1_307)
         .chain(CC_PROFILES_2_1_306)
         .chain(CC_PROFILES_2_1_305)
@@ -488,7 +489,7 @@ pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static C
 }
 
 /// 十七张 profile 表，按版本从旧到新。
-pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 17] {
+pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 18] {
     [
         CC_PROFILES_2_1_258,
         CC_PROFILES_2_1_260,
@@ -506,6 +507,7 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 17] {
         CC_PROFILES_2_1_305,
         CC_PROFILES_2_1_306,
         CC_PROFILES_2_1_307,
+        CC_PROFILES_2_1_308,
         CC_PROFILES,
     ]
 }
@@ -549,7 +551,23 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
     // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
     let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 308) => find(CC_PROFILES)
+        Some(v) if v >= (2, 1, 309) => find(CC_PROFILES)
+            .or_else(|| find(CC_PROFILES_2_1_308))
+            .or_else(|| find(CC_PROFILES_2_1_307))
+            .or_else(|| find(CC_PROFILES_2_1_306))
+            .or_else(|| find(CC_PROFILES_2_1_305))
+            .or_else(|| find(CC_PROFILES_2_1_303))
+            .or_else(|| find(CC_PROFILES_2_1_301))
+            .or_else(|| find(CC_PROFILES_2_1_300))
+            .or_else(|| find(CC_PROFILES_2_1_299))
+            .or_else(|| find(CC_PROFILES_2_1_296))
+            .or_else(|| find(CC_PROFILES_2_1_293))
+            .or_else(|| find(CC_PROFILES_2_1_291))
+            .or_else(|| find(CC_PROFILES_2_1_285))
+            .or_else(|| find(CC_PROFILES_2_1_280))
+            .or_else(|| find(CC_PROFILES_2_1_277))
+            .unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 308) => find(CC_PROFILES_2_1_308)
             .or_else(|| find(CC_PROFILES_2_1_307))
             .or_else(|| find(CC_PROFILES_2_1_306))
             .or_else(|| find(CC_PROFILES_2_1_305))

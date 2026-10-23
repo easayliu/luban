@@ -992,7 +992,7 @@ fn simulated_beta_matches_official() {
 /// `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带 `safeguards`，那两项都不该出现。
 /// 没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_308() {
+fn simulated_beta_matches_2_1_309() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          thinking-token-count-2026-05-13,context-management-2025-06-27,\
          prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
@@ -1014,16 +1014,16 @@ fn simulated_beta_matches_2_1_308() {
          thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,\
          extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00418", "claude-opus-5-5", opus),
-        ("00246", "claude-sonnet-5-5", opus),
+        ("00177", "claude-opus-5-5", opus),
+        ("00274", "claude-sonnet-5-5", opus),
         ("同 opus", "claude-fable-5-1", opus),
-        ("00364", "claude-haiku-4-5-20251001", haiku),
-        ("00364", "claude-haiku-4-5", haiku),
-        ("00329", "claude-haiku-5-5", haiku_5_5),
-        ("00294", "haiku", haiku_5_5),
+        ("00423", "claude-haiku-4-5-20251001", haiku),
+        ("00423", "claude-haiku-4-5", haiku),
+        ("00332", "claude-haiku-5-5", haiku_5_5),
+        ("00711", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.308");
+        assert_eq!(profile.version, "2.1.309");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1070,7 +1070,7 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.308 的额度探测（`cap/auto-2.1.308-20261022-full/00021`，2.1.307 的 `00021`、2.1.306 的 `00022`、2.1.305 的 `00019`、2.1.303 的 `00017`、
     // 2.1.301 的 `00015`、2.1.300 的 `00012`、2.1.299 的 `00014`、2.1.296 的 `00012`、2.1.293 的 `00017` 同）与 2.1.277 逐字相同。
     let quota = config::cc_profile(QuotaProbe);
-    assert_eq!((quota.version, quota.beta), ("2.1.308", cases[2].2));
+    assert_eq!((quota.version, quota.beta), ("2.1.309", cases[2].2));
     // 2.1.291 的标题生成（默认模式下 13 条）与 2.1.277 逐字相同。
     let title = config::cc_profile_at(SessionTitleHaiku, Some((2, 1, 291)));
     assert_eq!((title.version, title.beta), ("2.1.291", cases[1].2));
@@ -1095,12 +1095,12 @@ fn profile_betas_match_the_2_1_277_captures() {
     // （`cap/auto-2.1.300-20261015-full/00029`）、2.1.301（`cap/auto-2.1.301-20261016-full`）、2.1.303
     // （`cap/auto-2.1.303-20261019-full`）、2.1.305（`cap/auto-2.1.305-20261021-full`）、2.1.306
     // （`cap/auto-2.1.306-20261021-full`）、2.1.307（`cap/auto-2.1.307-20261022-full/00036`）、2.1.308
-    // （`cap/auto-2.1.308-20261022-full/00036`）同串。
+    // （`cap/auto-2.1.308-20261022-full/00036`）、2.1.309（`cap/auto-2.1.309-20261023-full/00036`）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.308",
+            "2.1.309",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              thinking-token-count-2026-05-13,context-management-2025-06-27,\
              prompt-caching-scope-2026-01-05,\

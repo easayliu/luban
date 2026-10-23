@@ -1,9 +1,9 @@
-//! 2.1.308 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.308 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.308 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.308 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.308 的 profile 表：2.1.308 来访的 beta 参照（[`cc_profile_at`]）。2.1.309 的表
+/// （[`CC_PROFILES`]）逐行同这张，只换版本号。
 ///
 /// **各行除版本号外与 2.1.307（[`CC_PROFILES_2_1_307`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.308-20261022-full`（场景同 2.1.307-full）：请求头除 UA 外逐字相同
@@ -14,7 +14,7 @@ use super::*;
 /// 次序（默认不启用，请求里从不出现）。可执行文件换了一版 Bun 运行时（版本串仍是 1.4.4），出口层的 cch
 /// 计算、HTTP/1.1 请求头写出与 TLS ClientHello 都没变（cch 全量回归覆盖这一版 178 条）；变的只有遥测里
 /// 报错栈的打包块名（`telemetry::shape::error_trace` 与失败 Bash 那条）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_308: &[CcProfile] = &[
     at_308(CC_PROFILES_2_1_307[0]),
     at_308(CC_PROFILES_2_1_307[1]),
     at_308(CC_PROFILES_2_1_307[2]),

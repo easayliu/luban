@@ -524,6 +524,19 @@ const READ_ALLOW_LARGE_TOKENS: u64 = 83;
 /// 14768），2.1.303 `intent` 加 dashboard 那句 +8。
 fn artifact_schema_delta(version: &str) -> u64 {
     match () {
+        // 2.1.309 改写 `root` 参数说明 +45。这整段 `context_size` 的工具计数都是**写死的标准值**
+        // （[`context_tool_counts`] 的硬编码，不读实际请求的工具 schema），`telemetry_capture` 对所有
+        // `api_telemetry && billable` 的出站请求都合成它——**不区分模拟路径还是真实 CC 经 BASE_URL 的透传**。
+        // 这里的 +45 是按**模拟路径注入的那份固定资产**（[`crate::proxy::cc_tools_core`]，两份都这个形态）定的：
+        // 其 `Artifact.input_schema` 15438→15620 字符（compact JSON，官方按 round(字符/4) 估），3860→3905=+45，
+        // 交互式各族的 `non_mcp_tools_tokens` 15457→15502。**对真实 CC 经 BASE_URL 的透传并不精确**：官方逐
+        // 工具按各自 schema 的字符数 round，同样 +182 落在别的基线可能 +46（`cap/auto-2.1.308-20261022-api` 的短
+        // schema **实抓** 12432 字符=3108 token，把 root 换成 309 版后**推算** 12614=3154、+46——尚无同条件的 309
+        // 网关实抓直接验证）；而且这份写死标准值对真实网关本就有基线差（308 写死 14305 vs 官方网关
+        // 自报 14415，差 110，是 309 之前就在的——合成的是「标准订阅端会话」的近似，不是逐请求实算）。要对真实
+        // CC 透传也精确，得把合成改成读实际请求 schema、按来源区分，那是独立于本次 309 增量对齐的改动。Bash 加
+        // 的那句 `@name` 提示不进这个估算（`-p` 带 Bash 却仍是 7742）。
+        _ if version_at_least(version, "2.1.309") => 274 - 2 + 8 + 45,
         _ if version_at_least(version, "2.1.303") => 274 - 2 + 8,
         _ if version_at_least(version, "2.1.301") => 274 - 2,
         _ if version_at_least(version, "2.1.300") => 274,

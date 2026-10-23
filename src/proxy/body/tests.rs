@@ -2644,13 +2644,15 @@ fn core_tool_stubs_are_profile_specific() {
         "Bash 描述取自 cap/auto-2.1.293-20261008-full/00419: {}",
         bash["description"]
     );
-    // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）。
-    assert_eq!(d(opus, "Bash").chars().count(), 3098);
+    // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）；
+    // 2.1.309 的 `# Git` 段又加了一句「GitHub notifies the owner of any `@name`…」（+283）。
+    assert_eq!(d(opus, "Bash").chars().count(), 3381);
     // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）；
     // 2.1.301 那句「Not allowed with …」去掉了 `root`（2.1.300 是 36637）；2.1.303 加了 dashboard
-    // 那几句（2.1.301 是 36629）。
-    assert_eq!(d(opus, "Artifact").chars().count(), 37253);
-    assert_eq!(d(haiku, "Bash").chars().count(), 11913);
+    // 那几句（2.1.301 是 36629）；2.1.309 改写了 `root` 参数的说明（2.1.303 ~ 2.1.308 是 37253，+182）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 37435);
+    // 2.1.309 的 `# Creating pull requests` 段也加了那句 `@name` 提示（2.1.308 及以前是 11913，+283）。
+    assert_eq!(d(haiku, "Bash").chars().count(), 12196);
 }
 
 /// 开关 `sim_trim_tools`：注入的官方工具去掉 Artifact / ListAgents / SendFeedback，剩 11 条、先后
@@ -2790,7 +2792,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.308."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.309."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -4903,7 +4905,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 308)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 309)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

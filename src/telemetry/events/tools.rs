@@ -528,6 +528,7 @@ impl EventBuilder<'_> {
             v306,
             v307,
             v308,
+            v309,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -783,8 +784,12 @@ impl EventBuilder<'_> {
             // 一次；2.1.300 ~ 2.1.302 没有样本，沿用 2.1.299，2.1.304 沿用 2.1.303。2.1.306
             // （`cap/auto-2.1.306-20261021-full` 三条）只换了 chunk 名与摘要，2.1.307
             // （`cap/auto-2.1.307-20261022-bash`，全量包里那次没有失败的 Bash）摘要、行列都换了，2.1.308
-            // （`cap/auto-2.1.308-20261022-full` A0 那条）只换了 chunk 名。
-            if v308 {
+            // （`cap/auto-2.1.308-20261022-full` A0 那条）只换了 chunk 名，2.1.309
+            // （`cap/auto-2.1.309-20261023-full` A0 那条）摘要、行列、块名都换了。
+            if v309 {
+                err["error_stack_hash"] = json!("1a36b34122c0");
+                err["error_top_frame"] = json!("chunk-kang00hq.js:3682:5744");
+            } else if v308 {
                 err["error_stack_hash"] = json!("40e496cc06bc");
                 err["error_top_frame"] = json!("chunk-a1cg2ptw.js:3661:6043");
             } else if v307 {
