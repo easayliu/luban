@@ -2292,4 +2292,6 @@ async fn telemetry_capture_reports_the_inbound_wall_clock(pool: sqlx::PgPool) {
     )
     .expect("telemetry on");
     assert_eq!(cap.started_at, wall);
+    // 不是模拟路径（`sim` 为 `None`），工具声明算来访自带的：`context_size` 按网关基线报。
+    assert!(upstream.sim.is_none() && cap.client_tools);
 }

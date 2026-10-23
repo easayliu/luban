@@ -232,6 +232,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             failure: None,
             aborted: false,
             cache_keepalive_ok: false,
+            client_tools: false,
             dispatch: Some("v2d".into()),
             prior_attempts: Vec::new(),
         }
@@ -3645,6 +3646,7 @@ fn a_capture_can_report_a_failure_without_a_response() {
         organization_id: None,
         started_at: frozen_now() - Duration::from_secs(3),
         cache_keepalive_ok: false,
+        client_tools: false,
     };
     // 连接层就失败：没有状态码、没有上游 request-id。
     cap(t.clone()).record_failure(
@@ -3712,6 +3714,7 @@ fn a_401_early_return_still_reports_an_auth_error() {
         organization_id: Some("09520b85-f6b6-432f-97e2-6ecb804a083f".into()),
         started_at: frozen_now() - Duration::from_secs(2),
         cache_keepalive_ok: false,
+        client_tools: false,
     }
     .record_failure(
         7,
@@ -4820,10 +4823,13 @@ fn dump_telemetry_replay() {
     // 抓包那个号 2.1.305 起开着会话活动心跳（`tengu_dapper_dawn` 是 force 的 true）。
     let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
     crate::proxy::dapper_dawn::note_eval(7, eval.as_object().unwrap());
+    // 回放真实 CC 经网关的抓包（`*-api`）时置 1，按透传路径报（[`ApiCall::client_tools`]）。
+    let client_tools = std::env::var("LUBAN_REPLAY_CLIENT_TOOLS").is_ok_and(|v| v == "1");
     let t = Telemetry::default();
     let s = |c: &Value, k: &str| c[k].as_str().map(str::to_string);
     for c in &calls {
         let mut a = call(c["body"].as_str().unwrap().as_bytes().to_vec(), "x", "end_turn");
+        a.client_tools = client_tools;
         a.betas = s(c, "betas");
         a.ua_out = s(c, "ua").unwrap_or_default();
         a.session_header = s(c, "session_header");
@@ -5649,6 +5655,66 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
         ctx_off_artifact("2.1.308"),
         "关 Artifact 时 309 == 308"
     );
+}
+
+/// 真实 CC 经网关透传（[`ApiCall::client_tools`]）时 `context_size` 的工具计数按网关基线报：
+/// `cap/auto-2.1.309-20261023-api` 同一会话先后跑 309 / 308 的客户端自报值（308 与
+/// `cap/auto-2.1.308-20261022-api` 逐值相同，307 的 opus 也是 14415）。309 比 308 多 46（网关那份 Artifact
+/// schema 12432→12614 字符），不是订阅端的 45。
+#[test]
+fn context_size_tool_tokens_follow_the_gateway_samples() {
+    let ctx = |ver: &str, body: Vec<u8>, sdk: bool, client_tools: bool| {
+        let t = Telemetry::default();
+        let mut body = String::from_utf8(body).unwrap();
+        if sdk {
+            body = body.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+        }
+        let mut c = call(body.into_bytes(), "req_ctx_gw", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        c.client_tools = client_tools;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let m = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        (m["non_mcp_tools_count"].as_u64().unwrap(), m["non_mcp_tools_tokens"].as_u64().unwrap())
+    };
+    let gw = |ver: &str, model: &str, sdk: bool| {
+        ctx(ver, body_for(model, Some("high"), true), sdk, true)
+    };
+    let (opus, sonnet, h55, h45) =
+        ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-haiku-4-5-20251001");
+    assert_eq!(gw("2.1.307", opus, false), (34, 14415));
+    assert_eq!(gw("2.1.308", opus, false), (34, 14415));
+    assert_eq!(gw("2.1.308", sonnet, false), (34, 14415));
+    assert_eq!(gw("2.1.308", h55, false), (33, 14385));
+    assert_eq!(gw("2.1.309", opus, false), (34, 14461));
+    assert_eq!(gw("2.1.309", h55, false), (33, 14431));
+    for ver in ["2.1.308", "2.1.309"] {
+        assert_eq!(gw(ver, opus, true), (26, 7452), "{ver} -p");
+        assert_eq!(gw(ver, h55, true), (26, 7452), "{ver} -p haiku-5-5");
+    }
+    assert_eq!(
+        gw("2.1.309", opus, false).1 - gw("2.1.308", opus, false).1,
+        46,
+        "网关 308→309 是 +46"
+    );
+
+    // 同一份请求走模拟路径（注入的固定资产）仍是订阅端标准值，309 只 +45。
+    let std = |ver: &str| ctx(ver, body_for(opus, Some("high"), true), false, false);
+    assert_eq!(std("2.1.308"), (34, 14305));
+    assert_eq!(std("2.1.309"), (34, 14350));
+    // 没有网关样本的：2.1.307 以前、haiku-4.5 主模型，照订阅端报。
+    assert_eq!(gw("2.1.303", opus, false), std("2.1.303"));
+    assert_eq!(gw("2.1.309", h45, false), ctx("2.1.309", body_for(h45, None, true), false, false));
+
+    // 网关关掉 Artifact：整组不在，只剩其余工具的 +862（订阅端 31 / 7914）。
+    let off = body_with_tools(&["Agent", "Read", "Bash", "ListAgents", "SendFeedback"]);
+    assert_eq!(ctx("2.1.309", off.clone(), false, true), (31, 7914 + 862));
+    assert_eq!(ctx("2.1.309", off.clone(), false, true), ctx("2.1.308", off, false, true));
 }
 
 /// 开关 `sim_trim_tools` 的遥测侧：正文里有官方工具却没有 Artifact / ListAgents / SendFeedback

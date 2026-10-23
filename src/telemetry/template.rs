@@ -469,6 +469,9 @@ pub(super) struct Subst<'a> {
     /// 正文里关着的那几个用户可关的工具（[`RequestShape::tools_off`]）。`-p` 不看它：打印模式本来就
     /// 不带 Artifact / SendFeedback（不是用户关的），也没有关掉之后的样本。
     pub(super) tools_off: ToolsOff,
+    /// 工具声明是来访客户端自带的（真实 CC 经网关透传），`tengu_context_size` 按网关基线报，见
+    /// [`gateway_tool_tokens`]。
+    pub(super) client_tools: bool,
     /// 这一轮那几条 `tengu_lucky_cerf` 一系实验曝光，空即不发——按会话钉住的分组与「模型走不走
     /// 精简提示词」见 [`crate::proxy::lucky_cerf_exposures`]，一个进程每个一次见
     /// [`super::session::TurnFacts::lucky_cerf`]。
@@ -524,24 +527,49 @@ const READ_ALLOW_LARGE_TOKENS: u64 = 83;
 /// 14768），2.1.303 `intent` 加 dashboard 那句 +8。
 fn artifact_schema_delta(version: &str) -> u64 {
     match () {
-        // 2.1.309 改写 `root` 参数说明 +45。这整段 `context_size` 的工具计数都是**写死的标准值**
-        // （[`context_tool_counts`] 的硬编码，不读实际请求的工具 schema），`telemetry_capture` 对所有
-        // `api_telemetry && billable` 的出站请求都合成它——**不区分模拟路径还是真实 CC 经 BASE_URL 的透传**。
-        // 这里的 +45 是按**模拟路径注入的那份固定资产**（[`crate::proxy::cc_tools_core`]，两份都这个形态）定的：
-        // 其 `Artifact.input_schema` 15438→15620 字符（compact JSON，官方按 round(字符/4) 估），3860→3905=+45，
-        // 交互式各族的 `non_mcp_tools_tokens` 15457→15502。**对真实 CC 经 BASE_URL 的透传并不精确**：官方逐
-        // 工具按各自 schema 的字符数 round，同样 +182 落在别的基线可能 +46（`cap/auto-2.1.308-20261022-api` 的短
-        // schema **实抓** 12432 字符=3108 token，把 root 换成 309 版后**推算** 12614=3154、+46——尚无同条件的 309
-        // 网关实抓直接验证）；而且这份写死标准值对真实网关本就有基线差（308 写死 14305 vs 官方网关
-        // 自报 14415，差 110，是 309 之前就在的——合成的是「标准订阅端会话」的近似，不是逐请求实算）。要对真实
-        // CC 透传也精确，得把合成改成读实际请求 schema、按来源区分，那是独立于本次 309 增量对齐的改动。Bash 加
-        // 的那句 `@name` 提示不进这个估算（`-p` 带 Bash 却仍是 7742）。
+        // 2.1.309 改写 `root` 参数说明 +45：按订阅端（模拟路径注入的固定资产 [`crate::proxy::cc_tools_core`]）
+        // 那份 `Artifact.input_schema` 15438→15620 字符（compact JSON，官方按 round(字符/4) 估），3860→3905，
+        // 交互式各族的 `non_mcp_tools_tokens` 15457→15502。真实 CC 经网关那份 schema 短，同一处改动是 +46，
+        // 那边另算，见 [`gateway_tool_tokens`]。Bash 加的那句 `@name` 提示不进这个估算（`-p` 带 Bash 却仍是 7742）。
         _ if version_at_least(version, "2.1.309") => 274 - 2 + 8 + 45,
         _ if version_at_least(version, "2.1.303") => 274 - 2 + 8,
         _ if version_at_least(version, "2.1.301") => 274 - 2,
         _ if version_at_least(version, "2.1.300") => 274,
         _ => 0,
     }
+}
+
+/// 真实 CC 经 `ANTHROPIC_BASE_URL` 走网关时（[`Subst::client_tools`]）`non_mcp_tools_tokens` 对订阅端标准值的
+/// 修正。客户端是按**全部**内建工具（含延迟池里没发出来的）估的，单条请求里只有一部分（2.1.309 网关主请求只带 16
+/// 个、客户端计 34），所以不能拿出站 `tools` 逐个求和，只能按抓包定基线。
+///
+/// `cap/auto-2.1.308-20261022-api` 与 `cap/auto-2.1.309-20261023-api`（同一台机器同一会话先后跑 309 / 308）：
+/// opus 等 308 34 / 14415、309 34 / 14461，haiku-5-5 308 33 / 14385、309 33 / 14431，`-p` 两版都是 26 / 7452；
+/// 2.1.307 的 opus 也是 14415。工具数与订阅端相同（订阅端多的那个 PublishPlugin 本来就不算），token 拆成两块：
+/// - Artifact 以外的工具网关形态多 [`GATEWAY_OTHER_TOOLS_TOKENS`]：`-p` 没有 Artifact，7452 − 6590 = 862；
+/// - Artifact 的 schema 网关形态短：308 12432 字符 = 3108 对订阅端 3860，少 752；309 12614 = 3154 对 3905，少 751。
+///
+/// 合起来交互式 308 +110、309 +111，各族都对得上。2.1.307 以前没有同条件的网关样本（2.1.293 那份是另一台
+/// 配置、工具数都不同），haiku-4.5 主模型也没有网关样本，这两种照订阅端报。关掉 Artifact 时整组不在、只加
+/// 862——ArtifactComments / ArtifactData 两种形态是否同长没有样本，按同长算。
+const GATEWAY_OTHER_TOOLS_TOKENS: u64 = 862;
+
+fn gateway_tool_tokens(
+    version: &str,
+    sdk: bool,
+    family: ToolFamily,
+    artifact_off: bool,
+    tokens: u64,
+) -> u64 {
+    if !version_at_least(version, "2.1.307") || family == ToolFamily::HaikuLong {
+        return tokens;
+    }
+    let artifact_shortfall = match () {
+        _ if sdk || artifact_off => 0,
+        _ if version_at_least(version, "2.1.309") => 751,
+        _ => 752,
+    };
+    tokens + GATEWAY_OTHER_TOOLS_TOKENS - artifact_shortfall
 }
 
 /// 2.1.303 起 `-p` 的 `Agent` 默认开 fork，`effort` 等参数说明随之变长：`-p` 多 17（`cap/auto-2.1.303-20261019-full`
@@ -844,6 +872,15 @@ where
                     }
                 } else if !off.artifact {
                     tokens += artifact_schema_delta(subst.version);
+                }
+                if subst.client_tools {
+                    tokens = gateway_tool_tokens(
+                        subst.version,
+                        subst.sdk,
+                        subst.tool_family,
+                        off.artifact,
+                        tokens,
+                    );
                 }
                 o.insert("non_mcp_tools_count".into(), json!(count));
                 o.insert("non_mcp_tools_tokens".into(), json!(tokens));

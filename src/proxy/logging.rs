@@ -543,6 +543,7 @@ impl Drop for ReqLog {
                 failure,
                 aborted,
                 cache_keepalive_ok: cap.cache_keepalive_ok,
+                client_tools: cap.client_tools,
                 dispatch: cap.dispatch,
                 prior_attempts: Vec::new(),
             });
@@ -836,6 +837,8 @@ pub(super) fn telemetry_capture(
         organization_id,
         started_at: started.wall,
         cache_keepalive_ok: false,
+        // 模拟路径的工具声明是注入的那份固定资产；其余（CC 形态的来访）原样发它自带的。
+        client_tools: upstream.sim.is_none(),
     })
 }
 

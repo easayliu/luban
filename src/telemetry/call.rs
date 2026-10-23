@@ -87,6 +87,10 @@ pub struct ApiCall {
     /// 这条主线程回复接替了一条续命成功过的缓存保活记录：收尾时补
     /// `tengu_feature_ok{api_cache_keepalive}`（见 [`crate::proxy`] 的 `cache_keepalive`）。
     pub cache_keepalive_ok: bool,
+    /// 出站的工具声明是来访客户端自带的（真实 CC 经 `ANTHROPIC_BASE_URL` 透传，网关 / API-key 那套形态），
+    /// 不是模拟路径注入的固定资产：`tengu_context_size` 的工具计数按网关基线报，见
+    /// [`super::template`] 的 `gateway_tool_tokens`。
+    pub client_tools: bool,
     /// 实际出站的 `anthropic-dispatch-id`（真实客户端透传它自己的，模拟路径恒为 `v2d`，额度探测不带）。
     pub dispatch: Option<String>,
     /// 同一请求在这一条之前失败过的那几次（客户端自己重发的），按先后。转发路径交过来时总是空的，
@@ -181,6 +185,8 @@ pub struct Capture {
     pub started_at: SystemTime,
     /// 这条主线程回复接替了一条续命成功过的缓存保活记录，见 [`ApiCall::cache_keepalive_ok`]。
     pub cache_keepalive_ok: bool,
+    /// 见 [`ApiCall::client_tools`]。
+    pub client_tools: bool,
 }
 
 impl Capture {
@@ -237,6 +243,7 @@ impl Capture {
             failure: Some(failure),
             aborted: false,
             cache_keepalive_ok: false,
+            client_tools: self.client_tools,
             dispatch: self.dispatch,
             prior_attempts: Vec::new(),
         });
