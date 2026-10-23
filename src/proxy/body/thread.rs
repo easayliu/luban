@@ -170,6 +170,11 @@ pub(super) fn apply_sim_thread(
 /// 逐条指纹，旧的那份拿不到；同一处每轮都变时，拿相邻两轮的这一行对比就能看出是哪一块、哪个
 /// 字段在变（键少了、长度变了、指纹变了）。来访下标按环境说明的实际插入点换算成出站下标
 /// （[`EnvNoted::out_index`]）；首条消息开头另有挪进来的客户端 system 那一块。
+///
+/// 另记这一轮来访**最后一条**消息的角色与结构（`tail_role` / `tail`）：最常见的断档是上一轮收尾
+/// 那条在下一轮历史里变了样（`common = best_len - 1`），而下一轮这行只看得到它进历史之后的样子。
+/// 同一会话接连几轮都断时，拿第 N 轮的 `tail` 对第 N+1 轮的 `blocks`，就是同一条消息发出时与
+/// 进历史后的两个样子。
 fn log_thread_miss(
     v: &serde_json::Value,
     sim: &Simulation,
@@ -186,6 +191,11 @@ fn log_thread_miss(
         .flatten();
     let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("-");
     let blocks = msg.and_then(|m| m.get("content")).map(block_shapes).unwrap_or_default();
+    let tail = fps.len().checked_sub(1).and_then(|last| {
+        v.get("messages").and_then(|m| m.as_array()).and_then(|m| m.get(env_note.out_index(last)))
+    });
+    let tail_role = tail.and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("-");
+    let tail_blocks = tail.and_then(|m| m.get("content")).map(block_shapes).unwrap_or_default();
     tracing::info!(
         cred_id,
         session = %sim.session_id,
@@ -198,6 +208,8 @@ fn log_thread_miss(
         why = miss.why,
         role,
         blocks = %blocks,
+        tail_role,
+        tail = %tail_blocks,
         "message thread fell back to create for a conversation that already has replies"
     );
 }
