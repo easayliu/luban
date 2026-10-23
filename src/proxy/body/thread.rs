@@ -60,8 +60,11 @@ pub(super) fn apply_sim_thread(
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
     let shape = thread_shape_of(v, raw_sys_shape);
     let seq = sim.link.turn.as_ref().map_or(0, |t| t.seq);
-    let (mut decision, pending, tokens_left) =
+    let (mut decision, pending, tokens_left, miss) =
         thread_decision(key, shape, fps, regular_prompt, seq);
+    if let Some(miss) = &miss {
+        log_thread_miss(v, sim, cred_id, fps, env_note, miss);
+    }
     let has_tool_choice = v.get("tool_choice").is_some_and(|c| !c.is_null());
     if !threads || (has_tool_choice && matches!(decision, ThreadDecision::Continue { .. })) {
         decision = ThreadDecision::Create;
@@ -156,6 +159,93 @@ pub(super) fn apply_sim_thread(
     align_cc_top_level_order(v, sim.profile.body_key_order);
     sim.set_thread(pending);
     true
+}
+
+/// 已有回复的一段对话这一轮退回 `create` 时打一行原因（[`ThreadMiss`]）：接不上的那一轮按完整历史
+/// 重发，历史提醒补不回原位时缓存从断点处整段重写，线上只看得到每轮缓存写入暴涨。
+///
+/// `history_changed` 时给出变了的那条（来访第 `common` 条）的**结构**：角色与逐块的类型、键名、
+/// 序列化长度和短指纹（[`block_shapes`]），不打任何正文——消息里有用户输入、工具入参与结果，
+/// 截多短都可能带出密钥或私有文件内容，与 [`crate::proxy::request_digest`] 同一规矩。线程状态只存
+/// 逐条指纹，旧的那份拿不到；同一处每轮都变时，拿相邻两轮的这一行对比就能看出是哪一块、哪个
+/// 字段在变（键少了、长度变了、指纹变了）。来访下标按环境说明的实际插入点换算成出站下标
+/// （[`EnvNoted::out_index`]）；首条消息开头另有挪进来的客户端 system 那一块。
+fn log_thread_miss(
+    v: &serde_json::Value,
+    sim: &Simulation,
+    cred_id: i64,
+    fps: &[ThreadMsg],
+    env_note: &EnvNoted,
+    miss: &ThreadMiss,
+) {
+    let msg = (miss.why == "history_changed")
+        .then(|| {
+            let at = env_note.out_index(miss.common);
+            v.get("messages").and_then(|m| m.as_array()).and_then(|m| m.get(at))
+        })
+        .flatten();
+    let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("-");
+    let blocks = msg.and_then(|m| m.get("content")).map(block_shapes).unwrap_or_default();
+    tracing::info!(
+        cred_id,
+        session = %sim.session_id,
+        model = %v.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
+        msgs = fps.len(),
+        threads = miss.threads,
+        same_root = miss.same_root,
+        best_len = miss.best_len,
+        common = miss.common,
+        why = miss.why,
+        role,
+        blocks = %blocks,
+        "message thread fell back to create for a conversation that already has replies"
+    );
+}
+
+/// 日志里最多列几块：工具结果一条消息里可以有上百块，只看前面这些足够判断形态。
+const MISS_LOG_MAX_BLOCKS: usize = 16;
+
+/// 一条消息 `content` 的结构摘要，逐块 `类型[键,键…]:字节数#指纹`，以 `|` 分隔；字符串形态的
+/// `content` 记作 `string:字节数#指纹`。字节数是那一块去掉 `cache_control` 后的序列化长度，指纹是
+/// 同一份的结构哈希（[`fingerprint_without_cache_control`]）取低 32 位——都不含正文本身。
+pub(super) fn block_shapes(content: &serde_json::Value) -> String {
+    let shape = |b: &serde_json::Value| {
+        let mut b = b.clone();
+        if let Some(o) = b.as_object_mut() {
+            o.shift_remove("cache_control");
+        }
+        let bytes = b.to_string().len();
+        let fp = fingerprint_without_cache_control(&b) & 0xffff_ffff;
+        (bytes, fp)
+    };
+    match content {
+        serde_json::Value::Array(blocks) => {
+            let mut out: Vec<String> = blocks
+                .iter()
+                .take(MISS_LOG_MAX_BLOCKS)
+                .map(|b| {
+                    let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    let keys = b
+                        .as_object()
+                        .map(|o| {
+                            o.keys().filter(|k| *k != "cache_control").cloned().collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                        .join(",");
+                    let (bytes, fp) = shape(b);
+                    format!("{ty}[{keys}]:{bytes}#{fp:08x}")
+                })
+                .collect();
+            if blocks.len() > MISS_LOG_MAX_BLOCKS {
+                out.push(format!("…{} more", blocks.len() - MISS_LOG_MAX_BLOCKS));
+            }
+            out.join("|")
+        }
+        other => {
+            let (bytes, fp) = shape(other);
+            format!("string:{bytes}#{fp:08x}")
+        }
+    }
 }
 
 /// 带 `thread` 时一条请求最多 3 个缓存断点：第 4 个名额留给上游自己标在对话末尾的那个，多了整条

@@ -186,7 +186,8 @@ async fn relay_ok(
     // "required"` 这类方言要先归一才知道补不补。
     if upstream.sim.is_some() {
         forensics.inbound_headers = inbound_headers_summary(&inb.headers);
-        forensics.inbound_shape = inb.body_json.as_ref().and_then(inbound_shape_summary);
+        forensics.inbound_shape =
+            inb.body_json.as_ref().and_then(|v| inbound_shape_summary(v, inb.cch_ok));
     }
     // 改写成预热的探针：`body_json` 已是预热，来访原本那份的摘要在 admit 时就留好了。
     if let Some(probe) = &inb.probe_prewarm {

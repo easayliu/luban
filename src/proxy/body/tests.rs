@@ -7817,3 +7817,45 @@ fn sim_threads_recreate_when_the_relocation_switch_flips() {
     let (v5, _) = thread_turn(&body(msgs3), on);
     assert_eq!(v5["thread"], serde_json::json!({ "type": "create" }), "切回来同样重建: {v5}");
 }
+
+/// 来访自带的 billing `cch` 对不对得上收到时的字节（[`super::cch_matches`]）：客户端算完就没人
+/// 动过的对得上；中转改了一个字节（这里把消息正文改了一个字）就对不上；没有 billing cch 的不判。
+#[test]
+fn cch_matches_tells_untouched_bodies_from_modified_ones() {
+    let mut raw = br#"{"model":"claude-opus-5-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.309.abc; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"hi"}]}"#.to_vec();
+    super::apply_cch(&mut raw).unwrap();
+    assert_eq!(super::cch_matches(&raw), Some(true), "客户端原件");
+    let text = String::from_utf8(raw).unwrap().replace(r#""hi""#, r#""ho""#);
+    assert_eq!(super::cch_matches(text.as_bytes()), Some(false), "正文被改过");
+    let bare = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(super::cch_matches(bare), None, "没有 billing cch");
+}
+
+/// 断档日志的出站下标按环境说明的**实际**插入点换算（[`super::EnvNoted::out_index`]）：开头连发两条
+/// user 时环境说明落在第一个 assistant 之前（第 2 条），来访第 1 条仍是出站第 1 条，第 2 条起才后移。
+#[test]
+fn env_note_out_index_follows_the_actual_insert_point() {
+    let noted = super::EnvNoted { added_msgs: 1, inserted_at: Some(2), ..Default::default() };
+    assert_eq!(noted.out_index(0), 0);
+    assert_eq!(noted.out_index(1), 1, "变了的 u2 在环境说明之前，不偏移");
+    assert_eq!(noted.out_index(2), 3, "a1 起后移一位");
+    let none = super::EnvNoted::default();
+    assert_eq!(none.out_index(5), 5, "没插环境说明不偏移");
+}
+
+/// 断档日志里的消息结构（[`super::block_shapes`]）只有类型、键名、长度与指纹，不带正文。
+#[test]
+fn block_shapes_never_include_message_text() {
+    let secret = "sk-ant-api03-SECRET-do-not-log";
+    let content = serde_json::json!([
+        {"type": "text", "text": secret, "cache_control": {"type": "ephemeral"}},
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": secret},
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+    ]);
+    let s = super::block_shapes(&content);
+    assert!(!s.contains("SECRET") && !s.contains("sig\""), "不含正文: {s}");
+    assert!(s.starts_with("text[type,text]:"), "{s}");
+    assert!(s.contains("|tool_result[type,tool_use_id,content]:"), "{s}");
+    assert!(s.contains("|thinking[type,thinking,signature]:"), "键名照列: {s}");
+    assert!(super::block_shapes(&serde_json::json!(secret)).starts_with("string:"));
+}

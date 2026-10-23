@@ -581,28 +581,91 @@ fn total_tokens_for(lineage: Option<&ThreadState>, regular_prompt: bool) -> (Tot
 
 /// 决定这一轮发 `create` 还是 `continue`，并把「等回程提交」的那份交出去。
 ///
+/// 一段已有回复的对话这一轮没能 `continue`、退回了 `create` 的原因，供排查缓存断档时打日志
+/// （[`crate::proxy::body`] 里 `apply_sim_thread`）。线程状态只存逐条指纹、不存原文，这里给出的是
+/// 「跟哪条旧状态比、从第几条开始不同、卡在哪一项」；那条消息的原文由调用方从出站体里截一段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ThreadMiss {
+    /// 会话里现存的线程状态条数（含其他对话、子代理）。
+    pub(super) threads: usize,
+    /// 其中首条消息指纹与这一轮相同的条数。
+    pub(super) same_root: usize,
+    /// 拿来比的那条（同 root、与这一轮公共前缀最长）记了几条消息；没有同 root 的为 0。
+    pub(super) best_len: usize,
+    /// 与那条的公共前缀长度：小于 `best_len` 即历史第 `common` 条变了。
+    pub(super) common: usize,
+    /// 卡在哪一项，见 [`thread_miss`]。
+    pub(super) why: &'static str,
+}
+
+/// 这一轮为什么接不上（[`find_continuable`] 的各项判据逐个对一遍）。这一轮的历史里还没有 assistant
+/// （对话首轮、子代理首轮）不算断档，返回 `None`。
+fn thread_miss(
+    threads: &[ThreadState],
+    root: u64,
+    shape: u64,
+    msgs: &[ThreadMsg],
+) -> Option<ThreadMiss> {
+    if !msgs.iter().any(|m| m.assistant) {
+        return None;
+    }
+    let common_of =
+        |t: &ThreadState| t.msgs.iter().zip(msgs).take_while(|(a, m)| **a == m.fp).count();
+    let same: Vec<&ThreadState> = threads.iter().filter(|t| t.root == root).collect();
+    let best = same.iter().copied().max_by_key(|t| (common_of(t), t.msgs.len(), t.seen));
+    let mut miss = ThreadMiss {
+        threads: threads.len(),
+        same_root: same.len(),
+        best_len: best.map_or(0, |t| t.msgs.len()),
+        common: best.map_or(0, common_of),
+        why: "",
+    };
+    let Some(t) = best else {
+        miss.why = if threads.is_empty() { "no_state" } else { "root_changed" };
+        return Some(miss);
+    };
+    let n = t.msgs.len();
+    miss.why = match msgs.get(n) {
+        _ if miss.common < n => "history_changed",
+        None => "no_reply_after_prefix",
+        Some(reply) if !reply.assistant => "no_reply_after_prefix",
+        Some(reply) if reply.tool_use_ids != t.tool_use_ids => "tool_use_ids",
+        Some(reply) if !reply.reply.matches(&t.reply_fp) => "reply_fp",
+        Some(_) if t.shape != shape => "shape",
+        Some(_) if t.dead => "dead",
+        Some(_) if n + 1 >= msgs.len() => "no_new_msgs",
+        Some(_) if msgs[n + 1..].iter().any(|m| m.assistant) => "extra_assistant",
+        Some(_) => "unknown",
+    };
+    Some(miss)
+}
+
 /// 会话表里还没有这个会话（[`CcSessionLink::load`] 没跑过，只在测试里出现）时照样 `create`，
 /// 回程提交时也就找不到条目、什么都不记。
 ///
 /// 第三个返回值是这一轮 `<total_tokens>` 提醒该写的数（[`TotalTokens`]）；`regular_prompt` 即末条
-/// 是一次新的用户输入（而非工具结果）。`seq` 是这条请求的发出序号（[`TurnMark::seq`]）。
+/// 是一次新的用户输入（而非工具结果）。`seq` 是这条请求的发出序号（[`TurnMark::seq`]）。第四个是
+/// 退回 `create` 时的断档原因（[`ThreadMiss`]），接上了或本来就是首轮为 `None`。
 pub(super) fn thread_decision(
     key: CcSessionKey<'_>,
     shape: u64,
     msgs: &[ThreadMsg],
     regular_prompt: bool,
     seq: u64,
-) -> (ThreadDecision, ThreadPending, u64) {
+) -> (ThreadDecision, ThreadPending, u64, Option<ThreadMiss>) {
     let root = msgs.first().map_or(0, |m| m.fp);
-    let (found, (budget, left), reminders) = {
+    let (found, (budget, left), reminders, miss) = {
         let map = CC_SESSIONS.lock();
         let threads = map.get(&key.owned()).map_or(&[][..], |e| &e.threads[..]);
         let lineage = find_lineage(threads, root, msgs);
+        let found = find_continuable(threads, root, shape, msgs)
+            .map(|t| (t.msgs.len() + 1, t.last_message_id.clone()));
+        let miss = if found.is_none() { thread_miss(threads, root, shape, msgs) } else { None };
         (
-            find_continuable(threads, root, shape, msgs)
-                .map(|t| (t.msgs.len() + 1, t.last_message_id.clone())),
+            found,
             total_tokens_for(lineage, regular_prompt),
             history_reminders(threads, root, msgs),
+            miss,
         )
     };
     let pending = ThreadPending {
@@ -620,7 +683,7 @@ pub(super) fn thread_decision(
         Some((from, previous_message_id)) => ThreadDecision::Continue { from, previous_message_id },
         None => ThreadDecision::Create,
     };
-    (decision, pending, left)
+    (decision, pending, left, miss)
 }
 
 /// 全表，键是 **`(凭证 id, 会话 id)`**。

@@ -10,7 +10,8 @@ use super::ban::parse_upstream_error;
 use super::learned_rules::{DeprecatedFieldMemory, LEARNED_KIND_DEPRECATED, SHAPE_MEMORY_CAP};
 use super::session_link::{
     CachePrefix, CcRequestKind, CcSessionKey, CcSessionLink, REPLY_TEXT_FP_INIT, ReplyFp,
-    ThreadDecision, ThreadMsg, TurnReminder, cache_prefix_stable, reply_text_fp, thread_decision,
+    ThreadDecision, ThreadMiss, ThreadMsg, TurnReminder, cache_prefix_stable, reply_text_fp,
+    thread_decision,
 };
 use super::simulation::{
     MAX_CACHE_BREAKPOINTS, SimEnv, Simulation, billing_header_text, cap_system_blocks,

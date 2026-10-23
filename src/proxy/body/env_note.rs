@@ -107,6 +107,7 @@ pub(in crate::proxy) fn insert_env_note(
         historical_switch: None,
         mid_conv_sys,
         added_msgs: 0,
+        inserted_at: None,
     };
     // 落位按**这一轮**模型自带的 beta，而非首轮那份：切回不支持中途 system 消息的旧模型
     // （opus 5.5 → opus 4.6）后，照首轮形态补一条 `role: system` 下去上游会 400。历史指纹跨模型族
@@ -124,6 +125,7 @@ pub(in crate::proxy) fn insert_env_note(
             serde_json::json!({ "role": "system", "content": [{ "type": "text", "text": text }] }),
         );
         noted.added_msgs = 1;
+        noted.inserted_at = Some(at);
         // 换模型那条用户消息排在环境说明之后的，下标跟着后移一位。
         if let Some((idx, _)) = historical_switch.as_mut()
             && *idx >= at
@@ -186,9 +188,21 @@ pub(in crate::proxy) struct EnvNoted {
     /// 消息、算 1；haiku 分支改的是首条用户消息的 `content`、算 0。message thread 的 `continue` 分支
     /// 按 raw 指纹比对出要丢的消息条数，再加上这个偏移才是出站 `messages` 里真正要 `drain` 的长度。
     pub(in crate::proxy) added_msgs: usize,
+    /// 那条 `role: system` 环境说明插在出站 `messages` 的第几条（`added_msgs` 为 1 时才有）。它不一定
+    /// 紧跟首条用户消息：落点是首条用户之后的第一个 assistant 之前（[`system_insert_pos`]），来访
+    /// 开头连发几条 user 时就往后挪。
+    pub(in crate::proxy) inserted_at: Option<usize>,
 }
 
 impl EnvNoted {
+    /// 来访第 `raw` 条消息在出站 `messages` 里的下标：排在环境说明插入点及之后的后移一位。
+    pub(in crate::proxy) fn out_index(&self, raw: usize) -> usize {
+        match self.inserted_at {
+            Some(at) if raw >= at => raw + 1,
+            _ => raw,
+        }
+    }
+
     /// 这一轮要在末尾补的模型说明：本来就是换模型那一轮的那条；历史里那条没能在原位重现
     /// （`placed` 为假，见 [`insert_historical_switch`]）时改补它，好让模型仍看到当前身份。
     pub(in crate::proxy) fn model_notice_after(&self, placed: bool) -> Option<String> {

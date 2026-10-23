@@ -1093,3 +1093,32 @@ fn an_expired_session_starts_over_between_sweeps() {
     assert!(again.first_seen, "过期的会话当新会话");
     assert_eq!(again.prompt_index, 1, "计数从头来");
 }
+
+/// 退回 `create` 时的断档原因（[`super::ThreadMiss`]）：会话里没有状态是 `no_state`；历史中间
+/// 某条变了是 `history_changed`，`common` 指到变了的那条；首轮（历史里还没有回复）不算断档。
+#[test]
+fn thread_miss_names_where_the_history_diverged() {
+    use super::{CcSessionKey, CcSessionLink, ReplyFp, ThreadMsg, thread_decision};
+    let m = |fp: u64, assistant: bool| ThreadMsg {
+        fp,
+        assistant,
+        tool_use_ids: Vec::new(),
+        reply: ReplyFp::default(),
+    };
+    let sid = crate::proxy::uuid_v4();
+    let key = CcSessionKey { cred_id: 44, session_id: &sid };
+    let (_, _, _, miss) = thread_decision(key, 7, &[m(1, false)], true, 1);
+    assert_eq!(miss, None, "首轮不算断档");
+    let turn1 = [m(1, false), m(2, true), m(3, false)];
+    let (_, _, _, miss) = thread_decision(key, 7, &turn1, false, 1);
+    assert_eq!(miss.map(|x| x.why), Some("no_state"), "会话表里还没有这个会话");
+
+    CcSessionLink::load(key, true, true);
+    let (_, pending, _, _) = thread_decision(key, 7, &turn1, false, 1);
+    CcSessionLink::record_thread(&pending, "msg_1", Vec::new(), ReplyFp::upstream(), 0);
+    let turn2 = [m(1, false), m(2, true), m(30, false), m(4, true), m(5, false)];
+    let (_, _, _, miss) = thread_decision(key, 7, &turn2, false, 2);
+    let miss = miss.expect("接不上");
+    assert_eq!(miss.why, "history_changed");
+    assert_eq!((miss.same_root, miss.best_len, miss.common), (1, 3, 2), "第 2 条变了");
+}

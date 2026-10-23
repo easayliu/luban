@@ -37,6 +37,9 @@ pub(super) struct Inbound {
     pub(super) key_access: store::KeyAccess,
     /// 命中探针判据、改写成官方 `/model` 预热再发的那条（见 [`ProbePrewarm`]）；其余为 `None`。
     pub(super) probe_prewarm: Option<ProbePrewarm>,
+    /// 来访自带的 billing `cch` 与收到时的 body 对不对得上（[`crate::proxy::body::cch_matches`]）；
+    /// 自报 CC 的来访、没有 billing cch 的为 `None`。
+    pub(super) cch_ok: Option<bool>,
 }
 
 /// 探针拒绝关着、`probe_as_prewarm` 开着时命中探针判据的来访
@@ -140,6 +143,11 @@ pub(super) async fn admit(
     // 只看头的闸都过了才读体，见 [`MAX_BODY_BYTES`]。
     let body = read_body(body, &method, &path_and_query, &client_ua).await?;
     let mut facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
+    // 自报不是 CC 的来访（会走模拟的那类）：趁 body 还是收到时的原样，校验它自带的 billing `cch`，
+    // 看规范化后的校验值是否匹配（校验范围内的内容有没有被中转动过，`model` / `max_tokens` 等几项
+    // 不在范围内，见 [`cch_matches`]），落进流水 `inbound_shape.facts.cch_ok`。下面换 id
+    // 那一步会改字节，必须在它之前算。自报 CC 的不算：真实路径另有 [`real_cch_stale`]。
+    let cch_ok = if facts.from_cc_client { None } else { crate::proxy::body::cch_matches(&body) };
     // 自报 CC 的历史里混进了 `call_` id（会话中途切过别的后端）：改写成 `toolu_` 再往下走，
     // 不然这个会话此后每一轮都被 2.3a 拒掉。后面所有闸门与出站改写都看改写后的那份。
     let body = remap_foreign_tool_ids(state, body, &mut facts, &client_ua);
@@ -188,7 +196,7 @@ pub(super) async fn admit(
         kind,
         wants_stream: body_json.as_ref().is_some_and(stream_requested),
         req_max_tokens: request_max_tokens(body_json.as_ref()),
-        inbound_shape: body_json.as_ref().and_then(inbound_shape_summary),
+        inbound_shape: body_json.as_ref().and_then(|v| inbound_shape_summary(v, cch_ok)),
     });
     let body = match probe_prewarm {
         Some(_) => {
@@ -299,6 +307,7 @@ pub(super) async fn admit(
             plan,
             key_access,
             probe_prewarm,
+            cch_ok,
         },
         Guards { in_flight, session_concurrency: session_concurrency_guard },
     ))

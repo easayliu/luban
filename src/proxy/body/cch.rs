@@ -69,12 +69,22 @@ pub(super) fn real_cch_stale(
     if sim.is_some() || !flags.cch_real_recompute {
         return false;
     }
-    let Some((start, end)) = billing_cch_region(body) else {
-        return false;
-    };
+    cch_matches(body) == Some(false)
+}
+
+/// 这份 body 的 billing header `cch` 与它**规范化后**的校验值是否匹配（[`compute_cch`]）：`Some(true)`
+/// 即匹配（官方客户端发出的原样请求恒匹配，`cap/` 263 条全中），`Some(false)` 即不匹配（校验范围内
+/// 的内容被改过，或者 cch 本就是编的），没有 billing cch 为 `None`。
+///
+/// 匹配**不等于**逐字节未改：规范化会清空 `model` 的值、剥掉 `max_tokens` / `fallbacks` /
+/// `fallback_credit_token`（[`normalize_for_cch`]），这几处改了照样匹配。模拟路径的来访（UA 被中转
+/// 换掉、请求体还是官方形态的那类）拿它看请求体在校验范围内有没有被动过，落进流水
+/// `inbound_shape.facts.cch_ok`，见 [`crate::proxy::logging::inbound_shape_summary`]。
+pub(in crate::proxy) fn cch_matches(body: &[u8]) -> Option<bool> {
+    let (start, end) = billing_cch_region(body)?;
     let mut zeroed = body.to_vec();
     zeroed[start..end].copy_from_slice(CCH_PLACEHOLDER.as_bytes());
-    compute_cch(&zeroed).as_bytes() != &body[start..end]
+    Some(compute_cch(&zeroed).as_bytes() == &body[start..end])
 }
 
 /// 出站字节定型后按策略处理 billing header 的 `cch`，改了就返回填进去的值，没动返回 `None`。
