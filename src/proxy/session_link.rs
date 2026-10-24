@@ -1567,9 +1567,10 @@ pub(crate) fn client_session_link(
     billable: bool,
     cred: &crate::credentials::Credential,
 ) -> Option<(String, CcSessionLink)> {
-    // 模拟那条路自己带链；`billing_cch` 是「允不允许动 billing header」的总开关；
-    // billing-only 下 billing header 只保证在、不往里追加会话关联字段。
-    if sim.is_some() || !billable || !flags.billing_cch || flags.billing_only() {
+    // 模拟那条路自己带链；`billing_cch` 是「允不允许动 billing header」的总开关。
+    // billing-only 照样建链：会话起点（握手）与每轮的 prompt id（遥测）都靠它，只是那几项
+    // 不往 billing header 里追加，判在 [`crate::proxy::rewrite_body_out`] 的 `link_added`。
+    if sim.is_some() || !billable || !flags.billing_cch {
         return None;
     }
     let v = body?;

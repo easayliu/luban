@@ -180,6 +180,24 @@ fn with_cache_keepalive(
     std::borrow::Cow::Owned(parts.join(","))
 }
 
+/// billing-only 模拟体里从不写 `thread`（[`crate::proxy::rewrite_body_out`] 那一步跳过），头上就不带
+/// [`config::CC_BETA_MESSAGE_THREADS`]：只带头不带体是官方不产生的组合。
+fn without_threads_if(
+    strip: bool,
+    beta: std::borrow::Cow<'static, str>,
+) -> std::borrow::Cow<'static, str> {
+    if !strip || !beta.split(',').any(|p| p.trim() == config::CC_BETA_MESSAGE_THREADS) {
+        return beta;
+    }
+    std::borrow::Cow::Owned(
+        beta.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != config::CC_BETA_MESSAGE_THREADS)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 /// 出站 beta 里有没有这一项；`<total_tokens>` 提醒按它选落法，见 [`crate::proxy::rewrite_body_out`]。
 pub(super) fn sim_has_beta(sim: &Simulation, name: &str) -> bool {
     let parts: Vec<String> = sim.beta.split(',').map(|b| b.trim().to_string()).collect();
@@ -317,12 +335,16 @@ impl Simulation {
         Some(Self {
             base: cc_system_base(model),
             profile,
-            beta: with_cache_keepalive(
-                config::cc_model_beta(profile, model),
-                SIM_CACHE_KEEPALIVE
-                    && profile_is_main_thread(profile.kind)
-                    && flags.cache_ttl_1h
-                    && super::cache_keepalive::account_enabled(cred.id),
+            beta: without_threads_if(
+                // 与下面的 `billing_only` 字段、请求体跳过 `thread`、遥测的 `bare` 同一个判据。
+                flags.sim_billing_only,
+                with_cache_keepalive(
+                    config::cc_model_beta(profile, model),
+                    SIM_CACHE_KEEPALIVE
+                        && profile_is_main_thread(profile.kind)
+                        && flags.cache_ttl_1h
+                        && super::cache_keepalive::account_enabled(cred.id),
+                ),
             ),
             session_id,
             link,

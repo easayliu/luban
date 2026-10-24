@@ -292,6 +292,7 @@ pub(super) async fn prepare<'a>(
         session_start(
             upstream.sim.as_ref(),
             upstream.client_link.as_ref(),
+            upstream.session_out.as_deref(),
             &trusted_cc_version(client_ua)
                 .map(|(a, b, c)| format!("{a}.{b}.{c}"))
                 .unwrap_or_else(|| config::CC_VERSION_BASE.to_string()),

@@ -434,6 +434,11 @@ pub(super) fn sample_dd_at(entry: &mut Value, roll: f64) -> bool {
     true
 }
 
+/// billing-only 模拟（[`Subst::bare`]）不报的事件：都在宣告注入进请求里的东西（环境说明、日期、各类附件），而这条路
+/// 除 billing header 外一样都没注入。
+pub(super) const BARE_SKIPPED: &[&str] =
+    &["tengu_attachments", "tengu_context_announcement", "tengu_context_rendering_recorded"];
+
 /// 模板占位符的取值。
 pub(super) struct Subst<'a> {
     pub(super) version: &'a str,
@@ -472,6 +477,8 @@ pub(super) struct Subst<'a> {
     /// 工具声明是来访客户端自带的（真实 CC 经网关透传），`tengu_context_size` 按网关基线报，见
     /// [`gateway_tool_tokens`]。
     pub(super) client_tools: bool,
+    /// billing-only 模拟，见 [`super::ApiCall::bare`]：模板里宣告注入内容的那几条不发。
+    pub(super) bare: bool,
     /// 这一轮那几条 `tengu_lucky_cerf` 一系实验曝光，空即不发——按会话钉住的分组与「模型走不走
     /// 精简提示词」见 [`crate::proxy::lucky_cerf_exposures`]，一个进程每个一次见
     /// [`super::session::TurnFacts::lucky_cerf`]。
@@ -814,6 +821,10 @@ where
                 });
                 let name = "tengu_file_suggestions_git_ls_files";
                 events.push((t, id.event_at(e.stage, name, t, &ctx(t), meta)));
+                continue;
+            }
+            // billing-only 模拟体里没有环境说明与附件，宣告它们的不报（[`super::ApiCall::bare`]）。
+            if subst.bare && BARE_SKIPPED.contains(&e.name.as_str()) {
                 continue;
             }
             let mut meta = substitute(&e.meta, subst);

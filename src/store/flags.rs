@@ -143,7 +143,7 @@ pub struct ForwardFlags {
     /// 加会话链的 `cc_prev_req` / `cc_prompt_id` / `cc_turn_origin` / 轮次，与出站头的 prompt id 同值），
     /// 其余注入一概跳过（[`Self::simulate_cc`] 的子项，实验性）。对所有来访生效：真实 CC 客户端
     /// 不走模拟，自带的 billing header 照旧（缺了只补 billing header、不补身份句），`metadata.user_id`
-    /// 的去留看 [`Self::sim_billing_keep_user_id`] / [`Self::real_billing_keep_user_id`]，身份补全 / 会话链 / 工具名混淆 / 断点与 system 整形 / 字段剥除等改写同样一概跳过，见 [`Self::billing_only`]。
+    /// 的去留看 [`Self::sim_billing_keep_user_id`] / [`Self::real_billing_keep_user_id`]，身份补全 / 工具名混淆 / 断点与 system 整形 / 字段剥除等改写同样一概跳过；会话链照建（握手与遥测的 prompt id 靠它）、但不写进 billing header，见 [`Self::billing_only`]。
     ///
     /// - **开**：不补身份句、官方基座、第四块、官方工具、`thread` / `diagnostics` /
     ///   `output_config`，不重排顶层键（`metadata.user_id` 另由两项子开关管）；客户端的 system 块、工具与参数原样透传（防 400 的归一照做）。

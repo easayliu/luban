@@ -3087,3 +3087,24 @@ fn total_tokens_without_tools_follows_the_model() {
         "{user:?}"
     );
 }
+
+/// billing-only 模拟体里从不写 `thread`，头上的 beta 也就不带 `message-threads`（只带头不带体官方不产生）；
+/// 完整模拟照旧带。2026-10-24 实测：billing-only 第三方两轮都带着这项 beta、体里却没有 thread。
+#[test]
+fn billing_only_sim_drops_the_thread_beta() {
+    let body = Bytes::from(
+        r#"{"model":"claude-sonnet-5-5","max_tokens":256,"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    let full = detect_for(&body, all_on()).expect("走模拟");
+    assert!(full.beta.contains(config::CC_BETA_MESSAGE_THREADS), "{}", full.beta);
+    let bo = store::ForwardFlags { sim_billing_only: true, ..all_on() };
+    let bare = detect_for(&body, bo).expect("走模拟");
+    assert!(!bare.beta.contains(config::CC_BETA_MESSAGE_THREADS), "{}", bare.beta);
+    assert_eq!(
+        bare.beta.split(',').count() + 1,
+        full.beta.split(',').count(),
+        "只少这一项: {} / {}",
+        bare.beta,
+        full.beta
+    );
+}

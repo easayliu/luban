@@ -515,11 +515,13 @@ pub(crate) struct SessionStart<'a> {
 
 /// 从两条路里取会话起点；不是新会话（或这条请求不在链上）时 `None`。
 ///
+/// `session_out` 是真实 CC 那条出站头与体上的会话 id（[`super::outbound_session_id`]），有就用它。
 /// `client_entrypoint` 是真实 CC 来访 UA 里自报的那段（[`super::body::cc_ua_entrypoint`]），
 /// 只决定 [`SessionStart::quota_probe`]。
 pub(super) fn session_start<'a>(
     sim: Option<&'a Simulation>,
     client_link: Option<&'a (String, CcSessionLink)>,
+    session_out: Option<&'a str>,
     client_version: &str,
     client_entrypoint: Option<&str>,
 ) -> Option<SessionStart<'a>> {
@@ -534,7 +536,9 @@ pub(super) fn session_start<'a>(
     }
     let (sid, link) = client_link?;
     link.first_seen.then(|| SessionStart {
-        session_id: sid,
+        // 链按客户端自己的会话 id 记，握手报的却得是**实际发出去的**那个（身份伪装会换掉它）：
+        // 额度探测的头、保活快照与主请求、遥测同值，见 [`super::outbound_session_id`]。
+        session_id: session_out.unwrap_or(sid),
         // 真实 CC 用**它自报的**版本：这个会话在上游那边就是那个版本的客户端在跑，
         // 握手事件里报 luban 自己那个版本等于把两个版本混进同一个会话。
         version: client_version.to_string(),
@@ -597,16 +601,15 @@ pub(crate) async fn spawn_session_handshake(
     let simulated = start.simulated;
     let runner = crate::oauth::HandshakeRunner::new(cred, h, org, simulated);
 
-    // 整串握手跑在**一个**后台任务里，严格按抓包的先后来：
+    // 整串握手跑在**一个**后台任务里，按抓包的发出时刻来（`cap/auto-2.1.309-20261023-full`），
+    // 各段**只看发出时刻、不等前一段的响应**：
     //
     // ```text
-    // policy_limits + settings（并发） → eval → 额度探测 → 收尾那批
+    // eval ─┬─ +90~250ms：policy_limits + settings（并发）
+    //       └─ +250~500ms：额度探测 ── +100~400ms：收尾那批
     // ```
     //
-    // **必须是同一个任务。** 拆成「lead 一个任务 + 限时等它 + 再 spawn rest」看着等价，
-    // 其实不是：等超时之后 rest 就发了，而 lead 可能还卡在 policy/settings 上，于是线上
-    // 顺序变成 `policy/settings → rest → eval → quota`——抓包里 eval 与额度探测是排在
-    // penguin/mcp/bootstrap 那批**之前**的。串在一个任务里，这个交错构造不出来。
+    // **必须是同一个任务**，各段的起点都从同一刻量：拆开 spawn 的话，哪段先被调度就不由这里说了算。
     //
     // 调用方只**限时等一个信号**（额度探测发完），拿到或超时都继续发主请求：
     //
@@ -623,10 +626,15 @@ pub(crate) async fn spawn_session_handshake(
     let probe_version = start.version.clone();
     let probe_flags = state.store.forward_flags();
     let quota_probe = start.quota_probe;
+    let gaps = handshake_gaps(quota_probe, |(lo, hi)| {
+        std::time::Duration::from_millis(rand::RngExt::random_range(&mut rand::rng(), lo..=hi))
+    });
     tokio::spawn(async move {
         handshake_sequence(
+            gaps,
             runner.lead(&client_for_task, &token_for_task),
-            // 不补额度探测时这一段立即完成，放行信号照常在 lead 之后发出。
+            runner.config_pull(&client_for_task, &token_for_task),
+            // 不补额度探测时这一段立即完成，放行信号照常等 eval 回来再发。
             async {
                 if quota_probe {
                     send_quota_probe(
@@ -667,25 +675,55 @@ pub(crate) async fn spawn_session_handshake(
     }
 }
 
-/// 串行跑完握手三段，并在**额度探测发完之后**发出放行信号。
+/// 握手的两段间隔（eval → 额度探测，额度探测 → 收尾那批），`pick` 从闭区间里取一个值。
 ///
-/// 抽成一个函数是为了让「顺序」本身可测（`tests::handshake_runs_in_capture_order`）——
-/// 这段代码唯一的职责就是顺序，而顺序错了不会有任何编译期或运行期症状，只会在上游那边
-/// 看到一个真实客户端不产生的时序。
+/// 不补额度探测的会话（`-p` 等）第一段取 0，收尾那批直接从 eval 起算：309 的 `-p` 启动
+/// （`cap/auto-2.1.309-20261023-full` 00917 起七次）mcp_servers 在 eval 后 +76~312ms、bootstrap
+/// +412~741ms，中间没有探测那一段。
+pub(crate) fn handshake_gaps(
+    quota_probe: bool,
+    mut pick: impl FnMut((u64, u64)) -> std::time::Duration,
+) -> (std::time::Duration, std::time::Duration) {
+    let to_quota = if quota_probe {
+        pick(config::HANDSHAKE_QUOTA_DELAY_MS)
+    } else {
+        std::time::Duration::ZERO
+    };
+    (to_quota, pick(config::HANDSHAKE_REST_DELAY_MS))
+}
+
+/// 按发出时刻跑完握手各段，并在 **eval 回来、额度探测也发完**之后发出放行信号。
 ///
-/// 放行信号发在 `quota` 之后、`rest` 之前：抓包里 eval 与额度探测排在 penguin/mcp/
-/// bootstrap 那批之前，而那批与首条 messages 是重叠的。
+/// `gaps` 是（eval → 额度探测，额度探测 → 收尾那批）两段间隔，都从**发出**量起、不等前一段的响应，
+/// 与抓包一致（`cap/auto-2.1.309-20261023-full`：探测常排在 policy 之前，收尾那批中位在探测后 +250ms）。
+/// 放行仍要等 eval 的结果：`tengu_lucky_cerf` 分组确认、`tengu_lantern_spool` 都看它，主请求必须排在它之后。
+///
+/// 抽成一个函数是为了让时序本身可测（`tests::handshake_runs_in_capture_order`）——
+/// 时序错了不会有任何编译期或运行期症状，只会在上游那边看到一个真实客户端不产生的时序。
 pub(crate) async fn handshake_sequence(
+    gaps: (std::time::Duration, std::time::Duration),
     lead: impl std::future::Future<Output = ()>,
+    config: impl std::future::Future<Output = ()>,
     quota: impl std::future::Future<Output = ()>,
     rest: impl std::future::Future<Output = ()>,
     probe_done: tokio::sync::oneshot::Sender<()>,
 ) {
-    lead.await;
-    quota.await;
-    // 接收端可能已经等超时走了，`send` 失败是正常情形。
-    let _ = probe_done.send(());
-    rest.await;
+    let (to_quota, to_rest) = gaps;
+    tokio::join!(
+        config,
+        async {
+            tokio::join!(lead, async {
+                tokio::time::sleep(to_quota).await;
+                quota.await;
+            });
+            // 接收端可能已经等超时走了，`send` 失败是正常情形。
+            let _ = probe_done.send(());
+        },
+        async {
+            tokio::time::sleep(to_quota + to_rest).await;
+            rest.await;
+        },
+    );
 }
 
 /// 官方启动串里那条额度探测：`POST /v1/messages?beta=true`，haiku、`max_tokens:1`、
@@ -784,9 +822,11 @@ pub(crate) async fn send_quota_probe(
     let url = ensure_beta_query(&format!("{}/v1/messages", config::UPSTREAM_BASE_URL));
     let req = client.post(&url).headers(headers);
     let req = if flags.orig_header_case { req.orig_headers(orig_header_case()) } else { req };
+    let req = req.body(body);
+    crate::oauth::side_dump(&req, "quota_probe");
     // 跑在后台握手任务里、没人限时等它（见 [`spawn_session_handshake`]），自己限时：
     // 卡住的话这一串剩下的握手连同任务本身都挂着不走。
-    let sent = req.body(body).timeout(crate::oauth::SIDE_REQUEST_TIMEOUT).send().await;
+    let sent = req.timeout(crate::oauth::SIDE_REQUEST_TIMEOUT).send().await;
     match sent {
         Ok(r) => tracing::debug!(
             cred_id = cred.id,

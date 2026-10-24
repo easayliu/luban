@@ -137,7 +137,10 @@ impl EventBuilder<'_> {
                     "queryDepth": prev_depth
                 }),
             );
-            self.push(ta, "tengu_attachments", attachments);
+            // billing-only 模拟没补 `<total_tokens>` 提醒（[`ApiCall::bare`]）。
+            if !self.env.call.bare {
+                self.push(ta, "tengu_attachments", attachments);
+            }
             self.push(
                 ms(ta, 1),
                 "tengu_query_after_attachments",

@@ -439,27 +439,29 @@ pub(crate) fn rewrite_body_out_parsed(
     let cch_added = flags.billing_cch && ensure_billing_cch(&mut v);
     // 真实 CC 来访的会话关联字段：API-key 端一个都不发，而订阅端官方每条主线程请求都有。
     // 跟在 `ensure_billing_cch` 之后——官方段序是 `cch` 在前、这两项在后。
-    let link_added = client_link.is_some_and(|l| {
-        // 没有 billing header 就整条不补：那种请求（额度探测那类）官方连 `cc_version` 都
-        // 不发，单给它一个 `diagnostics` 反而造出一个新组合。判在 `append_billing_link`
-        // 之外，因为后者「两项都已经在了」也返回 false，那种情况 `diagnostics` 还是要补。
-        if !has_billing_header(&v) {
-            return false;
-        }
-        // 主线程（含工具续轮与 thread 续轮）的 `cc_prompt_id` 后面还跟着 `cc_turn_origin`
-        // （2.1.277 起）与会话里的第几轮（2.1.285 起，`cap/2.1.285/00113`、`00115`）；子代理与
-        // helper 只有 `cc_prompt_id`（`00120`、`00125`）。按来访自报的版本给，版本读不出不补。
-        let ver = client.and_then(|c| parse_version(c.version));
-        let main = cc_kind == CcRequestKind::Main;
-        let turn = TurnFields {
-            origin: main && ver.is_some_and(|v| v >= (2, 1, 277)),
-            index: main && ver.is_some_and(|v| v >= (2, 1, 285)),
-        };
-        let billing = append_billing_link(&mut v, l, turn);
-        // `diagnostics` 同样是订阅端才有的（`cap/2.1.258-api` 六份一个都没有）。
-        let diag = l.diagnostics && ensure_diagnostics(&mut v, l);
-        billing || diag
-    });
+    // billing-only 下 billing header 只保证在、不追加会话关联字段（链照建，见 [`super::client_session_link`]）。
+    let link_added = !billing_only
+        && client_link.is_some_and(|l| {
+            // 没有 billing header 就整条不补：那种请求（额度探测那类）官方连 `cc_version` 都
+            // 不发，单给它一个 `diagnostics` 反而造出一个新组合。判在 `append_billing_link`
+            // 之外，因为后者「两项都已经在了」也返回 false，那种情况 `diagnostics` 还是要补。
+            if !has_billing_header(&v) {
+                return false;
+            }
+            // 主线程（含工具续轮与 thread 续轮）的 `cc_prompt_id` 后面还跟着 `cc_turn_origin`
+            // （2.1.277 起）与会话里的第几轮（2.1.285 起，`cap/2.1.285/00113`、`00115`）；子代理与
+            // helper 只有 `cc_prompt_id`（`00120`、`00125`）。按来访自报的版本给，版本读不出不补。
+            let ver = client.and_then(|c| parse_version(c.version));
+            let main = cc_kind == CcRequestKind::Main;
+            let turn = TurnFields {
+                origin: main && ver.is_some_and(|v| v >= (2, 1, 277)),
+                index: main && ver.is_some_and(|v| v >= (2, 1, 285)),
+            };
+            let billing = append_billing_link(&mut v, l, turn);
+            // `diagnostics` 同样是订阅端才有的（`cap/2.1.258-api` 六份一个都没有）。
+            let diag = l.diagnostics && ensure_diagnostics(&mut v, l);
+            billing || diag
+        });
     // 封顶排在**所有会增加 system 块数的步骤之后**：两条整形产出的都是 ≤5 块，而补前缀会在
     // 最前面加一到两块。原先它排在补前缀之前，一条客户端 5 块、没 billing header 的来访
     // （现网 2.1.238，req_ujomarOOPtXL38jx）过了封顶再被补成 6 或 7 块，出站超过

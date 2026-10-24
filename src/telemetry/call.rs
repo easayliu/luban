@@ -91,6 +91,14 @@ pub struct ApiCall {
     /// 不是模拟路径注入的固定资产：`tengu_context_size` 的工具计数按网关基线报，见
     /// [`super::template`] 的 `gateway_tool_tokens`。
     pub client_tools: bool,
+    /// 真实 CC 来访那条会话链上这一条的 prompt id（[`crate::proxy::CcSessionLink`]）。只在出站体的
+    /// billing header 里**没有** `cc_prompt_id` 时顶上：billing-only 链照建却不往 header 里写，
+    /// 遥测拿它才能跟握手、保活报同一个 id，且每次新输入换一个（官方网关形态遥测也逐轮换）。
+    pub link_prompt_id: Option<String>,
+    /// billing-only 模拟（[`crate::proxy::Simulation`] 的 `billing_only`）：出站体除 billing header 外什么都没注入——
+    /// 没有环境说明与各类附件、没有 `thread`。宣告这些东西的事件（`tengu_attachments`、`tengu_context_announcement`
+    /// 等）与 tether 三条一概不报：官方网关形态不用 thread 时 tether 一条都没有（`cap/auto-2.1.309-20261023-api`）。
+    pub bare: bool,
     /// 实际出站的 `anthropic-dispatch-id`（真实客户端透传它自己的，模拟路径恒为 `v2d`，额度探测不带）。
     pub dispatch: Option<String>,
     /// 同一请求在这一条之前失败过的那几次（客户端自己重发的），按先后。转发路径交过来时总是空的，
@@ -187,6 +195,10 @@ pub struct Capture {
     pub cache_keepalive_ok: bool,
     /// 见 [`ApiCall::client_tools`]。
     pub client_tools: bool,
+    /// 见 [`ApiCall::link_prompt_id`]。
+    pub link_prompt_id: Option<String>,
+    /// 见 [`ApiCall::bare`]。
+    pub bare: bool,
 }
 
 impl Capture {
@@ -244,6 +256,8 @@ impl Capture {
             aborted: false,
             cache_keepalive_ok: false,
             client_tools: self.client_tools,
+            link_prompt_id: self.link_prompt_id,
+            bare: self.bare,
             dispatch: self.dispatch,
             prior_attempts: Vec::new(),
         });

@@ -3,47 +3,63 @@ use crate::proxy::test_support::{
 };
 use crate::proxy::{Bytes, StatusCode, config, header, store};
 
-/// 握手三段**严格串行**，放行信号发在额度探测之后、收尾段之前。
+/// 握手各段按**发出时刻**排：eval 领头，额度探测与收尾那批各隔一段间隔发出、不等前一段的响应
+/// （`cap/auto-2.1.309-20261023-full`）；放行信号等 eval 回来、额度探测也发完才给。
 ///
-/// 回归的是一个只在慢网下才露头的交错：曾经是「lead 一个任务 + 限时等它 + 再 spawn
-/// rest」，等超时之后 rest 就发了，而 lead 可能还卡在 policy/settings 上，线上顺序变成
-/// `policy/settings → rest → eval → quota`——抓包里 eval 与额度探测排在 penguin/mcp/
-/// bootstrap 那批**之前**。这种错序不会有任何编译期或运行期症状，只能靠钉住顺序。
+/// 这里 eval 故意很慢（模拟本机到上游 1s 的往返）：探测与收尾那批照样按间隔发出，主请求却仍排在 eval 之后。
 #[tokio::test]
 async fn handshake_runs_in_capture_order() {
     use std::sync::{Arc, Mutex};
-    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let t0 = tokio::time::Instant::now();
     let step = |name: &'static str, delay_ms: u64| {
         let log = log.clone();
         async move {
-            // lead 故意比放行上限还慢，模拟慢网。
+            log.lock().unwrap().push(format!("{name}>"));
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            log.lock().unwrap().push(name);
+            log.lock().unwrap().push(format!("{name}<"));
         }
     };
+    let ms = std::time::Duration::from_millis;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let seq = tokio::spawn(crate::proxy::handshake_sequence(
-        step("lead", 30),
-        step("quota", 5),
+        // 两段间隔就算同一轮到期，`join!` 也按书写顺序推进，探测总在收尾那批之前；耗时拉到几百毫秒，
+        // 是为了「探测、收尾都早于 eval 回来」这类断言在机器忙时也站得住。
+        (ms(20), ms(20)),
+        step("eval", 600),
+        step("config", 900),
+        step("quota", 500),
         step("rest", 5),
         tx,
     ));
 
-    // 调用方只等「额度探测发完」这一个信号。
-    rx.await.expect("信号该在 quota 之后发出");
+    rx.await.expect("信号该在 eval 回来之后发出");
+    assert!(t0.elapsed() >= ms(600), "放行等 eval 的结果");
     {
         let seen = log.lock().unwrap();
-        assert_eq!(*seen, ["lead", "quota"], "放行时 lead 与 quota 已经完成，rest 还没开始");
+        let at = |e: &str| seen.iter().position(|x| x == e).unwrap();
+        assert!(at("eval>") < at("quota>") && at("quota>") < at("rest>"), "{seen:?}");
+        assert!(at("rest>") < at("eval<"), "探测与收尾那批不等 eval 回来: {seen:?}");
+        assert!(at("rest>") < at("quota<"), "收尾那批不等探测回来: {seen:?}");
+        assert!(!seen.contains(&"config<".to_string()), "拉配置不挡放行: {seen:?}");
     }
     seq.await.unwrap();
-    assert_eq!(*log.lock().unwrap(), ["lead", "quota", "rest"], "收尾段排在最后");
+    assert_eq!(log.lock().unwrap().len(), 8, "四段都跑完");
 }
 
-/// 调用方等超时之后，后台那串**照样按顺序跑完**——`rest` 不会越过还没完成的 `lead`。
-///
-/// 这是上一条的另一半：超时只是「不再等」，不是「取消」，更不是「让 rest 先跑」。
+/// 不补额度探测的会话（`-p` 等）收尾那批直接从 eval 起算，补的会话先隔一段探测间隔（[`super::handshake_gaps`]）。
+#[test]
+fn handshake_gaps_skip_the_quota_leg_without_a_probe() {
+    let ms = std::time::Duration::from_millis;
+    let hi = |(_, hi): (u64, u64)| ms(hi);
+    let (q, r) = (config::HANDSHAKE_QUOTA_DELAY_MS.1, config::HANDSHAKE_REST_DELAY_MS.1);
+    assert_eq!(super::handshake_gaps(true, hi), (ms(q), ms(r)));
+    assert_eq!(super::handshake_gaps(false, hi), (ms(0), ms(r)), "没有探测那一段");
+}
+
+/// 调用方等超时之后，后台那串**照样跑完**——超时只是「不再等」，不是「取消」。
 #[tokio::test]
-async fn handshake_keeps_its_order_after_the_caller_gives_up() {
+async fn handshake_keeps_running_after_the_caller_gives_up() {
     use std::sync::{Arc, Mutex};
     let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
     let step = |name: &'static str, delay_ms: u64| {
@@ -53,22 +69,27 @@ async fn handshake_keeps_its_order_after_the_caller_gives_up() {
             log.lock().unwrap().push(name);
         }
     };
+    let ms = std::time::Duration::from_millis;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let seq = tokio::spawn(crate::proxy::handshake_sequence(
-        step("lead", 60),
+        (ms(5), ms(5)),
+        step("eval", 400),
+        step("config", 0),
         step("quota", 5),
         step("rest", 5),
         tx,
     ));
 
     // 调用方 10ms 就放弃等待（真实里是 `HANDSHAKE_LEAD_TIMEOUT_MS`）。
-    let waited = tokio::time::timeout(std::time::Duration::from_millis(10), rx).await;
+    let waited = tokio::time::timeout(ms(10), rx).await;
     assert!(waited.is_err(), "该超时");
-    assert!(log.lock().unwrap().is_empty(), "此刻 lead 还没跑完");
+    assert!(!log.lock().unwrap().contains(&"eval"), "此刻 eval 还没回来");
 
-    // 放弃等待不影响后台：三段仍按序跑完，一段都没被取消。
+    // 放弃等待不影响后台：四段一段都没被取消。
     seq.await.unwrap();
-    assert_eq!(*log.lock().unwrap(), ["lead", "quota", "rest"]);
+    let mut seen = log.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, ["config", "eval", "quota", "rest"]);
 }
 
 /// 握手 / 额度探测的身份取**主请求实际发出去的那份**，不是重新派生一份。
@@ -526,7 +547,7 @@ fn quota_probe_only_for_interactive_cli_sessions() {
     use crate::proxy::session_link::CcSessionLink;
     let link = ("sid".to_string(), CcSessionLink { first_seen: true, ..Default::default() });
     let quota = |ep: Option<&str>| {
-        super::session_start(None, Some(&link), "2.1.293", ep).map(|s| s.quota_probe)
+        super::session_start(None, Some(&link), None, "2.1.293", ep).map(|s| s.quota_probe)
     };
     assert_eq!(quota(Some("cli")), Some(true));
     for ep in [Some("sdk-cli"), Some("claude-desktop"), Some("claude-vscode"), None] {
@@ -538,6 +559,17 @@ fn quota_probe_only_for_interactive_cli_sessions() {
         link: CcSessionLink { first_seen: true, ..Default::default() },
         ..sim
     };
-    let start = super::session_start(Some(&sim), None, "2.1.293", Some("sdk-cli")).unwrap();
+    let start = super::session_start(Some(&sim), None, None, "2.1.293", Some("sdk-cli")).unwrap();
     assert!(start.quota_probe, "模拟路径恒补，不看来访 UA");
+}
+
+/// 真实 CC 的握手报**出站**会话 id：身份伪装换掉了客户端自己那个时，额度探测的头与保活快照要与主请求、
+/// 遥测同值（2026-10-24 billing-only 实测：探测头带客户端原 id、体里却是出站那个）。
+#[test]
+fn real_cc_handshake_uses_the_outbound_session_id() {
+    use crate::proxy::session_link::CcSessionLink;
+    let link = ("client-sid".to_string(), CcSessionLink { first_seen: true, ..Default::default() });
+    let start = |out| super::session_start(None, Some(&link), out, "2.1.309", Some("cli")).unwrap();
+    assert_eq!(start(Some("outbound-sid")).session_id, "outbound-sid");
+    assert_eq!(start(None).session_id, "client-sid", "没改写时就是客户端那个");
 }

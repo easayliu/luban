@@ -233,6 +233,8 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             aborted: false,
             cache_keepalive_ok: false,
             client_tools: false,
+            link_prompt_id: None,
+        bare: false,
             dispatch: Some("v2d".into()),
             prior_attempts: Vec::new(),
         }
@@ -2349,7 +2351,8 @@ fn rejected_tool_events_keep_the_previous_prompt() {
 /// `tengu_dapper_dawn`）。
 #[test]
 fn cache_heartbeat_follows_the_flag_as_it_changes() {
-    let cred = 9_313;
+    // 开关是按号记的全局状态：用独占的号，别的测试（同用 9_313 的那两条）并发改它会让这里偶发失败。
+    let cred = 9_327;
     let at = heartbeat_calls(cred);
     let set = |on: bool| {
         let eval = json!({"tengu_dapper_dawn": {"value": on}});
@@ -3647,6 +3650,8 @@ fn a_capture_can_report_a_failure_without_a_response() {
         started_at: frozen_now() - Duration::from_secs(3),
         cache_keepalive_ok: false,
         client_tools: false,
+        link_prompt_id: None,
+        bare: false,
     };
     // 连接层就失败：没有状态码、没有上游 request-id。
     cap(t.clone()).record_failure(
@@ -3715,6 +3720,8 @@ fn a_401_early_return_still_reports_an_auth_error() {
         started_at: frozen_now() - Duration::from_secs(2),
         cache_keepalive_ok: false,
         client_tools: false,
+        link_prompt_id: None,
+        bare: false,
     }
     .record_failure(
         7,
@@ -4830,6 +4837,8 @@ fn dump_telemetry_replay() {
     for c in &calls {
         let mut a = call(c["body"].as_str().unwrap().as_bytes().to_vec(), "x", "end_turn");
         a.client_tools = client_tools;
+        // 模拟 billing-only：体里的 `cc_prompt_id` 被挪到这里（会话链那份），见 [`ApiCall::link_prompt_id`]。
+        a.link_prompt_id = s(c, "link_prompt_id");
         a.betas = s(c, "betas");
         a.ua_out = s(c, "ua").unwrap_or_default();
         a.session_header = s(c, "session_header");
@@ -9471,4 +9480,89 @@ fn derived_main_session_betas_match_the_2_1_308_captures() {
         let derived = crate::proxy::cc_main_beta_at(model, Some((2, 1, 308)));
         assert_eq!(session_betas(&derived), session_betas(&official), "{model}（{f}）");
     }
+}
+
+/// billing-only 模拟（[`ApiCall::bare`]）体里没有环境说明、附件与 `thread`：tether 三条、`tengu_attachments`、
+/// `tengu_context_announcement`、`tengu_context_rendering_recorded` 一概不报，其余照旧。
+/// 2026-10-24 billing-only 第三方实测：首轮报了六类附件与 session_context / date 宣告，两轮都报 tether。
+#[test]
+fn bare_simulation_reports_nothing_it_did_not_inject() {
+    const SID: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+    let run = |bare: bool| -> Vec<String> {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(120);
+        for (i, last_text) in [true, false, true].into_iter().enumerate() {
+            let mut c = call(cc_body(last_text), &format!("req_{i}"), "end_turn");
+            c.bare = bare;
+            c.ua_out = "claude-cli/2.1.309 (external, cli)".into();
+            c.started_at = base + Duration::from_secs(20 * i as u64);
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, SID.to_string())).expect("queued");
+        let mut names: Vec<String> = p.events.iter().map(|(_, e)| ev_name(e).to_string()).collect();
+        names.extend(p.dd.iter().filter_map(|d| {
+            let m = d["message"].as_str()?;
+            Some(match d["feature_name"].as_str() {
+                Some(f) => format!("{m}:{f}"),
+                None => m.to_string(),
+            })
+        }));
+        names
+    };
+    let full = run(false);
+    let bare = run(true);
+    let gone = [
+        "tengu_tether_decision",
+        "tengu_tether_echo_audit",
+        "tengu_tether_live_outcome",
+        "tengu_attachments",
+        "tengu_context_announcement",
+        "tengu_context_rendering_recorded",
+    ];
+    for n in gone {
+        assert!(!bare.iter().any(|x| x == n), "bare 不报 {n}");
+    }
+    assert!(full.iter().any(|x| x == "tengu_tether_decision"), "完整模拟照报 tether");
+    assert!(full.iter().any(|x| x == "tengu_attachments"), "完整模拟照报附件");
+    // 其余照旧（整份比不了：模板里有按种子抽样的项，两次运行本来就不同）。
+    for n in [
+        "tengu_input_prompt",
+        "tengu_api_query",
+        "tengu_api_success",
+        "tengu_turn_end",
+        "tengu_reminder_fold_replayed",
+        "tengu_wire_tool_input_echo_replayed",
+        "tengu_started",
+    ] {
+        assert!(bare.iter().any(|x| x == n), "bare 照报 {n}");
+    }
+}
+
+/// 真实 CC 透传（[`ApiCall::client_tools`]）只在出站头带 message-threads 时报 tether：经网关的客户端不带，官方那时
+/// 一条都不报（`cap/auto-2.1.309-20261023-api`）。2026-10-24 billing-only 实测：真实 CC 不带这项也报了 tether。
+#[test]
+fn passthrough_tether_follows_the_thread_beta() {
+    const SID: &str = "4dc73702-d904-4887-809d-17b93cc5357c";
+    let tethers = |betas: &str| -> usize {
+        let t = Telemetry::default();
+        let mut c = call(cc_body(true), "req_0", "end_turn");
+        c.client_tools = true;
+        c.betas = Some(betas.into());
+        c.ua_out = "claude-cli/2.1.309 (external, cli)".into();
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = st.pending.get(&(7, SID.to_string())).expect("queued");
+        p.events.iter().filter(|(_, e)| ev_name(e).starts_with("tengu_tether_")).count()
+            + p.dd
+                .iter()
+                .filter(|d| d["message"].as_str().is_some_and(|m| m.starts_with("tengu_tether_")))
+                .count()
+    };
+    assert_eq!(tethers("claude-code-20250219,effort-2025-11-24"), 0, "网关形态不报");
+    let with = format!(
+        "claude-code-20250219,effort-2025-11-24,{}",
+        crate::config::CC_BETA_MESSAGE_THREADS
+    );
+    assert!(tethers(&with) > 0, "带线程 beta 照报");
 }

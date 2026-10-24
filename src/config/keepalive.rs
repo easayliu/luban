@@ -61,12 +61,28 @@ pub const KEEPALIVE_UA_BUN: &str = "Bun/1.4.3";
 /// 启动握手「领跑段」最多挡住首条 `/v1/messages` 多久
 /// （见 [`crate::oauth::HandshakeRunner::lead`]）。
 ///
-/// 抓包里这一段实测 1.65s（policy/settings 并发 → eval → 额度探测），主请求排在它后面。
+/// 抓包里这一段实测 1.65s（2.1.260：policy/settings 并发 → eval → 额度探测），主请求排在它后面；
+/// 2.1.309 是 eval 领头、额度探测约 +0.3~0.5s，更短。
 /// luban 这边照着做，但**必须有上限**：那几个端点是 luban 替客户端补的，慢一点或挂了都
 /// 不该让用户的第一条请求跟着卡住。超时就放行，剩下的在后台继续跑完。
 ///
 /// 取 2.5s：够抓包那 1.65s 跑完，又不至于在端点无响应时把首条请求拖到用户能察觉。
 pub const HANDSHAKE_LEAD_TIMEOUT_MS: u64 = 2_500;
+
+/// 启动握手里 `policy_limits` / `settings` 比 `eval` 晚多久发出（毫秒，闭区间内随机取）。
+///
+/// `cap/auto-2.1.309-20261023-full` 交互式会话 13 次启动：eval 领头，两条拉配置在 +11~601ms 内跟上
+/// （多数 +100~250ms，彼此先后不定），且**不挡**额度探测——00443 那次探测（+211）排在 policy（+476）
+/// 之前。2.1.291 起各批都是这个形态（每批二十来次启动里 eval 在后的只有一两次，是竞态）。
+pub const HANDSHAKE_CONFIG_PULL_DELAY_MS: (u64, u64) = (90, 250);
+
+/// 启动握手里额度探测比 `eval` 晚多久发出（毫秒，闭区间内随机取）。**不等 eval 的响应**：同一份抓包里
+/// 13 次多数落在 +300~500ms（全距 +211~1469），本机到上游 eval 往返就要 1s 上下，等它回来再发就晚了一截。
+pub const HANDSHAKE_QUOTA_DELAY_MS: (u64, u64) = (250, 500);
+
+/// 收尾那批（penguin / mcp_servers / bootstrap / code triggers）比额度探测晚多久发出，同样不等探测的响应：
+/// 抓包里中位约 +250ms（+93~423）。
+pub const HANDSHAKE_REST_DELAY_MS: (u64, u64) = (100, 400);
 
 /// `downloads.claude.ai/claude-code-releases/latest` 离会话起点多久
 /// （见 [`crate::oauth::HandshakeRunner::downloads`]）。

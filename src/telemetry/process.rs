@@ -27,6 +27,10 @@ impl Telemetry {
         prev_end_override: Option<SystemTime>,
     ) {
         let Some(mut shape) = shape else { return };
+        // 体里没写 `cc_prompt_id`（billing-only 不往 header 里追加）就用会话链上那份，见 [`ApiCall::link_prompt_id`]。
+        if shape.cc_prompt_id.is_none() {
+            shape.cc_prompt_id = call.link_prompt_id.clone();
+        }
         if shape.quota_probe {
             // 官方不为它报任何事件，但它标着一次进程启动，见 [`State::process_starts`]。
             if let (Some(dev), Some(sid)) = (
@@ -540,7 +544,17 @@ impl Telemetry {
         }
         // tether 只管主线程与子代理（摘要、猜下一句、标题这类辅助调用一条都没有），子代理
         // 每条支线一个线程（`cap/2.1.280` Explore 首条 `create/first_request`、之后 `continue/append`）。
-        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent))
+        // 没有线程可言就不报：官方不用线程时 tether 一条都没有（`cap/auto-2.1.309-20261023-api` 客户端自报那几批）。
+        // billing-only 模拟体里不写 `thread`、头上也去掉了那项 beta（[`ApiCall::bare`]）；真实 CC 透传
+        // （[`ApiCall::client_tools`]）看出站头上有没有 message-threads——经网关的客户端自己就不带。
+        let threads = if call.client_tools {
+            call.betas.as_deref().is_some_and(|b| {
+                b.split(',').any(|p| p.trim() == crate::config::CC_BETA_MESSAGE_THREADS)
+            })
+        } else {
+            !call.bare
+        };
+        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent) && threads)
             .then(|| sess.tether_for(&call, &shape, &display_model, is_main, &agent_key));
         // 这条线程的全量形态记下来，给下一条增量请求补（见 [`ThreadBase`]）。
         // 只记全量视角：不是增量（`create` 或没开线程），或增量已经按底本补全了。没补上的增量（底本
@@ -1200,6 +1214,10 @@ impl Session {
             }
         } else if self.prompt_id.is_empty() {
             self.prompt_id = uuid_v4();
+        } else if new_prompt && !agent_side {
+            // 哪儿都没有 prompt id 时自己造，也得逐轮换：官方每次新输入一个新 id（`cap/2.1.258-api/00022`
+            // 四轮四个值）。
+            self.prev_prompt_id = std::mem::replace(&mut self.prompt_id, uuid_v4());
         }
         let prompt_id = match own_prompt {
             Some(pid) if agent_side => pid,

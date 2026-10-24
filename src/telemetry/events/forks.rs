@@ -34,7 +34,7 @@ impl EventBuilder<'_> {
         // 分叉里接着发的那条：客户端先把拒绝结果与这一步算出的附件攒进分叉再发（`cap/auto-2.1.307-20261022-full`
         // A19 .431：只有 `total_tokens_reminder`，没有主线程续轮前后那两条 query 计数）。附件计算耗时那条官方
         // 每个附件只抽 5%（`su`），不补。
-        if shape.suggestion_step > 0 {
+        if shape.suggestion_step > 0 && !self.env.call.bare {
             let mut attachments = json!({ "attachment_types": ["total_tokens_reminder"] });
             if v285 {
                 let query_source = env.query_source.as_str();

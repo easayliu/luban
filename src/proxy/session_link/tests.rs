@@ -591,7 +591,8 @@ fn api_key_cc_gets_the_oauth_session_chain() {
 /// 而官方那条（`cap/2.1.260-2/00063`）**根本不写** `cc_prompt_id`。
 #[test]
 fn session_chain_fields_follow_the_request_kind() {
-    const SID: &str = "d0c1fb05-9b19-4576-9465-e2b8a206dabf";
+    // 会话链是全局的（按凭证 + 会话 id 记）：用独占的 id，别的测试并发写同一条链会把这里的轮次拨乱。
+    let sid = crate::proxy::uuid_v4();
     let body = |tools: &str, last: &str, billing_extra: &str| {
         Bytes::from(format!(
             concat!(
@@ -604,11 +605,11 @@ fn session_chain_fields_follow_the_request_kind() {
                 r#""tools":{},"#,
                 r#""metadata":{{"user_id":"{{\"session_id\":\"{}\"}}"}}}}"#
             ),
-            last, billing_extra, tools, SID
+            last, billing_extra, tools, sid
         ))
     };
     let mut headers = crate::proxy::HeaderMap::new();
-    headers.insert("x-claude-code-session-id", HeaderValue::from_static(SID));
+    headers.insert("x-claude-code-session-id", HeaderValue::from_str(&sid).unwrap());
     headers.insert(
         "anthropic-beta",
         HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
@@ -1121,4 +1122,160 @@ fn thread_miss_names_where_the_history_diverged() {
     let miss = miss.expect("接不上");
     assert_eq!(miss.why, "history_changed");
     assert_eq!((miss.same_root, miss.best_len, miss.common), (1, 3, 2), "第 2 条变了");
+}
+
+/// billing-only 下真实 CC 照样建链（会话起点触发握手、每轮 prompt id 给遥测），但出站体一个字节都不因它改变：
+/// billing header 不追加 `cc_prompt_id` / `cc_prev_req`，也不补 `diagnostics`。
+#[test]
+fn billing_only_tracks_the_chain_without_touching_the_body() {
+    let sid = crate::proxy::uuid_v4();
+    let body = |text: &str| {
+        Bytes::from(format!(
+            concat!(
+                r#"{{"model":"claude-opus-5","max_tokens":64000,"#,
+                r#""messages":[{{"role":"user","content":"{}"}}],"#,
+                r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
+                r#"cc_version=2.1.309.1b3; cc_entrypoint=cli;"}},"#,
+                r#"{{"type":"text","text":"{}"}},{}],"#,
+                r#""tools":[{{"name":"Bash"}}],"#,
+                r#""metadata":{{"user_id":"{{\"device_id\":\"{}\",\"session_id\":\"{}\"}}"}}}}"#
+            ),
+            text,
+            config::CC_SYSTEM_IDENTITY,
+            base_block(),
+            "832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870",
+            sid
+        ))
+    };
+    let mut headers = crate::proxy::HeaderMap::new();
+    headers.insert("x-claude-code-session-id", HeaderValue::from_str(&sid).unwrap());
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
+    );
+    headers.insert(header::USER_AGENT, HeaderValue::from_static(config::CC_USER_AGENT));
+    let bo = crate::store::ForwardFlags { sim_billing_only: true, ..all_on() };
+    assert!(bo.billing_only());
+    let rewrite = |b: &Bytes, link: Option<&super::CcSessionLink>| {
+        crate::proxy::rewrite_body_out(
+            b,
+            &test_cred(),
+            "fp",
+            bo,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            Some(crate::proxy::CcClient { version: "2.1.309", entrypoint: "cli" }),
+            link,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0
+    };
+    let link_of = |b: &Bytes| {
+        crate::proxy::client_session_link(
+            parsed(b).as_ref(),
+            &headers,
+            None,
+            bo,
+            true,
+            &test_cred(),
+        )
+        .expect("billing-only 也建链")
+        .1
+    };
+
+    let first = body("hi");
+    let l1 = link_of(&first);
+    assert!(l1.first_seen, "会话首条：握手由它触发");
+    let out = rewrite(&first, Some(&l1));
+    assert_eq!(out, rewrite(&first, None), "有链没链出站体一致");
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let billing = v["system"][0]["text"].as_str().unwrap();
+    assert!(!billing.contains("cc_prompt_id=") && !billing.contains("cc_prev_req="), "{billing}");
+    assert!(v.get("diagnostics").is_none(), "{v}");
+
+    // 第二次新输入：不再是会话起点，prompt id 换一个。
+    let second = body("again");
+    let l2 = link_of(&second);
+    assert!(!l2.first_seen);
+    assert!(l1.prompt_id.is_some() && l2.prompt_id.is_some());
+    assert_ne!(l1.prompt_id, l2.prompt_id, "每次新输入换 prompt id");
+}
+
+/// **对照工具，默认不跑**：`LUBAN_CAP_CALLS` 是从网关形态抓包（`cap/auto-*-api`）里抽出的
+/// `/v1/messages` 请求（`[{headers:{..}, body:".."}]`），逐条按 billing-only 过一遍：有链与没链的出站体
+/// 必须逐字节一致，并打印每条的会话起点与 prompt id。
+/// `cargo test billing_only_capture_replay -- --ignored --nocapture`。
+#[test]
+#[ignore]
+fn billing_only_capture_replay() {
+    let Ok(inp) = std::env::var("LUBAN_CAP_CALLS") else {
+        eprintln!("set LUBAN_CAP_CALLS");
+        return;
+    };
+    let calls: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(inp).unwrap()).unwrap();
+    let bo = crate::store::ForwardFlags { sim_billing_only: true, ..all_on() };
+    for c in &calls {
+        let mut headers = crate::proxy::HeaderMap::new();
+        for (k, v) in c["headers"].as_object().unwrap() {
+            if let (Ok(k), Ok(v)) = (
+                axum::http::HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v.as_str().unwrap()),
+            ) {
+                headers.insert(k, v);
+            }
+        }
+        let body = Bytes::from(c["body"].as_str().unwrap().to_string());
+        let v = parsed(&body);
+        let beta: Vec<String> = headers
+            .get("anthropic-beta")
+            .and_then(|x| x.to_str().ok())
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_default();
+        let kind = v.as_ref().map(|v| super::CcRequestKind::of(v, &beta));
+        let link =
+            crate::proxy::client_session_link(v.as_ref(), &headers, None, bo, true, &test_cred());
+        let ua = headers.get(header::USER_AGENT).and_then(|x| x.to_str().ok()).unwrap_or("");
+        let client = crate::proxy::trusted_cc_version(ua).map(|(a, b, c)| format!("{a}.{b}.{c}"));
+        let cc =
+            client.as_deref().map(|v| crate::proxy::CcClient { version: v, entrypoint: "cli" });
+        let rewrite = |l: Option<&super::CcSessionLink>| {
+            crate::proxy::rewrite_body_out(
+                &body,
+                &test_cred(),
+                "fp",
+                bo,
+                None,
+                None,
+                None,
+                false,
+                None,
+                true,
+                true,
+                cc,
+                l,
+                kind.unwrap_or(crate::proxy::CcRequestKind::Main),
+                None,
+            )
+            .0
+        };
+        let with = rewrite(link.as_ref().map(|(_, l)| l));
+        let without = rewrite(None);
+        println!(
+            "{} kind={:?} link={} first_seen={} prompt_id={:?} same_body={}",
+            c["file"].as_str().unwrap_or(""),
+            kind,
+            link.is_some(),
+            link.as_ref().is_some_and(|(_, l)| l.first_seen),
+            link.as_ref().and_then(|(_, l)| l.prompt_id.clone()),
+            with == without,
+        );
+        assert_eq!(with, without, "{}", c["file"]);
+    }
 }

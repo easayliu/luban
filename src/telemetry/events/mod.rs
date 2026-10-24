@@ -409,6 +409,7 @@ impl<'a> EventEnv<'a> {
             tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
             client_tools: self.call.client_tools,
+            bare: self.call.bare,
             lucky_cerf: f.lucky_cerf.clone(),
             git: f.identity.vcs.is_some(),
             seed: self.req_hash,

@@ -206,7 +206,10 @@ impl EventBuilder<'_> {
             if recorded {
                 let tr = ms(t0, -5);
                 self.push_dd(tr, "tengu_feature_ok", feature("context_git_detect"));
-                for (kind_name, tokens) in [("session_context", 82), ("date", 9)] {
+                // billing-only 模拟没注入环境说明，不宣告（[`ApiCall::bare`]）。
+                let announced: &[(&str, u32)] =
+                    if self.env.call.bare { &[] } else { &[("session_context", 82), ("date", 9)] };
+                for &(kind_name, tokens) in announced {
                     self.push(
                         tr,
                         "tengu_context_announcement",
@@ -229,11 +232,13 @@ impl EventBuilder<'_> {
                     "tengu_wire_tool_input_echo_recorded",
                     json!({ "recorded": true, "echo": true, "carriedForward": false, "inherited": false, "cached": true, "cachedSource": "payload" }),
                 );
-                self.push(
-                    t4,
-                    "tengu_context_rendering_recorded",
-                    json!({ "rendering": "announced", "carriedForward": false }),
-                );
+                if !self.env.call.bare {
+                    self.push(
+                        t4,
+                        "tengu_context_rendering_recorded",
+                        json!({ "rendering": "announced", "carriedForward": false }),
+                    );
+                }
             }
             if replayed {
                 self.push(

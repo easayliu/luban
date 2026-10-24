@@ -1104,10 +1104,63 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
 /// 本身不限总时长（它也承载 `/v1/*` 的长 SSE），不限的话一个只建连不回包的代理能把串行的
 /// 保活 / 遥测循环永久挂住。要别的时长的，在**这一步之后**再 `.timeout(..)` 覆盖（后设的生效）。
 pub(crate) fn axios(req: wreq::RequestBuilder, shape: &str) -> wreq::RequestBuilder {
-    req.header("Accept-Encoding", config::AXIOS_ACCEPT_ENCODING)
+    let req = req
+        .header("Accept-Encoding", config::AXIOS_ACCEPT_ENCODING)
         .header("Connection", config::AXIOS_CONNECTION)
         .orig_headers(orig_headers(config::axios_shape(shape)))
-        .timeout(SIDE_REQUEST_TIMEOUT)
+        .timeout(SIDE_REQUEST_TIMEOUT);
+    side_dump(&req, shape);
+    req
+}
+
+/// **调试用，默认不开**：设了 `LUBAN_SIDE_DUMP=<目录>` 时，旁路请求（启动握手、保活、遥测上报、额度探测）
+/// 发出前把方法、URL、头与体各写成一个 JSON 文件（`<序号>_<时刻>_<shape>.json`），拿来与官方抓包逐条对照
+/// ——luban 的出站走 webpki 根证书，中间人抓不到。体只写能同步取出的那种（JSON 体都是）。
+pub(crate) fn side_dump(req: &wreq::RequestBuilder, shape: &str) {
+    use futures_util::FutureExt;
+    static DIR: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| std::env::var_os("LUBAN_SIDE_DUMP").map(Into::into));
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(dir) = DIR.as_ref() else { return };
+    let Some(mut r) = req.try_clone().and_then(|b| b.build().ok()) else { return };
+    let headers: Vec<(String, String)> = r
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            // token 不落盘，只留类型。
+            let v = String::from_utf8_lossy(v.as_bytes()).into_owned();
+            let v = if k == "authorization" {
+                v.split(' ').next().unwrap_or("").to_string() + " …"
+            } else {
+                v
+            };
+            (k.to_string(), v)
+        })
+        .collect();
+    let body = r.body_mut().take().and_then(|b| {
+        let b = axum::body::Body::new(b);
+        let bytes = axum::body::to_bytes(b, usize::MAX).now_or_never()?.ok()?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned().into()),
+        )
+    });
+    let now = chrono::Local::now();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let doc = serde_json::json!({
+        "ts": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "shape": shape,
+        "method": r.method().as_str(),
+        "url": r.uri().to_string(),
+        "headers": headers,
+        "body": body,
+    });
+    let name = format!("{seq:05}_{}_{shape}.json", now.format("%H%M%S%.3f"));
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|()| {
+        std::fs::write(dir.join(name), serde_json::to_vec_pretty(&doc).unwrap_or_default())
+    }) {
+        tracing::warn!(error = %e, "LUBAN_SIDE_DUMP write failed");
+    }
 }
 
 /// 旁路请求（保活、启动握手、遥测上报、额度探测）的总时长上限：从开始连接到读完响应体。
@@ -1216,19 +1269,17 @@ pub async fn keepalive_policy_limits(
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_POLICY_LIMITS);
-    let mut req = axios(
-        client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-            .header("User-Agent", ctx.ua())
-            .header("Accept", config::AXIOS_ACCEPT),
-        "policy_limits",
-    );
+    let mut req = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", ctx.ua())
+        .header("Accept", config::AXIOS_ACCEPT);
+    // 条件头加在套 axios 之前：线上顺序由 `orig_headers` 定，与加的先后无关；放前面 `LUBAN_SIDE_DUMP` 才落得到它。
     if let Some(etag) = etag_of(ctx.cred_id, "policy_limits") {
         req = req.header("If-None-Match", etag);
     }
-    conditional_get(req, ctx.cred_id, "policy_limits").await
+    conditional_get(axios(req, "policy_limits"), ctx.cred_id, "policy_limits").await
 }
 
 /// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。
@@ -1238,21 +1289,19 @@ pub async fn keepalive_settings(
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_SETTINGS);
-    let mut req = axios(
-        client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-            .header("User-Agent", ctx.ua())
-            .header("Cache-Control", "no-cache")
-            .header("Pragma", "no-cache")
-            .header("Accept", config::AXIOS_ACCEPT),
-        "settings",
-    );
+    let mut req = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("User-Agent", ctx.ua())
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("Accept", config::AXIOS_ACCEPT);
+    // 条件头加在套 axios 之前：线上顺序由 `orig_headers` 定，与加的先后无关；放前面 `LUBAN_SIDE_DUMP` 才落得到它。
     if let Some(etag) = etag_of(ctx.cred_id, "settings") {
         req = req.header("If-None-Match", etag);
     }
-    conditional_get(req, ctx.cred_id, "settings").await
+    conditional_get(axios(req, "settings"), ctx.cred_id, "settings").await
 }
 
 /// 发一条条件 GET，并把 200 的响应体摘要记进 [`AXIOS_ETAGS`] 供下次带 `If-None-Match`。
@@ -1351,7 +1400,7 @@ pub async fn keepalive_eval(
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVAL);
     // **不套 axios 形态**：eval 走的是 Bun 自带的 fetch，`Connection: keep-alive`、
     // `Accept: */*`、`Accept-Encoding` 跟 Messages API 那份一样，见 [`config::AXIOS_SHAPE_EVAL`]。
-    let resp = client
+    let req = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
@@ -1362,9 +1411,9 @@ pub async fn keepalive_eval(
         .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
         .orig_headers(orig_headers(config::AXIOS_SHAPE_EVAL.order))
         .json(&ctx.eval_body())
-        .timeout(SIDE_REQUEST_TIMEOUT)
-        .send()
-        .await;
+        .timeout(SIDE_REQUEST_TIMEOUT);
+    side_dump(&req, "eval");
+    let resp = req.send().await;
     match resp {
         // 成功时读体：里面的服务端开关 `tengu_lantern_spool` 决定模拟请求带不带
         // `anthropic-usage-limit`（[`crate::proxy::note_eval_features`]）。体按 `Content-Encoding`
@@ -1849,18 +1898,25 @@ impl HandshakeRunner {
         }
     }
 
-    /// 领跑段：`policy_limits` + `settings`（并发）→ `eval`。**调用方应当在发出这个会话的
-    /// 首条 `/v1/messages` 之前 `await` 它**，额度探测紧随其后由调用方发。
+    /// 领跑段：`eval`。**调用方应当在发出这个会话的首条 `/v1/messages` 之前 `await` 它**，额度探测
+    /// 紧随其后由调用方发；`policy_limits` / `settings` 与它并发，见 [`Self::config_pull`]。
     pub async fn lead(&self, client: &wreq::Client, access_token: &str) {
+        let eval = keepalive_eval(client, access_token, &self.ctx).await;
+        self.report("lead", &[("eval", eval)]);
+    }
+
+    /// `policy_limits` + `settings`（并发），比 `eval` 晚一小段才发（[`config::HANDSHAKE_CONFIG_PULL_DELAY_MS`]），
+    /// 与领跑段、额度探测并行，不挡它们。
+    pub async fn config_pull(&self, client: &wreq::Client, access_token: &str) {
+        let (lo, hi) = config::HANDSHAKE_CONFIG_PULL_DELAY_MS;
+        // 随机数生成器不是 Send，不能跨 await 持有，先取值。
+        let delay = rand::RngExt::random_range(&mut rand::rng(), lo..=hi);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         let (policy_limits, settings) = tokio::join!(
             keepalive_policy_limits(client, access_token, &self.ctx),
             keepalive_settings(client, access_token, &self.ctx),
         );
-        let eval = keepalive_eval(client, access_token, &self.ctx).await;
-        self.report(
-            "lead",
-            &[("policy_limits", policy_limits), ("settings", settings), ("eval", eval)],
-        );
+        self.report("config", &[("policy_limits", policy_limits), ("settings", settings)]);
     }
 
     /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers /
