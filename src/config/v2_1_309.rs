@@ -1,9 +1,9 @@
-//! 2.1.309 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.309 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.309 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.309 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.309 的 profile 表：2.1.309 来访的 beta 参照（[`cc_profile_at`]）。2.1.310 的表
+/// （[`CC_PROFILES`]）逐行同这张，只换版本号。
 ///
 /// **各行除版本号外与 2.1.308（[`CC_PROFILES_2_1_308`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.309-20261023-full`（场景同 2.1.308-full，测试项目换了干净的
@@ -28,7 +28,7 @@ use super::*;
 /// 行为。源码上这个入口由 `isArtifactsMcpLaptopEntry` 一串前置条件把关，其中基址判的是 **OAuth/frame 基址**
 /// （`base_not_first_party`），**不等同于设了 `ANTHROPIC_BASE_URL`**，`provider` 也不是由 `ANTHROPIC_BASE_URL`
 /// 直接决定；真正走 gateway 的会跳过创建（内部可能生成 `feature_sad`，外发还受遥测开关约束）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_309: &[CcProfile] = &[
     at_309(CC_PROFILES_2_1_308[0]),
     at_309(CC_PROFILES_2_1_308[1]),
     at_309(CC_PROFILES_2_1_308[2]),

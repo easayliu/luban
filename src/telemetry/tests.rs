@@ -7121,6 +7121,83 @@ fn version_2_1_307_telemetry_shape() {
     }
 }
 
+/// 2.1.310 的遥测（`cap/auto-2.1.310-20261024-{full,retry}`）：
+/// - 5xx 仍不带 `error_constructor`，栈哈希不变，顶帧只换块名（retry 三条同值）；
+/// - 组织配置闸的影子判定在 `settings_cache_age_ms` 后多五项：签名副本两项恒 `trusted`、现拉签名那侧
+///   还没答复（`unavailable_pending`）报 `no_answer`、否则 `valid`，`decision_if_strict` 与 `decision` 同值；
+///   2.1.309 不带。
+#[test]
+fn version_2_1_310_telemetry_shape() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.310 (external, sdk-cli)");
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        assert!(m.get("error_constructor").is_none(), "2.1.310 {n} 不带 error_constructor");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-36ysyspx.js:11:1510")),
+            "2.1.310 {n}"
+        );
+    }
+
+    let shadow = |ver: &str| {
+        let t = Telemetry::default();
+        let mut c = call(body_for("claude-opus-5-5", Some("medium"), true), "req_310", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_org_config_gate_shadow")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let m = shadow("2.1.310");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "settings_cache_age_ms").unwrap();
+    assert_eq!(
+        keys[at + 1..at + 7],
+        [
+            "settings_stored_copy",
+            "policy_stored_copy",
+            "settings_live_signed",
+            "policy_live_signed",
+            "decision_if_strict",
+            "shadow_trigger"
+        ]
+    );
+    assert_eq!(
+        (&m["settings_stored_copy"], &m["policy_stored_copy"]),
+        (&json!("trusted"), &json!("trusted"))
+    );
+    let live = |reason: &Value| if reason == "unavailable_pending" { "no_answer" } else { "valid" };
+    assert_eq!(m["settings_live_signed"], json!(live(&m["settings_reason"])));
+    assert_eq!(m["policy_live_signed"], json!(live(&m["policy_reason"])));
+    assert_eq!(m["decision_if_strict"], m["decision"]);
+    // 服务端配置那几项按 310 抓包的主流值（2.1.305 起那两份模板）。
+    assert_eq!(
+        (&m["decision"], &m["exclusion_now"], &m["flag_enabled"], &m["flag_percent"]),
+        (&json!("pass"), &json!("rollout_percent"), &json!(true), &json!(1))
+    );
+    assert_eq!((&m["grace_ttl_hours"], &m["settings_live_signed"]), (&json!(24), &json!("valid")));
+    // 2.1.293 ~ 2.1.303 不等配置落定就报，模板保持抓包里的 `blocked` + fallback 那套（`decision_reason` 等只跟
+    // `blocked` 一起出现），不跟着改。
+    let old_tpl = super::template::template_for("2.1.303", false)
+        .startup
+        .iter()
+        .find(|e| e.name == "tengu_org_config_gate_shadow")
+        .map(|e| e.meta.clone())
+        .unwrap();
+    assert_eq!(
+        (&old_tpl["decision"], &old_tpl["flag_source"], &old_tpl["decision_reason"]),
+        (&json!("blocked"), &json!("fallback"), &json!("unavailable_pending"))
+    );
+
+    let old = shadow("2.1.309");
+    for k in ["settings_stored_copy", "policy_live_signed", "decision_if_strict"] {
+        assert!(old.get(k).is_none(), "2.1.309 不带 {k}");
+    }
+}
+
 /// 「猜下一句」请求体：主线程上下文、一条回复、猜下一句的提示词；`denied` 是分叉里前面几步调过的工具（每步
 /// 一个，都被分叉拒了），接着发的那条末尾是拒绝结果与 total_tokens 附件那条 system 消息（`cap/auto-2.1.307-
 /// 20261022-full/00188` 的形态）。
@@ -7731,6 +7808,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.310 (external, cli)", "b26c68ea74b5", "chunk-31gxg38t.js:3618:6047"),
         ("claude-cli/2.1.309 (external, cli)", "1a36b34122c0", "chunk-kang00hq.js:3682:5744"),
         ("claude-cli/2.1.308 (external, cli)", "40e496cc06bc", "chunk-a1cg2ptw.js:3661:6043"),
         ("claude-cli/2.1.307 (external, cli)", "40e496cc06bc", "chunk-wvsyb4fb.js:3661:6043"),

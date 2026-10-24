@@ -466,6 +466,8 @@ impl Telemetry {
         let v308 = version_at_least(&version, "2.1.308");
         // 2.1.309：失败 Bash 的错误栈摘要、行列、块名都换了（`cap/auto-2.1.309-20261023-full` A0 那条）。
         let v309 = version_at_least(&version, "2.1.309");
+        // 2.1.310：失败 Bash 的错误栈摘要、行列、块名都换了（`cap/auto-2.1.310-20261024-bashfail`）。
+        let v310 = version_at_least(&version, "2.1.310");
         let safety_events = v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
@@ -727,6 +729,7 @@ impl Telemetry {
             v307,
             v308,
             v309,
+            v310,
             safety_events,
             suggestion_fork,
             lucky_cerf,

@@ -213,6 +213,14 @@ pub(super) static TEMPLATE_2_1_303_SDK: std::sync::LazyLock<Template> =
 /// 变的几处（摘要器收尾的 writer、auto 判决的 `skippedOnAllowRule`、压缩尝试的 `keepNoRound`、拒绝时的
 /// `tengu_safety_event`）都在按请求现算的事件里，见 `TurnFacts::v307`。2.1.308 也沿用：两版内嵌 JS 除版本号 /
 /// 构建时间外逐字相同，`cap/auto-2.1.308-20261022-full` 与 2.1.307-full 比多出的几个键都是场景分支。
+/// 2.1.309、2.1.310 也沿用；2.1.310 的 `org_config_gate_shadow` 多五项，在 [`emit_template`] 里按版本补。
+///
+/// 这两份里 `org_config_gate_shadow` 跟服务端配置走的几项（`decision`、`exclusion_now`、`flag_*`、`grace_ttl_hours`、
+/// 两侧 `*_reason`）按 `cap/auto-2.1.310-20261024-full` 交互式启动那 14 条的主流值改过（`pass` / `rollout_percent` /
+/// 开、`disk`、1%、24h / `ok`、`none_configured`；2.1.309 抓包时还是关、0%、96h）。2.1.305 起这条等配置落定
+/// （`shadow_trigger: settled`）才报，所以报的是当时的服务端状态。**2.1.293 ~ 2.1.303 那几份不改**：旧版在启动时、
+/// 配置还没拉回来就先报，每版抓包 24 条里 23 条是 `blocked` + `fallback` + 两侧 `unavailable_pending`（带
+/// `decision_reason` / `decision_resource`），那是旧客户端的时序、不是服务端状态，开关、比例、宽限期都是 fallback 下的默认值。
 pub(super) static TEMPLATE_2_1_305: std::sync::LazyLock<Template> =
     std::sync::LazyLock::new(|| {
         serde_json::from_str(include_str!("../assets/cc_telemetry_template_2_1_305.json"))
@@ -226,7 +234,7 @@ pub(super) static TEMPLATE_2_1_305_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_305_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306 ~ 2.1.308）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306 ~ 2.1.310）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
@@ -923,6 +931,29 @@ where
                     "haiku_match",
                     vec![("context_window_match", json!(true)), ("max_output_match", json!(true))],
                 );
+            }
+            // 2.1.310 起组织配置闸的影子判定在 `settings_cache_age_ms` 后多五项（`cap/auto-2.1.310-20261024-full`
+            // 全部 25 条都带）：两份签名副本恒 `trusted`；现拉的签名在那一侧还没答复（`unavailable_pending`）时报
+            // `no_answer`、拉到了报 `valid`；`decision_if_strict` 与 `decision` 同值。
+            if e.name == "tengu_org_config_gate_shadow"
+                && version_at_least(subst.version, "2.1.310")
+                && meta.get("settings_stored_copy").is_none()
+            {
+                let live = |side: &str| {
+                    if meta.get(side).and_then(|x| x.as_str()) == Some("unavailable_pending") {
+                        "no_answer"
+                    } else {
+                        "valid"
+                    }
+                };
+                let pairs = vec![
+                    ("settings_stored_copy", json!("trusted")),
+                    ("policy_stored_copy", json!("trusted")),
+                    ("settings_live_signed", json!(live("settings_reason"))),
+                    ("policy_live_signed", json!(live("policy_reason"))),
+                    ("decision_if_strict", meta.get("decision").cloned().unwrap_or(Value::Null)),
+                ];
+                insert_after(&mut meta, "settings_cache_age_ms", pairs);
             }
             // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
             // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关

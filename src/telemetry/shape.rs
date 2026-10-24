@@ -666,7 +666,8 @@ pub(super) fn error_message_hash(
 /// `/^[A-Z][a-zA-Z]{0,63}$/` 决定发不发）。2.1.306 的 5xx（`cap/auto-2.1.306-20261021-retry` 十条同值），2.1.307 的
 /// 5xx（`cap/auto-2.1.307-20261022-retry` 三条同值：摘要没变，类名与块名换了），2.1.308 的 5xx
 /// （`cap/auto-2.1.308-20261022-retry` 三条同值：只换了块名，行列与类名都没变），2.1.309 的 5xx
-/// （`cap/auto-2.1.309-20261023-retry` 两条同值：块名换了、不再带 `error_constructor`）。
+/// （`cap/auto-2.1.309-20261023-retry` 两条同值：块名换了、不再带 `error_constructor`），2.1.310 的 5xx
+/// （`cap/auto-2.1.310-20261024-retry` 三条同值：只换了块名，仍不带 `error_constructor`）。
 pub(super) fn error_trace(
     version: &str,
     status: Option<u16>,
@@ -686,6 +687,9 @@ pub(super) fn error_trace(
         // 顶帧只换打包块名（`cap/auto-2.1.309-20261023-retry` R1/R2 实测）。
         ("2.1.309", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-t24ds32q.js:11:1510"))
+        }
+        ("2.1.310", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-36ysyspx.js:11:1510"))
         }
         _ => None,
     }
