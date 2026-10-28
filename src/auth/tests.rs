@@ -379,6 +379,27 @@ fn url_credentials_are_redacted_anywhere_in_text() {
     assert!(matches!(super::redact_url_credentials(plain), std::borrow::Cow::Borrowed(_)));
 }
 
+#[test]
+fn email_domains_are_redacted_for_viewers() {
+    let r = |s: &str| super::redact_email_domains(s).into_owned();
+    assert_eq!(
+        r(r#"{"label":"alice.b+1@mail.example.co","org_name":"alice@example.com's Organization"}"#),
+        r#"{"label":"alice.b+1@***","org_name":"alice@***'s Organization"}"#
+    );
+    assert_eq!(r("contact bob@example.com."), "contact bob@***.");
+    // 不是邮箱的 `@`、已打码的代理串原样不动，且不分配新串。
+    for plain in [
+        r#"{"pkg":"@anthropic-ai/sdk","model":"claude@20250514"}"#,
+        r#"{"proxy":"http://user:***@host.example.com:8080"}"#,
+        "a@b",
+    ] {
+        assert!(
+            matches!(super::redact_email_domains(plain), std::borrow::Cow::Borrowed(_)),
+            "{plain}"
+        );
+    }
+}
+
 #[sqlx::test]
 async fn setup_requires_the_token_even_from_loopback(pool: sqlx::PgPool) {
     use axum::{

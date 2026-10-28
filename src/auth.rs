@@ -697,10 +697,11 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
             },
         },
     };
-    let redact = actor.is_viewer() || req.extensions().get::<TeamRead>().is_some();
+    let viewer = actor.is_viewer();
+    let redact = viewer || req.extensions().get::<TeamRead>().is_some();
     req.extensions_mut().insert(actor);
     let resp = next.run(req).await;
-    if redact { redact_for_viewer(resp).await } else { resp }
+    if redact { redact_for_viewer(resp, viewer).await } else { resp }
 }
 
 /// 请求是拿上号 Key 来的（放进请求扩展）。上号时没指定代理就自动从代理池分配，见
@@ -768,7 +769,7 @@ async fn provision_key_request(
     }
     req.extensions_mut().insert(Actor::from(user));
     req.extensions_mut().insert(ViaProvisionKey);
-    redact_for_viewer(next.run(req).await).await
+    redact_for_viewer(next.run(req).await, false).await
 }
 
 /// `/mcp` 的鉴权：认 MCP Key（[`KeyKind::Mcp`]），回所属成员与 Key 的 id。
@@ -1222,8 +1223,49 @@ pub fn redact_url_credentials(text: &str) -> std::borrow::Cow<'_, str> {
     if changed { std::borrow::Cow::Owned(out) } else { std::borrow::Cow::Borrowed(text) }
 }
 
-/// 访客的响应体过一遍 [`redact_url_credentials`]。管理接口没有流式响应，整段读进来无妨。
-async fn redact_for_viewer(resp: Response) -> Response {
+/// 把文本里邮箱的域名打码：`alice@example.com` → `alice@***`。账号名多半就是登录邮箱，
+/// 域名能看出是谁家的号，访客只留用户名那半。
+///
+/// 与 [`redact_url_credentials`] 同理按整段文本扫，不按字段：邮箱还会出现在组织名
+/// （`alice@example.com's Organization`）、流水的报错文案里。`@` 前须紧挨着邮箱用户名的
+/// 字符、后面的域名须带点且以字母顶级域结尾，`@anthropic-ai/sdk`、`model@20250514`、
+/// 已打过码的 `user:***@host` 都不算。
+pub fn redact_email_domains(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('@') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let is_local = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    let is_domain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut changed = false;
+    while let Some(at) = rest.find('@') {
+        let (head, tail) = rest.split_at(at);
+        let tail = &tail[1..];
+        let domain_len = tail.find(|c: char| !is_domain(c)).unwrap_or(tail.len());
+        let domain = tail[..domain_len].trim_end_matches(['.', '-']);
+        let tld = domain.rsplit('.').next().unwrap_or("");
+        let is_email = head.chars().next_back().is_some_and(is_local)
+            && domain.contains('.')
+            && tld.len() >= 2
+            && tld.chars().all(|c| c.is_ascii_alphabetic());
+        out.push_str(head);
+        out.push('@');
+        if is_email {
+            out.push_str("***");
+            rest = &tail[domain.len()..];
+            changed = true;
+        } else {
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    if changed { std::borrow::Cow::Owned(out) } else { std::borrow::Cow::Borrowed(text) }
+}
+
+/// 访客、代理看下属（[`TeamRead`]）与上号 Key 的响应体过一遍 [`redact_url_credentials`]；访客
+/// （`viewer`）再过一遍 [`redact_email_domains`]。管理接口没有流式响应，整段读进来无妨。
+async fn redact_for_viewer(resp: Response, viewer: bool) -> Response {
     let (mut parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
@@ -1232,7 +1274,18 @@ async fn redact_for_viewer(resp: Response) -> Response {
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     };
-    match redact_url_credentials(text) {
+    let redacted = redact_url_credentials(text);
+    let redacted = if viewer {
+        match redacted {
+            std::borrow::Cow::Borrowed(t) => redact_email_domains(t),
+            std::borrow::Cow::Owned(t) => {
+                std::borrow::Cow::Owned(redact_email_domains(&t).into_owned())
+            }
+        }
+    } else {
+        redacted
+    };
+    match redacted {
         std::borrow::Cow::Borrowed(_) => Response::from_parts(parts, axum::body::Body::from(bytes)),
         std::borrow::Cow::Owned(redacted) => {
             parts.headers.remove(header::CONTENT_LENGTH);
