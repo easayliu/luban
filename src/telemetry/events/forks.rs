@@ -109,6 +109,9 @@ impl EventBuilder<'_> {
                 if let Some(r) = &call.request_id {
                     can_use["requestId"] = json!(r);
                 }
+                if env.f.v312 {
+                    can_use_tool_v312(&mut can_use, &c.id);
+                }
                 self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
                 if safety_events {
                     let safety =
@@ -435,21 +438,24 @@ impl EventBuilder<'_> {
                 if env.f.v307 {
                     auto_mode_decision_v307(&mut decision);
                 }
+                if env.f.v312 {
+                    auto_mode_decision_v312(&mut decision, &tu.id);
+                }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
             let tg = ms(t_end, -3);
             self.push_dd(tg, "tengu_feature_ok", feature("permission_auto_approve_config"));
-            self.push(
-                tg,
-                "tengu_tool_use_can_use_tool_allowed",
-                json!({
-                    "messageID": msg,
-                    "toolName": &tu.name,
-                    "queryChainId": &chain_id,
-                    "queryDepth": query_depth,
-                    "requestId": rid
-                }),
-            );
+            let mut allowed = json!({
+                "messageID": msg,
+                "toolName": &tu.name,
+                "queryChainId": &chain_id,
+                "queryDepth": query_depth,
+                "requestId": rid
+            });
+            if env.f.v312 {
+                can_use_tool_v312(&mut allowed, &tu.id);
+            }
+            self.push(tg, "tengu_tool_use_can_use_tool_allowed", allowed);
             self.push(
                 tg,
                 "tengu_tool_use_granted_in_config",

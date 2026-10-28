@@ -475,7 +475,11 @@ impl Telemetry {
         // 2.1.311：失败 Bash 的错误栈又换了（`cap/auto-2.1.311-20261027-bashfail`），Bash 事件多命令类别、耗时与
         // CPU 那几项（[`super::tools::bash_meta_v311`]）。
         let v311 = version_at_least(&version, "2.1.311");
-        let safety_events = v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id);
+        // 2.1.312：权限与 auto 判定事件带 tool_use 的 id、`context_announcement` 多 `assumed_utc` 等，见
+        // [`TurnFacts::v312`]；`tengu_snoopy_creek` 读不到时也改按关（[`crate::proxy::snoopy_creek`]）。
+        let v312 = version_at_least(&version, "2.1.312");
+        let safety_events =
+            v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id, &version);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
         let injected = new_prompt && version_at_least(&version, "2.1.277") && !user_turn;
@@ -490,6 +494,13 @@ impl Telemetry {
             Vec::new()
         };
         sess.lucky_cerf_exposed.extend(lucky_cerf.iter().map(|e| e.feature));
+        // 头一回带上 `x-claude-code-sandy-plover` 的那条报首次使用，按进程一次（`/clear` 接着算）。重发过的看整串；这个
+        // 会话的额度探测带过也算（[`State::tools_used_header_sent`]）——真实 CC 经网关透传时主线程不带这个头，只有探测带。
+        let probe_header = st.tools_used_header_sent.remove(&key).is_some();
+        let used_header = call.chain_tools_used_header() || probe_header;
+        let tools_used_header_first = used_header && !sess.tools_used_header_reported;
+        sess.tools_used_header_reported |= used_header;
+        let tools_used_truncation = call.chain_tools_used_truncation();
         if first_prompt_tpl {
             sess.first_prompt_tpl_done = true;
         }
@@ -764,6 +775,9 @@ impl Telemetry {
             v309,
             v310,
             v311,
+            v312,
+            tools_used_header_first,
+            tools_used_truncation,
             safety_events,
             suggestion_fork,
             lucky_cerf,

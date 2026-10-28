@@ -981,14 +981,15 @@ fn simulated_beta_matches_official() {
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
 }
 
-/// 2.1.311 的模拟主线程 beta 逐字对上 `cap/auto-2.1.311-20261027-full`（opus `00217`、sonnet `00377`、haiku-4.5
-/// `00609`、haiku-5-5 `00463`（`--model haiku`）与 `00536`），见 [`config::CC_PROFILES`]：与 2.1.310 相比只是
+/// 2.1.312 的模拟主线程 beta 逐字对上 `cap/auto-2.1.312-20261028-full`（opus `00206`、sonnet `00369`、haiku-4.5
+/// `00603`、haiku-5-5 `00456`（`--model haiku`）与 `00529`），见 [`config::CC_PROFILES`]：与 2.1.311
+/// （`cap/auto-2.1.311-20261027-full` 的 `00217`、`00377`、`00609`、`00463`、`00536`）逐字相同；2.1.311 比 2.1.310 只是
 /// `thinking-token-count` 从 `interleaved-thinking` 后面挪到了 `advisor-tool` 后面。2.1.299 ~ 2.1.310 那串见
 /// `cap/auto-2.1.299-20261014-full` 起各版全量抓包（去掉按号下发的 `cache-keepalive` 后逐字相同）。fable 只抓到
-/// auto 模式（`00920`，多 `dangerous-tool-use` 与 `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带
+/// auto 模式（`00916`，多 `dangerous-tool-use` 与 `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带
 /// `safeguards`，那两项都不该出现。没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_311() {
+fn simulated_beta_matches_2_1_312() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
          mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
@@ -1010,16 +1011,16 @@ fn simulated_beta_matches_2_1_311() {
          thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
          cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00217", "claude-opus-5-5", opus),
-        ("00377", "claude-sonnet-5-5", opus),
+        ("00206", "claude-opus-5-5", opus),
+        ("00369", "claude-sonnet-5-5", opus),
         ("同 opus", "claude-fable-5-1", opus),
-        ("00609", "claude-haiku-4-5-20251001", haiku),
-        ("00609", "claude-haiku-4-5", haiku),
-        ("00536", "claude-haiku-5-5", haiku_5_5),
-        ("00463", "haiku", haiku_5_5),
+        ("00603", "claude-haiku-4-5-20251001", haiku),
+        ("00603", "claude-haiku-4-5", haiku),
+        ("00529", "claude-haiku-5-5", haiku_5_5),
+        ("00456", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.311");
+        assert_eq!(profile.version, "2.1.312");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1065,14 +1066,15 @@ fn profile_betas_match_the_2_1_277_captures() {
     }
     // 2.1.310 的额度探测（`cap/auto-2.1.310-20261024-full/00025`，2.1.309 的 `00023`、2.1.308 的 `00021`、2.1.307 的 `00021`、2.1.306 的 `00022`、2.1.305 的 `00019`、2.1.303 的 `00017`、
     // 2.1.301 的 `00015`、2.1.300 的 `00012`、2.1.299 的 `00014`、2.1.296 的 `00012`、2.1.293 的 `00017` 同）与 2.1.277 逐字相同；
-    // 2.1.311（`cap/auto-2.1.311-20261027-full/00019` 等 16 条）去掉了 `thinking-token-count`。
+    // 2.1.311（`cap/auto-2.1.311-20261027-full/00019` 等 16 条）去掉了 `thinking-token-count`，2.1.312
+    // （`cap/auto-2.1.312-20261028-full/00021` 等 16 条）同串。
     let quota = config::cc_profile_at(QuotaProbe, Some((2, 1, 310)));
     assert_eq!((quota.version, quota.beta), ("2.1.310", cases[2].2));
     let quota = config::cc_profile(QuotaProbe);
     assert_eq!(
         (quota.version, quota.beta),
         (
-            "2.1.311",
+            "2.1.312",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05"
         )
@@ -1103,12 +1105,12 @@ fn profile_betas_match_the_2_1_277_captures() {
     // （`cap/auto-2.1.306-20261021-full`）、2.1.307（`cap/auto-2.1.307-20261022-full/00036`）、2.1.308
     // （`cap/auto-2.1.308-20261022-full/00036`）、2.1.309（`cap/auto-2.1.309-20261023-full/00036`）、
     // 2.1.310（`cap/auto-2.1.310-20261024-full/00041`）同串；2.1.311（`cap/auto-2.1.311-20261027-full/00069` 等
-    // 16 条）把 `thinking-token-count` 挪到 `advisor-tool` 之后。
+    // 16 条）把 `thinking-token-count` 挪到 `advisor-tool` 之后，2.1.312（`cap/auto-2.1.312-20261028-full/00067` 等）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.311",
+            "2.1.312",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\

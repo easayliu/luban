@@ -282,6 +282,7 @@ pub(super) async fn prepare<'a>(
         client_link,
         cc_kind,
         refusal_fallbacks,
+        tools_used_truncation: None,
     };
     // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
     // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
@@ -409,6 +410,19 @@ pub(super) async fn prepare<'a>(
                     upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
             }
         }
+    }
+    // 模拟路径（含 billing-only）的 `/v1/messages`：这个会话用过的工具名（2.1.311 起，号的 `tengu_snug_mitten` 开着时），
+    // 按出站改名之后的名字记，见 [`crate::proxy::sandy_plover`]；`count_tokens` 官方不带。**放在启动握手之后**：新号首条
+    // 请求建头时还没见过 eval，握手刚把开关拉回来（打开或关掉），以它为准；遥测的首次使用也跟着这份出站头报。
+    if billable && let Some(s) = upstream.sim.as_ref() {
+        upstream.tools_used_truncation = crate::proxy::sandy_plover::apply_session_header(
+            &mut upstream.headers,
+            cred.id,
+            &s.session_id,
+            s.profile.version,
+            body_json.as_ref(),
+            tool_names.as_deref(),
+        );
     }
     // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
     // [`note_upstream_send`]。纯记录，不影响这条请求走向。

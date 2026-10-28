@@ -16,7 +16,7 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.311";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.312";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。原取自 `cap/2.1.258/00032`
@@ -30,7 +30,8 @@ pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.311";
 /// `cap/auto-2.1.308-20261022-full`；逐请求那份多出的 `cache-keepalive` 不进会话级），2.1.309 / 2.1.310 也同
 /// （`cap/auto-2.1.309-20261023-full`、`cap/auto-2.1.310-20261024-full`）。2.1.311 起官方按公共 beta 规则表算会话级
 /// 那份，`thinking-token-count` 移出了那张表（[`CC_BETA_THINKING_TOKEN_COUNT`](super::CC_BETA_THINKING_TOKEN_COUNT)），
-/// 会话级那份不再带它、出站头里照带（`cap/auto-2.1.311-20261027-full` 一万多条会话级事件无一带它）。有测试钉着它
+/// 会话级那份不再带它、出站头里照带（`cap/auto-2.1.311-20261027-full` 一万多条会话级事件无一带它），2.1.312 同
+/// （`cap/auto-2.1.312-20261028-full`）。有测试钉着它
 /// 等于保活那一版 sonnet-5 主线程的会话级那份，升版时跟着换。
 pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
     interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
@@ -57,9 +58,14 @@ pub const KEEPALIVE_EVAL: &str = "/api/eval/sdk-zAZezfDKGoZuXXKe";
 
 pub const KEEPALIVE_EVAL_TICKS: u64 = 12;
 
-/// eval 端点的 User-Agent（真实客户端 Bun 运行时自报的 UA，与其他端点不同）。
-/// `cap/2.1.280`、`cap/2.1.285` 的 eval 与早批 event_logging 都是 `Bun/1.4.3`。
+/// 2.1.291 之前 eval 端点的 User-Agent：调用点没传，Bun 运行时自己补的（与其他端点不同）。
+/// `cap/2.1.270` ~ `cap/2.1.285` 的 eval 与早批 event_logging 都是 `Bun/1.4.3`，更早的见 [`KEEPALIVE_UA_BUN_260`]。
+/// 2.1.291 起 eval 显式带 `claude-code/<版本>`（`cap/auto-2.1.291-20261006` 起，`cap/auto-2.1.312-20261028-full` 23 条同）。
 pub const KEEPALIVE_UA_BUN: &str = "Bun/1.4.3";
+
+/// 2.1.270 之前 eval 端点的 User-Agent：那时打包的 Bun 是 1.4.1（`cap/2.1.258/00003`、`cap/2.1.260-1`、
+/// `cap/2.1.260-2` 的 eval 都是它）。
+pub const KEEPALIVE_UA_BUN_260: &str = "Bun/1.4.1";
 
 /// 启动握手「领跑段」最多挡住首条 `/v1/messages` 多久
 /// （见 [`crate::oauth::HandshakeRunner::lead`]）。
@@ -141,9 +147,14 @@ pub const AXIOS_CONNECTION: &str = "close";
 ///
 /// 表里列的是**全部**头（含 `Host`/`Content-Length` 这些由 HTTP 客户端自己追加的），
 /// 交给 `wreq` 的 `OrigHeaderMap`：表里有、本次没带的不会凭空发出；表外的照发但排在队尾。
+///
+/// 同一端点的头序会随版本变（policy_limits 2.1.270 / 2.1.277 两次，eval、penguin_mode、mcp_servers 2.1.291 一次），
+/// 按版本列几份，发的时候取会话那一版的（[`axios_shape_at`]）。
 pub struct AxiosShape {
     /// 端点名，只用于日志与测试断言。
     pub name: &'static str,
+    /// 从哪一版官方客户端起是这个形态（含），`(0, 0, 0)` 即最早那份。
+    pub since: (u64, u64, u64),
     pub order: &'static [&'static str],
 }
 
@@ -151,13 +162,14 @@ pub struct AxiosShape {
 /// 带 body 的那几个在它之前还有 `Content-Length`。
 const AXIOS_TAIL: &[&str] = &["Accept-Encoding", "Host", "Connection"];
 
-/// 辅助端点的头序表，逐条取自 `cap/2.1.260-2`（括号里是抓包编号）。
+/// 辅助端点的头序表，最早那份逐条取自 `cap/2.1.260-2`（括号里是抓包编号），后来变过的按版本另列。
 ///
-/// 只列 axios 那套；eval 走 Bun 客户端，形态完全不同，见 [`AXIOS_SHAPE_EVAL`]。
+/// 只列 axios 那套；eval 走 Bun 客户端，形态完全不同，见 [`EVAL_SHAPES`]。
 pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00001
     AxiosShape {
         name: "policy_limits",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Authorization",
@@ -169,9 +181,43 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
             "Connection",
         ],
     },
+    // `cap/2.1.270/00002`：`User-Agent` 挪到 `Accept` 后，`If-None-Match` 跟上，鉴权两项挪到它们后面。
+    AxiosShape {
+        name: "policy_limits",
+        since: (2, 1, 270),
+        order: &[
+            "Accept",
+            "User-Agent",
+            "If-None-Match",
+            "Authorization",
+            "anthropic-beta",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
+    // `cap/2.1.277/00004` 起多 `Cache-Control` / `Pragma`（都是 `no-cache`），夹在 UA 与 `If-None-Match` 之间
+    // （`cap/auto-2.1.312-20261028-full` 24 条同）。
+    AxiosShape {
+        name: "policy_limits",
+        since: (2, 1, 277),
+        order: &[
+            "Accept",
+            "User-Agent",
+            "Cache-Control",
+            "Pragma",
+            "If-None-Match",
+            "Authorization",
+            "anthropic-beta",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
     // 00002：只有这一个带 `Cache-Control`/`Pragma`。
     AxiosShape {
         name: "settings",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Authorization",
@@ -188,6 +234,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00005
     AxiosShape {
         name: "penguin_mode",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Authorization",
@@ -198,9 +245,25 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
             "Connection",
         ],
     },
+    // 2.1.291 起显式带 `claude-code/<版本>`，排到 `Accept` 后（`cap/auto-2.1.291-20261006/00022`，
+    // `cap/auto-2.1.312-20261028-full` 23 条同）。
+    AxiosShape {
+        name: "penguin_mode",
+        since: (2, 1, 291),
+        order: &[
+            "Accept",
+            "User-Agent",
+            "Authorization",
+            "anthropic-beta",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
     // 00006
     AxiosShape {
         name: "mcp_servers",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -215,14 +278,35 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
             "Connection",
         ],
     },
+    // 2.1.291 起显式带 `claude-code/<版本>`，排到 `Content-Type` 后（`cap/auto-2.1.291-20261006/00020`，
+    // `cap/auto-2.1.312-20261028-full` 25 条同）。
+    AxiosShape {
+        name: "mcp_servers",
+        since: (2, 1, 291),
+        order: &[
+            "Accept",
+            "Content-Type",
+            "User-Agent",
+            "Authorization",
+            "anthropic-beta",
+            "anthropic-version",
+            "anthropic-mcp-client-capabilities",
+            "MCP-Protocol-Version",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
     // 00007：无鉴权，UA 是 SDK 那份。
     AxiosShape {
         name: "mcp_registry",
+        since: (0, 0, 0),
         order: &["Accept", "User-Agent", "Accept-Encoding", "Host", "Connection"],
     },
     // 00008
     AxiosShape {
         name: "bootstrap",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -237,6 +321,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00009
     AxiosShape {
         name: "code_triggers",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -254,6 +339,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00015
     AxiosShape {
         name: "metrics",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -269,6 +355,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00016
     AxiosShape {
         name: "event_logging",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -285,6 +372,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00017：Datadog 那台主机，无 Authorization。
     AxiosShape {
         name: "datadog",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -299,6 +387,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // 00032 / 00037：downloads.claude.ai，无鉴权。
     AxiosShape {
         name: "download",
+        since: (0, 0, 0),
         order: &["Accept", "User-Agent", "Accept-Encoding", "Host", "Connection"],
     },
     // **无抓包，按 axios 规律推断**（`cap/` 里没有 token/profile 端点的样本）。规律取自
@@ -308,6 +397,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // token 端点：源码只传了 `Content-Type`（`services/oauth/client.ts`）。
     AxiosShape {
         name: "oauth_token",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Content-Type",
@@ -322,6 +412,7 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     // GET 上带 `Content-Type` 是 axios 原样发出的（00006 那条 GET 就带着）。
     AxiosShape {
         name: "oauth_profile",
+        since: (0, 0, 0),
         order: &[
             "Accept",
             "Authorization",
@@ -334,30 +425,64 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
     },
 ];
 
-/// eval（`/api/eval/sdk-…`）**不是 axios**：它走 Bun 自带的 fetch，UA 是
-/// [`KEEPALIVE_UA_BUN`]、`Connection: keep-alive`、`Accept: */*`，`Accept-Encoding` 也是
-/// Messages API 那份 [`CC_ACCEPT_ENCODING`](super::CC_ACCEPT_ENCODING)。整条与 axios 那套没有一处相同
-/// （`cap/2.1.260-2/00003`），故单列一份。
-pub const AXIOS_SHAPE_EVAL: AxiosShape = AxiosShape {
-    name: "eval",
-    order: &[
-        "Authorization",
-        "Content-Type",
-        "anthropic-beta",
-        "Connection",
-        "User-Agent",
-        "Accept",
-        "Host",
-        "Accept-Encoding",
-        "Content-Length",
-    ],
-};
+/// eval（`/api/eval/sdk-…`）**不是 axios**：它走 Bun 自带的 fetch，`Connection: keep-alive`、`Accept: */*`，
+/// `Accept-Encoding` 也是 Messages API 那份 [`CC_ACCEPT_ENCODING`](super::CC_ACCEPT_ENCODING)。整条与 axios 那套没有一处
+/// 相同（`cap/2.1.260-2/00003`），故单列。
+pub const EVAL_SHAPES: &[AxiosShape] = &[
+    // UA 是 Bun 自己补的 [`KEEPALIVE_UA_BUN`]，排在 `Connection` 后（`cap/2.1.260-2/00003` ~ `cap/2.1.285/00008`）。
+    AxiosShape {
+        name: "eval",
+        since: (0, 0, 0),
+        order: &[
+            "Authorization",
+            "Content-Type",
+            "anthropic-beta",
+            "Connection",
+            "User-Agent",
+            "Accept",
+            "Host",
+            "Accept-Encoding",
+            "Content-Length",
+        ],
+    },
+    // 2.1.291 起显式带 `claude-code/<版本>`，排到 `Content-Type` 后（`cap/auto-2.1.291-20261006/00011`，
+    // `cap/auto-2.1.312-20261028-full` 23 条同）。
+    AxiosShape {
+        name: "eval",
+        since: (2, 1, 291),
+        order: &[
+            "Authorization",
+            "Content-Type",
+            "User-Agent",
+            "anthropic-beta",
+            "Connection",
+            "Accept",
+            "Host",
+            "Accept-Encoding",
+            "Content-Length",
+        ],
+    },
+];
 
-/// 按端点名取头序表。查不到即漏写了一行——退回只有尾部三件套的最小形态，比发一个
-/// 随机顺序强。
-pub fn axios_shape(name: &str) -> &'static [&'static str] {
-    match AXIOS_SHAPES.iter().find(|s| s.name == name) {
-        Some(s) => s.order,
-        None => AXIOS_TAIL,
-    }
+/// 按端点名取 `version` 那一版官方客户端的头序表：`since` 不超过它的里头最新的那份，`None`（读不出版本）取最新那份。
+/// 查不到即漏写了一行——退回只有尾部三件套的最小形态，比发一个随机顺序强。
+pub fn axios_shape_at(name: &str, version: Option<(u64, u64, u64)>) -> &'static [&'static str] {
+    shape_at(AXIOS_SHAPES, name, version).unwrap_or(AXIOS_TAIL)
+}
+
+/// eval 在 `version` 那一版的头序，见 [`EVAL_SHAPES`]。
+pub fn eval_shape(version: Option<(u64, u64, u64)>) -> &'static [&'static str] {
+    shape_at(EVAL_SHAPES, "eval", version).unwrap_or(EVAL_SHAPES[0].order)
+}
+
+fn shape_at(
+    table: &'static [AxiosShape],
+    name: &str,
+    version: Option<(u64, u64, u64)>,
+) -> Option<&'static [&'static str]> {
+    table
+        .iter()
+        .filter(|s| s.name == name && version.is_none_or(|v| s.since <= v))
+        .max_by_key(|s| s.since)
+        .map(|s| s.order)
 }

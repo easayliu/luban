@@ -27,10 +27,19 @@ pub(super) struct BashProfile {
     pub(super) has_subshell: bool,
     pub(super) has_heredoc: bool,
     pub(super) simple_commands: usize,
-    /// 命令里出现的绝对路径与 `~` 路径（判「只读」时要看它们是不是在工作目录里）。
+    /// 命令里出现的绝对路径与 `~` 路径（判「只读」时要看它们是不是在工作目录里），含贴着重定向符写的目标
+    /// （`>/tmp/x`）。
     pub(super) paths: Vec<String>,
     /// 每条简单命令的 argv0（与 `argv0` 同一规则）。
     pub(super) argv0s: Vec<String>,
+    /// 有 `cd` 那一段：后面的相对路径不再按工作目录算。
+    pub(super) has_cd: bool,
+    /// 有带 `..` 段的路径（`../x`、`a/../../b`）：可能出了工作目录。
+    pub(super) parent_dir: bool,
+    /// 有 `$` 展开（变量、命令替换）：路径落在哪儿看不出来。
+    pub(super) has_expansion: bool,
+    /// 输出重定向写到哪儿（原样，相对的、贴着 `>` 写的都在），判写的是不是工作目录里的文件用。
+    pub(super) redirect_targets: Vec<String>,
 }
 
 pub(super) fn bash_profile(cmd: &str) -> BashProfile {
@@ -113,12 +122,24 @@ pub(super) fn bash_profile(cmd: &str) -> BashProfile {
         let sub = it.find(|w| !w.starts_with('-')).cloned();
         (base, sub)
     };
-    let simple: Vec<Vec<String>> = segs
-        .iter()
-        .map(|s| words(s))
-        .filter(|ws| !ws.is_empty())
-        .filter(|ws| ws[0] != "cd")
-        .collect();
+    let all: Vec<Vec<String>> = segs.iter().map(|s| words(s)).filter(|ws| !ws.is_empty()).collect();
+    let has_cd = all.iter().any(|ws| ws[0] == "cd");
+    let simple: Vec<Vec<String>> = all.into_iter().filter(|ws| ws[0] != "cd").collect();
+    // 输出重定向的目标：`> x` 那种在下一个词，`>x` / `2>>x` / `&>x` 那种贴在符号后面；`2>&1` 这种 fd 复制不算。
+    let mut redirect_targets: Vec<String> = Vec::new();
+    for ws in &simple {
+        let mut it = ws.iter();
+        while let Some(w) = it.next() {
+            let rest = w.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+            let Some(op) = rest.strip_prefix('>') else { continue };
+            let glued = op.trim_start_matches(['>', '|']);
+            let target =
+                if glued.is_empty() { it.next().cloned() } else { Some(glued.to_string()) };
+            if let Some(t) = target.filter(|t| !t.is_empty() && !t.starts_with('&')) {
+                redirect_targets.push(t);
+            }
+        }
+    }
     let norm = |a: &str| -> String {
         if a.starts_with("python") { "python".to_string() } else { a.to_string() }
     };
@@ -161,8 +182,46 @@ pub(super) fn bash_profile(cmd: &str) -> BashProfile {
             .flatten()
             .filter(|w| w.starts_with('/') || w.starts_with('~'))
             .cloned()
+            .chain(
+                redirect_targets
+                    .iter()
+                    .filter(|t| t.starts_with('/') || t.starts_with('~'))
+                    .cloned(),
+            )
             .collect(),
+        has_cd,
+        parent_dir: simple.iter().flatten().any(|w| w.split('/').any(|c| c == "..")),
+        has_expansion: cmd.contains('$'),
+        redirect_targets,
     }
+}
+
+/// `path` 落不落在工作目录 `cwd` 里：相对路径接在 `cwd` 后面，先按字面规整掉 `.` 与 `..`，再按路径段比（`/tmp/project-other`
+/// 不在 `/tmp/project` 里）。`/dev/null` 算在里面；`~` 开头的、没有工作目录的都不算。
+pub(super) fn inside_cwd(path: &str, cwd: Option<&str>) -> bool {
+    if path == "/dev/null" {
+        return true;
+    }
+    let Some(cwd) = cwd.filter(|c| c.starts_with('/')) else { return false };
+    if path.starts_with('~') {
+        return false;
+    }
+    fn normalize(p: &str) -> Vec<&str> {
+        let mut parts: Vec<&str> = Vec::new();
+        for c in p.split('/') {
+            match c {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(c),
+            }
+        }
+        parts
+    }
+    let full = if path.starts_with('/') { path.to_string() } else { format!("{cwd}/{path}") };
+    let (full, root) = (normalize(&full), normalize(cwd));
+    full.len() >= root.len() && full[..root.len()] == root[..]
 }
 
 /// `tengu_bash_tool_command_executed` 的正文（键序照 `cap/auto-2.1.285-20260930`）。用户在输入框里
@@ -813,43 +872,51 @@ pub(super) fn tool_success_extras(
 /// 碰到工作目录外面的路径就不算（`~/.codex/config.toml`：`/init` 那条读配置的命令 default 模式下
 /// 照样弹了框，`cap/auto-2.1.285-20260930` 08:02:04.556）；工作目录里的绝对路径照算只读。
 pub(super) fn bash_read_only(p: &BashProfile, cwd: Option<&str>) -> bool {
-    let inside = p.paths.iter().all(|w| {
-        w == "/dev/null" || (!w.starts_with('~') && cwd.is_some_and(|c| w.starts_with(c)))
-    });
-    if !inside {
+    if !p.paths.iter().all(|w| inside_cwd(w, cwd)) {
         return false;
     }
-    let git_ro = p.class == "vcs"
+    // 每一条都得是只读的：`ls …; which …` 那条（`07:58:12.088` 前）没弹框。
+    (matches!(p.class, "file_search" | "file_read") || git_read_only(p))
+        && !p.has_redirect
+        && p.argv0s.iter().all(|a| READ_ONLY_COMMANDS.contains(&a.as_str()))
+}
+
+/// [`bash_read_only`] 认的只读命令（`git` 还得是只读的子命令，见 [`git_read_only`]）。
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "stat", "file", "du", "xxd",
+    "echo", "which", "pwd", "sort", "uniq", "cut", "git",
+];
+
+/// 头一条是只读的 git 子命令。
+fn git_read_only(p: &BashProfile) -> bool {
+    p.class == "vcs"
         && p.subcommand
             .as_deref()
-            .is_some_and(|s| matches!(s, "status" | "log" | "diff" | "show" | "branch" | "blame"));
-    // 每一条都得是只读的：`ls …; which …` 那条（`07:58:12.088` 前）没弹框。
-    (matches!(p.class, "file_search" | "file_read") || git_ro)
-        && !p.has_redirect
-        && p.argv0s.iter().all(|a| {
-            matches!(
-                a.as_str(),
-                "ls" | "cat"
-                    | "head"
-                    | "tail"
-                    | "wc"
-                    | "grep"
-                    | "rg"
-                    | "find"
-                    | "tree"
-                    | "stat"
-                    | "file"
-                    | "du"
-                    | "xxd"
-                    | "echo"
-                    | "which"
-                    | "pwd"
-                    | "sort"
-                    | "uniq"
-                    | "cut"
-                    | "git"
-            )
-        })
+            .is_some_and(|s| matches!(s, "status" | "log" | "diff" | "show" | "branch" | "blame"))
+}
+
+/// acceptEdits 模式下放行的文件命令（官方 `FAo`）：路径落在工作目录里就不弹框。
+const ACCEPT_EDITS_COMMANDS: &[&str] = &["mkdir", "touch", "rm", "rmdir", "mv", "cp", "sed"];
+
+/// auto 模式里这条 Bash 走不走 acceptEdits 快路径。官方先按默认模式判，要弹框的再把模式换成 `acceptEdits` 重判一遍
+/// （工具自己的 `checkPermissions`），放行就不用分类器的结果，报 `fastPath: "acceptEdits"`——服务端判过也一样
+/// （`cap/auto-2.1.312-20261028-full` `01004`：`echo … >> <工作目录>/README.md`，服务端 `not_flagged`）。默认模式本来
+/// 就放行的只读命令不走这里（[`bash_read_only`]，报服务端判决推翻快路径那种）。
+///
+/// 近似官方的判定：每一段都是只读命令或 acceptEdits 放行的文件命令（[`ACCEPT_EDITS_COMMANDS`]），真有写（重定向或文件
+/// 命令），路径都在工作目录里；换了目录、有 `..`、有 `$` 展开或命令替换的看不清落在哪儿，不算。
+pub(super) fn bash_accept_edits(p: &BashProfile, cwd: Option<&str>) -> bool {
+    if bash_read_only(p, cwd) || p.has_subshell || p.has_cd || p.parent_dir || p.has_expansion {
+        return false;
+    }
+    // 写到哪儿都得在工作目录里：命令里的绝对路径，与每个重定向目标（相对的接在工作目录后面判）。
+    let inside = p.paths.iter().chain(&p.redirect_targets).all(|w| inside_cwd(w, cwd));
+    let file_command = |a: &String| ACCEPT_EDITS_COMMANDS.contains(&a.as_str());
+    let allowed = |a: &String| {
+        file_command(a)
+            || (READ_ONLY_COMMANDS.contains(&a.as_str()) && (a != "git" || git_read_only(p)))
+    };
+    inside && p.argv0s.iter().all(allowed) && (p.has_redirect || p.argv0s.iter().any(file_command))
 }
 
 /// Bash 失败结果开头的 `Exit code N`；认不出按 1。
@@ -863,11 +930,13 @@ pub(super) fn exit_code_of(head: &str) -> i64 {
 
 /// `tengu_auto_mode_decision` 的正文（键序照 `cap/auto-2.1.285-20260930`）。两种形态：
 ///
-/// - 服务端判了（`not_flagged` / `flagged`）：长的那份，Bash 多破坏性判定三项；只读命令服务端
+/// - 走分类器（服务端判了 `not_flagged` / `flagged`）：长的那份，Bash 多破坏性判定三项；只读命令服务端
 ///   直接放行，报 `serverVerdictOverrodeFastPath: true` + `serverHeldShellAllowFrom: readOnly`；
 ///   复合命令的判定来源是 `subcommandResults`，SubagentHandback 是 `safetyCheck`，其余工具没有这一项；
 ///   同一条回复里第二个起的工具 `sameTurnSiblings` 递增、不再等分类器；
-/// - 服务端没判（`skipped`，acceptEdits 快路径下的 Edit / Write）：短的那份。
+/// - acceptEdits 快路径：短的那份。是不是快路径由客户端自己的权限判定定，不只看服务端判决：服务端没判（`skipped`）
+///   的 Edit / Write，与按 acceptEdits 重判放行的 Bash（[`bash_accept_edits`]，服务端 `not_flagged` 也走这里）。Bash
+///   多破坏性判定三项；`serverClassifierNoVerdict` 只在服务端没判时才有（`cap/auto-2.1.312-20261028-full` `01004`）。
 ///
 /// `session*Tokens` 是会话到上一条回复为止的用量合计。
 #[allow(clippy::too_many_arguments)]
@@ -892,7 +961,10 @@ pub(super) fn auto_mode_decision_meta(
     put("isMcp", json!(false));
     put("inProtectedNamespace", json!(false));
     put("chromeAutomode", json!(false));
-    if verdict == "skipped" {
+    // 服务端判了危险的不按快路径报：抓包里没有「标了危险、acceptEdits 却放行」的样本，宁可照分类器那份报拒绝。
+    let fast_path = verdict == "skipped"
+        || (verdict != "flagged" && profile.is_some_and(|p| bash_accept_edits(p, cwd)));
+    if fast_path {
         put("mcpAlwaysAllowOverride", json!(false));
         put("mcpServerAskOverride", json!(false));
         put("agentMsgId", json!(agent_msg_id));
@@ -900,8 +972,15 @@ pub(super) fn auto_mode_decision_meta(
         put("fastPath", json!("acceptEdits"));
         put("chromePointerPress", json!(false));
         put("hookAllowVouch", json!(false));
+        if profile.is_some() {
+            put("destructive_category", json!("none"));
+            put("destructive_target_scope", json!("none"));
+            put("git_destructive_target", json!("none"));
+        }
         put("classifierSource", json!("server"));
-        put("serverClassifierNoVerdict", json!("server_call_skipped"));
+        if verdict == "skipped" {
+            put("serverClassifierNoVerdict", json!("server_call_skipped"));
+        }
         put("classifierTotalWaitMs", json!(if sibling == 0 { wait } else { 0 }));
         return Value::Object(m);
     }
@@ -972,12 +1051,32 @@ pub(super) fn auto_mode_decision_v300(v: &mut Value) {
 }
 
 /// 2.1.307 的 `tengu_auto_mode_decision` 在 `classifierSource` 之后多 `skippedOnAllowRule`
-/// （`cap/auto-2.1.307-20261022-full` 走分类器的 28 条都是 `false`）。acceptEdits 快路径那种（带
-/// `serverClassifierNoVerdict`）是另一个调用点，不带它。
+/// （`cap/auto-2.1.307-20261022-full` 走分类器的 28 条都是 `false`）。acceptEdits 快路径那种（带 `fastPath`；
+/// 服务端判过的那种没有 `serverClassifierNoVerdict`，不能凭它认）是另一个调用点，不带它。
 pub(super) fn auto_mode_decision_v307(v: &mut Value) {
-    if v.get("serverClassifierNoVerdict").is_none() {
+    if v.get("fastPath").is_none() {
         insert_after(v, "classifierSource", vec![("skippedOnAllowRule", json!(false))]);
     }
+}
+
+/// 2.1.312 的 `tengu_auto_mode_decision`：每种形态都在 `toolName` 后多 `toolUseId`（这次调用的 tool_use id），
+/// 走服务端分类器判过的那种还在 `classifierSource` 后多 `serverClassifierRole: "arbiter"`
+/// （`cap/auto-2.1.312-20261028-full` 判过的 26 条都是它；acceptEdits 快路径那种带 `fastPath`，服务端判没判过都不带，
+/// `01004` 那条 Bash 判过、照样不带）。
+/// 官方同一处另展开的 `serverClassifierOffReason` / `classifiedOutsideAutoMode` / `classifierSite` /
+/// `localUnderArbiterReason` 与 `serverRewrite*` 只在服务端不当仲裁、auto 模式之外判、本地分类器兜底或服务端改写了
+/// 输入时才有值，平常是 `undefined`、不出现。
+pub(super) fn auto_mode_decision_v312(v: &mut Value, tool_use_id: &str) {
+    insert_after(v, "toolName", vec![("toolUseId", json!(tool_use_id))]);
+    if v.get("fastPath").is_none() {
+        insert_after(v, "classifierSource", vec![("serverClassifierRole", json!("arbiter"))]);
+    }
+}
+
+/// 2.1.312 的权限两条（`tengu_tool_use_can_use_tool_allowed` / `rejected`）在 `messageID` 后多 `toolUseID`，
+/// 即这次调用的 tool_use id（`cap/auto-2.1.312-20261028-full` 的 60 条 allowed 与 B1 那条 rejected）。
+pub(super) fn can_use_tool_v312(v: &mut Value, tool_use_id: &str) {
+    insert_after(v, "messageID", vec![("toolUseID", json!(tool_use_id))]);
 }
 
 /// 工具是谁拒的：2.1.307 `tengu_safety_event` 的类别、来源与判据那几项按它填（官方 `NMn` 读的那份判定记录，

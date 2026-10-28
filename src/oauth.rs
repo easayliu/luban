@@ -911,6 +911,22 @@ impl KeepaliveCtx {
         format!("claude-code/{}", self.version)
     }
 
+    /// 这份上下文的客户端版本：各端点的头形态按它分档（[`config::axios_shape_at`]），读不出是 `None`，按最新那版发。
+    fn client_version(&self) -> Option<(u64, u64, u64)> {
+        crate::proxy::parse_version(&self.version)
+    }
+
+    /// 客户端版本不低于 `v`（读不出按最新那版算）。
+    fn at_least(&self, v: (u64, u64, u64)) -> bool {
+        self.client_version().is_none_or(|have| have >= v)
+    }
+
+    /// eval、penguin_mode、mcp_servers 的 UA：2.1.291 起调用点显式带 `claude-code/<版本>`（[`Self::ua`]），之前没带，
+    /// 是 HTTP 客户端自己补的 `legacy`（eval 走 Bun，另两条走 axios）。
+    fn ua_since_291(&self, legacy: &str) -> String {
+        if self.at_least((2, 1, 291)) { self.ua() } else { legacy.to_string() }
+    }
+
     /// `claude-cli/<版本> (external, cli)`：mcp-registry 与 code/triggers 用的是 SDK 那份 UA。
     pub fn cli_ua(&self) -> String {
         format!("claude-cli/{} (external, cli)", self.version)
@@ -1089,8 +1105,8 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
 
 // ---------- Axios 形态 ----------
 
-/// 给一条辅助请求套上 axios 的传输形态：`Accept-Encoding` / `Connection` 两个头 + 该端点的
-/// 线上头序（[`config::axios_shape`]）。
+/// 给一条辅助请求套上 axios 的传输形态：`Accept-Encoding` / `Connection` 两个头 + 该端点最新那版的
+/// 线上头序（[`config::axios_shape_at`]）。
 ///
 /// **必须每条都套**：这些端点原先复用的是 Messages API 客户端的 `default_headers`，于是
 /// 发出去的 `Accept-Encoding` 是 Bun 那份 `gzip, deflate, br, zstd`，`Connection` 缺省成
@@ -1104,10 +1120,20 @@ fn derive_hex64(basis: &str, seed: &[u8], tag: &[u8]) -> String {
 /// 本身不限总时长（它也承载 `/v1/*` 的长 SSE），不限的话一个只建连不回包的代理能把串行的
 /// 保活 / 遥测循环永久挂住。要别的时长的，在**这一步之后**再 `.timeout(..)` 覆盖（后设的生效）。
 pub(crate) fn axios(req: wreq::RequestBuilder, shape: &str) -> wreq::RequestBuilder {
+    axios_at(req, shape, None)
+}
+
+/// 同 [`axios`]，头序取 `version` 那一版官方客户端的（[`config::axios_shape_at`]，`None` 即最新那版）：
+/// 头序随版本变过的端点（policy_limits、penguin_mode、mcp_servers）按会话版本发。
+fn axios_at(
+    req: wreq::RequestBuilder,
+    shape: &str,
+    version: Option<(u64, u64, u64)>,
+) -> wreq::RequestBuilder {
     let req = req
         .header("Accept-Encoding", config::AXIOS_ACCEPT_ENCODING)
         .header("Connection", config::AXIOS_CONNECTION)
-        .orig_headers(orig_headers(config::axios_shape(shape)))
+        .orig_headers(orig_headers(config::axios_shape_at(shape, version)))
         .timeout(SIDE_REQUEST_TIMEOUT);
     side_dump(&req, shape);
     req
@@ -1268,18 +1294,33 @@ pub async fn keepalive_policy_limits(
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_POLICY_LIMITS);
+    let req = policy_limits_request(client, config::UPSTREAM_BASE_URL, access_token, ctx);
+    conditional_get(req, ctx.cred_id, "policy_limits").await
+}
+
+/// [`keepalive_policy_limits`] 发往 `base` 的那条。2.1.277 起与 settings 一样带 `Cache-Control` / `Pragma: no-cache`
+/// （`cap/2.1.277` 起，`cap/auto-2.1.312-20261028-full` 24 条都有）；头序跟会话版本，见 [`config::axios_shape_at`]。
+fn policy_limits_request(
+    client: &wreq::Client,
+    base: &str,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> wreq::RequestBuilder {
+    let url = format!("{base}{}", config::KEEPALIVE_POLICY_LIMITS);
     let mut req = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", access_token))
         .header("anthropic-beta", config::OAUTH_BETA_HEADER)
         .header("User-Agent", ctx.ua())
         .header("Accept", config::AXIOS_ACCEPT);
+    if ctx.at_least((2, 1, 277)) {
+        req = req.header("Cache-Control", "no-cache").header("Pragma", "no-cache");
+    }
     // 条件头加在套 axios 之前：线上顺序由 `orig_headers` 定，与加的先后无关；放前面 `LUBAN_SIDE_DUMP` 才落得到它。
     if let Some(etag) = etag_of(ctx.cred_id, "policy_limits") {
         req = req.header("If-None-Match", etag);
     }
-    conditional_get(axios(req, "policy_limits"), ctx.cred_id, "policy_limits").await
+    axios_at(req, "policy_limits", ctx.client_version())
 }
 
 /// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。
@@ -1374,65 +1415,98 @@ pub async fn keepalive_bootstrap(
 
 /// 启动握手：`GET /api/claude_code_penguin_mode`。
 ///
-/// 取自 `cap/2.1.260-2/00005`（UA = `axios/1.15.2`，不带 Content-Type）。
-pub async fn keepalive_penguin_mode(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_PENGUIN_MODE);
-    let resp = axios(
-        client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-            .header("User-Agent", config::DATADOG_USER_AGENT)
-            .header("Accept", config::AXIOS_ACCEPT),
-        "penguin_mode",
-    )
-    .send()
-    .await;
-    match resp {
+/// 取自 `cap/2.1.260-2/00005`（不带 Content-Type）；UA 与头序跟会话版本，见 [`penguin_mode_request`]。
+pub async fn keepalive_penguin_mode(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> KeepaliveResult {
+    let req = penguin_mode_request(client, config::UPSTREAM_BASE_URL, access_token, ctx);
+    match req.send().await {
         Ok(r) => KeepaliveResult::from_response(r, "penguin_mode").await,
         Err(_) => KeepaliveResult::Failed,
     }
 }
 
+/// [`keepalive_penguin_mode`] 发往 `base` 的那条：2.1.291 之前 UA 是 axios 自己补的 `axios/1.15.2`，之后显式带
+/// `claude-code/<版本>`（[`KeepaliveCtx::ua_since_291`]），头序也跟着换。
+fn penguin_mode_request(
+    client: &wreq::Client,
+    base: &str,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> wreq::RequestBuilder {
+    let url = format!("{base}{}", config::KEEPALIVE_PENGUIN_MODE);
+    axios_at(
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+            .header("User-Agent", ctx.ua_since_291(config::AXIOS_DEFAULT_USER_AGENT))
+            .header("Accept", config::AXIOS_ACCEPT),
+        "penguin_mode",
+        ctx.client_version(),
+    )
+}
+
 /// Statsig 特性标志评估：启动 + 每 6h。
 ///
-/// 取自 `cap/2.1.145/00039`（UA = `Bun/1.4.1`，Accept = `*/*`）。
+/// 取自 `cap/2.1.145/00039`（Accept = `*/*`）；UA 与头序跟会话版本，见 [`eval_request`]。
 pub async fn keepalive_eval(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
+    store: &crate::store::CredentialStore,
 ) -> KeepaliveResult {
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVAL);
-    // **不套 axios 形态**：eval 走的是 Bun 自带的 fetch，`Connection: keep-alive`、
-    // `Accept: */*`、`Accept-Encoding` 跟 Messages API 那份一样，见 [`config::AXIOS_SHAPE_EVAL`]。
-    let req = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-        .header("Connection", "keep-alive")
-        .header("User-Agent", config::KEEPALIVE_UA_BUN)
-        .header("Accept", "*/*")
-        .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
-        .orig_headers(orig_headers(config::AXIOS_SHAPE_EVAL.order))
-        .json(&ctx.eval_body())
-        .timeout(SIDE_REQUEST_TIMEOUT);
-    side_dump(&req, "eval");
-    let resp = req.send().await;
+    let resp = eval_request(client, config::UPSTREAM_BASE_URL, access_token, ctx).send().await;
     match resp {
         // 成功时读体：里面的服务端开关 `tengu_lantern_spool` 决定模拟请求带不带
         // `anthropic-usage-limit`（[`crate::proxy::note_eval_features`]）。体按 `Content-Encoding`
-        // 由客户端解压（官方回的是 br）；读不出来就当没拉到，那个头照旧不写。
+        // 由客户端解压（官方回的是 br）；读不出来就当没拉到，那个头照旧不写。带不带用过的工具那两个开关另外落库，
+        // 重启后不必等下一份 eval（[`crate::proxy::sandy_plover::save_eval`]）。
         Ok(r) if r.status().is_success() => {
             let status = r.status().as_u16();
             if let Ok(body) = r.bytes().await {
                 crate::proxy::note_eval_features(ctx.cred_id, &body);
+                crate::proxy::sandy_plover::save_eval(store, ctx.cred_id).await;
             }
             KeepaliveResult::from_status(status)
         }
         Ok(r) => KeepaliveResult::from_response(r, "eval").await,
         Err(_) => KeepaliveResult::Failed,
     }
+}
+
+/// [`keepalive_eval`] 发往 `base` 的那条。**不套 axios 形态**：eval 走的是 Bun 自带的 fetch，`Connection: keep-alive`、
+/// `Accept: */*`、`Accept-Encoding` 跟 Messages API 那份一样（[`config::EVAL_SHAPES`]）。2.1.291 之前 UA 是 Bun 自己补的
+/// （2.1.270 起 [`config::KEEPALIVE_UA_BUN`]，更早 [`config::KEEPALIVE_UA_BUN_260`]），之后显式带 `claude-code/<版本>`，
+/// 头序也跟着换。
+fn eval_request(
+    client: &wreq::Client,
+    base: &str,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> wreq::RequestBuilder {
+    let url = format!("{base}{}", config::KEEPALIVE_EVAL);
+    let bun = if ctx.at_least((2, 1, 270)) {
+        config::KEEPALIVE_UA_BUN
+    } else {
+        config::KEEPALIVE_UA_BUN_260
+    };
+    let req = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("Connection", "keep-alive")
+        .header("User-Agent", ctx.ua_since_291(bun))
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
+        .orig_headers(orig_headers(config::eval_shape(ctx.client_version())))
+        .json(&ctx.eval_body())
+        .timeout(SIDE_REQUEST_TIMEOUT);
+    side_dump(&req, "eval");
+    req
 }
 
 // ---------- 会话启动握手（每个新会话一次） ----------
@@ -1488,13 +1562,49 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
 
 /// `GET /v1/mcp_servers?limit=1000&include_additional_installs=true`（claude.ai 侧配置的 MCP
 /// 连接器）；`cap/2.1.260-1/00024`。2.1.277 起查询串多了 `include_additional_installs=true`
-/// （`cap/2.1.277`、`2.1.280`、`2.1.285` 的 `00021` 等都是），其余头逐字未变。
-async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> KeepaliveResult {
-    let url = format!(
-        "{}/v1/mcp_servers?limit=1000&include_additional_installs=true",
-        config::UPSTREAM_BASE_URL
-    );
-    let resp = axios(
+/// （`cap/2.1.277`、`2.1.280`、`2.1.285` 的 `00021` 等都是）；UA 与头序 2.1.291 起换了，见 [`mcp_servers_request`]。
+async fn handshake_mcp_servers(
+    client: &wreq::Client,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> KeepaliveResult {
+    let req = mcp_servers_request(client, config::UPSTREAM_BASE_URL, access_token, ctx);
+    match req.send().await {
+        Ok(r) => KeepaliveResult::from_response(r, "mcp_servers").await,
+        Err(_) => KeepaliveResult::Failed,
+    }
+}
+
+/// `{"roots":{"listChanged":true},"elicitation":{}}` 的 base64：MCP 客户端声明（`cap/2.1.260-1/00024` 起）。
+const MCP_CLIENT_CAPABILITIES: &str =
+    "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=";
+
+/// 同上再加 `"extensions":{"io.modelcontextprotocol/tasks":{}}`：号的 `tengu_glowing_lark` 开着时
+/// （[`crate::proxy::glowing_lark`]，`cap/auto-2.1.312-20261028-full` 25 条逐字是它）。
+const MCP_CLIENT_CAPABILITIES_TASKS: &str = "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fSwiZXh0ZW5zaW9ucyI6eyJpby5tb2RlbGNvbnRleHRwcm90b2NvbC90YXNrcyI6e319fQ==";
+
+/// [`handshake_mcp_servers`] 发往 `base` 的那条：2.1.291 之前 UA 是 axios 自己补的 `axios/1.15.2`，之后显式带
+/// `claude-code/<版本>`（[`KeepaliveCtx::ua_since_291`]），头序也跟着换；MCP 客户端声明带不带 tasks 扩展看号的开关。
+fn mcp_servers_request(
+    client: &wreq::Client,
+    base: &str,
+    access_token: &str,
+    ctx: &KeepaliveCtx,
+) -> wreq::RequestBuilder {
+    // 2.1.277 起查询串多 `include_additional_installs=true`；`cap/2.1.258` ~ `cap/2.1.270` 的 10 条只有 `limit=1000`。
+    let query = if ctx.at_least((2, 1, 277)) {
+        "limit=1000&include_additional_installs=true"
+    } else {
+        "limit=1000"
+    };
+    let url = format!("{base}/v1/mcp_servers?{query}");
+    let capabilities =
+        if crate::proxy::glowing_lark::tasks_extension(ctx.cred_id, ctx.client_version()) {
+            MCP_CLIENT_CAPABILITIES_TASKS
+        } else {
+            MCP_CLIENT_CAPABILITIES
+        };
+    axios_at(
         client
             .get(&url)
             .header("Accept", config::AXIOS_ACCEPT)
@@ -1502,29 +1612,27 @@ async fn handshake_mcp_servers(client: &wreq::Client, access_token: &str) -> Kee
             .header("Authorization", format!("Bearer {}", access_token))
             .header("anthropic-beta", "mcp-servers-2025-12-04")
             .header("anthropic-version", "2023-06-01")
-            .header(
-                "anthropic-mcp-client-capabilities",
-                "eyJyb290cyI6eyJsaXN0Q2hhbmdlZCI6dHJ1ZX0sImVsaWNpdGF0aW9uIjp7fX0=",
-            )
+            .header("anthropic-mcp-client-capabilities", capabilities)
             .header("MCP-Protocol-Version", "2025-11-25")
-            .header("User-Agent", config::DATADOG_USER_AGENT),
+            .header("User-Agent", ctx.ua_since_291(config::AXIOS_DEFAULT_USER_AGENT)),
         "mcp_servers",
+        ctx.client_version(),
     )
-    .send()
-    .await;
-    match resp {
-        Ok(r) => KeepaliveResult::from_response(r, "mcp_servers").await,
-        Err(_) => KeepaliveResult::Failed,
-    }
 }
 
 /// `GET /v1/code/triggers`（Claude Code Remote 的触发器列表），带 `x-organization-uuid`；
 /// 没拿到组织 id 就不发——缺了那个头的形态官方不产生。`cap/2.1.260-1/00027`。
+///
+/// 只有 2.1.276 及以前的会话发：`cap/2.1.258` ~ `cap/2.1.270` 每次启动都有，`cap/2.1.277` 起到
+/// `cap/auto-2.1.312-20261028-full` 一条都没有了。
 async fn handshake_code_triggers(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
+    if ctx.at_least((2, 1, 277)) {
+        return KeepaliveResult::Ok;
+    }
     let Some(org) = ctx.organization_uuid.as_deref() else { return KeepaliveResult::Ok };
     let url = format!("{}/v1/code/triggers", config::UPSTREAM_BASE_URL);
     let resp = axios(
@@ -1883,7 +1991,8 @@ pub struct HandshakeRunner {
     ///
     /// 故只给**模拟客户端**补：那种客户端根本不是 CC，不会自己发这些。
     public_traffic: bool,
-    /// bootstrap 回包里的 `client_data` 落库用，见 [`crate::proxy::client_data`]。
+    /// bootstrap 回包里的 `client_data` 与 eval 里带不带用过的工具那两个开关落库用，见 [`crate::proxy::client_data`]、
+    /// [`crate::proxy::sandy_plover`]。
     store: std::sync::Arc<crate::store::CredentialStore>,
 }
 
@@ -1910,7 +2019,7 @@ impl HandshakeRunner {
     /// 领跑段：`eval`。**调用方应当在发出这个会话的首条 `/v1/messages` 之前 `await` 它**，额度探测
     /// 紧随其后由调用方发；`policy_limits` / `settings` 与它并发，见 [`Self::config_pull`]。
     pub async fn lead(&self, client: &wreq::Client, access_token: &str) {
-        let eval = keepalive_eval(client, access_token, &self.ctx).await;
+        let eval = keepalive_eval(client, access_token, &self.ctx, &self.store).await;
         self.report("lead", &[("eval", eval)]);
     }
 
@@ -1928,16 +2037,16 @@ impl HandshakeRunner {
         self.report("config", &[("policy_limits", policy_limits), ("settings", settings)]);
     }
 
-    /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers /
-    /// downloads。抓包里这批与首条 messages 重叠，故 spawn 即可，不必挡着主请求。
+    /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers（2.1.276 及以前，见
+    /// [`handshake_code_triggers`]）/ downloads。抓包里这批与首条 messages 重叠，故 spawn 即可，不必挡着主请求。
     pub async fn rest(&self, client: &wreq::Client, access_token: &str) {
         let (penguin_mode, mcp_servers, mcp_registry, bootstrap, code_triggers, mcp_servers_2) = tokio::join!(
-            keepalive_penguin_mode(client, access_token),
-            handshake_mcp_servers(client, access_token),
+            keepalive_penguin_mode(client, access_token, &self.ctx),
+            handshake_mcp_servers(client, access_token, &self.ctx),
             self.maybe_registry(client),
             keepalive_bootstrap(client, access_token, &self.ctx, &self.model, &self.store),
             handshake_code_triggers(client, access_token, &self.ctx),
-            handshake_mcp_servers(client, access_token),
+            handshake_mcp_servers(client, access_token, &self.ctx),
         );
         self.report(
             "rest",

@@ -45,6 +45,16 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
         }
     }
 
+    // 上次运行记下的 eval 里带不带用过的工具那两个开关（`tengu_snug_mitten` / `tengu_silly_shore`）按号读回内存：
+    // 重启后每个号第一个会话的额度探测不等 eval 回包就发，不读回就漏带那个头。读失败只告警，回到只等 eval 的老样子。
+    match proxy::sandy_plover::restore(&state.store).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(rows, "restored tools-used header flags from the database"),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load tools-used header flags; starting empty")
+        }
+    }
+
     // 每小时裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
     // 流水只需保留近期。按小时而不是按天：一天一次会让表最多撑到保留期再加一整天，删除也全挤在
     // 同一时段。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务。
@@ -364,7 +374,7 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
                             }
                             continue;
                         }
-                        let pg = oauth::keepalive_penguin_mode(&http, &access_token).await;
+                        let pg = oauth::keepalive_penguin_mode(&http, &access_token, &ctx).await;
                         (bo, pg)
                     } else {
                         (oauth::KeepaliveResult::Ok, oauth::KeepaliveResult::Ok)
@@ -374,7 +384,7 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
                     // 同 policy/settings：刚因为新会话握过手的号跳过——那一串里已经发过
                     // 一次 eval，30 秒后的首个 tick 再发一次就是同一分钟内两条。
                     let eval_ok = if is_eval && send_telemetry && !just_handshook {
-                        oauth::keepalive_eval(&http, &access_token, &ctx).await
+                        oauth::keepalive_eval(&http, &access_token, &ctx, &store).await
                     } else {
                         oauth::KeepaliveResult::Ok
                     };

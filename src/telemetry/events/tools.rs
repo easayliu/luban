@@ -325,6 +325,7 @@ impl EventBuilder<'_> {
             ref base_identity,
             ref chain_id,
             v285,
+            v312,
             usage_before,
             ref dd_model,
             ref session_cwd,
@@ -371,6 +372,9 @@ impl EventBuilder<'_> {
             }
             if env.f.v307 {
                 auto_mode_decision_v307(&mut decision);
+            }
+            if v312 {
+                auto_mode_decision_v312(&mut decision, &tu.id);
             }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
@@ -471,17 +475,17 @@ impl EventBuilder<'_> {
             if !is_sub {
                 self.push_file_suggestions_refresh(tp);
             }
-            self.push(
-                ms(tp, 2),
-                "tengu_tool_use_can_use_tool_allowed",
-                json!({
-                    "messageID": &prev_msg,
-                    "toolName": &tu.name,
-                    "queryChainId": &chain_id,
-                    "queryDepth": prev_depth,
-                    "requestId": &prev_req
-                }),
-            );
+            let mut allowed = json!({
+                "messageID": &prev_msg,
+                "toolName": &tu.name,
+                "queryChainId": &chain_id,
+                "queryDepth": prev_depth,
+                "requestId": &prev_req
+            });
+            if v312 {
+                can_use_tool_v312(&mut allowed, &tu.id);
+            }
+            self.push(ms(tp, 2), "tengu_tool_use_can_use_tool_allowed", allowed);
         } else {
             let mut granted = json!({
                 "messageID": &prev_msg,
@@ -499,17 +503,17 @@ impl EventBuilder<'_> {
             self.push(tg, "tengu_tool_use_granted_in_config", granted);
             self.note_edit_decision((&tu.name, &tu.input), "accept", "config");
             self.push_dd(ms(tg, 1), "tengu_feature_ok", feature("permission_auto_approve_config"));
-            self.push(
-                ms(tg, 2),
-                "tengu_tool_use_can_use_tool_allowed",
-                json!({
-                    "messageID": &prev_msg,
-                    "toolName": &tu.name,
-                    "queryChainId": &chain_id,
-                    "queryDepth": prev_depth,
-                    "requestId": &prev_req
-                }),
-            );
+            let mut allowed = json!({
+                "messageID": &prev_msg,
+                "toolName": &tu.name,
+                "queryChainId": &chain_id,
+                "queryDepth": prev_depth,
+                "requestId": &prev_req
+            });
+            if v312 {
+                can_use_tool_v312(&mut allowed, &tu.id);
+            }
+            self.push(ms(tg, 2), "tengu_tool_use_can_use_tool_allowed", allowed);
         }
     }
 
@@ -534,6 +538,7 @@ impl EventBuilder<'_> {
             v309,
             v310,
             v311,
+            v312,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -610,7 +615,7 @@ impl EventBuilder<'_> {
                 tu.input.get("run_in_background").and_then(|b| b.as_bool()) == Some(true);
             // 官方量的是命令的原始输出，末尾那个换行在 tool_result 里被去掉了（10 对 9、258 对
             // 257……）；转到后台的那种当场只有一个换行（`00146`）。
-            let stdout = if backgrounded { 1 } else { tu.result_len + 1 };
+            let stdout = if backgrounded { 1 } else { tu.result_size() + 1 };
             let mut bash = bash_executed_meta(
                 &bash_profile(command),
                 stdout,
@@ -677,9 +682,9 @@ impl EventBuilder<'_> {
                 json!({
                     "toolName": &tu.name,
                     "originalSizeBytes": orig,
-                    "persistedSizeBytes": tu.result_len,
+                    "persistedSizeBytes": tu.result_size(),
                     "estimatedOriginalTokens": (orig + 2) / 4,
-                    "estimatedPersistedTokens": (tu.result_len + 2) / 4,
+                    "estimatedPersistedTokens": (tu.result_size() + 2) / 4,
                     "thresholdUsed": 50_000,
                     "truncatedAtCap": false
                 }),
@@ -720,7 +725,7 @@ impl EventBuilder<'_> {
             "externalDeltaBytes": 2_870_395,
             "preToolHookDurationMs": 0,
             "permissionDurationMs": permission_ms,
-            "toolResultSizeBytes": tu.persisted_from.unwrap_or(tu.result_len),
+            "toolResultSizeBytes": tu.persisted_from.unwrap_or(tu.result_size()),
             "toolInputSizeBytes": if tu.name == "ExitPlanMode" && tu.input_len <= 2 {
                 self.file_sizes.get(PLAN_INPUT_KEY).copied().unwrap_or(tu.input_len)
             } else {
@@ -741,7 +746,7 @@ impl EventBuilder<'_> {
         // 2.1.285：结果的 token 估算（字节数 / 4 四舍五入，11 条里 10 条相等）、媒体块数、
         // 会不会被落盘（超过 50000 字节的那条 60278 为 true，41469 为 false）。
         if v285 {
-            let size = tu.persisted_from.unwrap_or(tu.result_len) as u64;
+            let size = tu.persisted_from.unwrap_or(tu.result_size()) as u64;
             insert_after(
                 &mut rest,
                 "toolResultSizeBytes",
@@ -804,8 +809,13 @@ impl EventBuilder<'_> {
             // （`cap/auto-2.1.309-20261023-full` A0 那条）摘要、行列、块名都换了，2.1.310
             // （`cap/auto-2.1.310-20261024-bashfail`：全量包里那次没有失败的 Bash，另用 `-p` 跑
             // `ls` 不存在的目录补抓，同法在 2.1.309 上复现出 1a36b34122c0）摘要、行列、块名都换了，2.1.311
-            // （`cap/auto-2.1.311-20261027-bashfail`，同法补抓，同一次跑的 2.1.310 对照复现出 b26c68ea74b5）也都换了。
-            if v311 {
+            // （`cap/auto-2.1.311-20261027-bashfail`，同法补抓，同一次跑的 2.1.310 对照复现出 b26c68ea74b5）也都换了，2.1.312
+            // （`cap/auto-2.1.312-20261028-bashfail` 与全量包里那条，同一次跑的 2.1.311 对照复现出 11211b82294f）摘要、行、块名
+            // 又换了、列没变。
+            if v312 {
+                err["error_stack_hash"] = json!("9eb7b5f2f5a2");
+                err["error_top_frame"] = json!("chunk-r5cyd28m.js:3545:6820");
+            } else if v311 {
                 err["error_stack_hash"] = json!("11211b82294f");
                 err["error_top_frame"] = json!("chunk-2ht8z368.js:3554:6820");
             } else if v310 {
@@ -881,6 +891,12 @@ impl EventBuilder<'_> {
             self.push_dd_snake(t_done, "tengu_tool_use_error", err);
         } else {
             self.push_dd_snake(t_done, "tengu_tool_use_success", success);
+            // 没有输出：客户端换占位那一刻报一条（官方 `Q`，只进事件链），同一毫秒紧跟成功那条（`cap/auto-2.1.312-
+            // 20261028-full` `01004` / `00081`）。工具名照官方 `Un` 脱敏：MCP 工具报 `mcp_tool`，其余报原名。
+            if tu.empty_result() {
+                let name = if tu.name.starts_with("mcp__") { "mcp_tool" } else { tu.name.as_str() };
+                self.push(t_done, "tengu_tool_empty_result", json!({ "toolName": name }));
+            }
         }
     }
 }

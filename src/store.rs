@@ -51,6 +51,7 @@ mod stats;
 #[cfg(test)]
 mod tests;
 mod thinking_blocks;
+mod tools_used_flags;
 mod usage;
 mod users;
 

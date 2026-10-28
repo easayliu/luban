@@ -101,6 +101,13 @@ pub struct ApiCall {
     pub bare: bool,
     /// 实际出站的 `anthropic-dispatch-id`（真实客户端透传它自己的，模拟路径恒为 `v2d`，额度探测不带）。
     pub dispatch: Option<String>,
+    /// 出站带了 `x-claude-code-sandy-plover`（[`crate::proxy::sandy_plover`]）：官方头一回在请求上补它时报一条
+    /// `tengu_feature_ok{api_tools_used_header}`，紧跟启动段的 `provider_route`。
+    pub tools_used_header: bool,
+    /// 这条的 `x-claude-code-sandy-plover` 装不下、会话锁存头一回丢名字：（写进去几个，丢了几个）。随这条报
+    /// `tengu_feature_sad{sent, dropped, api_tools_used_header, incomplete_list}`。锁存只在头一回给，那次失败、客户端
+    /// 重发的几次都是 `None`，报的时候看整串（[`Self::chain_tools_used_truncation`]）。
+    pub tools_used_truncation: Option<(usize, usize)>,
     /// 同一请求在这一条之前失败过的那几次（客户端自己重发的），按先后。转发路径交过来时总是空的，
     /// 遥测把扣住的失败接到最终那一次上时才填（见 `Telemetry::process` 的重试链）。
     pub prior_attempts: Vec<PriorAttempt>,
@@ -119,6 +126,10 @@ pub struct PriorAttempt {
     pub message: String,
     pub in_band: bool,
     pub request_id: Option<String>,
+    /// 那一次出站带了 `x-claude-code-sandy-plover`，见 [`ApiCall::tools_used_header`]。
+    pub tools_used_header: bool,
+    /// 那一次的头装不下的诊断，见 [`ApiCall::tools_used_truncation`]。
+    pub tools_used_truncation: Option<(usize, usize)>,
 }
 
 impl ApiCall {
@@ -126,6 +137,21 @@ impl ApiCall {
     /// 提交、`api_query` 这些请求前缀的事件挂在它上面，首字与收尾仍按最终这次算。
     pub fn logical_start(&self) -> SystemTime {
         self.prior_attempts.first().map_or(self.started_at, |a| a.started_at)
+    }
+
+    /// 这个逻辑请求有哪次尝试带了 `x-claude-code-sandy-plover`（[`Self::tools_used_header`]）：官方在头一次拼头时就记下
+    /// 首次使用，重发的几次带不带不改它。
+    pub fn chain_tools_used_header(&self) -> bool {
+        self.tools_used_header || self.prior_attempts.iter().any(|a| a.tools_used_header)
+    }
+
+    /// 这个逻辑请求那条头装不下的诊断（[`Self::tools_used_truncation`]）：取最早给出的那次。会话锁存只在头一回丢名字
+    /// 那次给（官方 `reportTruncationOnce`），那次 503、客户端重发成功时它在先前那几次里，只看最终这次就永远漏了。
+    pub fn chain_tools_used_truncation(&self) -> Option<(usize, usize)> {
+        self.prior_attempts
+            .iter()
+            .find_map(|a| a.tools_used_truncation)
+            .or(self.tools_used_truncation)
     }
 }
 
@@ -142,6 +168,8 @@ impl PriorAttempt {
             message: f.map(|f| f.message.clone()).unwrap_or_default(),
             in_band: f.is_some_and(|f| f.in_band),
             request_id: c.request_id.clone(),
+            tools_used_header: c.tools_used_header,
+            tools_used_truncation: c.tools_used_truncation,
         }
     }
 }
@@ -199,6 +227,10 @@ pub struct Capture {
     pub link_prompt_id: Option<String>,
     /// 见 [`ApiCall::bare`]。
     pub bare: bool,
+    /// 见 [`ApiCall::tools_used_header`]。
+    pub tools_used_header: bool,
+    /// 见 [`ApiCall::tools_used_truncation`]。
+    pub tools_used_truncation: Option<(usize, usize)>,
 }
 
 impl Capture {
@@ -259,6 +291,8 @@ impl Capture {
             link_prompt_id: self.link_prompt_id,
             bare: self.bare,
             dispatch: self.dispatch,
+            tools_used_header: self.tools_used_header,
+            tools_used_truncation: self.tools_used_truncation,
             prior_attempts: Vec::new(),
         });
     }

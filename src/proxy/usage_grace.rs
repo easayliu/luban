@@ -59,8 +59,12 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::agent_summary_config::note_eval(cred_id, features);
     // 会话活动心跳（`tengu_cache_heartbeat_shadow`）开没开。
     super::dapper_dawn::note_eval(cred_id, features);
-    // 2.1.307 的安全事件（`tengu_safety_event`）报不报，默认开。
+    // 2.1.307 的安全事件（`tengu_safety_event`）报不报，读不到时 2.1.311 及以前按开、2.1.312 起按关。
     super::snoopy_creek::note_eval(cred_id, features);
+    // 2.1.311 起 `/v1/messages` 带不带 `x-claude-code-sandy-plover`（`tengu_snug_mitten` / `tengu_silly_shore`）。
+    super::sandy_plover::note_eval(cred_id, features);
+    // 握手里 `/v1/mcp_servers` 的 MCP 客户端声明带不带 tasks 扩展（`tengu_glowing_lark` / `tengu_brindle_causeway`）。
+    super::glowing_lark::note_eval(cred_id, features);
     // tether 固定按无状态发送的模型清单（遥测 `modelHeldStateless`），默认空串。
     super::curious_tower::note_eval(cred_id, features);
     // 拼进 system 的那段 `tengu_heron_brook`（bootstrap 的 `client_data` 优先，这里是兜底那份）。

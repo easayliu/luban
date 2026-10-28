@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.311."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.312."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.311."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.312."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1627,26 +1627,28 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.311-20261027-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
-/// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
-/// `context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00685` 是中断后重开那轮；
-/// `00377`、`00609`、`00463` 是各自首轮）；
-/// fable 只有 auto 模式的（`00920`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// **对着 `cap/auto-2.1.312-20261028-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、`x-claude-code-sandy-plover`、顶层键序、
+/// `thinking`、`context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方
+/// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00681` 是中断后重开那轮；
+/// `00369`、`00603`、`00456` 是各自首轮；2.1.311 那次是 `00685`、`00377`、`00609`、`00463`）；
+/// fable 只有 auto 模式的（`00916`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
 /// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`；2.1.310 起这个号服务端已把
 /// 那个开关关了，官方串里本就没有）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
 /// 从第四块挪到基座）。抓包时服务端在 opus / sonnet 的 bootstrap 里下发了 `tengu_lapis_anchor:"off"`
 /// （[`crate::proxy::lapis_anchor`]），这里同样喂给测试号：这两族第四块与首轮都没有 `<total_tokens>`，其余三族照有。
+/// 抓包那天服务端开着 `tengu_snug_mitten`，五条官方主线程都带 `x-claude-code-sandy-plover: []`（各自首轮，还没用过工具），
+/// 测试号同样喂开，见 [`crate::proxy::sandy_plover`]。
 ///
 /// `effort` 与官方逐值相同（opus / sonnet / haiku-5-5 是 medium、fable 是 high、haiku-4.5 不带）。
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_311_captures() {
-    let dir = format!("{}/cap/auto-2.1.311-20261027-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_312_captures() {
+    let dir = format!("{}/cap/auto-2.1.312-20261028-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.311-20261027-full not present");
+        eprintln!("skipped: cap/auto-2.1.312-20261028-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
@@ -1665,7 +1667,8 @@ fn simulated_main_threads_match_the_2_1_311_captures() {
                 "source": "experiment", "experiment": {"key": "tengu_lucky_cerf_experiment_v4"},
                 "experimentResult": {"inExperiment": true, "variationId": 1}},
             "tengu_sequential_cloud": {"value": {"enabled": true, "touchIntervalSeconds": 30,
-                "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
+                "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"},
+            "tengu_snug_mitten": {"value": true, "source": "force"}}});
         crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
         // 抓包那天 bootstrap 的 `client_data`：opus / sonnet 下发 `tengu_lapis_anchor:"off"`，haiku 与 fable 没有这一项。
         for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
@@ -1676,7 +1679,7 @@ fn simulated_main_threads_match_the_2_1_311_captures() {
         cred
     };
     for (i, (n, auto_mode)) in
-        [("00685", false), ("00377", false), ("00463", false), ("00609", false), ("00920", true)]
+        [("00681", false), ("00369", false), ("00456", false), ("00603", false), ("00916", true)]
             .into_iter()
             .enumerate()
     {
@@ -1733,6 +1736,19 @@ fn simulated_main_threads_match_the_2_1_311_captures() {
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap();
         assert!(billing.contains(&format!("cc_prompt_id={pid};")), "{model}: 头与 billing 同值");
         assert_eq!(h["x-stainless-package-version"], header("X-Stainless-Package-Version"));
+        // 用过的工具：模拟会话的首条，与官方首轮一样是空的（`attempt` 在建完头之后补，这里照那里调）。
+        let sandy = crate::proxy::sandy_plover::session_header(
+            cred.id,
+            &sim.session_id,
+            sim.profile.version,
+            serde_json::from_slice::<serde_json::Value>(&body).ok().as_ref(),
+            None,
+        );
+        assert_eq!(
+            sandy.as_ref().and_then(|(v, _)| v.to_str().ok()),
+            Some(header("x-claude-code-sandy-plover")),
+            "{model}（{n}）"
+        );
 
         // `thread`：2.1.308 五个主线程首轮都是 `create`，模拟出站与之一致。
         assert_eq!(v.get("thread"), official.get("thread"), "{model}（{n}）thread");
@@ -1766,7 +1782,7 @@ fn simulated_main_threads_match_the_2_1_311_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.311."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.312."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1775,7 +1791,7 @@ fn simulated_main_threads_match_the_2_1_311_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/7a468bc9-fb57-4289-92bc-6d4c109c2ded/scratchpad/cal4",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/68df3b4b-11d0-4e4a-ba24-8ea24d3157e7/scratchpad/cal5",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。

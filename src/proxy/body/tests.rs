@@ -2656,6 +2656,10 @@ fn core_tool_stubs_are_profile_specific() {
     // 2.1.309 的 `# Creating pull requests` 段也加了那句 `@name` 提示（2.1.308 及以前是 11913，+283）；
     // 2.1.311 同样改写了开头那句工作目录的说明（2.1.309 ~ 2.1.310 是 12196，+161）。
     assert_eq!(d(haiku, "Bash").chars().count(), 12357);
+    // 2.1.312 的 AskUserQuestion 在「Preview feature」前多一段「The user may see only the question
+    // dialog…」，四族都加（`cap/auto-2.1.312-20261028-full/00069`、haiku-4.5 `00603`；2.1.311 是 4926 / 4669，+299）。
+    assert_eq!(d(opus, "AskUserQuestion").chars().count(), 5225);
+    assert_eq!(d(haiku, "AskUserQuestion").chars().count(), 4968);
 }
 
 /// 开关 `sim_trim_tools`：注入的官方工具去掉 Artifact / ListAgents / SendFeedback，剩 11 条、先后
@@ -2795,7 +2799,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.311."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.312."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -4908,7 +4912,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 311)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 312)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

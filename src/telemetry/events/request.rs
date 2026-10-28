@@ -210,16 +210,21 @@ impl EventBuilder<'_> {
                 let announced: &[(&str, u32)] =
                     if self.env.call.bare { &[] } else { &[("session_context", 82), ("date", 9)] };
                 for &(kind_name, tokens) in announced {
-                    self.push(
-                        tr,
-                        "tengu_context_announcement",
-                        json!({
-                            "announcement_type": kind_name,
-                            "token_estimate": tokens,
-                            "updates_copy": false,
-                            "query_source": query_source
-                        }),
-                    );
+                    let mut announce = json!({
+                        "announcement_type": kind_name,
+                        "token_estimate": tokens,
+                        "updates_copy": false,
+                        "query_source": query_source
+                    });
+                    // 2.1.312 起多 `assumed_utc`，本机恒为 `false`（见模板那处）。
+                    if self.env.f.v312 {
+                        insert_after(
+                            &mut announce,
+                            "updates_copy",
+                            vec![("assumed_utc", json!(false))],
+                        );
+                    }
+                    self.push(tr, "tengu_context_announcement", announce);
                 }
                 let t4 = ms(t0, -4);
                 self.push(
@@ -512,6 +517,15 @@ impl EventBuilder<'_> {
             query.insert("previousRequestId".into(), json!(prev));
         }
         self.push(t0, "tengu_api_query", Value::Object(query));
+        // 头一回带上 `x-claude-code-sandy-plover`（或头装不下）却不发启动模板的这条：官方在拼这条请求的头时报，紧跟
+        // `api_query`（`-p` 首条是 +4ms，那时中间还夹一条 `provider_route`）；发启动模板的那条落在模板里，见
+        // [`super::template::tools_used_header_events`]。
+        if !env.f.emits_startup() {
+            let first_use = env.f.tools_used_header_first;
+            for (name, meta) in tools_used_header_events(first_use, env.f.tools_used_truncation) {
+                self.push_dd(ms(t0, 4), name, meta);
+            }
+        }
         self.push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
         // 2.1.291：会话首条主线程请求发出后约 40 ~ 120ms 头一回写会话记录（交互式与 `-p` 都有，
         // `cap/auto-2.1.291-20261006-full` 每个会话恰好一条，`/clear` 之后的新会话再一条）。

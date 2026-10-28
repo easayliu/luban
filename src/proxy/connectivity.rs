@@ -261,7 +261,7 @@ pub async fn probe(
         ProbeShape::Quota => {
             let flags = store::ForwardFlags::default();
             let sim = probe_simulation(cred, model);
-            let headers = build_forward_headers_for(
+            let mut headers = build_forward_headers_for(
                 &HeaderMap::new(),
                 &token,
                 flags,
@@ -271,6 +271,10 @@ pub async fn probe(
                 false,
                 super::headers::BetaCtx::MAIN,
             );
+            // 不在任何对话里：用过的工具是空的（[`super::sandy_plover`]）。
+            if let Some(v) = super::sandy_plover::fresh_header(cred.id, sim.profile.version) {
+                headers.insert(super::sandy_plover::SANDY_PLOVER_HEADER, v);
+            }
             Upstream {
                 _state: std::marker::PhantomData,
                 client,
@@ -293,6 +297,7 @@ pub async fn probe(
                 cc_kind: CcRequestKind::QuotaProbe,
                 // 探测不补 fallbacks：它要测的是这个号在**这个模型**上通不通，换模型作答等于没测。
                 refusal_fallbacks: None,
+                tools_used_truncation: None,
             }
         }
     };
@@ -626,6 +631,7 @@ pub(crate) async fn spawn_session_handshake(
     let session_id = start.session_id.to_string();
     let probe_version = start.version.clone();
     let probe_flags = state.store.forward_flags();
+    let probe_telemetry = state.telemetry.clone();
     let quota_probe = start.quota_probe;
     let gaps = handshake_gaps(quota_probe, |(lo, hi)| {
         std::time::Duration::from_millis(rand::RngExt::random_range(&mut rand::rng(), lo..=hi))
@@ -646,6 +652,7 @@ pub(crate) async fn spawn_session_handshake(
                         &probe_version,
                         &session_id,
                         probe_flags,
+                        &probe_telemetry,
                     )
                     .await;
                 }
@@ -751,6 +758,10 @@ fn quota_probe_profile(version: &str) -> &'static config::CcProfile {
 ///
 /// `flags` 用后台的真实配置，与同会话的主请求一致：用户关掉的（身份伪装、原始头大小写……）
 /// 这条也不做，否则同一会话里只有它还带着 luban 派生的身份或官方的头大小写。
+///
+/// 它不进遥测，带了 `x-claude-code-sandy-plover` 就告诉 `telemetry` 一声：首次使用的那条事件挂到这个会话上
+/// （[`crate::telemetry::Telemetry::note_tools_used_header`]）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_quota_probe(
     client: &wreq::Client,
     token: &str,
@@ -759,6 +770,7 @@ pub(crate) async fn send_quota_probe(
     version: &str,
     session_id: &str,
     flags: store::ForwardFlags,
+    telemetry: &crate::telemetry::Telemetry,
 ) {
     let model = QUOTA_PROBE_MODEL;
     let profile = quota_probe_profile(version);
@@ -793,6 +805,12 @@ pub(crate) async fn send_quota_probe(
         false,
         super::headers::BetaCtx::MAIN,
     );
+    // 会话刚开头，用过的工具是空的；带不带跟着这个会话的版本（2.1.311 起）与号的开关，见 [`super::sandy_plover`]。
+    // 官方拼头那一刻记首次使用，这里同样在发出前登记，不管这一发成不成。
+    if let Some(v) = super::sandy_plover::fresh_header(cred.id, version) {
+        headers.insert(super::sandy_plover::SANDY_PLOVER_HEADER, v);
+        telemetry.note_tools_used_header(cred.id, session_id);
+    }
     // **UA 跟着这个会话的版本走**，不是 luban 自己那个。
     //
     // 探测体与 beta 在 2.1.258 与 2.1.260 上**逐字节相同**（`cap/2.1.258/00004` ↔
@@ -1044,7 +1062,7 @@ pub(super) fn prewarm_upstream<'a>(
     let flags = store::ForwardFlags::default();
     let sim = prewarm_simulation(cred, model);
     let session = sim.session_id.clone();
-    let headers = build_forward_headers_for(
+    let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
         token,
         flags,
@@ -1054,6 +1072,10 @@ pub(super) fn prewarm_upstream<'a>(
         false,
         super::headers::BetaCtx::MAIN,
     );
+    // 官方 `/model` 预热也带（`cap/auto-2.1.312-20261028-model/00067` 是 `[]`），见 [`super::sandy_plover`]。
+    if let Some(v) = super::sandy_plover::fresh_header(cred.id, sim.profile.version) {
+        headers.insert(super::sandy_plover::SANDY_PLOVER_HEADER, v);
+    }
     Upstream {
         _state: std::marker::PhantomData,
         client,
@@ -1075,6 +1097,7 @@ pub(super) fn prewarm_upstream<'a>(
         cc_kind: CcRequestKind::Prewarm,
         // 不补 fallbacks：探的是这个号在**这个模型**上通不通，换模型作答等于没探。
         refusal_fallbacks: None,
+        tools_used_truncation: None,
     }
 }
 

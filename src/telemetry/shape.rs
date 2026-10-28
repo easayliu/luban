@@ -27,8 +27,11 @@ pub(super) struct ToolUse {
     pub(super) input_len: usize,
     /// Bash 的 `command` 长度（其它工具为 0）。
     pub(super) command_len: usize,
-    /// 对应 `tool_result` 的内容字符数。
+    /// 对应 `tool_result` 的内容字符数（请求里那份原样量）；官方量的大小见 [`Self::result_size`]。
     pub(super) result_len: usize,
+    /// 结果是官方的空输出占位时占位里的工具名（[`no_output_placeholder`]），是不是这个工具的空结果见
+    /// [`Self::empty_result`]。
+    pub(super) no_output_of: Option<String>,
     /// 结果太大被客户端落了盘、请求里只带预览（`<persisted-output>` 开头）时，预览里写的原始
     /// 大小（字节，按 `Output too large (58.9KB)` 还原）。见 [`persisted_original_size`]。
     pub(super) persisted_from: Option<usize>,
@@ -346,6 +349,17 @@ pub(super) struct ToolResultInfo {
     /// 结果是 Read 去重那句话，见 [`ReadDedup`]。按剥掉尾部提醒之前的原文判（种进来那种整段就是一个
     /// `<system-reminder>`，剥完就空了）。
     pub(super) read_dedup: Option<ReadDedup>,
+    /// 结果是官方空输出的占位时占位里的工具名，见 [`no_output_placeholder`]。
+    pub(super) no_output_of: Option<String>,
+}
+
+/// 工具结果为空（空串、全是空白、空数组、全是空文本块）时客户端换上的占位（官方 `Q`：报一条
+/// `tengu_tool_empty_result{toolName}`，再把内容换成 `(${name} completed with no output)`）：取出里面的工具名。官方量
+/// 结果大小用的是换之前的空内容（`cap/auto-2.1.312-20261028-full` `01000` / `00073` 两条空输出的 Bash，遥测在 `01004` /
+/// `00081`：`toolResultSizeBytes`、`toolResultTokensEst` 都是 0，`stdout_length` 是 1）。
+pub(super) fn no_output_placeholder(text: &str) -> Option<String> {
+    let name = text.trim_end().strip_prefix('(')?.strip_suffix(" completed with no output)")?;
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
 }
 
 /// 客户端在工具没跑起来时回的 `<tool_use_error>…</tool_use_error>`：取出中间那段话（验证不过、找不到
@@ -403,6 +417,7 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                             .saturating_sub(js_len(&text).saturating_sub(js_len(tail))),
                         None => 0,
                     };
+                    let no_output_of = no_output_placeholder(tail);
                     let text = tail.to_string();
                     Some(ToolResultInfo {
                         id,
@@ -421,6 +436,7 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                         },
                         stripped_bytes: read_content_bytes(&text),
                         read_dedup,
+                        no_output_of,
                         image_b64,
                         media_blocks: match content {
                             Some(Value::Array(blocks)) => blocks
@@ -462,6 +478,18 @@ impl ToolUse {
         if verdict.is_some() {
             self.verdict = verdict.cloned();
         }
+    }
+
+    /// 结果是这个工具的空输出占位：工具跑完没有输出，客户端换上了 `(<名字> completed with no output)`。按当前名字现判——
+    /// 线程续轮的增量里名字先按顺序临时配（`Bash` / `Read` / `Bash` 的第三条可能暂配成 `Read`），按 id 纠正
+    /// （[`Self::apply_call`]）之后才可靠。
+    pub(super) fn empty_result(&self) -> bool {
+        self.no_output_of.as_deref() == Some(self.name.as_str())
+    }
+
+    /// 官方量的结果大小（字符数）：空输出的占位按换上之前的空内容算 0。
+    pub(super) fn result_size(&self) -> usize {
+        if self.empty_result() { 0 } else { self.result_len }
     }
 }
 
@@ -505,6 +533,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         input_len: tool_input_len(b.get("name")?.as_str()?, &input),
                         command_len,
                         result_len: hit.map_or(0, |r| r.len),
+                        no_output_of: hit.and_then(|r| r.no_output_of.clone()),
                         persisted_from: hit.and_then(|r| r.persisted),
                         is_error: hit.is_some_and(|r| r.is_error),
                         result_head: hit.map(|r| r.head.clone()).unwrap_or_default(),
@@ -701,6 +730,10 @@ pub(super) fn error_trace(
         // 2.1.311 同样只换了打包块名（`cap/auto-2.1.311-20261027-retry` R1/R2）。
         ("2.1.311", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-ecgnkn41.js:11:1510"))
+        }
+        // 2.1.312 同样只换了打包块名，类名 `Z8t` 带数字照旧过不了构造名校验（`cap/auto-2.1.312-20261028-retry` R1/R2）。
+        ("2.1.312", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-b95e8fn6.js:11:1510"))
         }
         _ => None,
     }

@@ -937,6 +937,10 @@ fn link_fields_follow_official_captures() {
 /// 侧查询判定（[`super::CcRequestKind::is_side_query`]）与官方抓包逐条对：标题、起名、安全
 /// 分类、预热、额度探测、WebFetch 页面处理（主线程与子代理发起的）、WebSearch 子调用全算；
 /// 主线程、子代理（含摘要）、猜下一句、分叉一条都不算。抓包目录不在就跳过。
+///
+/// 只比直连形态。设了 `ANTHROPIC_BASE_URL` 的那几轮（`auto-2.1.311-20261028-ttc*` 里 UA 2.1.277 起却不带
+/// `x-claude-code-request-class` 的）只拿来对比，跳过：那种形态的额度探测用的是主模型（官方 `LFe()` 只在官方地址上用
+/// haiku-4.5，否则退回主模型，`ttc3/00007` 等三条是 `claude-opus-5-5`），额度探测的判据只认直连那条。
 #[test]
 fn side_queries_match_official_captures() {
     use super::CcRequestKind as K;
@@ -962,15 +966,23 @@ fn side_queries_match_official_captures() {
             {
                 continue;
             }
+            let header = |name: &str| {
+                head.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+                })
+            };
+            // 2.1.277 起直连每条都带请求类别头，BASE_URL 下客户端不发。
+            let version = header("user-agent").and_then(crate::proxy::cc_cli_version);
+            if version.is_some_and(|v| v >= (2, 1, 277))
+                && header("x-claude-code-request-class").is_none()
+            {
+                continue;
+            }
             let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw[sep + 4..]) else {
                 continue;
             };
-            let beta: Vec<String> = head
-                .lines()
-                .find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.trim().eq_ignore_ascii_case("anthropic-beta").then(|| v.trim().to_string())
-                })
+            let beta: Vec<String> = header("anthropic-beta")
                 .unwrap_or_default()
                 .split(',')
                 .map(str::to_string)

@@ -499,6 +499,14 @@ pub(super) struct Subst<'a> {
     /// `cap/auto-2.1.311-20261027-full` 的 opus / sonnet 会话 12/14 有 `{mode}` 那条，交互式 `00072`、`-p` `01448`；
     /// `{userTurn}` / `{budget}` 没有样本，跟在它后面）。
     pub(super) lapis: Vec<Value>,
+    /// 这条出站带了 `x-claude-code-sandy-plover`（[`super::ApiCall::tools_used_header`]）：启动段的
+    /// `feature_ok{provider_route}` 之后 1ms 紧跟一条 `feature_ok{api_tools_used_header}`——官方头一回在请求上补这个头
+    /// 时报，一个进程一次（`cap/auto-2.1.312-20261028-full` 交互式与 `-p` 全部 22 个会话都是这个位置）。
+    pub(super) tools_used_header: bool,
+    /// 这条的头装不下、会话锁存头一回丢名字（重发过的看整串，[`super::ApiCall::chain_tools_used_truncation`]）：
+    /// 同一处、首次使用那条之前先报 `feature_sad{sent, dropped, api_tools_used_header, incomplete_list}`（官方拼头时
+    /// 先报它，再记首次使用）。
+    pub(super) tools_used_truncation: Option<(usize, usize)>,
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -982,6 +990,15 @@ where
                     vec![("config_dir_kind", json!("unset"))],
                 );
             }
+            // 2.1.312 起上下文宣告在 `updates_copy` 之后多一项 `assumed_utc`：只有日期那条、且客户端按 UTC 推当天日期
+            // （远程会话、进程时区是 UTC、服务端开关 `tengu_peppy_nest` 开着）时为真，本机的交互式与 `-p` 恒为 `false`
+            // （`cap/auto-2.1.312-20261028-full` 全部 75 条，主线程、`-p` 与子代理都是）。
+            if e.name == "tengu_context_announcement"
+                && version_at_least(subst.version, "2.1.312")
+                && meta.get("assumed_utc").is_none()
+            {
+                insert_after(&mut meta, "updates_copy", vec![("assumed_utc", json!(false))]);
+            }
             // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
             // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关
             // 的四个会话正是这三个名字），关了哪个列哪个。
@@ -1017,6 +1034,8 @@ where
             if !subst.sdk && e.name == "tengu_mcp_instructions_pool_change" {
                 events.extend(lapis(&c));
             }
+            let tools_used_at_route = e.name == "tengu_feature_ok"
+                && meta.get("feature_name").and_then(|f| f.as_str()) == Some("provider_route");
             // 关掉 Artifact 的会话，启动计时那条之后紧跟一条「本会话 Artifact 已停用」（四族关掉的
             // 会话各一条，`mechanism: env`）。
             if v291
@@ -1055,9 +1074,45 @@ where
                 }
                 dd.push(id.dd_entry_at(e.stage, &e.name, &c, resp_model, flat));
             }
+            if tools_used_at_route {
+                let ta = t + chrono::Duration::milliseconds(1);
+                let ca = ctx(ta);
+                for (name, meta) in
+                    tools_used_header_events(subst.tools_used_header, subst.tools_used_truncation)
+                {
+                    events.push((ta, id.event_at(e.stage, name, ta, &ca, meta.clone())));
+                    dd.push(id.dd_entry_at(e.stage, name, &ca, resp_model, meta));
+                }
+            }
         }
     }
     (events, dd)
+}
+
+/// `x-claude-code-sandy-plover` 带出来的两条（官方拼头那一刻）：头装不下、锁存头一回丢名字时先报
+/// `feature_sad{sent, dropped, feature_name, error_code}`（官方 `p(name, code, {sent, dropped})` 的键序，日志层再追加
+/// `tengu_quizzical_giraffe`），进程头一回带上这个头再报 `feature_ok{api_tools_used_header}`。两条都进 Datadog。
+pub(super) fn tools_used_header_events(
+    first_use: bool,
+    truncation: Option<(usize, usize)>,
+) -> Vec<(&'static str, Value)> {
+    let mut out = Vec::new();
+    if let Some((sent, dropped)) = truncation {
+        out.push((
+            "tengu_feature_sad",
+            json!({
+                "sent": sent,
+                "dropped": dropped,
+                "feature_name": "api_tools_used_header",
+                "error_code": "incomplete_list",
+                "tengu_quizzical_giraffe": "unset"
+            }),
+        ));
+    }
+    if first_use {
+        out.push(("tengu_feature_ok", json!({ "feature_name": "api_tools_used_header" })));
+    }
+    out
 }
 
 /// 模板事件是不是 IDE 那个 MCP 服务的（`transportType` 为 `ws-ide` / `sse-ide`）。

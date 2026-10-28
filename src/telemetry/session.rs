@@ -69,6 +69,9 @@ pub(super) struct Session {
     pub(super) background_done: usize,
     /// 进程启动约 30 秒后那条 `ide_detect{found:false}` 已经补发过（按进程记，`/clear` 接着算）。
     pub(super) ide_detect_done: bool,
+    /// 这个进程已经报过 `feature_ok{api_tools_used_header}`：官方头一回在请求上补 `x-claude-code-sandy-plover` 时报，
+    /// 按进程一次（`ri().once`，`/clear` 与 resume 都不清），所以 `/clear` 接着算、新进程从头算。
+    pub(super) tools_used_header_reported: bool,
     /// 主线程各轮 `tengu_attachments` 里报过的附件类型与条数（首次出现的先后）：`/compact` 收尾那条
     /// `reactive_compact_succeeded` 按类型报 `attachment_*_count`，官方数的是内部消息表里的附件，与各轮
     /// 宣告过的逐类相等（`cap/auto-2.1.305-20261021-full` A0：33 条 total_tokens_reminder 等 11 类全对上）。
@@ -453,6 +456,7 @@ impl ThreadBase {
                         // 原文的（[`ToolCall`]），[`Telemetry::process`] 随后按 id 换成真值。
                         command_len: if name == "Bash" { input_len.saturating_sub(40) } else { 0 },
                         result_len: r.len,
+                        no_output_of: r.no_output_of.clone(),
                         persisted_from: r.persisted,
                         is_error: r.is_error,
                         result_head: r.head.clone(),
@@ -689,6 +693,18 @@ pub(super) struct TurnFacts {
     pub(super) v309: bool,
     pub(super) v310: bool,
     pub(super) v311: bool,
+    /// 2.1.312：权限两条（`can_use_tool_allowed` / `rejected`）与 auto 模式判定带上 tool_use 的 id、
+    /// 服务端判过的那种多 `serverClassifierRole`，`context_announcement` 多 `assumed_utc`，
+    /// `resume_model_restore` 去掉 `is_eap`，失败 Bash 与 5xx 的错误栈换块（`cap/auto-2.1.312-20261028-*`）。
+    pub(super) v312: bool,
+    /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
+    /// [`State::tools_used_header_sent`]），而这个进程还没报过（[`Session::tools_used_header_reported`]）：这条报
+    /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`
+    /// 之后（握手的 eval 没赶上首条、续轮才头一回带上时就是这样）。
+    pub(super) tools_used_header_first: bool,
+    /// 这条（重发过的看整串，[`super::ApiCall::chain_tools_used_truncation`]）的头装不下、会话锁存头一回丢名字：与首次使用
+    /// 同一处先报 `feature_sad{incomplete_list}`。
+    pub(super) tools_used_truncation: Option<(usize, usize)>,
     /// 工具被拒时报 `tengu_safety_event`：2.1.307 起，且号的服务端开关 `tengu_snoopy_creek` 没关
     /// （[`crate::proxy::snoopy_creek`]，官方每次报之前现读，这里按这条请求处理时读一次）。
     pub(super) safety_events: bool,
@@ -745,6 +761,14 @@ pub(super) struct TurnFacts {
     pub(super) betas_own: String,
     pub(super) thread_step: Option<u32>,
     pub(super) betas_session: String,
+}
+
+impl TurnFacts {
+    /// 这条请求发不发启动模板（[`super::events::EventBuilder::emit_startup`] 的分支）：`--continue` 接上的新进程发在启动探测那个
+    /// 临时会话上，新会话发在自己身上，同一进程里 `/clear` 换出来的不发。
+    pub(super) fn emits_startup(&self) -> bool {
+        self.continued_from.is_some() || (self.cleared_from.is_none() && self.is_new_session)
+    }
 }
 
 impl Pending {
@@ -815,6 +839,10 @@ pub(super) struct State {
     /// 遇到可重试的失败、还不知道客户端会不会重发的那几次，按 `(凭证, session_id, 线)` 记（会话可能还
     /// 没建起来：`-p` 的头一条就失败）。见 [`HeldRetry`] / [`RetryLane`]。
     pub(super) held_retries: HashMap<(i64, String, RetryLane), HeldRetry>,
+    /// 不经遥测的请求带出去的 `x-claude-code-sandy-plover`：`(凭证, session_id)` → 登记时刻，见
+    /// [`Telemetry::note_tools_used_header`]。这个会话下一条处理到的调用把它算进首次使用（[`TurnFacts::tools_used_header_first`]）
+    /// 后去掉；一直没等到的由 [`Telemetry::gc`] 按 [`config::TELEMETRY_SESSION_IDLE_SECS`] 清。
+    pub(super) tools_used_header_sent: HashMap<(i64, String), Instant>,
 }
 
 /// 扣重试的线：主线程一条；每个子代理的进度摘要各一条（摘要器与主线程、子代理本身同时在跑，各扣各的）。官方
@@ -941,6 +969,7 @@ impl Session {
             // `/clear` 换的是会话不是进程：运行时长与后台任务的进度接着上一个会话的算。
             background_done: cleared_prev.map_or(0, |p| p.background_done),
             ide_detect_done: cleared_prev.is_some_and(|p| p.ide_detect_done),
+            tools_used_header_reported: cleared_prev.is_some_and(|p| p.tools_used_header_reported),
             attachment_counts: Vec::new(),
             last_main_reply_model: None,
             recent_ends: VecDeque::new(),
@@ -1017,6 +1046,8 @@ pub(super) struct ClearedPrev {
     pub(super) background_done: usize,
     /// 进程里那条 IDE 探测已经报过。
     pub(super) ide_detect_done: bool,
+    /// 进程里那条 `api_tools_used_header` 已经报过，见 [`Session::tools_used_header_reported`]。
+    pub(super) tools_used_header_reported: bool,
     /// 进程里已经发过的 `tengu_lucky_cerf` 一系曝光（按 feature）：GrowthBook 的曝光按进程记，
     /// `/clear` 之后不再发。
     pub(super) lucky_cerf_exposed: Vec<&'static str>,
@@ -1124,6 +1155,7 @@ impl State {
                 started_wall: p.started_wall,
                 background_done: p.background_done,
                 ide_detect_done: p.ide_detect_done,
+                tools_used_header_reported: p.tools_used_header_reported,
                 lucky_cerf_exposed: p.lucky_cerf_exposed.clone(),
                 hb: p.hb.clone(),
                 prompt_id: p.prompt_id.clone(),

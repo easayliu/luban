@@ -268,13 +268,15 @@ fn axios_header_orders_match_the_captures() {
             ],
         ),
     ];
+    let v260 = Some((2, 1, 260));
     for (name, cap, order) in cases {
-        assert_eq!(config::axios_shape(name), *order, "{name}（cap/2.1.260-2/{cap}）");
+        assert_eq!(config::axios_shape_at(name, v260), *order, "{name}（cap/2.1.260-2/{cap}）");
     }
 
     // `Authorization` 与 `User-Agent` 的先后在两个端点上正好相反——这正是「不能合并成
     // 一张总表」的证据，别哪天又想着统一。
-    let pos = |ep: &str, h: &str| config::axios_shape(ep).iter().position(|x| *x == h).unwrap();
+    let pos =
+        |ep: &str, h: &str| config::axios_shape_at(ep, v260).iter().position(|x| *x == h).unwrap();
     assert!(pos("policy_limits", "Authorization") < pos("policy_limits", "User-Agent"));
     assert!(pos("bootstrap", "User-Agent") < pos("bootstrap", "Authorization"));
 
@@ -289,10 +291,60 @@ fn axios_header_orders_match_the_captures() {
     }
 
     // eval 不是 axios：Bun 的 fetch，`Connection` 在串中间而不是队尾。
-    let eval = config::AXIOS_SHAPE_EVAL.order;
-    assert_eq!(eval.last(), Some(&"Content-Length"), "eval 队尾是 Content-Length");
-    assert!(eval.contains(&"Connection"));
-    assert_ne!(eval.last(), Some(&"Connection"));
+    for shape in config::EVAL_SHAPES {
+        let eval = shape.order;
+        assert_eq!(eval.last(), Some(&"Content-Length"), "eval 队尾是 Content-Length");
+        assert!(eval.contains(&"Connection"));
+        assert_ne!(eval.last(), Some(&"Connection"));
+    }
+}
+
+/// 头序变过的端点按会话版本取（`cap/2.1.270`、`cap/2.1.277`、`cap/auto-2.1.291-20261006`、
+/// `cap/auto-2.1.312-20261028-full`）：policy_limits 2.1.270 起 UA 前移、2.1.277 起多 `Cache-Control` / `Pragma`；
+/// eval、penguin_mode、mcp_servers 2.1.291 起 UA 前移。版本之间取不超过它的最新那份，读不出版本取最新那份；
+/// 没变过的端点各版同一份。
+#[test]
+fn header_orders_follow_the_client_version() {
+    let at = |name: &str, v: (u64, u64, u64)| config::axios_shape_at(name, Some(v));
+    let v260 = config::axios_shape_at("policy_limits", Some((2, 1, 260)));
+    assert_eq!(at("policy_limits", (2, 1, 269)), v260);
+    let v270 = ["Accept", "User-Agent", "If-None-Match", "Authorization", "anthropic-beta"];
+    assert_eq!(at("policy_limits", (2, 1, 270))[..5], v270);
+    assert_eq!(at("policy_limits", (2, 1, 276))[..5], v270);
+    let v277 = [
+        "Accept",
+        "User-Agent",
+        "Cache-Control",
+        "Pragma",
+        "If-None-Match",
+        "Authorization",
+        "anthropic-beta",
+    ];
+    for v in [(2, 1, 277), (2, 1, 285), (2, 1, 312)] {
+        assert_eq!(at("policy_limits", v)[..7], v277, "{v:?}");
+    }
+    assert_eq!(config::axios_shape_at("policy_limits", None)[..7], v277, "读不出版本取最新那份");
+
+    let ua_first = |name: &str, v| at(name, v).iter().position(|h| *h == "User-Agent").unwrap();
+    let auth = |name: &str, v| at(name, v).iter().position(|h| *h == "Authorization").unwrap();
+    for name in ["penguin_mode", "mcp_servers"] {
+        assert!(ua_first(name, (2, 1, 285)) > auth(name, (2, 1, 285)), "{name} 2.1.285");
+        assert!(ua_first(name, (2, 1, 291)) < auth(name, (2, 1, 291)), "{name} 2.1.291");
+    }
+    let eval_at = |v| config::eval_shape(Some(v))[..4].to_vec();
+    assert_eq!(
+        eval_at((2, 1, 285)),
+        ["Authorization", "Content-Type", "anthropic-beta", "Connection"]
+    );
+    assert_eq!(
+        eval_at((2, 1, 291)),
+        ["Authorization", "Content-Type", "User-Agent", "anthropic-beta"]
+    );
+    assert_eq!(config::eval_shape(None), config::eval_shape(Some((2, 1, 312))));
+
+    for name in ["settings", "bootstrap", "metrics", "event_logging", "datadog"] {
+        assert_eq!(at(name, (2, 1, 260)), at(name, (2, 1, 312)), "{name}");
+    }
 }
 
 /// `If-None-Match` 里那串 `sha256:…` 是**客户端自己算的响应体摘要**，不是服务端 ETag。
@@ -655,7 +707,7 @@ fn ban_reason_is_bounded() {
 #[test]
 fn oauth_token_and_profile_shapes_follow_axios_rules() {
     assert_eq!(
-        config::axios_shape("oauth_token"),
+        config::axios_shape_at("oauth_token", None),
         &[
             "Accept",
             "Content-Type",
@@ -667,7 +719,7 @@ fn oauth_token_and_profile_shapes_follow_axios_rules() {
         ]
     );
     assert_eq!(
-        config::axios_shape("oauth_profile"),
+        config::axios_shape_at("oauth_profile", None),
         &[
             "Accept",
             "Authorization",
@@ -679,8 +731,8 @@ fn oauth_token_and_profile_shapes_follow_axios_rules() {
         ]
     );
     for h in ["anthropic-beta", "anthropic-version"] {
-        assert!(!config::axios_shape("oauth_profile").contains(&h), "profile 不带 {h}");
-        assert!(!config::axios_shape("oauth_token").contains(&h), "token 不带 {h}");
+        assert!(!config::axios_shape_at("oauth_profile", None).contains(&h), "profile 不带 {h}");
+        assert!(!config::axios_shape_at("oauth_token", None).contains(&h), "token 不带 {h}");
     }
     assert_eq!(config::AXIOS_DEFAULT_USER_AGENT, config::DATADOG_USER_AGENT);
 }
@@ -815,6 +867,201 @@ fn split_raw(
         values.insert(n.to_ascii_lowercase(), v.to_string());
     }
     (request_line, names, values, body.to_string())
+}
+
+/// 握手里随版本变过的四条（eval、penguin_mode、mcp_servers、policy_limits）**线上**的头序与 UA 跟会话版本走，真发到
+/// 本地监听口、看原始字节：2.1.312 的会话照 `cap/auto-2.1.312-20261028-full`（全是 `claude-code/2.1.312`，
+/// policy_limits 带 `Cache-Control` / `Pragma`），2.1.285 的照 `cap/2.1.285`（eval 是 Bun 补的 UA、penguin_mode 与
+/// mcp_servers 是 axios 补的），2.1.270 的 policy_limits 照 `cap/2.1.270`（UA 已前移、还没有缓存控制头）。
+#[sqlx::test]
+async fn handshake_wire_shapes_follow_the_session_version(pool: sqlx::PgPool) {
+    let store = crate::store::CredentialStore::for_test(pool.clone()).await;
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
+    super::remember_etag(cred.id, "policy_limits", 200, b"{}");
+    let client = crate::clients::upstream_client(None).unwrap();
+    let ctx_at = |version: &str| {
+        let snapshot = crate::telemetry::SessionSnapshot {
+            session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
+            device_id: "b9".repeat(32),
+            account_uuid: "9922ef8e-7945-4f5a-ab4f-cf5f521531df".into(),
+            version: version.into(),
+            model: "claude-opus-5-5".into(),
+            betas: String::new(),
+            prompt_id: "6c079143-0c53-4c48-817d-105460b3f622".into(),
+            started_wall: std::time::SystemTime::now(),
+        };
+        KeepaliveCtx::new(&cred, 1.0, None, Some(snapshot))
+    };
+    type Build = fn(&wreq::Client, &str, &str, &KeepaliveCtx) -> wreq::RequestBuilder;
+    const TAIL: [&str; 3] = ["Accept-Encoding", "Host", "Connection"];
+    let eval_tail = ["Accept", "Host", "Accept-Encoding", "Content-Length"];
+    let mcp_mid = [
+        "anthropic-beta",
+        "anthropic-version",
+        "anthropic-mcp-client-capabilities",
+        "MCP-Protocol-Version",
+    ];
+    let cases: Vec<(&str, &str, Build, &str, Vec<&str>)> = vec![
+        (
+            "2.1.312",
+            "eval",
+            super::eval_request,
+            "claude-code/2.1.312",
+            [&["Authorization", "Content-Type", "User-Agent", "anthropic-beta", "Connection"][..], &eval_tail]
+                .concat(),
+        ),
+        (
+            "2.1.285",
+            "eval",
+            super::eval_request,
+            config::KEEPALIVE_UA_BUN,
+            [&["Authorization", "Content-Type", "anthropic-beta", "Connection", "User-Agent"][..], &eval_tail]
+                .concat(),
+        ),
+        // 2.1.270 之前 Bun 还是 1.4.1（`cap/2.1.258`、`cap/2.1.260-1`、`cap/2.1.260-2`）。
+        (
+            "2.1.260",
+            "eval",
+            super::eval_request,
+            "Bun/1.4.1",
+            [&["Authorization", "Content-Type", "anthropic-beta", "Connection", "User-Agent"][..], &eval_tail]
+                .concat(),
+        ),
+        (
+            "2.1.312",
+            "penguin_mode",
+            super::penguin_mode_request,
+            "claude-code/2.1.312",
+            [&["Accept", "User-Agent", "Authorization", "anthropic-beta"][..], &TAIL].concat(),
+        ),
+        (
+            "2.1.285",
+            "penguin_mode",
+            super::penguin_mode_request,
+            "axios/1.15.2",
+            [&["Accept", "Authorization", "anthropic-beta", "User-Agent"][..], &TAIL].concat(),
+        ),
+        (
+            "2.1.312",
+            "mcp_servers",
+            super::mcp_servers_request,
+            "claude-code/2.1.312",
+            [&["Accept", "Content-Type", "User-Agent", "Authorization"][..], &mcp_mid, &TAIL].concat(),
+        ),
+        (
+            "2.1.285",
+            "mcp_servers",
+            super::mcp_servers_request,
+            "axios/1.15.2",
+            [&["Accept", "Content-Type", "Authorization"][..], &mcp_mid, &["User-Agent"], &TAIL]
+                .concat(),
+        ),
+        (
+            "2.1.312",
+            "policy_limits",
+            super::policy_limits_request,
+            "claude-code/2.1.312",
+            [
+                &["Accept", "User-Agent", "Cache-Control", "Pragma", "If-None-Match"][..],
+                &["Authorization", "anthropic-beta"],
+                &TAIL,
+            ]
+            .concat(),
+        ),
+        (
+            "2.1.270",
+            "policy_limits",
+            super::policy_limits_request,
+            "claude-code/2.1.270",
+            [&["Accept", "User-Agent", "If-None-Match", "Authorization", "anthropic-beta"][..], &TAIL]
+                .concat(),
+        ),
+    ];
+    for (version, name, build, ua, order) in cases {
+        let (addr, server) = serve_once("{}");
+        build(&client, &format!("http://{addr}"), "AT", &ctx_at(version)).send().await.unwrap();
+        let raw = server.join().unwrap();
+        let (_, names, values, _) = split_raw(&raw);
+        assert_eq!(names, order, "{name} {version}\n{raw}");
+        assert_eq!(values["user-agent"], ua, "{name} {version}");
+        if names.iter().any(|n| n == "Cache-Control") {
+            assert_eq!(
+                (&values["cache-control"][..], &values["pragma"][..]),
+                ("no-cache", "no-cache")
+            );
+        }
+        // 号的 `tengu_glowing_lark` 开着（下面那段之前没喂，这一圈都是关）：MCP 客户端声明不带 tasks 扩展。
+        if name == "mcp_servers" {
+            assert_eq!(
+                values["anthropic-mcp-client-capabilities"],
+                super::MCP_CLIENT_CAPABILITIES,
+                "{version}"
+            );
+        }
+    }
+
+    // `tengu_glowing_lark` 下发了开：2.1.309 起的会话带 tasks 扩展，与 `cap/auto-2.1.312-20261028-full` 25 条逐字同；
+    // 更早的会话照旧。
+    let features = serde_json::json!({"tengu_glowing_lark": {"value": true, "source": "force"}});
+    crate::proxy::glowing_lark::note_eval(cred.id, features.as_object().unwrap());
+    for (version, want) in [
+        ("2.1.312", super::MCP_CLIENT_CAPABILITIES_TASKS),
+        ("2.1.285", super::MCP_CLIENT_CAPABILITIES),
+    ] {
+        let (addr, server) = serve_once("{}");
+        super::mcp_servers_request(&client, &format!("http://{addr}"), "AT", &ctx_at(version))
+            .send()
+            .await
+            .unwrap();
+        let (_, _, values, _) = split_raw(&server.join().unwrap());
+        assert_eq!(values["anthropic-mcp-client-capabilities"], want, "{version}");
+    }
+
+    // 查询串 2.1.277 起才多 `include_additional_installs=true`（`cap/2.1.258` ~ `cap/2.1.270` 只有 `limit=1000`）。
+    for (version, line) in [
+        ("2.1.312", "GET /v1/mcp_servers?limit=1000&include_additional_installs=true HTTP/1.1"),
+        ("2.1.277", "GET /v1/mcp_servers?limit=1000&include_additional_installs=true HTTP/1.1"),
+        ("2.1.270", "GET /v1/mcp_servers?limit=1000 HTTP/1.1"),
+    ] {
+        let (addr, server) = serve_once("{}");
+        super::mcp_servers_request(&client, &format!("http://{addr}"), "AT", &ctx_at(version))
+            .send()
+            .await
+            .unwrap();
+        let (request_line, _, _, _) = split_raw(&server.join().unwrap());
+        assert_eq!(request_line, line, "{version}");
+    }
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(super::MCP_CLIENT_CAPABILITIES_TASKS)
+        .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&decoded).unwrap(),
+        r#"{"roots":{"listChanged":true},"elicitation":{},"extensions":{"io.modelcontextprotocol/tasks":{}}}"#
+    );
+}
+
+/// 2.1.277 起官方启动时不再发 `/v1/code/triggers`（`cap/2.1.277` 起到 `cap/auto-2.1.312-20261028-full` 一条都没有）：
+/// 这样的会话有组织 id 也直接跳过、不出网（真发出去拿假 token 只会是失败或被拒，不会是 `Ok`）。
+#[sqlx::test]
+async fn code_triggers_stop_at_2_1_277(pool: sqlx::PgPool) {
+    let store = crate::store::CredentialStore::for_test(pool.clone()).await;
+    let cred = store.insert("t", None, "a", "r", 0, None, None, 1).await.unwrap();
+    let snapshot = crate::telemetry::SessionSnapshot {
+        session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
+        device_id: "b9".repeat(32),
+        account_uuid: "9922ef8e-7945-4f5a-ab4f-cf5f521531df".into(),
+        version: "2.1.312".into(),
+        model: "claude-opus-5-5".into(),
+        betas: String::new(),
+        prompt_id: "6c079143-0c53-4c48-817d-105460b3f622".into(),
+        started_wall: std::time::SystemTime::now(),
+    };
+    let org = Some("09520b85-f6b6-432f-97e2-6ecb804a083f".to_string());
+    let ctx = KeepaliveCtx::new(&cred, 1.0, org, Some(snapshot));
+    let client = crate::clients::upstream_client(None).unwrap();
+    let got = super::handshake_code_triggers(&client, "AT", &ctx).await;
+    assert!(matches!(got, super::KeepaliveResult::Ok));
 }
 
 /// token 端点**线上**形态：不是比常量表，是真发一条到本地监听口、看原始字节。

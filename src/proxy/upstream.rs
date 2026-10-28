@@ -68,6 +68,9 @@ pub(crate) struct Upstream<'a> {
     /// 出站体要补的 `fallbacks` 字面量（[`refusal_fallbacks_for`](crate::proxy::refusal_fallbacks_for)）；`None` 即不补。
     /// 有值时出站头已带 `server-side-fallback` beta（[`build_forward_headers_for`](crate::proxy::build_forward_headers_for)）。
     pub(super) refusal_fallbacks: Option<&'static str>,
+    /// 这条的 `x-claude-code-sandy-plover` 装不下、这个会话的锁存头一回丢名字（[`crate::proxy::sandy_plover::apply_session_header`]）：
+    /// 遥测随这条报一次 `tengu_feature_sad{api_tools_used_header, incomplete_list}`。
+    pub(super) tools_used_truncation: Option<crate::proxy::sandy_plover::Truncation>,
 }
 
 impl Upstream<'_> {

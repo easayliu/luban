@@ -100,9 +100,11 @@ pub(crate) mod cache_keepalive;
 pub(crate) mod client_data;
 pub(crate) mod curious_tower;
 pub(crate) mod dapper_dawn;
+pub(crate) mod glowing_lark;
 pub(crate) mod heron_brook;
 pub(crate) mod lapis_anchor;
 mod lucky_cerf;
+pub(crate) mod sandy_plover;
 pub(crate) mod snoopy_creek;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,

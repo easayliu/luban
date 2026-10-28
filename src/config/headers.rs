@@ -58,7 +58,8 @@ pub fn cc_stainless_version(version: &str) -> Option<&'static str> {
 /// 某个版本的官方客户端发的 `X-Stainless-Runtime-Version`（遥测 `env.node_version` 同值，见
 /// [`crate::telemetry::Identity::env_block`]）：2.1.258 ~ 2.1.310 的可执行文件内嵌 Bun 报 `v26.3.0`（`cap/2.1.258`
 /// 起各版抓包一致），2.1.311 换了一版 Bun 构建（版本串仍 1.4.4）报 `v26.12.1`
-/// （`cap/auto-2.1.311-20261027-{full,model,retry}` 全部请求）。更早的或读不出版本的没有样本，返回 `None`。
+/// （`cap/auto-2.1.311-20261027-{full,model,retry}` 全部请求），2.1.312 的原生层与它逐字节相同、同报
+/// `v26.12.1`（`cap/auto-2.1.312-20261028-*`）。更早的或读不出版本的没有样本，返回 `None`。
 pub fn cc_stainless_runtime_version(version: &str) -> Option<&'static str> {
     let v = crate::proxy::parse_version(version)?;
     match v {
@@ -152,6 +153,10 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     // `cc_prompt_id`，也不带它。落在 `prev-tool-durations` 与 `request-class` 之间。
     "x-claude-code-prompt-id",
     "x-claude-code-request-class",
+    // 2.1.311 起、服务端开关 `tengu_snug_mitten` 开着的号每条 `/v1/messages` 都带（`count_tokens` 不带），
+    // 落在 `request-class` 与 `x-client-request-id` 之间（`cap/auto-2.1.312-20261028-full` 全部 182 条），见
+    // [`crate::proxy::sandy_plover`]。
+    "x-claude-code-sandy-plover",
     "x-client-request-id",
     // 以下四个由 HTTP 客户端自己追加，官方线序里它们在队尾，不是字母序里的位置。
     "Connection",

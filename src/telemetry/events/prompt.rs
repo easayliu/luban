@@ -48,11 +48,13 @@ impl EventBuilder<'_> {
                     "print": false
                 }),
             );
-            self.push(
-                t_res,
-                "tengu_resume_model_restore",
-                json!({ "outcome": "restored", "is_eap": false }),
-            );
+            // 2.1.312 去掉了 `is_eap`（`cap/auto-2.1.312-20261028-full` `--continue` 那条只剩 `outcome`）。
+            let restore = if env.f.v312 {
+                json!({ "outcome": "restored" })
+            } else {
+                json!({ "outcome": "restored", "is_eap": false })
+            };
+            self.push(t_res, "tengu_resume_model_restore", restore);
             self.push(
                 t_res,
                 "tengu_continue",
@@ -242,6 +244,9 @@ impl EventBuilder<'_> {
                 can_use["queryChainId"] = json!(&prev_turn.0);
                 can_use["queryDepth"] = json!(prev_main_depth);
                 can_use["requestId"] = json!(&prev_req);
+                if env.f.v312 {
+                    can_use_tool_v312(&mut can_use, &c.id);
+                }
                 self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
                 // 2.1.307 紧跟着一条 `tengu_safety_event`（`cap/auto-2.1.307-20261022-full` B1，同一毫秒）。
                 if safety_events {

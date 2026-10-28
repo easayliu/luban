@@ -412,6 +412,8 @@ impl<'a> EventEnv<'a> {
             bare: self.call.bare,
             lucky_cerf: f.lucky_cerf.clone(),
             lapis: f.lapis.clone(),
+            tools_used_header: f.tools_used_header_first && f.emits_startup(),
+            tools_used_truncation: f.tools_used_truncation.filter(|_| f.emits_startup()),
             git: f.identity.vcs.is_some(),
             seed: self.req_hash,
             tracked_files: 0,

@@ -225,6 +225,16 @@ impl Telemetry {
             .push((at, process::sleepy_key(model)));
     }
 
+    /// 一条不经遥测的请求（握手里替会话补的额度探测，[`crate::proxy::send_quota_probe`]）带上了
+    /// `x-claude-code-sandy-plover`：官方头一回在哪条请求上补这个头就在那时报首次使用（一个进程一次），探测是会话里最早
+    /// 发的那条。记下来，这个会话下一条处理到的调用一并算进首次使用（[`TurnFacts::tools_used_header_first`]）——发启动
+    /// 模板的那条正好落在模板里 `provider_route` 之后。不记的话，真实 CC 经网关透传（主线程不带这个头）的会话就只有
+    /// 探测带过、首次使用永远不报。
+    pub fn note_tools_used_header(&self, cred_id: i64, session_id: &str) {
+        let mut st = self.0.state.lock();
+        st.tools_used_header_sent.insert((cred_id, session_id.to_string()), Instant::now());
+    }
+
     pub fn org_uuid(&self, cred_id: i64) -> Option<String> {
         self.0.state.lock().org_uuid.get(&cred_id).cloned()
     }
@@ -439,6 +449,8 @@ impl Telemetry {
             t.retain(|(at, _)| wall.duration_since(*at).unwrap_or_default() < keep);
             !t.is_empty()
         });
+        // 探测带过头、会话却一直没有调用处理到的（主请求本地就被拦了之类）：过了闲置时限就不再等。
+        st.tools_used_header_sent.retain(|_, at| now.duration_since(*at) < idle);
         let expired: Vec<((i64, String), Session)> = {
             let keys: Vec<(i64, String)> = st
                 .sessions

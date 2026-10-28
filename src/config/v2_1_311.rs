@@ -1,9 +1,9 @@
-//! 2.1.311 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.311 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.311 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.311 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.311 的 profile 表：2.1.311 来访的 beta 参照（[`cc_profile_at`]）。2.1.312 的表（[`CC_PROFILES`]）
+/// 各行除版本号外与这张相同。
 ///
 /// 相对 2.1.310（[`CC_PROFILES_2_1_310`]）**只改了 beta**：`thinking-token-count-2026-05-13` 移出了
 /// 官方的公共 beta 规则表，改在请求发出前、`advisor-tool` 之后单独补（条件是这一档模型支持 thinking），
@@ -23,7 +23,7 @@ use super::*;
 /// `<total_tokens>` 提醒整个关了（两版判断代码逐字相同），luban 按号跟着走，见
 /// [`crate::proxy::lapis_anchor`]；账号额度状态变了，310 那次全被 `rate_limit` 压掉的「猜下一句」这次照常发出；
 /// 本机多装了插件与 MCP，请求数 1237→1879 多出来的都是 MCP 连接。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_311: &[CcProfile] = &[
     at_311(
         CC_PROFILES_2_1_310[0],
         "claude-code-20250219,interleaved-thinking-2025-05-14,\

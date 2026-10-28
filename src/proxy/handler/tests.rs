@@ -2295,3 +2295,88 @@ async fn telemetry_capture_reports_the_inbound_wall_clock(pool: sqlx::PgPool) {
     // 不是模拟路径（`sim` 为 `None`），工具声明算来访自带的：`context_size` 按网关基线报。
     assert!(upstream.sim.is_none() && cap.client_tools);
 }
+
+/// 号的 `tengu_snug_mitten` 开着时，模拟路径的 `/v1/messages` 出站带 `x-claude-code-sandy-plover`（2.1.311 起，见
+/// [`crate::proxy::sandy_plover`]）：值是这个会话用过的工具，第三方工具写出站改名之后的名字、排在官方核心工具前面，
+/// 官方旧名 `Task` 记成 `Agent`；后一条对话里少了先前用过的工具也照样留着。`count_tokens` 官方不带，开关没开的号也不带。
+/// （新会话首条要等启动握手拉回 eval 再定，握手打的是写死的官方地址、这里关着，那一步见
+/// `sandy_plover::tests::the_send_time_decision_follows_the_handshakes_eval`。）
+#[sqlx::test]
+async fn simulated_messages_carry_the_tools_used_header(pool: sqlx::PgPool) {
+    let count_ok = Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: br#"{"input_tokens":12}"#.to_vec(),
+    };
+    let mock = MockUpstream::start(vec![sse_ok("a"), sse_ok("b"), count_ok, sse_ok("c")]).await;
+    let (_store, state, ids) = setup(pool, 1, &mock.base).await;
+    let eval =
+        |on: bool| serde_json::json!({"tengu_snug_mitten": {"value": on, "source": "force"}});
+    crate::proxy::sandy_plover::note_eval(ids[0], eval(true).as_object().unwrap());
+    let tools = serde_json::json!([
+        {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+        {"name": "lookup_docs", "description": "docs", "input_schema": {"type": "object"}},
+        {"name": "Task", "description": "delegate", "input_schema": {"type": "object"}}
+    ]);
+    let with_tools = serde_json::json!({
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": "list files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "lookup_docs", "input": {}},
+                {"type": "tool_use", "id": "toolu_3", "name": "Task", "input": {"prompt": "x"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"},
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "none"},
+                {"type": "tool_result", "tool_use_id": "toolu_3", "content": "done"}
+            ]}
+        ]
+    });
+    let (status, _, body) = send(&state, cc_request(with_tools)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let seen = mock.seen();
+    let sandy = |s: &Seen| {
+        s.headers.get("x-claude-code-sandy-plover").map(|v| v.to_str().unwrap().to_string())
+    };
+    let first = sandy(&seen[0]).expect("模拟路径的 messages 带这个头");
+    let items: Vec<serde_json::Value> = serde_json::from_str(&first).unwrap();
+    let names: Vec<&str> = items.iter().map(|i| i["name"].as_str().unwrap()).collect();
+    // 官方旧名 `Task` 白名单放行、出站不改名，记的时候过别名表成 `Agent`（与 `Bash` 同在核心那组、按先后）。
+    assert_eq!(names.len(), 3, "{first}");
+    assert_eq!(names[1..], ["Bash", "Agent"], "核心工具排后头: {first}");
+    let out: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    let out_tools: Vec<&str> =
+        out["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(out_tools.contains(&names[0]), "写的是出站那个名字: {first} / {out_tools:?}");
+    assert_ne!(names[0], "lookup_docs", "第三方工具出站改了名");
+
+    // 同一会话的下一条：对话里只剩 Bash，先前用过的照样在。
+    let later = serde_json::json!({
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": "list files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"},
+                {"type": "text", "text": "and now?"}
+            ]}
+        ]
+    });
+    let (status, _, _) = send(&state, cc_request(later.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sandy(&mock.seen()[1]).as_deref(), Some(first.as_str()), "只增不减");
+
+    let (status, _, _) =
+        send_to(&state, "/v1/messages/count_tokens", cc_request(later.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sandy(&mock.seen()[2]), None, "count_tokens 不带");
+
+    crate::proxy::sandy_plover::note_eval(ids[0], eval(false).as_object().unwrap());
+    let (status, _, _) = send(&state, cc_request(later)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sandy(&mock.seen()[3]), None, "开关关了不带");
+}
