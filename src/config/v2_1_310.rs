@@ -1,9 +1,9 @@
-//! 2.1.310 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.310 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.310 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.310 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.310 的 profile 表：2.1.310 来访的 beta 参照（[`cc_profile_at`]）。2.1.311 的表
+/// （[`CC_PROFILES`]）挪了 `thinking-token-count` 的位置、额度探测去掉了这一项，其余同这张。
 ///
 /// **各行除版本号外与 2.1.309（[`CC_PROFILES_2_1_309`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.310-20261024-full`（场景同 2.1.309-full，测试项目换了干净的
@@ -20,7 +20,7 @@ use super::*;
 /// `tengu_sequential_cloud` 关了（309 时 force 开，这次 defaultValue=false，判断代码两版逐字同，
 /// [`crate::proxy::cache_keepalive`] 本就按开关走）；A 会话一次上游连接重置后官方整个进程关 keep-alive，
 /// 之后的请求不带 `Connection`（「Stale connection — disabling keep-alive for retry」，两版同逻辑）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_310: &[CcProfile] = &[
     at_310(CC_PROFILES_2_1_309[0]),
     at_310(CC_PROFILES_2_1_309[1]),
     at_310(CC_PROFILES_2_1_309[2]),

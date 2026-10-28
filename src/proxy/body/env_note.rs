@@ -56,6 +56,20 @@ pub(in crate::proxy) fn insert_env_note(
         return none;
     }
     let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    // 模拟版本的官方客户端对原生 1M 的模型不再走 1M 那套（2.1.311 起，见
+    // [`crate::proxy::context_1m_beta_wanted`]）：体里的模型名就算带了 `[1m]` 也按普通会话写这一行。
+    let model = if crate::proxy::context_1m_beta_wanted(
+        model,
+        crate::proxy::parse_version(sim.profile.version),
+    ) {
+        model
+    } else {
+        model
+            .trim()
+            .strip_suffix("[1m]")
+            .or_else(|| model.trim().strip_suffix("[1M]"))
+            .unwrap_or(model)
+    };
     let Some(model_line) = env_model_line(model, sim.context_1m) else { return none };
     let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else { return none };
     // 首条**用户**消息：前面只允许夹指令式 system（[`is_system_directive`]，提升不动它、原样
@@ -90,16 +104,17 @@ pub(in crate::proxy) fn insert_env_note(
         Some(sw) => locate_switch(msgs, sw),
         None => (None, None),
     };
-    let sections = [
+    let mut sections = vec![
         env_head(env, &sim.session_id, first.trim),
         first.model_line,
         (if first.haiku { config::CC_ENV_AGENTS_HAIKU } else { config::CC_ENV_AGENTS }).to_string(),
         env_skills(first.trim).to_string(),
-        format!(
-            "<total_tokens>{} tokens left</total_tokens>",
-            crate::proxy::session_link::TOTAL_TOKENS_BUDGET
-        ),
     ];
+    // 这个会话不发 `<total_tokens>`（服务端下发 `off`，见 [`crate::proxy::lapis_anchor`]）时这一段整个没有，日期
+    // 紧跟技能清单（`cap/auto-2.1.311-20261027-full/00070`）；写的数是这个会话的预算（官方 `vnn` 取 `RJ()`）。
+    if sim.lapis.reminders() {
+        sections.push(format!("<total_tokens>{} tokens left</total_tokens>", sim.lapis.budget));
+    }
     let date = pin.date;
     let mut noted = EnvNoted {
         inserted: true,

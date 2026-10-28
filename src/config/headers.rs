@@ -27,7 +27,7 @@ pub const CC_SIM_HEADERS: &[(&str, &str)] = &[
     ("x-stainless-package-version", "0.128.0"),
     ("x-stainless-retry-count", "0"),
     ("x-stainless-runtime", "node"),
-    ("x-stainless-runtime-version", "v26.3.0"),
+    ("x-stainless-runtime-version", "v26.12.1"),
     ("x-stainless-timeout", "600"),
     ("anthropic-dangerous-direct-browser-access", "true"),
     ("anthropic-version", "2023-06-01"),
@@ -51,6 +51,19 @@ pub fn cc_stainless_version(version: &str) -> Option<&'static str> {
         v if v >= (2, 1, 288) => Some("0.128.0"),
         v if v >= (2, 1, 285) => Some("0.127.0"),
         v if v >= (2, 1, 251) => Some("0.112.1"),
+        _ => None,
+    }
+}
+
+/// 某个版本的官方客户端发的 `X-Stainless-Runtime-Version`（遥测 `env.node_version` 同值，见
+/// [`crate::telemetry::Identity::env_block`]）：2.1.258 ~ 2.1.310 的可执行文件内嵌 Bun 报 `v26.3.0`（`cap/2.1.258`
+/// 起各版抓包一致），2.1.311 换了一版 Bun 构建（版本串仍 1.4.4）报 `v26.12.1`
+/// （`cap/auto-2.1.311-20261027-{full,model,retry}` 全部请求）。更早的或读不出版本的没有样本，返回 `None`。
+pub fn cc_stainless_runtime_version(version: &str) -> Option<&'static str> {
+    let v = crate::proxy::parse_version(version)?;
+    match v {
+        v if v >= (2, 1, 311) => Some("v26.12.1"),
+        v if v >= (2, 1, 251) => Some("v26.3.0"),
         _ => None,
     }
 }

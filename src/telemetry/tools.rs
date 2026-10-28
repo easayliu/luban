@@ -261,6 +261,79 @@ pub(super) fn bash_meta_v299(
     );
 }
 
+/// 2.1.311 起 Bash 执行 / 失败事件里那次命令自己的耗时与 CPU（官方 `__t(shellUsage)`：`wallMs` 与子进程的
+/// 用户态 / 内核态 CPU，都保留三位小数）。代理看不到命令真跑了多久，从那次调用报的外部时长推
+/// （[`Self::from_external`]）。转到后台的那种没有这一份（官方 `Lzn` 把 `shellUsage` 去掉了）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ShellUsage {
+    pub(super) wall_ms: f64,
+    pub(super) user_ms: f64,
+    pub(super) system_ms: f64,
+}
+
+impl ShellUsage {
+    /// 按 `cap/auto-2.1.311-20261027-full` 的 26 条：同一次调用 `tool_use_success.externalWallMs` 比 `duration_ms`
+    /// 大 0.3 ~ 1.7ms；用户态 CPU 占耗时的 34% ~ 63%、内核态 17% ~ 48%（命令越长占比越低）。长命令多半在等
+    /// （网络、子进程、`sleep`），CPU 只按前 200ms 算满比例、之后只计 3%。`h` 是 0..100 的扰动。
+    pub(super) fn from_external(external_ms: i64, h: i64) -> Self {
+        let gap = 0.3 + ((h * 37) % 1400) as f64 / 1000.0;
+        Self::of_wall((external_ms as f64 - gap).max(0.5), h)
+    }
+
+    /// 用户在输入框里 `!` 直接跑的那种：没有工具调用可推，按抓包那条的量级（输入到执行完 48ms，
+    /// `duration_ms` 32.866，`00234`）取 25 ~ 45ms。
+    pub(super) fn typed(h: i64) -> Self {
+        Self::of_wall(25.0 + (h % 20) as f64 + ((h * 53) % 1000) as f64 / 1000.0, h)
+    }
+
+    fn of_wall(wall: f64, h: i64) -> Self {
+        let busy = wall.min(200.0) + (wall - 200.0).max(0.0) * 0.03;
+        let user = busy * (0.38 + (h % 25) as f64 / 100.0);
+        let system = busy * (0.30 + ((h * 7) % 16) as f64 / 100.0);
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+        Self { wall_ms: r3(wall), user_ms: r3(user), system_ms: r3(system) }
+    }
+}
+
+/// 2.1.311 的 Bash 命令画像多几项（`cap/auto-2.1.311-20261027-full` 全部 27 条执行事件、`-bashfail` 那条失败事件）：
+/// - `bash_command_kinds`：命令按用途分的类别（[`super::bash_kinds::shell_run`]），排在
+///   `bash_last_argv0` / `bash_subcommand` 之后、`has_pipe` 之前；
+/// - `interrupted` 之后报 [`ShellUsage`] 那三项与 `left_process_running`，转到后台的没有。三项数值照 JS 的写法
+///   （[`js_number`]）：恰好整数时不带 `.0`。`left_process_running` 是 shell 退出时它那个进程组里还有活着的进程
+///   （官方 `leftRunningPgid` / 进程组探活），即命令自己 `&` 起了后台任务又没 `wait`，同一次解析判出
+///   （[`super::bash_kinds::ShellRun::leaves_running`]）；抓包那 27 条正好都没有，全是 false；
+/// - `same_as_running_background`：同目录同一条命令已经在后台跑着时为真，平时 false；执行事件排在
+///   `was_backgrounded` 之后，失败事件（没有那一项）排在 `had_sandbox_violation` 之后。
+///
+/// 在 [`bash_meta_v299`] 之后、失败事件去掉 `was_backgrounded` 之后调。
+pub(super) fn bash_meta_v311(meta: &mut Value, command: &str, usage: Option<ShellUsage>) {
+    let run = super::bash_kinds::shell_run(command);
+    let kinds = vec![("bash_command_kinds", json!(run.kinds))];
+    if meta.get("bash_subcommand").is_some() {
+        insert_after(meta, "bash_subcommand", kinds);
+    } else {
+        insert_before(meta, "has_pipe", kinds);
+    }
+    if let Some(u) = usage {
+        insert_after(
+            meta,
+            "interrupted",
+            vec![
+                ("duration_ms", js_number(u.wall_ms)),
+                ("command_cpu_user_ms", js_number(u.user_ms)),
+                ("command_cpu_system_ms", js_number(u.system_ms)),
+                ("left_process_running", json!(run.leaves_running)),
+            ],
+        );
+    }
+    let after = if meta.get("was_backgrounded").is_some() {
+        "was_backgrounded"
+    } else {
+        "had_sandbox_violation"
+    };
+    insert_after(meta, after, vec![("same_as_running_background", json!(false))]);
+}
+
 /// `bash_pipestatus_use`：命令里真的用了 `$PIPESTATUS`（照官方 2.1.299 的
 /// `e.includes("PIPESTATUS") && /\$\{?PIPESTATUS\b/.test(Fdt(e))`）。`Fdt`（[`strip_shell_quotes`]）先把
 /// 单引号内容、转义掉的 `$` 去掉，所以 `echo '$PIPESTATUS'`、`echo \$PIPESTATUS`、`echo $PIPESTATUS_x`、
@@ -1063,7 +1136,7 @@ pub(super) fn ignored_suggestion_meta(
         "timeToIgnoreMs": to_ignore,
         "timeToFirstKeystrokeMs": (to_ignore - typing).max(0),
         "wasFocusedWhenShown": true,
-        "similarity": typed_chars as f64 / suggestion_chars.max(1) as f64
+        "similarity": js_number(typed_chars as f64 / suggestion_chars.max(1) as f64)
     })
 }
 

@@ -12,7 +12,7 @@
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
 /// 同一个客户端不会一边自称 2.1.308、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.310 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.311 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -124,7 +124,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.310";
+pub const CC_VERSION_BASE: &str = "2.1.311";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -137,10 +137,10 @@ pub const CC_VERSION_BASE: &str = "2.1.310";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.310-20261024-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
-/// UA `claude-cli/2.1.310`）。
+/// 依据：`cap/auto-2.1.311-20261027-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
+/// UA `claude-cli/2.1.311`）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.310";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.311";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -302,6 +302,24 @@ pub const CC_ENV_SKILLS: &str = include_str!("../assets/cc_env_skills.txt");
 /// 精简工具（关掉 Artifact）时技能清单里随之消失的三条。
 pub const CC_ENV_TRIMMED_SKILLS: &[&str] =
     &["artifact-design", "artifact-diagramming", "artifact-capabilities"];
+
+/// 名字本身就是原生 1M 上下文的模型（官方内置模型表里 `context.native_1m` 为真的那几行，2.1.310 与
+/// 2.1.311 两版逐字相同）。2.1.311 起这些模型带 `[1m]` 后缀时官方不再发 `context-1m`、环境说明不写
+/// `(1M context)`、遥测模型名也不带 `[1m]`（`cap/auto-2.1.311-20261027-full/00303`、`01392`），见
+/// [`crate::proxy::context_1m_beta_wanted`]。键是规范名，后面可跟日期。
+pub const CC_NATIVE_1M_MODELS: &[&str] = &[
+    "claude-haiku-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-opus-5-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "claude-mythos-5",
+    "claude-mythos-5-1",
+];
 
 /// 环境说明里「You are powered by the model named …」那行的模型名与知识截止，逐条取自抓包
 /// （`cap/` 各版本的环境说明）。键是去掉日期与 `[1m]` 的规范名；表里没有的模型按官方的兜底写法
@@ -496,6 +514,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.310-20261024-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致。
     ("2.1.310", "2026-10-23T17:43:32Z"),
+    // `cap/auto-2.1.311-20261027-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.311", "2026-10-26T18:31:42Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

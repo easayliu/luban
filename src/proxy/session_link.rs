@@ -567,16 +567,22 @@ fn history_reminders(threads: &[ThreadState], root: u64, msgs: &[ThreadMsg]) -> 
 }
 
 /// 这一轮的 `<total_tokens>` 倒数，规则见 [`TotalTokens`]。`lineage` 是 [`find_lineage`] 找到的
-/// 上一条；找不到（对话第一轮、状态已过期）时当前上下文按 0 算，与官方新会话首轮一致。
-fn total_tokens_for(lineage: Option<&ThreadState>, regular_prompt: bool) -> (TotalTokens, u64) {
+/// 上一条；找不到（对话第一轮、状态已过期）时当前上下文按 0 算，与官方新会话首轮一致。`reanchor` 是这一轮
+/// 要不要重新锚定（新输入、且这个会话用户输入之后也跟提醒，见 [`crate::proxy::lapis_anchor`]），`total` 是这个
+/// 会话的预算。
+fn total_tokens_for(
+    lineage: Option<&ThreadState>,
+    reanchor: bool,
+    total: u64,
+) -> (TotalTokens, u64) {
     let ctx = lineage.map_or(0, |t| t.ctx_tokens);
-    let budget = if regular_prompt {
+    let budget = if reanchor {
         TotalTokens { anchor: ctx, used: 0 }
     } else {
         let prev = lineage.map(|t| t.budget).unwrap_or_default();
         TotalTokens { anchor: prev.anchor, used: prev.used.max(ctx.saturating_sub(prev.anchor)) }
     };
-    (budget, TOTAL_TOKENS_BUDGET.saturating_sub(budget.used))
+    (budget, total.saturating_sub(budget.used))
 }
 
 /// 决定这一轮发 `create` 还是 `continue`，并把「等回程提交」的那份交出去。
@@ -643,14 +649,16 @@ fn thread_miss(
 /// 会话表里还没有这个会话（[`CcSessionLink::load`] 没跑过，只在测试里出现）时照样 `create`，
 /// 回程提交时也就找不到条目、什么都不记。
 ///
-/// 第三个返回值是这一轮 `<total_tokens>` 提醒该写的数（[`TotalTokens`]）；`regular_prompt` 即末条
-/// 是一次新的用户输入（而非工具结果）。`seq` 是这条请求的发出序号（[`TurnMark::seq`]）。第四个是
+/// 第三个返回值是这一轮 `<total_tokens>` 提醒该写的数（[`TotalTokens`]）；`reanchor` 即这一轮在新的用户输入处
+/// 重新锚定倒数（末条是新输入而非工具结果、且这个会话用户输入之后也跟提醒），`total` 是这个会话的预算（都见
+/// [`crate::proxy::lapis_anchor`]）。`seq` 是这条请求的发出序号（[`TurnMark::seq`]）。第四个是
 /// 退回 `create` 时的断档原因（[`ThreadMiss`]），接上了或本来就是首轮为 `None`。
 pub(super) fn thread_decision(
     key: CcSessionKey<'_>,
     shape: u64,
     msgs: &[ThreadMsg],
-    regular_prompt: bool,
+    reanchor: bool,
+    total: u64,
     seq: u64,
 ) -> (ThreadDecision, ThreadPending, u64, Option<ThreadMiss>) {
     let root = msgs.first().map_or(0, |m| m.fp);
@@ -663,7 +671,7 @@ pub(super) fn thread_decision(
         let miss = if found.is_none() { thread_miss(threads, root, shape, msgs) } else { None };
         (
             found,
-            total_tokens_for(lineage, regular_prompt),
+            total_tokens_for(lineage, reanchor, total),
             history_reminders(threads, root, msgs),
             miss,
         )

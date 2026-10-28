@@ -127,6 +127,13 @@ pub(super) struct RequestShape {
     /// 倒数第二块 / 最后一块的长度（`tengu_sysprompt_boundary_found`）。
     pub(super) static_len: usize,
     pub(super) dynamic_len: usize,
+    /// 体里有没有官方那种 `<total_tokens>N tokens left</total_tokens>` 提醒（[`note_total_tokens`]）：system 那段、
+    /// 首轮环境说明、每轮跟在用户消息或工具结果后面那条都算——客户端换了 system（Agent SDK、`--system-prompt`）
+    /// 时 system 里没有，提醒照样作为附件进 messages。system 与 messages 是客户端自己的会话（真实 CC 透传、
+    /// billing-only）拿它核 `tengu_lapis_anchor_from_client_data` 报不报，见 [`crate::proxy::lapis_anchor`]。
+    pub(super) total_tokens_reminder: bool,
+    /// 那些提醒里最大的那个数：会话首轮 system / 环境说明写的就是预算本身，核 `{budget}` 那条用。
+    pub(super) total_tokens_max: Option<u64>,
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
     pub(super) tools_hash: String,
@@ -691,6 +698,10 @@ pub(super) fn error_trace(
         ("2.1.310", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-36ysyspx.js:11:1510"))
         }
+        // 2.1.311 同样只换了打包块名（`cap/auto-2.1.311-20261027-retry` R1/R2）。
+        ("2.1.311", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-ecgnkn41.js:11:1510"))
+        }
         _ => None,
     }
 }
@@ -743,6 +754,50 @@ pub(super) fn tail_tokens_est(m: &Value) -> u64 {
 /// 同一份 body 的字节数是 101908）。
 pub(super) fn js_len(s: &str) -> usize {
     s.encode_utf16().count()
+}
+
+/// JS `JSON.stringify` 写数字的样子：值恰好是整数的浮点不带小数点（`25`、`0`、`1`，serde_json 会写成 `25.0`）。
+/// 官方那些三位小数的时长、比例、累加出来的花费都是 JS number，线上见不到 `.0` 结尾的。非有限值同 JS 写 `null`。
+pub(super) fn js_number(x: f64) -> Value {
+    // 2^53：再往上整数在 f64 里就不连续了，JS 那边照样按整数写，这里落回浮点只影响格式，碰不到真实取值。
+    if x.is_finite() && x.fract() == 0.0 && x.abs() < 9_007_199_254_740_992.0 {
+        json!(x as i64)
+    } else {
+        json!(x)
+    }
+}
+
+/// 一段文本里官方那种 `<total_tokens>` 提醒（`nnn`：`<total_tokens>N tokens left</total_tokens>`，`infinite` 档写
+/// `Infinite`）：有就记下，数取最大的那个。只认这个整串，别的提到 `<total_tokens>` 的文字不算。
+fn note_total_tokens(text: &str, shape: &mut RequestShape) {
+    const OPEN: &str = "<total_tokens>";
+    const CLOSE: &str = " tokens left</total_tokens>";
+    // 按收尾那段找、再往回认开头：从每个开头往后找收尾，在一堆开头、末尾才收尾的体上是平方级（体是来访给的）。
+    // 往回只扫紧挨着的那串数字，各段互不重叠，整体一遍。
+    let mut from = 0;
+    while let Some(at) = text[from..].find(CLOSE) {
+        let end = from + at;
+        from = end + CLOSE.len();
+        let head = &text[..end];
+        let n = if head.ends_with("Infinite") {
+            "Infinite"
+        } else {
+            let digits = head.bytes().rev().take_while(u8::is_ascii_digit).count();
+            &head[head.len() - digits..]
+        };
+        if !head[..head.len() - n.len()].ends_with(OPEN) {
+            continue;
+        }
+        if n == "Infinite" {
+            shape.total_tokens_reminder = true;
+        } else if !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(v) = n.parse::<u64>()
+        {
+            shape.total_tokens_reminder = true;
+            shape.total_tokens_max = Some(shape.total_tokens_max.map_or(v, |m| m.max(v)));
+        }
+    }
 }
 
 /// 内容块的 base64 数据（`source.type == "base64"` 且 `data` 是字符串，官方 `WXe`），别的来源没有。
@@ -860,13 +915,19 @@ fn jpeg_frame(n: &[u8]) -> Option<usize> {
 /// 一条消息的 content：字符串或块数组。
 pub(super) fn walk_content(content: &Value, shape: &mut RequestShape) {
     match content {
-        Value::String(s) => shape.input_text_chars += js_len(s),
+        Value::String(s) => {
+            shape.input_text_chars += js_len(s);
+            note_total_tokens(s, shape);
+        }
         Value::Array(blocks) => {
             for b in blocks {
                 match b.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
-                        shape.input_text_chars +=
-                            b.get("text").and_then(|t| t.as_str()).map_or(0, js_len);
+                        let text = b.get("text").and_then(|t| t.as_str());
+                        shape.input_text_chars += text.map_or(0, js_len);
+                        if let Some(text) = text {
+                            note_total_tokens(text, shape);
+                        }
                     }
                     // 工具调用块按「工具名 + input 的 JSON」计：`cap/2.1.260-2` 续轮与猜下一句的
                     // inputTextCharLength 都比纯文本多 170 = "Bash"(4) + input JSON(166，与
@@ -1077,6 +1138,9 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         };
         shape.system_blocks = texts.len();
         shape.system_chars = texts.iter().map(|t| js_len(t)).sum();
+        for t in &texts {
+            note_total_tokens(t, &mut shape);
+        }
         if let Some(first) = texts.first() {
             shape.sys0_len = js_len(first);
             shape.sys0_hash = sha256_hex(first.as_bytes());
@@ -1407,4 +1471,48 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
             .map(str::to_string);
     }
     Some(shape)
+}
+
+#[cfg(test)]
+mod total_tokens_tests {
+    use super::*;
+
+    fn seen(text: &str) -> (bool, Option<u64>) {
+        let mut shape = RequestShape::default();
+        note_total_tokens(text, &mut shape);
+        (shape.total_tokens_reminder, shape.total_tokens_max)
+    }
+
+    /// 只认整串：数字或 `Infinite`，开头紧挨着；取最大的那个。一堆开头、末尾才收尾的体一遍扫完。
+    #[test]
+    fn total_tokens_reminders_are_recognised_in_one_pass() {
+        assert_eq!(
+            seen("<total_tokens>15000000 tokens left</total_tokens>"),
+            (true, Some(15_000_000))
+        );
+        assert_eq!(
+            seen(
+                "a<total_tokens>5 tokens left</total_tokens> b <total_tokens>70 tokens left</total_tokens>"
+            ),
+            (true, Some(70))
+        );
+        assert_eq!(seen("<total_tokens>Infinite tokens left</total_tokens>"), (true, None));
+        assert_eq!(seen("<total_tokens>12 13 tokens left</total_tokens>"), (false, None));
+        assert_eq!(seen("<total_tokens> tokens left</total_tokens>"), (false, None));
+        assert_eq!(seen("x9 tokens left</total_tokens>"), (false, None));
+        assert_eq!(
+            seen("<total_tokens><total_tokens>8 tokens left</total_tokens>"),
+            (true, Some(8))
+        );
+        assert_eq!(
+            seen("<total_tokens>99999999999999999999999 tokens left</total_tokens>"),
+            (false, None)
+        );
+
+        let mut evil = "<total_tokens>".repeat(1_000_000);
+        evil.push_str("1 tokens left</total_tokens>");
+        let started = std::time::Instant::now();
+        assert_eq!(seen(&evil), (true, Some(1)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
 }

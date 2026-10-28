@@ -60,8 +60,10 @@ pub(super) fn apply_sim_thread(
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
     let shape = thread_shape_of(v, raw_sys_shape);
     let seq = sim.link.turn.as_ref().map_or(0, |t| t.seq);
+    // 倒数只在「用户输入之后也跟提醒」时于新输入处重新锚定，预算按这个会话那一档（[`crate::proxy::lapis_anchor`]）。
+    let reanchor = regular_prompt && sim.lapis.user_turn;
     let (mut decision, pending, tokens_left, miss) =
-        thread_decision(key, shape, fps, regular_prompt, seq);
+        thread_decision(key, shape, fps, reanchor, sim.lapis.budget, seq);
     if let Some(miss) = &miss {
         log_thread_miss(v, sim, cred_id, fps, env_note, miss);
     }
@@ -141,8 +143,14 @@ pub(super) fn apply_sim_thread(
     if let Some(notice) = model_notice.filter(|_| !mcs) {
         place_model_notice(v, notice, false, regular_prompt);
     }
-    let msgs = v.get_mut("messages").and_then(|m| m.as_array_mut());
-    if let Some(msgs) = msgs
+    // 这一轮不跟 `<total_tokens>`（服务端下发 `off`，或下发了用户输入之后不跟、这一轮正是新输入，见
+    // [`crate::proxy::lapis_anchor`]）：末条用户消息原样收尾、断点留在它身上，换模型那一轮的说明单独落（带 beta 时
+    // 是一条 system）。不记提醒，`create` 也就不重现。
+    if !sim.lapis.reminds_after(regular_prompt) {
+        if let Some(notice) = model_notice.filter(|_| mcs) {
+            place_model_notice(v, notice, true, regular_prompt);
+        }
+    } else if let Some(msgs) = v.get_mut("messages").and_then(|m| m.as_array_mut())
         && insert_total_tokens_reminder(
             msgs,
             tokens_left,

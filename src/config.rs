@@ -29,6 +29,7 @@ mod v2_1_307;
 mod v2_1_308;
 mod v2_1_309;
 mod v2_1_310;
+mod v2_1_311;
 
 pub use betas::*;
 pub use client::*;
@@ -56,6 +57,7 @@ pub use v2_1_307::*;
 pub use v2_1_308::*;
 pub use v2_1_309::*;
 pub use v2_1_310::*;
+pub use v2_1_311::*;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +116,14 @@ mod tests {
         let table =
             CC_SIM_HEADERS.iter().find(|(k, _)| *k == "x-stainless-package-version").unwrap().1;
         assert_eq!(Some(table), cc_stainless_version(CC_VERSION_BASE));
+        // 运行时版本：2.1.311 换了 Bun 构建（`cap/auto-2.1.311-20261027-full`）。
+        assert_eq!(cc_stainless_runtime_version("2.1.311"), Some("v26.12.1"));
+        assert_eq!(cc_stainless_runtime_version("2.1.310"), Some("v26.3.0"));
+        assert_eq!(cc_stainless_runtime_version("2.1.258"), Some("v26.3.0"));
+        assert_eq!(cc_stainless_runtime_version("2.1.250"), None, "没样本的不猜");
+        let rt =
+            CC_SIM_HEADERS.iter().find(|(k, _)| *k == "x-stainless-runtime-version").unwrap().1;
+        assert_eq!(Some(rt), cc_stainless_runtime_version(CC_VERSION_BASE));
     }
 
     /// [`CC_LATEST_KNOWN_RELEASE`] 是可信版本的下限：低于模拟版本会把 luban 自己发出去的
@@ -228,7 +238,8 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 308))).version, "2.1.308", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 309))).version, "2.1.309", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 310))).version, "2.1.310", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.310", "模拟路径用 2.1.310 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 311))).version, "2.1.311", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.311", "模拟路径用 2.1.311 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
             let (old, mid) =
                 (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
@@ -254,11 +265,30 @@ mod tests {
                 (v300.beta, v300.effort, v300.request_class),
                 (new.beta, new.effort, new.request_class)
             );
-            let latest = cc_profile(kind);
+            let v310 = cc_profile_at(kind, Some((2, 1, 310)));
             assert_eq!(
-                (latest.beta, latest.effort, latest.request_class),
+                (v310.beta, v310.effort, v310.request_class),
                 (new.beta, new.effort, new.request_class)
             );
+            // 2.1.311 表：`thinking-token-count` 从 `interleaved-thinking` 后面挪到 `advisor-tool` 后面，
+            // 额度探测那行去掉了它；别的项与顺序同 2.1.310。
+            let latest = cc_profile(kind);
+            fn squeeze(b: &'static str) -> Vec<&'static str> {
+                b.split(',').map(str::trim).filter(|p| !p.is_empty()).collect()
+            }
+            let ttc = CC_BETA_THINKING_TOKEN_COUNT;
+            let without_ttc =
+                |b: &'static str| squeeze(b).into_iter().filter(|p| *p != ttc).collect::<Vec<_>>();
+            assert_eq!(without_ttc(latest.beta), without_ttc(v310.beta), "{kind:?}");
+            let (old_has, new_has) =
+                (squeeze(v310.beta).contains(&ttc), squeeze(latest.beta).contains(&ttc));
+            assert_eq!(new_has, old_has && kind != QuotaProbe, "{kind:?}");
+            if new_has {
+                let l = squeeze(latest.beta);
+                let at = l.iter().position(|p| *p == ttc).unwrap();
+                assert!(at > 0 && l[at - 1].starts_with("advisor-tool-"), "{kind:?}: {l:?}");
+            }
+            assert_eq!((latest.effort, latest.request_class), (new.effort, new.request_class));
             assert!(!latest.beta.contains(CC_BETA_CACHE_KEEPALIVE), "{kind:?}");
         }
         // haiku-5-5 只有 2.1.293 起的表里有；更老的版本（或读不出版本）落回那一版的 haiku-4.5 行。
@@ -297,6 +327,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.308").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.309").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.310").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.311").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

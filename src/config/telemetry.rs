@@ -22,6 +22,10 @@ pub const TELEMETRY_SESSION_BETA_PREFIXES: &[&str] = &[
     "mid-conversation-system-2",
 ];
 
+/// 处理一条调用时解析 shell 命令的总额度（毫秒），见 `telemetry::bash_ast::ParseBudget`：正常命令解析几十微秒，
+/// 这个额度够几千条；租户塞来一轮上万字的命令也只能占住遥测消费者（与它拿着的状态锁）这么久。
+pub const TELEMETRY_BASH_PARSE_BUDGET_MS: u64 = 100;
+
 /// event_logging 批次的攒批时长：真实客户端每 ~30s 把攒下的事件一次发出
 /// （`cap/2.1.258`：09:24:59 起，批次落在 09:25:29 / 09:26:39 / 09:30:11）。
 pub const TELEMETRY_EVENT_FLUSH_SECS: u64 = 30;

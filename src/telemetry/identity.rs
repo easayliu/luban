@@ -65,11 +65,17 @@ impl Identity {
         config::cc_build_time(&self.version)
     }
 
+    /// 内嵌运行时报的 Node 版本，与出站头 `X-Stainless-Runtime-Version` 同值（2.1.311 起 `v26.12.1`），
+    /// 见 [`config::cc_stainless_runtime_version`]；读不出版本的按此前各版的 `v26.3.0`。
+    pub fn node_version(&self) -> &'static str {
+        config::cc_stainless_runtime_version(&self.version).unwrap_or("v26.3.0")
+    }
+
     /// 所有事件共用的 `env` 块（键序照 `cap/2.1.258/00022`）。
     pub fn env_block(&self) -> Value {
         let mut env = json!({
             "platform": "darwin",
-            "node_version": "v26.3.0",
+            "node_version": self.node_version(),
             "terminal": "vscode",
             "package_managers": "npm,pnpm",
             "runtimes": "bun,node",
@@ -322,7 +328,7 @@ impl Identity {
         m.insert("platform".into(), s("darwin"));
         m.insert("platform_raw".into(), s("darwin"));
         m.insert("arch".into(), s("arm64"));
-        m.insert("node_version".into(), s("v26.3.0"));
+        m.insert("node_version".into(), s(self.node_version()));
         m.insert("terminal".into(), s("vscode"));
         m.insert("shell".into(), s("zsh"));
         m.insert("package_managers".into(), s("npm,pnpm"));
@@ -363,7 +369,7 @@ pub fn process_metrics(uptime_secs: f64) -> Value {
     let rss = 300_000_000.0 + uptime_secs * 6.0;
     let heap = 120_000_000.0 + uptime_secs * 5.0;
     json!({
-        "uptime": uptime_secs,
+        "uptime": js_number(uptime_secs),
         "rss": rss as u64,
         "heapTotal": (heap * 0.72) as u64,
         "heapUsed": heap as u64,
@@ -424,8 +430,14 @@ pub fn camel_to_snake(s: &str) -> String {
 }
 
 /// 从出站 `anthropic-beta` 里筛出会话级那几项，顺序照原串。见
-/// [`config::TELEMETRY_SESSION_BETA_PREFIXES`]。
-pub fn session_betas(header: &str) -> String {
+/// [`config::TELEMETRY_SESSION_BETA_PREFIXES`]。`version` 是这个会话的客户端版本：2.1.311 起官方从公共
+/// beta 规则表算会话级那份，`thinking-token-count` 已移出那张表（[`config::CC_BETA_THINKING_TOKEN_COUNT`]），
+/// 出站头里有它、会话级那份也不带（`cap/auto-2.1.311-20261027-full` 全部事件顶层 `betas`）。
+pub fn session_betas(header: &str, version: &str) -> String {
+    let drop_ttc = crate::proxy::parse_version(version).is_some_and(|v| v >= (2, 1, 311));
+    // 名字部分（去掉日期），同名不同日期也算。
+    let ttc_name = config::CC_BETA_THINKING_TOKEN_COUNT
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '-');
     // haiku 的出站头把 `claude-code` 排在中间（`…prompt-caching-scope,claude-code,advisor…`），
     // 它的会话级那份**没有**这一项（`cap/2.1.285/00060`、`cap/2.1.280/00041` 的 haiku 事件：
     // `oauth,interleaved,redact,ttc,cm,pcs`）；opus / fable / sonnet 以它开头的照留。
@@ -435,6 +447,7 @@ pub fn session_betas(header: &str) -> String {
         .map(str::trim)
         .filter(|b| config::TELEMETRY_SESSION_BETA_PREFIXES.iter().any(|p| b.starts_with(p)))
         .filter(|b| leads_with_cc || !b.starts_with("claude-code-"))
+        .filter(|b| !(drop_ttc && b.starts_with(ttc_name)))
         .collect();
     // `redact-thinking` **不跟请求头走**：会话级那份始终带着它。
     //

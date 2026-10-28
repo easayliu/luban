@@ -1408,7 +1408,7 @@ fn feature_name_position_follows_the_version() {
 fn heron_is_reported_again_after_a_successful_compaction() {
     const CRED: i64 = -3_081;
     let boot = json!({ "client_data": { "tengu_heron_brook": "x".repeat(2790) } }).to_string();
-    crate::proxy::heron_brook::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
+    crate::proxy::client_data::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
     let t = Telemetry::default();
     let ua = "claude-cli/2.1.308 (external, cli)";
     let base = frozen_now() - Duration::from_secs(120);
@@ -1455,7 +1455,7 @@ fn heron_is_reported_again_after_a_successful_compaction() {
 fn a_cancelled_compaction_does_not_report_heron_again() {
     const CRED: i64 = -3_082;
     let boot = json!({ "client_data": { "tengu_heron_brook": "x".repeat(2790) } }).to_string();
-    crate::proxy::heron_brook::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
+    crate::proxy::client_data::note_bootstrap(CRED, "claude-opus-5", boot.as_bytes());
     let t = Telemetry::default();
     let base = frozen_now() - Duration::from_secs(120);
     let send = |body: Vec<u8>, id: &str, stop: &str, at: u64, compact: bool| {
@@ -3982,22 +3982,30 @@ fn camel_to_snake_matches_datadog_spelling() {
 fn session_betas_is_a_filtered_subset_in_header_order() {
     let header = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,server-side-fallback-2026-07-01,fallback-credit-2026-06-01,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
     assert_eq!(
-        session_betas(header),
+        session_betas(header, "2.1.258"),
         "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07",
         "cap/2.1.258/00020 那条 opus 事件的 betas"
     );
     // haiku 主线程（`cap/2.1.285/00051` 的出站头）→ 同批事件里的会话级 betas（`00060`）。
     let haiku = "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     assert_eq!(
-        session_betas(haiku),
+        session_betas(haiku, "2.1.285"),
         "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
     );
     // opus-4-6（`cap/2.1.285/00083`）少 `mid-conversation-system`，会话级那份跟着少（`00090`）。
     let opus46 = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     assert_eq!(
-        session_betas(opus46),
+        session_betas(opus46, "2.1.285"),
         "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
     );
+    // 2.1.311 起会话级那份不带 `thinking-token-count`（出站头里照带）：`cap/auto-2.1.311-20261027-full/00070`
+    // 的 opus 主线程头 → 同会话事件顶层的 `betas`。
+    let opus311 = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    assert_eq!(
+        session_betas(opus311, "2.1.311"),
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+    );
+    assert!(session_betas(opus311, "2.1.310").contains("thinking-token-count-"));
 }
 
 #[test]
@@ -5539,7 +5547,7 @@ fn version_2_1_293_telemetry_shape() {
         ("claude-haiku-4-5", json!({})),
     ] {
         let boot = json!({ "client_data": client_data }).to_string();
-        crate::proxy::heron_brook::note_bootstrap(CRED, model, boot.as_bytes());
+        crate::proxy::client_data::note_bootstrap(CRED, model, boot.as_bytes());
     }
     let opus = first_turn_2_1_293(CRED, "claude-opus-5-5", Some("high"), opus_betas);
     let h55 = first_turn_2_1_293(CRED, "claude-haiku-5-5", Some("high"), h55_betas);
@@ -5630,6 +5638,9 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
         ("2.1.303", 15457 - 1152, 15427 - 1152, 15928 - 1152),
         // 2.1.309 Artifact `root` 说明改写 +45（交互式各族一律 15457→15502；Bash 的 `@name` 句不进估算）。
         ("2.1.309", 15502 - 1152, 15472 - 1152, 15973 - 1152),
+        // 2.1.311 Artifact `intent` 说明改写 +37（`cap/auto-2.1.311-20261027-full` 交互式各族一律 +37；Bash 那句
+        // `cd` 说明不进估算）。
+        ("2.1.311", 15539 - 1152, 15509 - 1152, 16010 - 1152),
     ] {
         assert_eq!(ctx(ver, opus, false), (34, o), "{ver} opus");
         assert_eq!(ctx(ver, h55, false), (33, h), "{ver} haiku-5-5");
@@ -5639,6 +5650,8 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
     assert_eq!(ctx("2.1.303", opus, true), (26, 7742 - 1152));
     // `-p` 不带 Artifact，2.1.309 的 +45 不落到它头上（Bash 的 `@name` 也不进）：仍是 2.1.303 的值。
     assert_eq!(ctx("2.1.309", opus, true), (26, 7742 - 1152));
+    // 2.1.311 的 +37 同样不落到 `-p` 头上（抓包仍是 7742）。
+    assert_eq!(ctx("2.1.311", opus, true), (26, 7742 - 1152));
 
     // 关掉 Artifact（带官方工具集 Agent+Read，留着 ListAgents / SendFeedback，只少 Artifact 一组）时，
     // `artifact_schema_delta` 不加（`!off.artifact` 为假），连 Artifact 的 schema 一起减：opus 主线程
@@ -5711,6 +5724,10 @@ fn context_size_tool_tokens_follow_the_gateway_samples() {
         46,
         "网关 308→309 是 +46"
     );
+    // 2.1.311 没有网关样本：`intent` 说明那 146 字符在网关那份 schema 里同样多出来，3154→3190 是 +36（推算）。
+    assert_eq!(gw("2.1.311", opus, false), (34, 14461 + 36));
+    assert_eq!(gw("2.1.311", h55, false), (33, 14431 + 36));
+    assert_eq!(gw("2.1.311", opus, true), (26, 7452), "-p 没有 Artifact，不变");
 
     // 同一份请求走模拟路径（注入的固定资产）仍是订阅端标准值，309 只 +45。
     let std = |ver: &str| ctx(ver, body_for(opus, Some("high"), true), false, false);
@@ -7198,6 +7215,277 @@ fn version_2_1_310_telemetry_shape() {
     }
 }
 
+/// `tengu_lapis_anchor_from_client_data` 只在请求体真按那一档发的时候报（号的 bootstrap 都下发了 off）：完整模拟
+/// 按钉住的那一档报；billing-only 与真实 CC 透传发的是客户端自己的 system 与 messages，看出站体里（system 那段，
+/// 或换了 system 的客户端只在 messages 里跟的那条）有没有 `<total_tokens>`，与 off 对得上（没有）才报。
+#[test]
+fn lapis_event_follows_what_the_body_actually_did() {
+    let boot = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+    // `reminder`：提醒放在哪（`""` 没有、`"system"` system 末块、`"messages"` 末尾一条 system 消息）。
+    let first_turn = |cred_id: i64, bare: bool, client_tools: bool, reminder: &str| {
+        crate::proxy::client_data::note_bootstrap(cred_id, "claude-opus-5-5", boot);
+        let mut body: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        let line = "<total_tokens>15000000 tokens left</total_tokens>";
+        if reminder == "system" {
+            let last = body["system"].as_array_mut().unwrap().last_mut().unwrap();
+            let text = last["text"].as_str().unwrap().to_string();
+            last["text"] = json!(format!("{text}\n\n{line}"));
+        } else if reminder == "messages" {
+            let msgs = body["messages"].as_array_mut().unwrap();
+            msgs.push(json!({"role":"system","content":[{"type":"text","text":line}]}));
+        }
+        let t = Telemetry::default();
+        let mut c = call(body.to_string().into_bytes(), "req_lapis", "end_turn");
+        c.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+        c.cred_id = cred_id;
+        c.bare = bare;
+        c.client_tools = client_tools;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&(cred_id, SESSION.to_string())]
+            .events
+            .iter()
+            .map(|(_, e)| ev_name(e).to_string())
+            .collect::<Vec<_>>()
+    };
+    let lapis = |names: &[String]| {
+        names.iter().filter(|n| *n == "tengu_lapis_anchor_from_client_data").count()
+    };
+    assert_eq!(lapis(&first_turn(93_221, false, false, "")), 1, "完整模拟按钉住的那一档报");
+    assert_eq!(
+        lapis(&first_turn(93_222, true, false, "")),
+        1,
+        "billing-only 的第三方 system 本来就没有提醒，与 off 对得上"
+    );
+    let bare = first_turn(93_225, true, false, "system");
+    assert!(bare.iter().any(|n| n == "tengu_mcp_instructions_pool_change"), "启动那段照报");
+    assert_eq!(lapis(&bare), 0, "billing-only 下真实 CC 自己照发提醒，与 off 对不上");
+    assert_eq!(lapis(&first_turn(93_223, false, true, "")), 1, "透传的体里没有提醒，与 off 对得上");
+    assert_eq!(
+        lapis(&first_turn(93_224, false, true, "system")),
+        0,
+        "透传的体里照发提醒，与 off 对不上"
+    );
+    assert_eq!(
+        lapis(&first_turn(93_226, false, true, "messages")),
+        0,
+        "换了 system 的客户端（Agent SDK / --system-prompt）提醒只在 messages 里，照样对不上"
+    );
+}
+
+/// 预算与用户轮两项也由 `client_data` 给出时，首次输入那段在档位那条之后按序再各报一条（`{userTurn}`、`{budget}`）。
+/// 透传的体里那个最大的数不是下发的预算（客户端照默认 1500 万），预算那条不报。
+#[test]
+fn lapis_budget_and_user_turn_events_follow_the_mode() {
+    let boot = br#"{"client_data":{"tengu_lapis_anchor":"padded-countdown","tengu_lapis_anchor_user_turn":true,"tengu_lapis_anchor_budget":500000}}"#;
+    let first_turn = |cred_id: i64, client_tools: bool| {
+        crate::proxy::client_data::note_bootstrap(cred_id, "claude-opus-5-5", boot);
+        let mut body: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        let last = body["system"].as_array_mut().unwrap().last_mut().unwrap();
+        let text = last["text"].as_str().unwrap().to_string();
+        let n = if client_tools { 15_000_000 } else { 500_000 };
+        last["text"] = json!(format!("{text}\n\n<total_tokens>{n} tokens left</total_tokens>"));
+        let t = Telemetry::default();
+        let mut c = call(body.to_string().into_bytes(), "req_lapis", "end_turn");
+        c.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+        c.cred_id = cred_id;
+        c.client_tools = client_tools;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&(cred_id, SESSION.to_string())]
+            .events
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>()
+    };
+    let ev = first_turn(93_227, false);
+    let names: Vec<&str> = ev.iter().map(ev_name).collect();
+    let at = names.iter().position(|n| *n == "tengu_mcp_instructions_pool_change").unwrap();
+    let lapis: Vec<Value> = ev[at + 1..at + 4].iter().map(meta_of).collect();
+    assert!(names[at + 1..at + 4].iter().all(|n| *n == "tengu_lapis_anchor_from_client_data"));
+    assert_eq!(lapis[0]["mode"], "padded-countdown");
+    assert_eq!(lapis[1]["userTurn"], true);
+    assert_eq!(lapis[2]["budget"], 500_000);
+    assert_eq!(names.iter().filter(|n| **n == "tengu_lapis_anchor_from_client_data").count(), 3);
+
+    let ev = first_turn(93_228, true);
+    let metas: Vec<Value> = ev
+        .iter()
+        .filter(|e| ev_name(e) == "tengu_lapis_anchor_from_client_data")
+        .map(meta_of)
+        .collect();
+    assert_eq!(metas.len(), 2, "预算对不上体里的数");
+    assert!(metas.iter().all(|m| m.get("budget").is_none()));
+}
+
+/// 遥测里的浮点照 JS 写：值恰好是整数时不带 `.0`（serde_json 默认会写成 `25.0`）。
+#[test]
+fn floats_are_written_like_json_stringify() {
+    assert_eq!(js_number(25.0).to_string(), "25");
+    assert_eq!(js_number(-0.0).to_string(), "0");
+    assert_eq!(js_number(32.866).to_string(), "32.866");
+    assert_eq!(js_number(0.1 + 0.2).to_string(), "0.30000000000000004");
+    assert_eq!(js_number(f64::NAN), Value::Null);
+    // `!` 命令那条在 `h = 0` 时耗时正好 25ms；命令自己 `&` 起了后台任务时 `left_process_running` 为真。
+    let mut meta = json!({"bash_subcommand":"run","has_pipe":false,"interrupted":false,"was_backgrounded":false});
+    super::tools::bash_meta_v311(
+        &mut meta,
+        "npm run dev &",
+        Some(super::tools::ShellUsage::typed(0)),
+    );
+    let text = meta.to_string();
+    assert!(text.contains(r#""duration_ms":25,"#), "{text}");
+    assert!(!text.contains(".0,") && !text.contains(".0}"), "{text}");
+    assert_eq!(meta["left_process_running"], true);
+}
+
+/// 2.1.311 的遥测（`cap/auto-2.1.311-20261027-{full,retry,bashfail}`）：
+/// - 5xx 仍不带 `error_constructor`，栈哈希不变，顶帧只换块名；
+/// - 启动那条 `tengu_init` 在 `rendererEntryPath` 后多 `config_dir_kind: "unset"`；
+/// - `env.node_version` 换成 `v26.12.1`（内嵌 Bun 换了构建），2.1.310 仍是 `v26.3.0`；
+/// - 事件顶层的会话级 `betas` 不再带 `thinking-token-count`（出站头里照带，API 事件顶层报的完整串也照带）；
+/// - Bash 执行事件多 `bash_command_kinds`（`bash_last_argv0` 之后）、`interrupted` 之后的耗时与 CPU 四项、
+///   `was_backgrounded` 之后的 `same_as_running_background`；
+/// - 这个号这个模型的 bootstrap 下发了 `tengu_lapis_anchor:"off"` 时，首次输入那段在
+///   `mcp_instructions_pool_change` 之后紧跟一条 `tengu_lapis_anchor_from_client_data {mode: "off"}`。
+#[test]
+fn version_2_1_311_telemetry_shape() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.311 (external, sdk-cli)");
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        assert!(m.get("error_constructor").is_none(), "2.1.311 {n} 不带 error_constructor");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-ecgnkn41.js:11:1510")),
+            "2.1.311 {n}"
+        );
+    }
+
+    // 2.1.311 的 opus 主线程出站头（`cap/auto-2.1.311-20261027-full/00217`）。
+    let opus311 = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+    let first_turn = |ver: &str, cred_id: i64| {
+        let t = Telemetry::default();
+        let mut c = call(body_for("claude-opus-5-5", Some("medium"), true), "req_311", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        c.cred_id = cred_id;
+        c.betas = Some(opus311.into());
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&(cred_id, SESSION.to_string())]
+            .events
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect::<Vec<_>>()
+    };
+    let ev = first_turn("2.1.311", 93_211);
+    let init = ev.iter().find(|e| ev_name(e) == "tengu_init").map(meta_of).unwrap();
+    let keys: Vec<&str> = init.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "rendererEntryPath").unwrap();
+    assert_eq!(keys[at + 1], "config_dir_kind");
+    assert_eq!(init["config_dir_kind"], "unset");
+    for e in &ev {
+        assert_eq!(e["event_data"]["env"]["node_version"], "v26.12.1", "{}", ev_name(e));
+        // API 事件顶层报这条请求的完整串（与 meta 同值，带 ttc），其余报会话级那份。
+        if ev_name(e).starts_with("tengu_api_") {
+            continue;
+        }
+        let betas = e["event_data"]["betas"].as_str().unwrap_or_default();
+        assert!(!betas.contains("thinking-token-count"), "{}: {betas}", ev_name(e));
+    }
+    assert!(ev.iter().any(|e| e["event_data"]["betas"]
+        == "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05"));
+    assert!(
+        !ev.iter().any(|e| ev_name(e) == "tengu_lapis_anchor_from_client_data"),
+        "没见过 bootstrap 不报"
+    );
+    let old = first_turn("2.1.310", 93_212);
+    let init = old.iter().find(|e| ev_name(e) == "tengu_init").map(meta_of).unwrap();
+    assert!(init.get("config_dir_kind").is_none(), "2.1.310 不带");
+    assert!(old.iter().all(|e| e["event_data"]["env"]["node_version"] == "v26.3.0"));
+    assert!(old.iter().any(|e| {
+        e["event_data"]["betas"].as_str().is_some_and(|b| b.contains("thinking-token-count"))
+    }));
+
+    // bootstrap 下发了 off：首次输入那段 `mcp_instructions_pool_change` 之后紧跟一条。
+    let boot = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+    crate::proxy::client_data::note_bootstrap(93_213, "claude-opus-5-5", boot);
+    let ev = first_turn("2.1.311", 93_213);
+    let names: Vec<&str> = ev.iter().map(ev_name).collect();
+    let at = names.iter().position(|n| *n == "tengu_mcp_instructions_pool_change").unwrap();
+    assert_eq!(names[at + 1], "tengu_lapis_anchor_from_client_data");
+    assert_eq!(meta_of(&ev[at + 1])["mode"], "off");
+    assert_eq!(names.iter().filter(|n| **n == "tengu_lapis_anchor_from_client_data").count(), 1);
+
+    // Bash：续轮那条 tool_result 报命令执行。
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.text_chars = 0;
+    first.started_at = frozen_now() - Duration::from_secs(20);
+    first.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git diff | head -5","description":"diff"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"diff --git a b"}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.started_at = frozen_now() - Duration::from_secs(10);
+    second.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let bash = st.pending[&key()]
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_bash_tool_command_executed")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    let keys: Vec<&str> = bash.as_object().unwrap().keys().map(String::as_str).collect();
+    let after = |k: &str| keys[keys.iter().position(|x| *x == k).unwrap() + 1];
+    assert_eq!(after("bash_subcommand"), "bash_command_kinds");
+    assert_eq!(after("bash_command_kinds"), "has_pipe");
+    assert_eq!(bash["bash_command_kinds"], "file_read,vcs", "官方 yte：git diff | head");
+    assert_eq!(after("interrupted"), "duration_ms");
+    assert_eq!(after("duration_ms"), "command_cpu_user_ms");
+    assert_eq!(after("command_cpu_system_ms"), "left_process_running");
+    assert_eq!(after("left_process_running"), "zsh_note_in_prompt");
+    assert_eq!(after("was_backgrounded"), "same_as_running_background");
+    assert_eq!(bash["same_as_running_background"], false);
+    assert_eq!(bash["left_process_running"], false);
+    let wall = bash["duration_ms"].as_f64().unwrap();
+    let cpu = bash["command_cpu_user_ms"].as_f64().unwrap()
+        + bash["command_cpu_system_ms"].as_f64().unwrap();
+    assert!(wall > 0.0 && cpu > 0.0 && cpu < wall * 1.2, "{wall} {cpu}");
+    assert_eq!((wall * 1000.0).round() / 1000.0, wall, "三位小数");
+    drop(st);
+
+    // 失败事件（`cap/auto-2.1.311-20261027-bashfail` 那条）：没有 `was_backgrounded`，`same_as_running_background`
+    // 排在 `had_sandbox_violation` 之后；耗时与 CPU 照报。
+    let t = Telemetry::default();
+    let mut first = call(cc_body(true), "req_1", "tool_use");
+    first.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+    t.ingest(first);
+    let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+    body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls /nonexistent_dir_luban_311","description":"fail"}}]});
+    body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nls: /nonexistent_dir_luban_311: No such file or directory"}]});
+    let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+    second.ua_out = "claude-cli/2.1.311 (external, cli)".into();
+    t.ingest(second);
+    let st = t.0.state.lock();
+    let failed = st.pending[&key()]
+        .events
+        .iter()
+        .find(|(_, e)| ev_name(e) == "tengu_bash_tool_command_failed")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    let keys: Vec<&str> = failed.as_object().unwrap().keys().map(String::as_str).collect();
+    let after = |k: &str| keys[keys.iter().position(|x| *x == k).unwrap() + 1];
+    assert!(failed.get("was_backgrounded").is_none());
+    assert_eq!(after("bash_last_argv0"), "bash_command_kinds");
+    assert_eq!(failed["bash_command_kinds"], "file_search", "官方 yte：ls");
+    assert_eq!(after("interrupted"), "duration_ms");
+    assert_eq!(after("had_sandbox_violation"), "same_as_running_background");
+    assert_eq!(after("same_as_running_background"), "tool_use_id");
+}
+
 /// 「猜下一句」请求体：主线程上下文、一条回复、猜下一句的提示词；`denied` 是分叉里前面几步调过的工具（每步
 /// 一个，都被分叉拒了），接着发的那条末尾是拒绝结果与 total_tokens 附件那条 system 消息（`cap/auto-2.1.307-
 /// 20261022-full/00188` 的形态）。
@@ -7808,6 +8096,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.311 (external, cli)", "11211b82294f", "chunk-2ht8z368.js:3554:6820"),
         ("claude-cli/2.1.310 (external, cli)", "b26c68ea74b5", "chunk-31gxg38t.js:3618:6047"),
         ("claude-cli/2.1.309 (external, cli)", "1a36b34122c0", "chunk-kang00hq.js:3682:5744"),
         ("claude-cli/2.1.308 (external, cli)", "40e496cc06bc", "chunk-a1cg2ptw.js:3661:6043"),
@@ -9556,7 +9845,11 @@ fn derived_main_session_betas_match_the_2_1_308_captures() {
             return;
         };
         let derived = crate::proxy::cc_main_beta_at(model, Some((2, 1, 308)));
-        assert_eq!(session_betas(&derived), session_betas(&official), "{model}（{f}）");
+        assert_eq!(
+            session_betas(&derived, "2.1.308"),
+            session_betas(&official, "2.1.308"),
+            "{model}（{f}）"
+        );
     }
 }
 

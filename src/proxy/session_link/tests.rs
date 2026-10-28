@@ -1108,17 +1108,27 @@ fn thread_miss_names_where_the_history_diverged() {
     };
     let sid = crate::proxy::uuid_v4();
     let key = CcSessionKey { cred_id: 44, session_id: &sid };
-    let (_, _, _, miss) = thread_decision(key, 7, &[m(1, false)], true, 1);
+    let (_, _, _, miss) = thread_decision(
+        key,
+        7,
+        &[m(1, false)],
+        true,
+        crate::proxy::session_link::TOTAL_TOKENS_BUDGET,
+        1,
+    );
     assert_eq!(miss, None, "首轮不算断档");
     let turn1 = [m(1, false), m(2, true), m(3, false)];
-    let (_, _, _, miss) = thread_decision(key, 7, &turn1, false, 1);
+    let (_, _, _, miss) =
+        thread_decision(key, 7, &turn1, false, crate::proxy::session_link::TOTAL_TOKENS_BUDGET, 1);
     assert_eq!(miss.map(|x| x.why), Some("no_state"), "会话表里还没有这个会话");
 
     CcSessionLink::load(key, true, true);
-    let (_, pending, _, _) = thread_decision(key, 7, &turn1, false, 1);
+    let (_, pending, _, _) =
+        thread_decision(key, 7, &turn1, false, crate::proxy::session_link::TOTAL_TOKENS_BUDGET, 1);
     CcSessionLink::record_thread(&pending, "msg_1", Vec::new(), ReplyFp::upstream(), 0);
     let turn2 = [m(1, false), m(2, true), m(30, false), m(4, true), m(5, false)];
-    let (_, _, _, miss) = thread_decision(key, 7, &turn2, false, 2);
+    let (_, _, _, miss) =
+        thread_decision(key, 7, &turn2, false, crate::proxy::session_link::TOTAL_TOKENS_BUDGET, 2);
     let miss = miss.expect("接不上");
     assert_eq!(miss.why, "history_changed");
     assert_eq!((miss.same_root, miss.best_len, miss.common), (1, 3, 2), "第 2 条变了");

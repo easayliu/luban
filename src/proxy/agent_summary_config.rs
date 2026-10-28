@@ -118,6 +118,53 @@ fn parse(feature: &serde_json::Value) -> SummaryConfig {
 /// 从一份 eval 的 `features` 里记下这个号的三个开关（整份替换：没有的就是没下发），从现在起生效。
 pub(crate) fn note_eval(cred_id: i64, features: &serde_json::Map<String, serde_json::Value>) {
     note_eval_at(cred_id, features, SystemTime::now());
+    let hold = HoldPolicy::parse(features.get(HOLD_FLAG).and_then(|f| f.get("value")));
+    HOLDS.write().insert(cred_id, hold);
+}
+
+/// 2.1.311 起摘要器在子代理自己那条请求还没回、提示词缓存多半已冷时先不分叉（官方 `hi()`）的配置开关。
+const HOLD_FLAG: &str = "tengu_wobbly_petal";
+
+/// [`HOLD_FLAG`] 解析后的值：哪些会话主模型族会等（`sessionModelFamilies`，至多 16 项）、SDK 宿主等不等
+/// （`sdkHosts`）、多久没回包算冷（`coldAfterSeconds`，0~3600，默认 270）。不是对象或整个不合法即全取默认
+/// （一族都不等）。2026-10-27 服务端下发 `{sessionModelFamilies:[sonnet,opus,haiku,fable,other],sdkHosts:false}`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct HoldPolicy {
+    families: Vec<String>,
+    sdk_hosts: bool,
+    cold_after_secs: Option<u64>,
+}
+
+impl HoldPolicy {
+    fn parse(v: Option<&serde_json::Value>) -> Self {
+        let Some(o) = v.and_then(|v| v.as_object()) else { return Self::default() };
+        let families = o
+            .get("sessionModelFamilies")
+            .and_then(|a| a.as_array())
+            .filter(|a| a.len() <= 16)
+            .and_then(|a| {
+                a.iter()
+                    .map(|s| s.as_str().filter(|s| s.chars().count() <= 32).map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .unwrap_or_default();
+        let sdk_hosts = o.get("sdkHosts").and_then(|b| b.as_bool()).unwrap_or(false);
+        let cold_after_secs =
+            o.get("coldAfterSeconds").and_then(|n| n.as_u64()).filter(|n| *n <= 3600);
+        Self { families, sdk_hosts, cold_after_secs }
+    }
+}
+
+static HOLDS: LazyLock<parking_lot::RwLock<HashMap<i64, HoldPolicy>>> =
+    LazyLock::new(Default::default);
+
+/// 收尾那条 `tengu_agent_summary_stopped` 的 `holds_fork` / `cold_after_ms`（官方 `hi(会话主模型族, 是不是 SDK 宿主)`）：
+/// 按这个号最近一份 eval 里的 [`HOLD_FLAG`]，没下发即不等、冷却 270 秒。
+pub(crate) fn hold_policy(cred_id: i64, session_family: &str, sdk_host: bool) -> (bool, u64) {
+    let all = HOLDS.read();
+    let p = all.get(&cred_id).cloned().unwrap_or_default();
+    let holds = if sdk_host { p.sdk_hosts } else { p.families.iter().any(|f| f == session_family) };
+    (holds, p.cold_after_secs.unwrap_or(270) * 1_000)
 }
 
 /// 同 [`note_eval`]，指定生效时刻。

@@ -14,9 +14,50 @@
 //! 函数名后的注释是原文里的函数名，便于对照。
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub(super) type Id = usize;
+
+thread_local! {
+    /// 这一段（一条调用的事件，[`ParseBudget`]）里解析还能用到什么时候。
+    static BUDGET_END: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// 最近一次解析的源码与结果：同一条命令 `bash_word_split_use` 与 `bash_command_kinds` 各要一棵树，第二次直接取。
+    static LAST: RefCell<Option<(String, Option<Rc<Tree>>)>> = const { RefCell::new(None) };
+}
+
+/// 一条调用的事件里解析 shell 命令的总额度（[`crate::config::TELEMETRY_BASH_PARSE_BUDGET_MS`]）。
+///
+/// 遥测只有一个消费者、建事件时拿着状态锁（转发路径上新会话的握手也要那把锁），而命令是租户给的：一轮塞几十上百条
+/// 上万字的命令，每条都能吃满单次解析的 50ms。正常命令解析几十微秒，这个额度够几千条；用完之后的命令按「解析器
+/// 放弃」处理（`bash_word_split_use` 为假、`bash_command_kinds` 报 `unparsed`，都是官方解析失败时的取值），单次
+/// 解析的时限也压到剩余额度以内。
+pub(super) struct ParseBudget {
+    outer: bool,
+}
+
+impl ParseBudget {
+    /// 开一段额度；已经在一段里（处理一条调用时连带补处理扣住的那几条）时不另开，外层那段说了算。
+    pub(super) fn start(limit: Duration) -> Self {
+        BUDGET_END.with(|b| {
+            if b.get().is_some() {
+                return Self { outer: false };
+            }
+            b.set(Some(Instant::now() + limit));
+            Self { outer: true }
+        })
+    }
+}
+
+impl Drop for ParseBudget {
+    fn drop(&mut self) {
+        if self.outer {
+            BUDGET_END.with(|b| b.set(None));
+            LAST.with(|l| l.borrow_mut().take());
+        }
+    }
+}
 
 /// 语法树节点：类型、字节范围、子节点。
 pub(super) struct Node {
@@ -50,14 +91,30 @@ impl Tree {
     }
 }
 
-/// 解析；原文返回 `null` 的情形（放弃、超时、超限）返回 `None`。
-pub(super) fn parse(src: &str) -> Option<Tree> {
+/// 解析；原文返回 `null` 的情形（放弃、超时、超限）返回 `None`。同一条源码连着要两次时第二次直接取上一棵
+/// （[`LAST`]）；这一段的额度（[`ParseBudget`]）用完了也返回 `None`。
+pub(super) fn parse(src: &str) -> Option<Rc<Tree>> {
+    let hit = LAST.with(|l| l.borrow().as_ref().filter(|(s, _)| s == src).map(|(_, t)| t.clone()));
+    if let Some(tree) = hit {
+        return tree;
+    }
+    let end = BUDGET_END.with(Cell::get);
+    if end.is_some_and(|end| Instant::now() >= end) {
+        return None;
+    }
+    let tree = parse_fresh(src, end).map(Rc::new);
+    LAST.with(|l| *l.borrow_mut() = Some((src.to_string(), tree.clone())));
+    tree
+}
+
+/// [`parse`] 的本体：`budget_end` 是这一段额度的尽头，单次解析的时限不越过它。
+fn parse_fresh(src: &str, budget_end: Option<Instant>) -> Option<Tree> {
     let bytes = src.len();
     if bytes >= 67_108_864 {
         return None;
     }
     let u: Vec<u16> = src.encode_utf16().collect();
-    let mut p = P::new(u, bytes);
+    let mut p = P::new(u, bytes, budget_end);
     let mut root = p.program().ok()?;
     if p.zsh_brace_diff || p.zsh_cond_paren_diff {
         let (s, e) = (p.nodes[root].start, p.nodes[root].end);
@@ -278,8 +335,9 @@ const RESERVED: [&str; 15] = [
 const DECL: [&str; 5] = ["export", "declare", "typeset", "readonly", "local"];
 
 impl P {
-    fn new(src: Vec<u16>, src_bytes: usize) -> Self {
+    fn new(src: Vec<u16>, src_bytes: usize, budget_end: Option<Instant>) -> Self {
         let table = byte_table(&src);
+        let deadline = Instant::now() + DEADLINE;
         P {
             len: src.len(),
             src,
@@ -291,7 +349,7 @@ impl P {
             src_bytes,
             nodes: Vec::new(),
             node_count: 0,
-            deadline: Instant::now() + DEADLINE,
+            deadline: budget_end.map_or(deadline, |end| end.min(deadline)),
             in_backtick: 0,
             in_dquote: 0,
             stop_bracket: false,
@@ -4833,4 +4891,27 @@ fn her(s: &[u16]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 同一条连着要两次取同一棵；一段额度用完之后的解析按放弃处理（单次时限也压在额度以内），出了那一段照常。
+    #[test]
+    fn repeats_are_cached_and_a_spent_budget_gives_up() {
+        let a = parse("echo hi").unwrap();
+        let b = parse("echo hi").unwrap();
+        assert!(Rc::ptr_eq(&a, &b), "同一条只解析一次");
+        {
+            let _budget = ParseBudget::start(Duration::ZERO);
+            {
+                let _inner = ParseBudget::start(Duration::from_secs(60));
+                assert!(parse("ls -la").is_none(), "嵌套那段不另开额度，外层用完了就是用完了");
+            }
+            assert!(parse("git status").is_none());
+            assert_eq!(super::super::bash_kinds::shell_run("git status").kinds, "unparsed");
+        }
+        assert!(parse("git status").is_some(), "那一段过去就不再限");
+    }
 }

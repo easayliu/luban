@@ -2645,14 +2645,17 @@ fn core_tool_stubs_are_profile_specific() {
         bash["description"]
     );
     // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）；
-    // 2.1.309 的 `# Git` 段又加了一句「GitHub notifies the owner of any `@name`…」（+283）。
-    assert_eq!(d(opus, "Bash").chars().count(), 3381);
+    // 2.1.309 的 `# Git` 段又加了一句「GitHub notifies the owner of any `@name`…」（+283）；2.1.311 把
+    // 「Working directory persists between calls」那句改写成 `cd` 只在主会话里延续的说明（+160）。
+    assert_eq!(d(opus, "Bash").chars().count(), 3541);
     // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）；
     // 2.1.301 那句「Not allowed with …」去掉了 `root`（2.1.300 是 36637）；2.1.303 加了 dashboard
-    // 那几句（2.1.301 是 36629）；2.1.309 改写了 `root` 参数的说明（2.1.303 ~ 2.1.308 是 37253，+182）。
-    assert_eq!(d(opus, "Artifact").chars().count(), 37435);
-    // 2.1.309 的 `# Creating pull requests` 段也加了那句 `@name` 提示（2.1.308 及以前是 11913，+283）。
-    assert_eq!(d(haiku, "Bash").chars().count(), 12196);
+    // 那几句（2.1.301 是 36629）；2.1.309 改写了 `root` 参数的说明（2.1.303 ~ 2.1.308 是 37253，+182）；
+    // 2.1.311 改写了连接器那段、「artifact, not a document」那句与 `intent` 参数说明（2.1.309 ~ 2.1.310 是 37435，+367）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 37802);
+    // 2.1.309 的 `# Creating pull requests` 段也加了那句 `@name` 提示（2.1.308 及以前是 11913，+283）；
+    // 2.1.311 同样改写了开头那句工作目录的说明（2.1.309 ~ 2.1.310 是 12196，+161）。
+    assert_eq!(d(haiku, "Bash").chars().count(), 12357);
 }
 
 /// 开关 `sim_trim_tools`：注入的官方工具去掉 Artifact / ListAgents / SendFeedback，剩 11 条、先后
@@ -2792,7 +2795,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.310."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.311."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -4905,7 +4908,7 @@ fn parses_version_strings() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 310)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 311)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6362,10 +6365,15 @@ fn env_note_matches_the_2_1_293_captures() {
             let para: Vec<&str> = para.lines().filter(|l| !plugin(l)).collect();
             keep.push(para.join("\n"));
         }
-        let want = keep
-            .join("\n\n")
-            .replace(session, &sim.session_id)
-            .replace("Today's date is 2026-10-08.", "");
+        // 2.1.311 改写了技能清单里 code-review 那行（描述改了措辞、行尾多一句 whenToUse），其余段落与 2.1.293
+        // 逐字相同：官方那行换成当前资产里的再比。
+        let review =
+            |s: &str| s.lines().find(|l| l.starts_with("- code-review: ")).map(str::to_owned);
+        let mut want = keep.join("\n\n").replace(session, &sim.session_id);
+        if let (Some(old), Some(new)) = (review(&want), review(config::CC_ENV_SKILLS)) {
+            want = want.replace(&old, &new);
+        }
+        let want = want.replace("Today's date is 2026-10-08.", "");
         let got = text.split("Today's date is ").next().unwrap().to_string();
         assert_eq!(got, want, "{model}（{n}）");
         let line = config::CC_MODEL_IDENTITIES.iter().find(|(id, ..)| *id == model).unwrap().1;

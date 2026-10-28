@@ -6,6 +6,8 @@
 //! 这里按内部形态折算（`cap/auto-2.1.305-20261021-full` / `auto-2.1.303-20261019-full` 的 A0：人类消息
 //! 17945 / 17736 对官方 17749 / 17591，总数差 1% 以内），分到工具名的那几组逐个对得上个位数。
 
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{Value, json};
 
 use super::shape::{js_len, read_dedup_of};
@@ -80,12 +82,20 @@ pub(super) struct CompactStats {
     pub(super) kept_reads: Vec<String>,
     /// ToolSearch 加载过几次（`attachment_deferred_tools_record_count` 的估值）。
     pub(super) tool_search_loads: usize,
+    /// ToolSearch 结果里加载进来的延迟工具（`tool_reference` 的名字，去重、按先后）：2.1.311 压缩后重宣告延迟工具池时
+    /// 报它们的个数（`feature_sad{compact_names_loaded_tools}`，`cap/auto-2.1.311-20261027-full/00214` 三个）。
+    pub(super) loaded_deferred: Vec<String>,
 }
 
-fn bump(list: &mut Vec<(String, u64)>, name: &str, n: u64) {
-    match list.iter_mut().find(|(k, _)| k == name) {
-        Some((_, v)) => *v += n,
-        None => list.push((name.to_string(), n)),
+/// 按名字累加，保留首次出现的先后。`index` 是名字在 `list` 里的下标：名字与 id 都是来访给的，逐个线性查找在
+/// 刻意造出几十万个不同名字的体上是平方级，见 [`compact_stats_of`]。
+fn bump(list: &mut Vec<(String, u64)>, index: &mut HashMap<String, usize>, name: &str, n: u64) {
+    match index.get(name) {
+        Some(&i) => list[i].1 += n,
+        None => {
+            index.insert(name.to_string(), list.len());
+            list.push((name.to_string(), n));
+        }
     }
 }
 
@@ -148,9 +158,13 @@ fn stat_tool_name(name: &str) -> &str {
 /// 那组里：A0 的 `preservedMessageCount` 是 assistant + 工具结果 + 它 = 3）。
 pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
     let mut st = CompactStats::default();
-    let mut names: Vec<(String, String)> = Vec::new();
-    let mut read_paths: Vec<(String, String)> = Vec::new();
-    let mut reads: Vec<(String, u64, u64)> = Vec::new();
+    // 下面几张表都按来访给的 id / 名字 / 路径查，一律走哈希（同一个 id 重复出现时认先出现的那个，同原来的线性查找）。
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut read_paths: HashMap<String, String> = HashMap::new();
+    // 路径 → (次数, token)；只拿来求和，不看先后。
+    let mut reads: HashMap<String, (u64, u64)> = HashMap::new();
+    let (mut request_index, mut result_index) = (HashMap::new(), HashMap::new());
+    let mut loaded_seen: HashSet<String> = HashSet::new();
     for m in msgs {
         let (user, blocks) = internal_blocks(m);
         for b in &blocks {
@@ -174,8 +188,8 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                     let raw = b.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                     let name = stat_tool_name(raw);
                     let id = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    bump(&mut st.tool_requests, name, t);
-                    names.push((id.to_string(), name.to_string()));
+                    bump(&mut st.tool_requests, &mut request_index, name, t);
+                    names.entry(id.to_string()).or_insert_with(|| name.to_string());
                     if raw == "ToolSearch" {
                         st.tool_search_loads += 1;
                     }
@@ -183,29 +197,33 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                         && let Some(p) =
                             b.get("input").and_then(|i| i.get("file_path")).and_then(|p| p.as_str())
                     {
-                        read_paths.push((id.to_string(), p.to_string()));
+                        read_paths.entry(id.to_string()).or_insert_with(|| p.to_string());
                     }
                 }
                 Some("tool_result") => {
                     let id = b.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("");
-                    let name =
-                        names.iter().find(|(i, _)| i == id).map_or("unknown", |(_, n)| n.as_str());
-                    bump(&mut st.tool_results, name, t);
-                    if let Some((_, p)) = read_paths.iter().find(|(i, _)| i == id) {
-                        match reads.iter_mut().find(|(q, _, _)| q == p) {
-                            Some((_, c, tok)) => {
-                                *c += 1;
-                                *tok += t;
-                            }
-                            None => reads.push((p.clone(), 1, t)),
+                    let name = names.get(id).map_or("unknown", String::as_str);
+                    bump(&mut st.tool_results, &mut result_index, name, t);
+                    let refs = b.get("content").and_then(|c| c.as_array()).into_iter().flatten();
+                    for r in refs {
+                        if r.get("type").and_then(|t| t.as_str()) == Some("tool_reference")
+                            && let Some(n) = r.get("tool_name").and_then(|n| n.as_str())
+                            && loaded_seen.insert(n.to_string())
+                        {
+                            st.loaded_deferred.push(n.to_string());
                         }
+                    }
+                    if let Some(p) = read_paths.get(id) {
+                        let (c, tok) = reads.entry(p.clone()).or_default();
+                        *c += 1;
+                        *tok += t;
                     }
                 }
                 _ => st.other += t,
             }
         }
     }
-    for (_, count, tokens) in &reads {
+    for (count, tokens) in reads.values() {
         if *count > 1 {
             st.duplicate_read_files += 1;
             st.duplicate_read_tokens += tokens / count * (count - 1);
@@ -242,7 +260,7 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                 })
                 .count()
         });
-        let mut dedup_ids: Vec<&str> = Vec::new();
+        let mut dedup_ids: HashSet<&str> = HashSet::new();
         for m in &kept[1..] {
             if let Some(blocks) = m.get("content").and_then(|c| c.as_array()) {
                 for b in blocks {
@@ -252,7 +270,7 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                             .is_some_and(|c| read_dedup_of(c).is_some())
                         && let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str())
                     {
-                        dedup_ids.push(id);
+                        dedup_ids.insert(id);
                     }
                 }
             }
@@ -262,7 +280,7 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                 if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
                     && b.get("name").and_then(|n| n.as_str()) == Some("Read")
                     && let Some(id) = b.get("id").and_then(|i| i.as_str())
-                    && !dedup_ids.contains(&id)
+                    && !dedup_ids.contains(id)
                     && let Some(p) =
                         b.get("input").and_then(|i| i.get("file_path")).and_then(|p| p.as_str())
                 {
@@ -338,5 +356,37 @@ mod tests {
         assert_eq!(st.trailing, qc("1\tx\n") + qc("<total_tokens>0 tokens left</total_tokens>"));
         assert!(st.human > 0 && st.assistant == 0 && st.other > 0);
         assert_eq!(st.total, st.human + st.other + st.tool_requests[0].1 + st.tool_results[0].1);
+    }
+
+    /// 加载过的延迟工具去重、按先后；几十万个各不相同的 id / 名字也是一遍扫完（表都走哈希）。
+    #[test]
+    fn loaded_tools_dedup_and_scale_linearly() {
+        let refs = |names: &[&str]| {
+            names.iter().map(|n| json!({"type":"tool_reference","tool_name":n})).collect::<Vec<_>>()
+        };
+        let msgs = vec![
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"ToolSearch","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":refs(&["B","A","B"])}]}),
+        ];
+        assert_eq!(compact_stats_of(&msgs).loaded_deferred, ["B", "A"]);
+
+        let n = 200_000;
+        let uses: Vec<Value> = (0..n)
+            .map(|i| json!({"type":"tool_use","id":format!("u{i}"),"name":format!("tool_{i}"),"input":{}}))
+            .collect();
+        let results: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"type":"tool_result","tool_use_id":format!("u{i}"),
+                "content":[{"type":"tool_reference","tool_name":format!("d{i}")}]})
+            })
+            .collect();
+        let msgs = vec![
+            json!({"role":"assistant","content":uses}),
+            json!({"role":"user","content":results}),
+        ];
+        let started = std::time::Instant::now();
+        let st = compact_stats_of(&msgs);
+        assert_eq!((st.loaded_deferred.len(), st.tool_results.len()), (n, n));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 }

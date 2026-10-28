@@ -95,6 +95,12 @@ pub const CC_BETA_THINKING_DISPLAY_UPDATES: &str = "thinking-display-updates-202
 /// 思维链本来就不返回，这项对它没有语义。
 pub const CC_BETA_REDACT_THINKING: &str = "redact-thinking-2026-02-12";
 
+/// `thinking-token-count-2026-05-13`：2.1.310 及以前在官方公共 beta 规则表里，紧跟
+/// `interleaved-thinking` / `redact-thinking`，遥测顶层那份会话级 beta 也带它；2.1.311 起移出规则表，
+/// 改在发请求前、[`CC_BETA_ADVISOR_TOOL`] 之后单独补（这一档模型支持 thinking 时才补，额度探测不再带），
+/// 会话级那份随之没有它（`cap/auto-2.1.311-20261027-full`，见 [`super::CC_PROFILES`]）。
+pub const CC_BETA_THINKING_TOKEN_COUNT: &str = "thinking-token-count-2026-05-13";
+
 /// `extended-cache-ttl-2025-04-11`：2.1.220 的四份直连抓包里是**最后一项**；2.1.251 起排在
 /// [`CC_BETA_CACHE_DIAGNOSIS`] 之前（`cap/2.1.258` 四族一致）。
 ///

@@ -335,6 +335,7 @@ impl EventBuilder<'_> {
             v291,
             v293,
             v299,
+            v311,
             injected,
             first_prompt_tpl,
             sleepy,
@@ -469,6 +470,10 @@ impl EventBuilder<'_> {
                     }
                     if v299 {
                         bash_meta_v299(&mut meta, cmd, "", &shape.model, true);
+                    }
+                    if v311 {
+                        let h = i64::from(env.req_hash % 100);
+                        bash_meta_v311(&mut meta, cmd, Some(ShellUsage::typed(h)));
                     }
                     self.push_dd_snake(ms(t0, -6), "tengu_bash_tool_command_executed", meta);
                 }

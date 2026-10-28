@@ -82,8 +82,16 @@ pub(crate) struct Simulation {
     /// 开关 `simulate_full_system`；只有官方不发 `system` 的 profile（额度探测）为 `None`。
     pub(super) env: Option<SimEnv>,
     /// 来访头上带着 `context-1m`：出站同样带它（[`crate::proxy::headers::simulated_beta`]），环境说明的模型
-    /// 行随之写 `(1M context)` 与 `[1m]`（`cap/auto-2.1.291-20261006-full/00216`）。
+    /// 行随之写 `(1M context)` 与 `[1m]`（`cap/auto-2.1.291-20261006-full/00216`）。模拟版本的官方客户端对这个
+    /// 模型已经不走 1M 那套时（[`context_1m_beta_wanted`]，2.1.311 起的原生 1M 模型）为假。
     pub(super) context_1m: bool,
+    /// 这个会话的 `<total_tokens>` 提醒那一档（档位、预算、用户输入之后跟不跟；按号、按模型跟服务端下发，会话内
+    /// 钉住，见 [`super::lapis_anchor::session_mode`]）。`off` 时 system 第四块、首轮环境说明与线程里每轮那条一概不发；
+    /// 预算换掉那几处写的数与倒数的起点。
+    pub(super) lapis: super::lapis_anchor::SessionMode,
+    /// 来访带了 `context-1m`、但模拟版本的官方客户端对这个模型不发它（原生 1M，见 [`context_1m_beta_wanted`]）：
+    /// 出站把来访那一项去掉。原生 1M 的模型窗口本来就是 1M，去掉它不改语义，留着则是官方不产生的形态。
+    pub(super) strip_context_1m: bool,
     /// 来访**整个没带 `tools` 键**时也按主线程补齐官方工具（开关 `fill_absent_tools`，见
     /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
     /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
@@ -326,10 +334,28 @@ impl Simulation {
         // 管）都照它写。额度探测那种官方就不发 `system` 的 profile 两样都不补，不算。
         let env = (profile.system != config::CcSystemShape::None)
             .then(|| client_env(v).unwrap_or_else(|| sim_env_for(cred, device_fp)));
+        let inbound_beta = inbound_beta_list(headers);
+        // `<total_tokens>` 那一档按会话钉住，只让主线程那条来钉（官方按启动时的主模型读 `client_data`）：同一会话里
+        // 抢先到的标题、无工具侧查询多半是别的模型，只看不钉，见 [`super::lapis_anchor::session_mode`]。
+        let main_thread = matches!(
+            super::CcRequestKind::of(v, &inbound_beta),
+            super::CcRequestKind::Main
+                | super::CcRequestKind::Fork
+                | super::CcRequestKind::Suggestion
+        );
+        let lapis = if main_thread {
+            super::lapis_anchor::session_mode(cred.id, &session_id, model)
+        } else {
+            super::lapis_anchor::peek_session_mode(cred.id, &session_id, model)
+        };
         let rest = env.as_ref().filter(|_| flags.simulate_full_system).and_then(|env| {
-            cc_system_rest(model).map(|template| render_system_rest(template, env))
+            cc_system_rest(model).map(|template| {
+                super::lapis_anchor::fit_system_rest(render_system_rest(template, env), lapis)
+            })
         });
-        let context_1m = has_beta(&inbound_beta_list(headers), config::CC_BETA_CONTEXT_1M);
+        let inbound_1m = has_beta(&inbound_beta, config::CC_BETA_CONTEXT_1M);
+        let wants_1m = context_1m_beta_wanted(model, super::parse_version(profile.version));
+        let context_1m = inbound_1m && wants_1m;
         // 判定结果不在这里记：调用点把三条路（模拟/补身份/原样转发）一起打成一条，
         // 只在这儿打的话，「没走模拟」永远是一片空白，反而看不出发生了什么。
         Some(Self {
@@ -352,6 +378,8 @@ impl Simulation {
             rest,
             env,
             context_1m,
+            strip_context_1m: inbound_1m && !wants_1m,
+            lapis,
             fill_absent_tools: flags.fill_absent_tools,
             trim_tools: flags.sim_trim_tools,
             billing_only: flags.sim_billing_only,
@@ -1186,6 +1214,23 @@ pub(crate) fn cc_profile_for(model: &str) -> &'static config::CcProfile {
     config::cc_profile(cc_profile_kind_for(model))
 }
 
+/// `model`（可带 `[1m]`）在 `version` 那一版的官方客户端上还走不走 1M 那套：发 `context-1m`、环境说明写
+/// `(1M context)` 与 `[1m]`、遥测模型名带 `[1m]`。2.1.311 起官方只给**名字本身不是原生 1M** 的模型发
+/// `context-1m`（规则表那项改成 `[1m]` 且 `!kA(model,{byItsOwnName:true})`），原生 1M 的
+/// （[`config::CC_NATIVE_1M_MODELS`]）带 `[1m]` 也与普通会话一模一样（`cap/auto-2.1.311-20261027-full/00303`
+/// 的 opus-5-5\[1m]：没有 `context-1m`，环境说明那行是 `Opus 5.5` / `claude-opus-5-5`，事件模型名也不带后缀）。
+/// 更早的版本照旧都走。
+pub(crate) fn context_1m_beta_wanted(model: &str, version: Option<(u64, u64, u64)>) -> bool {
+    if version.is_none_or(|v| v < (2, 1, 311)) {
+        return true;
+    }
+    let lower = model.trim().to_ascii_lowercase();
+    let bare = lower.strip_suffix("[1m]").unwrap_or(&lower);
+    !config::CC_NATIVE_1M_MODELS
+        .iter()
+        .any(|k| bare == *k || bare.strip_prefix(k).is_some_and(|rest| rest.starts_with("-20")))
+}
+
 /// 官方主线程在 `version` 那一版、用 `model`（展示名，1M 会话带 `[1m]`）时出站头里的 `anthropic-beta`：按那一版的
 /// profile 拼，订阅登录带 `oauth`，1M 会话带 `context-1m`（位置同 [`super::simulated_beta`]）。每请求才带的那几项
 /// （auto 模式、按号下发的保活）不在里头。遥测还没见到会话的主线程请求时，拿它推主线程那份会话级 beta。
@@ -1199,6 +1244,7 @@ pub(crate) fn cc_main_beta_at(model: &str, version: Option<(u64, u64, u64)>) -> 
     };
     let profile = config::cc_profile_at(cc_profile_kind_for(base), version);
     let beta = config::cc_model_beta(profile, base);
+    let one_m = one_m && context_1m_beta_wanted(base, version);
     super::simulated_beta(&beta, one_m.then_some(config::CC_BETA_CONTEXT_1M))
 }
 

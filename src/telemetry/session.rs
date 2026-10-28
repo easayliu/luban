@@ -688,6 +688,7 @@ pub(super) struct TurnFacts {
     pub(super) v308: bool,
     pub(super) v309: bool,
     pub(super) v310: bool,
+    pub(super) v311: bool,
     /// 工具被拒时报 `tengu_safety_event`：2.1.307 起，且号的服务端开关 `tengu_snoopy_creek` 没关
     /// （[`crate::proxy::snoopy_creek`]，官方每次报之前现读，这里按这条请求处理时读一次）。
     pub(super) safety_events: bool,
@@ -720,6 +721,10 @@ pub(super) struct TurnFacts {
     /// 这条前面报一条 `tengu_heron_brook_applied`：服务端下发的那段文本的 `(len, fromClientData)`
     /// （[`crate::proxy::heron_brook`]），会话首次输入一条。
     pub(super) heron: Option<(usize, bool)>,
+    /// 这个会话的 `<total_tokens>` 那一族由 bootstrap 的 `client_data` 给出的几项：启动模板里各报一条
+    /// `tengu_lapis_anchor_from_client_data`，这里是它们的内容（`{mode}` / `{userTurn}` / `{budget}`，按官方的先后，
+    /// [`crate::proxy::lapis_anchor::SessionMode::client_data_events`]，见 [`super::template::Subst::lapis`]）。
+    pub(super) lapis: Vec<Value>,
     pub(super) tether: Option<Tether>,
     pub(super) usage_before: [i64; 4],
     pub(super) ignored_suggestion: Option<(String, SystemTime, usize)>,

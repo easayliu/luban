@@ -164,7 +164,7 @@ pub(super) fn metrics_body(
         a
     };
     let cost_points: Vec<Value> =
-        cost.iter().map(|(c, v)| point(with_model(c), json!(v))).collect();
+        cost.iter().map(|(c, v)| point(with_model(c), js_number(*v))).collect();
     let mut token_points: Vec<Value> = Vec::new();
     for (c, v) in &tokens {
         for (i, ty) in ["input", "output", "cacheRead", "cacheCreation"].iter().enumerate() {
@@ -178,7 +178,7 @@ pub(super) fn metrics_body(
         for (ty, v) in [("user", *user), ("cli", *cli)] {
             let mut a = attrs(c);
             a.insert("type".into(), json!(ty));
-            active_points.push(point(a, json!((v * 100.0).round() / 100.0)));
+            active_points.push(point(a, js_number((v * 100.0).round() / 100.0)));
         }
     }
     // 改动的行数：按（会话, 模型）各一对 `added` / `removed`，删了 0 行也报那个点（`cap/auto-2.1.305-20261021-full`

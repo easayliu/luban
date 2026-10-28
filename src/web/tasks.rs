@@ -35,6 +35,16 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
         }
     }
 
+    // 上次运行记下的 bootstrap `client_data`（`<total_tokens>` 那档、`tengu_heron_brook`）按号按模型读回内存：
+    // 进行中的会话重启后不必等下一次握手、也就不会中途换档。读失败只告警，回到只等握手的老样子。
+    match proxy::client_data::restore(&state.store).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(rows, "restored bootstrap client_data from the database"),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load bootstrap client_data; starting empty")
+        }
+    }
+
     // 每小时裁剪一次用量日志流水：终身统计在账本里（见 store 的 credential_stats/device_costs），
     // 流水只需保留近期。按小时而不是按天：一天一次会让表最多撑到保留期再加一整天，删除也全挤在
     // 同一时段。interval 的首个 tick 立即触发，兼作启动清理；删除是分批短事务。
@@ -342,6 +352,7 @@ pub(super) async fn spawn_background_tasks(state: &AppState) {
                             &access_token,
                             &ctx,
                             &ctx.model_normalized(),
+                            &store,
                         )
                         .await;
                         if let oauth::KeepaliveResult::AuthRejected(rej) = &bo {

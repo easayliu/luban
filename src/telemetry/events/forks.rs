@@ -51,7 +51,7 @@ impl EventBuilder<'_> {
             .map_or(([0; 4], 0), |f| (f.usage, f.messages + suggestion_resumed_messages(shape)));
         let hit_rate = |u: &[i64; 4]| {
             let total_in = u[0] + u[2] + u[3];
-            if total_in > 0 { json!(u[2] as f64 / total_in as f64) } else { json!(0) }
+            if total_in > 0 { js_number(u[2] as f64 / total_in as f64) } else { json!(0) }
         };
         // 猜下一句：自己就是一轮（`cap/2.1.260-2` 09:43:21），收尾多一条 fork 统计，没有 tips。
         // 失败的那条只有上面的错误串（fork 统计报的是这一发的用量，没有用量就没有它）。
@@ -634,6 +634,30 @@ impl EventBuilder<'_> {
                         }
                         keys.push(("writer_failed", json!(done.summary_writer_failed)));
                         insert_after(&mut stopped, "agent_model", keys);
+                    }
+                    // 2.1.311 在 `lines_accepted` 后多「子代理请求未回、缓存已冷时先不分叉」那几项（官方 `hi()` 与
+                    // 收尾计数；`cap/auto-2.1.311-20261027-full` 六条都是 0）。`holds_fork` / `cold_after_ms` 只在 full 模式
+                    // 的计时器至少触发过一次时才有（官方那次才 `le ??= hi(...)`）：子代理跑满首个等待、且收尾是 full；
+                    // 抓包里的子代理都不到 30 秒，六条都没有这两项。等没等、等了多久、发出时子代理请求在不在等回包、
+                    // 有没有被抢先代理看不到（被扣下的摘要根本不发），四个计数报 0。
+                    if env.f.v311 {
+                        let mut keys = Vec::new();
+                        if !mode_short && summary_ms >= cfg.wait_ms(0) as i64 {
+                            let (holds, cold) = crate::proxy::agent_summary_config::hold_policy(
+                                call.cred_id,
+                                session_family,
+                                false,
+                            );
+                            keys.push(("holds_fork", json!(holds)));
+                            keys.push(("cold_after_ms", json!(cold)));
+                        }
+                        keys.extend([
+                            ("calls_held", json!(0)),
+                            ("held_ms", json!(0)),
+                            ("calls_sent_awaiting_response", json!(0)),
+                            ("calls_overtaken", json!(0)),
+                        ]);
+                        insert_after(&mut stopped, "lines_accepted", keys);
                     }
                 }
                 self.push(t2, "tengu_agent_summary_stopped", stopped);

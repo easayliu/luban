@@ -65,6 +65,8 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::curious_tower::note_eval(cred_id, features);
     // 拼进 system 的那段 `tengu_heron_brook`（bootstrap 的 `client_data` 优先，这里是兜底那份）。
     super::heron_brook::note_eval(cred_id, features);
+    // `<total_tokens>` 提醒的那一档（bootstrap 的 `client_data` 优先，这里是兜底那份）。
+    super::lapis_anchor::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)
     };

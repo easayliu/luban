@@ -320,17 +320,19 @@ impl EventBuilder<'_> {
             return 0;
         }
         if env.f.v305 {
-            self.push(
-                ms(t2, 3),
-                "tengu_compact_summary_reply",
-                json!({
-                    "path": "reactive",
-                    "summaryBlock": "closed",
-                    "unansweredRequestTail": "none",
-                    "outputTokens": env.call.output_tokens,
-                    "stopReason": env.call.stop_reason.as_deref().unwrap_or("end_turn")
-                }),
-            );
+            let mut reply = json!({
+                "path": "reactive",
+                "summaryBlock": "closed",
+                "unansweredRequestTail": "none",
+                "outputTokens": env.call.output_tokens,
+                "stopReason": env.call.stop_reason.as_deref().unwrap_or("end_turn")
+            });
+            // 2.1.311 起末尾多第几次要摘要（回包里没有 `<summary>` 时再要一次，`cap/auto-2.1.311-20261027-full/00224`
+            // 一次就成，报 1）。
+            if env.f.v311 {
+                reply["attempt"] = json!(1);
+            }
+            self.push(ms(t2, 3), "tengu_compact_summary_reply", reply);
         }
         let kept_reads =
             env.shape.compact_stats.as_ref().map(|s| s.kept_reads.clone()).unwrap_or_default();
@@ -386,6 +388,18 @@ impl EventBuilder<'_> {
             meta["callSite"] = json!("reactive_compact");
             meta["querySource"] = json!("unknown");
             self.push(t_deferred, "tengu_deferred_tools_pool_change", meta);
+            // 2.1.311：重宣告的延迟工具里有压缩前加载过的，官方想在宣告里点名它们，开关 `tengu_radiant_lemur`
+            // 没开（服务端 false），报一条 `feature_sad{flag_off}` 带个数，紧跟在池子那条后面（同一毫秒）。
+            let loaded = env.shape.compact_stats.as_ref().map_or(0, |s| s.loaded_deferred.len());
+            if env.f.v311 && loaded > 0 {
+                let mut sad = json!({
+                    "count": loaded,
+                    "feature_name": "compact_names_loaded_tools",
+                    "error_code": "flag_off"
+                });
+                sad["tengu_quizzical_giraffe"] = json!("unset");
+                self.push_dd(t_deferred, "tengu_feature_sad", sad);
+            }
         }
         if let Some(mut meta) = mcp {
             meta["messagesLength"] = json!(preserved);
@@ -508,7 +522,7 @@ impl EventBuilder<'_> {
         put("compactionCacheReadTokens", json!(call.cache_read_tokens));
         put("compactionCacheCreationTokens", json!(call.cache_creation_tokens));
         put("compactionTotalTokens", json!(total_in + call.output_tokens));
-        put("cacheHitRate", json!(hit_rate));
+        put("cacheHitRate", js_number(hit_rate));
         put("cacheCold", json!(false));
         // 上下文统计（官方 `wSe`）。
         put("total_tokens", json!(st.total));

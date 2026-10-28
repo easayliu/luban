@@ -585,6 +585,7 @@ pub(crate) async fn spawn_session_handshake(
         // 会话级 beta 从**实际发出的**头上筛，与遥测那边同一套口径。
         betas: crate::telemetry::session_betas(
             out.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or_default(),
+            &start.version,
         ),
         prompt_id: start.prompt_id.to_string(),
         started_wall: std::time::SystemTime::now(),
@@ -599,7 +600,7 @@ pub(crate) async fn spawn_session_handshake(
     // 那几条（`cap/2.1.258-api` 里它们是客户端直连打的，不经 luban），再补一遍就是同一台
     // 机器把同一批公共端点打了两遍。见 [`crate::oauth::HandshakeRunner::public_traffic`]。
     let simulated = start.simulated;
-    let runner = crate::oauth::HandshakeRunner::new(cred, h, org, simulated);
+    let runner = crate::oauth::HandshakeRunner::new(cred, h, org, simulated, state.store.clone());
 
     // 整串握手跑在**一个**后台任务里，按抓包的发出时刻来（`cap/auto-2.1.309-20261023-full`），
     // 各段**只看发出时刻、不等前一段的响应**：
@@ -763,6 +764,9 @@ pub(crate) async fn send_quota_probe(
         rest: None,
         env: None,
         context_1m: false,
+        strip_context_1m: false,
+        // 探测不带 system 第四块、环境说明与线程，这一档用不上。
+        lapis: super::lapis_anchor::SessionMode::DEFAULT,
         fill_absent_tools: false,
         trim_tools: false,
         billing_only: false,
@@ -793,6 +797,10 @@ pub(crate) async fn send_quota_probe(
     // 不是 luban 当前模拟版本的 0.128.0），见 [`config::cc_stainless_version`]。
     if let Some(sdk) = config::cc_stainless_version(version) {
         headers.insert("x-stainless-package-version", HeaderValue::from_static(sdk));
+    }
+    // 运行时版本同理（2.1.311 起 `v26.12.1`），见 [`config::cc_stainless_runtime_version`]。
+    if let Some(rt) = config::cc_stainless_runtime_version(version) {
+        headers.insert("x-stainless-runtime-version", HeaderValue::from_static(rt));
     }
     let body = rewrite_body_out(
         &probe_body(model),
@@ -908,6 +916,9 @@ fn header_simulation(
         rest: None,
         env: None,
         context_1m: false,
+        strip_context_1m: false,
+        // 探测不带 system 第四块、环境说明与线程，这一档用不上。
+        lapis: super::lapis_anchor::SessionMode::DEFAULT,
         // 两种官方形态都不带工具。
         fill_absent_tools: false,
         trim_tools: false,

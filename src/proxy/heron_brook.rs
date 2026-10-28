@@ -7,7 +7,8 @@
 //! `cap/auto-2.1.308-20261022-full` 都没有这一项、也没有那条事件。eval 里一直没出现过。
 //!
 //! bootstrap 按号、按请求的模型记（`client_data` 随 `model` 参数变，会话启动握手与首次保活拉 bootstrap 时顺带记），
-//! eval 按号记。长度按官方 `value.trim().length`（UTF-16 码元）。只存在内存里；没见过的一律当没下发。
+//! eval 按号记。长度按官方 `value.trim().length`（UTF-16 码元）。bootstrap 那份随整份 `client_data` 落库、启动时
+//! 读回（[`super::client_data`]）；eval 那份只在内存。两处都没见过的一律当没下发。
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -37,11 +38,15 @@ fn text_len(v: Option<&serde_json::Value>) -> Option<usize> {
     (!t.is_empty()).then(|| t.encode_utf16().count())
 }
 
-/// 记下一份 bootstrap 回包（`GET /api/claude_cli/bootstrap?model=<model>` 的 200 体）。解析不了的体不动旧值。
-pub(crate) fn note_bootstrap(cred_id: i64, model: &str, body: &[u8]) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
-    let len = text_len(v.get("client_data").and_then(|c| c.get(HERON_BROOK_FEATURE)));
+/// 记下一份 bootstrap 回包里的 `client_data`（[`super::client_data`] 拆好交过来，回包里没有这一项时是空对象）。
+pub(crate) fn note_client_data(cred_id: i64, model: &str, data: &serde_json::Value) {
+    let len = text_len(data.get(HERON_BROOK_FEATURE));
     CLIENT_DATA.write().insert((cred_id, model_key(model)), len);
+}
+
+/// 忘掉这个号这个模型的那份（[`super::client_data`] 按号限条数，挤出去的一并清掉）。
+pub(crate) fn forget_client_data(cred_id: i64, model: &str) {
+    CLIENT_DATA.write().remove(&(cred_id, model_key(model)));
 }
 
 /// 从一份 eval 的 `features` 里记下这个号的文本：一份 eval 是整份特性缓存，没有这一项即按没下发记。
@@ -67,9 +72,8 @@ mod tests {
         let id = -93_201;
         assert_eq!(applied(id, "claude-haiku-5-5"), None, "没见过 bootstrap / eval 当没下发");
         let text = "x".repeat(2790);
-        let boot =
-            serde_json::json!({ "client_data": { "tengu_heron_brook": format!(" {text}\n") } });
-        note_bootstrap(id, "claude-haiku-5-5", boot.to_string().as_bytes());
+        let boot = serde_json::json!({ "tengu_heron_brook": format!(" {text}\n") });
+        note_client_data(id, "claude-haiku-5-5", &boot);
         assert_eq!(applied(id, "claude-haiku-5-5[1m]"), Some((2790, true)), "按 trim 后的长度");
         assert_eq!(applied(id, "claude-opus-5-5"), None, "client_data 按模型记");
 
@@ -79,8 +83,7 @@ mod tests {
         assert_eq!(applied(id, "claude-haiku-5-5"), Some((2790, true)), "client_data 优先");
 
         // 2.1.299 起的 bootstrap：没有这一项。
-        let boot = serde_json::json!({ "client_data": { "heather_vale": true } });
-        note_bootstrap(id, "claude-haiku-5-5", boot.to_string().as_bytes());
+        note_client_data(id, "claude-haiku-5-5", &serde_json::json!({ "heather_vale": true }));
         note_eval(id, &serde_json::Map::new());
         assert_eq!(applied(id, "claude-haiku-5-5"), None);
     }

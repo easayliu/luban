@@ -16,7 +16,7 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.310";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.311";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。原取自 `cap/2.1.258/00032`
@@ -27,10 +27,13 @@ pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.310";
 /// `prompt-caching-scope`），与 [`KEEPALIVE_USER_AGENT`] 同版。2.1.300 / 2.1.301 / 2.1.303 / 2.1.305 / 2.1.306 / 2.1.307 / 2.1.308 的会话级那份与 2.1.299 逐字相同
 /// （`cap/auto-2.1.300-20261015-full`、`cap/auto-2.1.301-20261016-full`、`cap/auto-2.1.303-20261019-full`、
 /// `cap/auto-2.1.305-20261021-full`、`cap/auto-2.1.306-20261021-full`、`cap/auto-2.1.307-20261022-full`、
-/// `cap/auto-2.1.308-20261022-full`；逐请求那份多出的 `cache-keepalive` 不进会话级）。
+/// `cap/auto-2.1.308-20261022-full`；逐请求那份多出的 `cache-keepalive` 不进会话级），2.1.309 / 2.1.310 也同
+/// （`cap/auto-2.1.309-20261023-full`、`cap/auto-2.1.310-20261024-full`）。2.1.311 起官方按公共 beta 规则表算会话级
+/// 那份，`thinking-token-count` 移出了那张表（[`CC_BETA_THINKING_TOKEN_COUNT`](super::CC_BETA_THINKING_TOKEN_COUNT)），
+/// 会话级那份不再带它、出站头里照带（`cap/auto-2.1.311-20261027-full` 一万多条会话级事件无一带它）。有测试钉着它
+/// 等于保活那一版 sonnet-5 主线程的会话级那份，升版时跟着换。
 pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
-    interleaved-thinking-2025-05-14,\
-    redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+    interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
     context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 
 /// 保活端点路径。

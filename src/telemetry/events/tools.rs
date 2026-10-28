@@ -533,6 +533,7 @@ impl EventBuilder<'_> {
             v308,
             v309,
             v310,
+            v311,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -624,6 +625,11 @@ impl EventBuilder<'_> {
             if v299 {
                 bash_meta_v299(&mut bash, command, &tu.result_head, &shape.model, false);
             }
+            // 2.1.311 的命令类别、耗时与 CPU（[`bash_meta_v311`]）：耗时从这次调用的外部时长推，转到后台的没有。
+            let usage = (v311 && !backgrounded).then(|| {
+                let h = (i64::from(req_hash % 1_000) + i).rem_euclid(100);
+                ShellUsage::from_external(bash_timing.map_or(0, |t| t.external), h)
+            });
             // meta 带着这条请求的模型（2.1.299 起）：顶层 `betas` 按这个模型取，子代理跑 haiku 时是 haiku 那份
             // （`cap/auto-2.1.308-20261022-gaps` claude-code-guide 里那条 Bash，事件与 Datadog 都是 6 项）。
             self.own_betas_scope = bash.get("model").is_some();
@@ -635,6 +641,9 @@ impl EventBuilder<'_> {
                     o.shift_remove("was_backgrounded");
                     o.insert("exit_code".into(), json!(exit_code_of(&tu.result_head)));
                 }
+                if v311 {
+                    bash_meta_v311(&mut bash, command, usage);
+                }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_failed", bash);
                 self.own_betas_scope = false;
                 let mut sad =
@@ -645,6 +654,9 @@ impl EventBuilder<'_> {
                 }
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
+                if v311 {
+                    bash_meta_v311(&mut bash, command, usage);
+                }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
                 self.own_betas_scope = false;
                 self.emit_bash_mentions(command, t_done, prev_msg);
@@ -791,8 +803,12 @@ impl EventBuilder<'_> {
             // （`cap/auto-2.1.308-20261022-full` A0 那条）只换了 chunk 名，2.1.309
             // （`cap/auto-2.1.309-20261023-full` A0 那条）摘要、行列、块名都换了，2.1.310
             // （`cap/auto-2.1.310-20261024-bashfail`：全量包里那次没有失败的 Bash，另用 `-p` 跑
-            // `ls` 不存在的目录补抓，同法在 2.1.309 上复现出 1a36b34122c0）摘要、行列、块名都换了。
-            if v310 {
+            // `ls` 不存在的目录补抓，同法在 2.1.309 上复现出 1a36b34122c0）摘要、行列、块名都换了，2.1.311
+            // （`cap/auto-2.1.311-20261027-bashfail`，同法补抓，同一次跑的 2.1.310 对照复现出 b26c68ea74b5）也都换了。
+            if v311 {
+                err["error_stack_hash"] = json!("11211b82294f");
+                err["error_top_frame"] = json!("chunk-2ht8z368.js:3554:6820");
+            } else if v310 {
                 err["error_stack_hash"] = json!("b26c68ea74b5");
                 err["error_top_frame"] = json!("chunk-31gxg38t.js:3618:6047");
             } else if v309 {

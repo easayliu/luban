@@ -503,7 +503,24 @@ pub(crate) fn build_forward_headers_for(
     // - CC 形态来访：仍走 [`merge_beta_for`]，按经验规则把订阅端多出来的几项补回官方位置。
     let incoming = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
     let beta = match sim {
-        Some(sim) => Some(simulated_beta_for(&sim.beta, incoming, beta_ctx.display_explicit)),
+        Some(sim) => {
+            // 模拟版本的官方客户端对这个模型不发 `context-1m`（2.1.311 起的原生 1M 模型）：来访那一项去掉，
+            // 见 [`super::simulation::Simulation::strip_context_1m`]。
+            let kept;
+            let incoming = if sim.strip_context_1m {
+                kept = incoming
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| beta_name(p) != beta_name(config::CC_BETA_CONTEXT_1M))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Some(kept.as_str())
+            } else {
+                incoming
+            };
+            Some(simulated_beta_for(&sim.beta, incoming, beta_ctx.display_explicit))
+        }
         None if flags.merge_beta => {
             // 来访自报的版本决定按哪一版的官方形态补，见 [`merge_beta_for`]。
             let version = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());

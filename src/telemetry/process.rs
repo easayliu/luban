@@ -27,6 +27,10 @@ impl Telemetry {
         prev_end_override: Option<SystemTime>,
     ) {
         let Some(mut shape) = shape else { return };
+        // 这条调用的事件里解析 shell 命令的总额度：建事件时拿着状态锁，命令是租户给的，见 [`super::bash_ast::ParseBudget`]。
+        let _parse_budget = super::bash_ast::ParseBudget::start(Duration::from_millis(
+            config::TELEMETRY_BASH_PARSE_BUDGET_MS,
+        ));
         // 体里没写 `cc_prompt_id`（billing-only 不往 header 里追加）就用会话链上那份，见 [`ApiCall::link_prompt_id`]。
         if shape.cc_prompt_id.is_none() {
             shape.cc_prompt_id = call.link_prompt_id.clone();
@@ -468,6 +472,9 @@ impl Telemetry {
         let v309 = version_at_least(&version, "2.1.309");
         // 2.1.310：失败 Bash 的错误栈摘要、行列、块名都换了（`cap/auto-2.1.310-20261024-bashfail`）。
         let v310 = version_at_least(&version, "2.1.310");
+        // 2.1.311：失败 Bash 的错误栈又换了（`cap/auto-2.1.311-20261027-bashfail`），Bash 事件多命令类别、耗时与
+        // CPU 那几项（[`super::tools::bash_meta_v311`]）。
+        let v311 = version_at_least(&version, "2.1.311");
         let safety_events = v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
         // 一条排队消息送达（`cap/2.1.280` 两条、`cap/2.1.285` 06:57:29.588）。
@@ -538,6 +545,32 @@ impl Telemetry {
         // 一条请求之前——有标题请求时是标题那条，紧挨它的 `sleepy_snowflake_applied`。标题请求里看不出主线程是哪个
         // 模型（opus 会话的标题同样是 haiku-5-5，却没有这一条），这里挂在主线程的首次输入上。
         // 段缓存清掉（压缩成功）之后的下一条主线程请求也重新组装，不论是不是新输入（自动压缩后接着的是续轮）。
+        // `<total_tokens>` 那一族（档位、用户轮、预算）由 bootstrap 的 `client_data` 给出时，官方算那一项的那一刻各报
+        // 一条 `tengu_lapis_anchor_from_client_data`（一个进程一次；2.1.309 起的可执行文件里都有）。会话钉住的那一档
+        // 与模拟路径同一份（[`crate::proxy::lapis_anchor::session_mode`]，只让主线程那条来钉），位置跟启动模板走
+        // （[`Subst::lapis`]）。system 与 messages 是客户端自己的两种（真实 CC 透传 [`ApiCall::client_tools`]、
+        // billing-only [`ApiCall::bare`]）另说，报不报看实际出站：体里（system、首轮环境说明、每轮跟的那条都算——
+        // 换了 system 的 Agent SDK / `--system-prompt` 提醒只在 messages 里）有没有 `<total_tokens>` 与号的这一档对得上
+        // 才报。第三方应用本来就不带提醒，号下发 off 时照报（官方拿到 off 就报这一条）；经网关的真实 CC 拿不到号的
+        // client_data、照默认发提醒，这时报 off 就与它的请求体自相矛盾，不报。
+        let own_system = call.client_tools || call.bare;
+        let lapis = if v309 {
+            let m = if is_main {
+                crate::proxy::lapis_anchor::session_mode(call.cred_id, &session_id, &display_model)
+            } else {
+                crate::proxy::lapis_anchor::peek_session_mode(
+                    call.cred_id,
+                    &session_id,
+                    &display_model,
+                )
+            };
+            m.client_data_events(own_system.then_some(crate::proxy::lapis_anchor::Observed {
+                reminders: shape.total_tokens_reminder,
+                max: shape.total_tokens_max,
+            }))
+        } else {
+            Vec::new()
+        };
         let heron = (v293 && is_main && (new_prompt || post_compaction) && !sess.heron_done)
             .then(|| crate::proxy::heron_brook::applied(call.cred_id, &display_model))
             .flatten();
@@ -605,7 +638,7 @@ impl Telemetry {
         let sess_turn_retry = sess.turn_retry_status;
         let session_cwd = sess.cwd.clone();
         let betas_full = call.betas.clone().unwrap_or_default();
-        let betas_own = session_betas(&betas_full);
+        let betas_own = session_betas(&betas_full, &version);
         // 子代理支线上的事件顶层 `betas` 报**主线程**那份；它自己的 `api_query` / `api_success` 报这条请求的
         // 完整串（与 meta 同值），`agent_tool_selected` / `agent_tool_completed` 与它里面的 Bash 报它这条请求过滤出
         // 的那份（`cap/2.1.285`：claude-code-guide 跑 haiku-4.5，API 事件是 11 项的完整串、收尾那条是
@@ -636,7 +669,7 @@ impl Telemetry {
             sess.main_betas.clone()
         } else if ctx_model != display_model {
             let v = crate::proxy::parse_version(&version);
-            session_betas(&crate::proxy::cc_main_beta_at(&ctx_model, v))
+            session_betas(&crate::proxy::cc_main_beta_at(&ctx_model, v), &version)
         } else {
             betas_own.clone()
         };
@@ -730,6 +763,7 @@ impl Telemetry {
             v308,
             v309,
             v310,
+            v311,
             safety_events,
             suggestion_fork,
             lucky_cerf,
@@ -750,6 +784,7 @@ impl Telemetry {
             snapshot,
             sleepy,
             heron,
+            lapis,
             tether,
             usage_before,
             ignored_suggestion,
@@ -1100,7 +1135,7 @@ impl Session {
         // 会话第一条就是侧查询时还是要写一次，否则整个会话的 beta 都是空的。
         self.version = version.to_string();
         if is_main || self.betas.is_empty() {
-            self.betas = session_betas(call.betas.as_deref().unwrap_or(""));
+            self.betas = session_betas(call.betas.as_deref().unwrap_or(""), version);
         }
         // 新一轮用户输入（只有主线程算）：prompt 计数 +1、换 prompt_id（优先用 billing header
         // 里客户端自己的）与 queryChainId、depth 归零。tool_result 续轮沿用上一轮的，depth +1。

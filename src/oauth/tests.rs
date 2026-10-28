@@ -348,6 +348,20 @@ fn a_recent_handshake_is_visible_to_the_keepalive_loop() {
     assert!(!super::handshake_recent(90_003, Duration::from_secs(1800)), "别的号不受影响");
 }
 
+/// 没挂到真实会话时保活事件顶层的 `betas`（[`crate::config::KEEPALIVE_EVENT_BETAS`]）就是保活那一版官方
+/// sonnet-5 主线程的会话级那份：跟着 [`crate::config::KEEPALIVE_USER_AGENT`] 升版时一起换（2.1.311 起不带
+/// `thinking-token-count`，`cap/auto-2.1.311-20261027-full`）。
+#[test]
+fn idle_event_betas_follow_the_keepalive_version() {
+    let version = super::keepalive_version();
+    let main =
+        crate::proxy::cc_main_beta_at("claude-sonnet-5", crate::proxy::parse_version(version));
+    assert_eq!(
+        crate::config::KEEPALIVE_EVENT_BETAS,
+        crate::telemetry::session_betas(&main, version)
+    );
+}
+
 /// 有近期真实会话时，保活事件与 Datadog 日志挂在那个会话的身份上：同一个 session_id /
 /// device_id / 版本 / 模型 / beta 串，`auth` 块带组织 id。没有时退回按账号派生的身份。
 #[sqlx::test]

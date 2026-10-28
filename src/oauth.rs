@@ -1328,13 +1328,16 @@ async fn conditional_get(
 
 /// 启动握手：`GET /api/claude_cli/bootstrap?entrypoint=cli&model=<规范名>`。
 ///
-/// 头形态取自 `cap/2.1.260-1/00029`（UA = `claude-code/<版本>`）。
+/// 头形态取自 `cap/2.1.260-1/00029`（UA = `claude-code/<版本>`）。`store` 只用来落 `client_data`。`model` 来自
+/// 来访请求体，先规整成规范名、不合规的换成默认那个再拼进 URL（[`crate::proxy::client_data::bootstrap_model`]）。
 pub async fn keepalive_bootstrap(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
     model: &str,
+    store: &crate::store::CredentialStore,
 ) -> KeepaliveResult {
+    let model = crate::proxy::client_data::bootstrap_model(model);
     let url = format!(
         "{}{}?entrypoint=cli&model={model}",
         config::UPSTREAM_BASE_URL,
@@ -1354,11 +1357,13 @@ pub async fn keepalive_bootstrap(
     .await;
     match resp {
         // 成功时读体：`client_data` 里的 `tengu_heron_brook` 决定遥测报不报那条
-        // `heron_brook_applied`（[`crate::proxy::heron_brook`]）。体几百字节，读不出来就当没拉到。
+        // `heron_brook_applied`（[`crate::proxy::heron_brook`]），`tengu_lapis_anchor` 决定模拟路径发不发
+        // `<total_tokens>`（[`crate::proxy::lapis_anchor`]）；整份按号按模型落库，重启后不必等下一次握手
+        // （[`crate::proxy::client_data`]）。体几百字节，读不出来就当没拉到。
         Ok(r) if r.status().is_success() => {
             let status = r.status().as_u16();
             if let Ok(body) = r.bytes().await {
-                crate::proxy::heron_brook::note_bootstrap(ctx.cred_id, model, &body);
+                crate::proxy::client_data::save_bootstrap(store, ctx.cred_id, &model, &body).await;
             }
             KeepaliveResult::from_status(status)
         }
@@ -1878,6 +1883,8 @@ pub struct HandshakeRunner {
     ///
     /// 故只给**模拟客户端**补：那种客户端根本不是 CC，不会自己发这些。
     public_traffic: bool,
+    /// bootstrap 回包里的 `client_data` 落库用，见 [`crate::proxy::client_data`]。
+    store: std::sync::Arc<crate::store::CredentialStore>,
 }
 
 impl HandshakeRunner {
@@ -1887,6 +1894,7 @@ impl HandshakeRunner {
         h: crate::telemetry::Handshake,
         organization_uuid: Option<String>,
         public_traffic: bool,
+        store: std::sync::Arc<crate::store::CredentialStore>,
     ) -> Self {
         note_handshake(cred.id);
         Self {
@@ -1895,6 +1903,7 @@ impl HandshakeRunner {
             cred_id: cred.id,
             cred_label: cred.label.clone(),
             public_traffic,
+            store,
         }
     }
 
@@ -1926,7 +1935,7 @@ impl HandshakeRunner {
             keepalive_penguin_mode(client, access_token),
             handshake_mcp_servers(client, access_token),
             self.maybe_registry(client),
-            keepalive_bootstrap(client, access_token, &self.ctx, &self.model),
+            keepalive_bootstrap(client, access_token, &self.ctx, &self.model, &self.store),
             handshake_code_triggers(client, access_token, &self.ctx),
             handshake_mcp_servers(client, access_token),
         );

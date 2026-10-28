@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.310."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.311."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.310."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.311."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1627,45 +1627,60 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.310-20261024-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.311-20261027-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、顶层键序、`thinking`、
-/// `context_management`、`thread`、基座、第四块、14 个内建工具都要与那个模型的官方主线程一致。
-/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00476` 是中断后重开那轮；
-/// `00276`、`00427`、`00330` 是各自首轮）；
-/// fable 只有 auto 模式的（`00624`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// `context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方主线程一致。
+/// opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00685` 是中断后重开那轮；
+/// `00377`、`00609`、`00463` 是各自首轮）；
+/// fable 只有 auto 模式的（`00920`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
-/// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`；2.1.310 这份抓包服务端已把
+/// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`；2.1.310 起这个号服务端已把
 /// 那个开关关了，官方串里本就没有）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
-/// 从第四块挪到基座）。
+/// 从第四块挪到基座）。抓包时服务端在 opus / sonnet 的 bootstrap 里下发了 `tengu_lapis_anchor:"off"`
+/// （[`crate::proxy::lapis_anchor`]），这里同样喂给测试号：这两族第四块与首轮都没有 `<total_tokens>`，其余三族照有。
 ///
 /// `effort` 与官方逐值相同（opus / sonnet / haiku-5-5 是 medium、fable 是 high、haiku-4.5 不带）。
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_310_captures() {
-    let dir = format!("{}/cap/auto-2.1.310-20261024-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_311_captures() {
+    let dir = format!("{}/cap/auto-2.1.311-20261027-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.310-20261024-full not present");
+        eprintln!("skipped: cap/auto-2.1.311-20261027-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
     // 清单是默认值；正文照 2.1.303 抓包那个号的 v4 第 1 组那段喂进去（`assets/cc_agent_cerf_text_v4.txt`）——
     // 2.1.305 起不再读这个开关，出站的 cerf 说明必须仍是内置正文、与抓包一致；2.1.307 起清单也不读，清单外的
     // opus-5-5 一样用 cerf 那版。用独立的号喂进去，不动别的用例共用的测试凭证。
-    let cred = crate::credentials::Credential { id: 9_310, ..test_cred() };
-    let eval = serde_json::json!({"features": {
-        "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
-            "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
-            "source": "defaultValue"},
-        "tengu_lucky_cerf_text": {"value": include_str!("../../assets/cc_agent_cerf_text_v4.txt"),
-            "source": "experiment", "experiment": {"key": "tengu_lucky_cerf_experiment_v4"},
-            "experimentResult": {"inExperiment": true, "variationId": 1}},
-        "tengu_sequential_cloud": {"value": {"enabled": true, "touchIntervalSeconds": 30,
-            "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
-    crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
-    for (n, auto_mode) in
-        [("00476", false), ("00276", false), ("00330", false), ("00427", false), ("00624", true)]
+    // 官方这五轮是五个独立会话（各自一个进程），`<total_tokens>` 那一档按会话钉住（[`crate::proxy::lapis_anchor`]），
+    // 每个模型用自己的号，免得前一轮钉住的会话带到下一轮。
+    let cred_for = |i: i64| {
+        let cred = crate::credentials::Credential { id: 93_110 + i, ..test_cred() };
+        let eval = serde_json::json!({"features": {
+            "tengu_lucky_cerf": {"value": ["claude-opus-5", "claude-fable-5", "claude-fable-5-1",
+                "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
+                "source": "defaultValue"},
+            "tengu_lucky_cerf_text": {"value": include_str!("../../assets/cc_agent_cerf_text_v4.txt"),
+                "source": "experiment", "experiment": {"key": "tengu_lucky_cerf_experiment_v4"},
+                "experimentResult": {"inExperiment": true, "variationId": 1}},
+            "tengu_sequential_cloud": {"value": {"enabled": true, "touchIntervalSeconds": 30,
+                "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"}}});
+        crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
+        // 抓包那天 bootstrap 的 `client_data`：opus / sonnet 下发 `tengu_lapis_anchor:"off"`，haiku 与 fable 没有这一项。
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let boot =
+                br#"{"client_data":{"cedar_basin":"2027-08-31","tengu_lapis_anchor":"off"}}"#;
+            crate::proxy::client_data::note_bootstrap(cred.id, model, boot);
+        }
+        cred
+    };
+    for (i, (n, auto_mode)) in
+        [("00685", false), ("00377", false), ("00463", false), ("00609", false), ("00920", true)]
+            .into_iter()
+            .enumerate()
     {
+        let cred = cred_for(i as i64);
         let path = files
             .iter()
             .find(|p| {
@@ -1751,7 +1766,7 @@ fn simulated_main_threads_match_the_2_1_310_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.310."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.311."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1760,7 +1775,7 @@ fn simulated_main_threads_match_the_2_1_310_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/04bc1f08-6625-4990-87f3-a5f40aefb98b/scratchpad/cal3",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/7a468bc9-fb57-4289-92bc-6d4c109c2ded/scratchpad/cal4",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -1778,11 +1793,15 @@ fn simulated_main_threads_match_the_2_1_310_captures() {
             "{model}"
         );
         let template = super::cc_system_rest(model).unwrap();
-        assert_eq!(
+        let rest = crate::proxy::lapis_anchor::fit_system_rest(
             crate::proxy::render_system_rest(template, &cap_env),
-            official_rest,
-            "{model}: 第四块按抓包机的环境回填后逐字节相同"
+            sim.lapis,
         );
+        assert_eq!(rest, official_rest, "{model}: 第四块按抓包机的环境回填后逐字节相同");
+        // `<total_tokens>` 跟这个号这个模型的下发走：有没有与官方那条一致（opus / sonnet 没有，其余有）。
+        let has_tt =
+            |x: &serde_json::Value| serde_json::to_string(x).unwrap().contains("<total_tokens>");
+        assert_eq!(has_tt(&v), has_tt(&official), "{model}（{n}）<total_tokens>");
 
         // 工具：注入的 14 个内建工具与官方那 14 个逐字节相同（顺序是官方的名字序）；opus-5-5、sonnet-5-5、
         // haiku-5-5、fable-5-1 的 `Agent` 是 cerf 那版、内置正文（[`crate::proxy::cc_tools_core_for`]）。
@@ -3108,4 +3127,139 @@ fn billing_only_sim_drops_the_thread_beta() {
         bare.beta,
         full.beta
     );
+}
+
+/// 2.1.311 起名字本身就是原生 1M 的模型带 `[1m]` 也不走 1M 那套（[`super::context_1m_beta_wanted`]）：官方不发
+/// `context-1m`，环境说明那行不写 `(1M context)` / `[1m]`（`cap/auto-2.1.311-20261027-full/00303`、`01392`）；
+/// 窗口本来不是 1M 的（haiku-4.5、opus-4.6）照旧，2.1.310 及以前一律照旧。
+#[test]
+fn native_1m_models_drop_the_1m_beta_from_2_1_311() {
+    let wanted = super::context_1m_beta_wanted;
+    let (v311, v310) = (Some((2, 1, 311)), Some((2, 1, 310)));
+    for m in
+        ["claude-opus-5-5[1m]", "claude-sonnet-5-5", "claude-fable-5-1[1M]", "claude-haiku-5-5"]
+    {
+        assert!(!wanted(m, v311), "{m}");
+        assert!(wanted(m, v310), "{m}");
+    }
+    assert!(!wanted("claude-opus-4-8-20260101[1m]", v311), "规范名后面跟日期也算");
+    for m in ["claude-haiku-4-5[1m]", "claude-opus-4-6[1m]", "claude-sonnet-4-6"] {
+        assert!(wanted(m, v311), "{m}");
+    }
+    // 遥测按会话主模型推主线程那份 beta 时同样跟版本走。
+    assert!(!crate::proxy::cc_main_beta_at("claude-opus-5-5[1m]", v311).contains("context-1m"));
+    assert!(crate::proxy::cc_main_beta_at("claude-opus-5-5[1m]", v310).contains("context-1m"));
+    assert!(crate::proxy::cc_main_beta_at("claude-haiku-4-5[1m]", v311).contains("context-1m"));
+
+    // 模拟路径（2.1.311）：第三方客户端自己带了 `context-1m` 来请求 opus-5-5，出站去掉它、环境说明按普通会话写；
+    // haiku-4.5 照带。
+    for (model, keeps) in [("claude-opus-5-5", false), ("claude-haiku-4-5", true)] {
+        let body = Bytes::from(format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"system":"你是助手","max_tokens":32000}}"#
+        ));
+        let mut headers = crate::proxy::HeaderMap::new();
+        headers.insert("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        let sim = crate::proxy::test_support::detect_with(&body, &headers, all_on()).unwrap();
+        assert_eq!(sim.context_1m, keeps, "{model}");
+        assert_eq!(sim.strip_context_1m, !keeps, "{model}");
+        let h = crate::proxy::build_forward_headers_for(
+            &headers,
+            "tok",
+            all_on(),
+            Some(&sim),
+            None,
+            Some(model),
+            false,
+            crate::proxy::BetaCtx::MAIN,
+        );
+        let beta = h["anthropic-beta"].to_str().unwrap();
+        assert_eq!(beta.contains("context-1m"), keeps, "{model}: {beta}");
+        let out = rewrite_body(&body, &test_cred(), "fp", all_on(), Some(&sim), None);
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(text.contains("(1M context)"), keeps, "{model}");
+    }
+}
+
+/// 号的 bootstrap 给这个模型下发了 `tengu_lapis_anchor:"off"`（[`crate::proxy::lapis_anchor`]）：模拟出站的第四块、
+/// 首轮环境说明与续轮跟在工具结果后面那条一概没有 `<total_tokens>`；没下发的号照旧都有。
+#[test]
+fn lapis_anchor_off_drops_every_total_tokens_reminder() {
+    let body = Bytes::from(
+        r#"{"model":"claude-opus-5-5","max_tokens":32000,"system":"你是助手","tools":[{"name":"run","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"list files"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"run","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt"}]}]}"#,
+    );
+    let run = |cred_id: i64| {
+        let cred = crate::credentials::Credential { id: cred_id, ..test_cred() };
+        let sim = crate::proxy::test_support::detect_as(&body, all_on(), &cred).unwrap();
+        let out = rewrite_body(&body, &cred, "fp", all_on(), Some(&sim), None);
+        (sim.lapis.reminders(), String::from_utf8(out.to_vec()).unwrap())
+    };
+    let boot = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+    crate::proxy::client_data::note_bootstrap(93_121, "claude-opus-5-5", boot);
+    let (on, text) = run(93_121);
+    assert!(!on);
+    assert!(!text.contains("<total_tokens>"), "{text}");
+    let (on, text) = run(93_122);
+    assert!(on);
+    assert!(text.matches("<total_tokens>").count() >= 2, "第四块与续轮那条都在: {text}");
+}
+
+/// 同一会话里无工具的侧查询（haiku）抢在主线程前面到：只看不钉，随后到的主线程（opus）照它自己那个模型的下发定档
+/// （官方按启动时的主模型读 `client_data`，见 [`crate::proxy::lapis_anchor::session_mode`]）。
+#[test]
+fn a_side_request_first_does_not_pin_the_lapis_mode() {
+    let cred = crate::credentials::Credential { id: 93_131, ..test_cred() };
+    let boot = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+    crate::proxy::client_data::note_bootstrap(cred.id, "claude-opus-5-5", boot);
+    let user_id = serde_json::json!({
+        "device_id": "a".repeat(64),
+        "account_uuid": "7766686b-9614-4e43-a874-0e1c11b9f180",
+        "session_id": "0f6b1a8c-1111-4222-8333-944455556666"
+    })
+    .to_string();
+    let side = Bytes::from(
+        serde_json::json!({"model":"claude-haiku-4-5","max_tokens":512,"system":"Name this chat.",
+            "messages":[{"role":"user","content":"hi"}],"metadata":{"user_id":user_id}})
+        .to_string(),
+    );
+    let main = Bytes::from(
+        serde_json::json!({"model":"claude-opus-5-5","max_tokens":32000,"system":"你是助手",
+            "tools":[{"name":"run","description":"d","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"hi"}],"metadata":{"user_id":user_id}})
+        .to_string(),
+    );
+    let s = crate::proxy::test_support::detect_as(&side, all_on(), &cred).unwrap();
+    assert!(s.lapis.reminders(), "haiku 那份没下发，按默认");
+    let m = crate::proxy::test_support::detect_as(&main, all_on(), &cred).unwrap();
+    assert_eq!(s.session_id, m.session_id, "同一会话");
+    assert!(!m.lapis.reminders(), "主线程照 opus 那份定档");
+}
+
+/// 号的 bootstrap 给这个模型下发了预算与「用户输入之后不跟」（[`crate::proxy::lapis_anchor`]）：第四块与首轮环境说明
+/// 写这个预算，工具结果之后那条从它往下数；新输入之后不再跟一条（首轮环境说明那条照有）。没下发的号照默认。
+#[test]
+fn lapis_budget_and_user_turn_shape_the_reminders() {
+    let tool_turn = Bytes::from(
+        r#"{"model":"claude-opus-5-5","max_tokens":32000,"system":"你是助手","tools":[{"name":"run","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"list files"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"run","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt"}]}]}"#,
+    );
+    let new_prompt = Bytes::from(
+        r#"{"model":"claude-opus-5-5","max_tokens":32000,"system":"你是助手","tools":[{"name":"run","description":"d","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"say hi"},{"role":"assistant","content":"hi"},{"role":"user","content":"and now?"}]}"#,
+    );
+    let boot = br#"{"client_data":{"tengu_lapis_anchor_budget":500000,"tengu_lapis_anchor_user_turn":false}}"#;
+    let run = |cred_id: i64, body: &Bytes, delivered: bool| {
+        if delivered {
+            crate::proxy::client_data::note_bootstrap(cred_id, "claude-opus-5-5", boot);
+        }
+        let cred = crate::credentials::Credential { id: cred_id, ..test_cred() };
+        let sim = crate::proxy::test_support::detect_as(body, all_on(), &cred).unwrap();
+        let out = rewrite_body(body, &cred, "fp", all_on(), Some(&sim), None);
+        String::from_utf8(out.to_vec()).unwrap()
+    };
+    let text = run(93_141, &tool_turn, true);
+    assert!(text.contains("<total_tokens>500000 tokens left</total_tokens>"), "{text}");
+    assert!(!text.contains("15000000 tokens left"), "{text}");
+    assert!(text.matches("<total_tokens>").count() >= 2, "第四块与续轮那条都在: {text}");
+
+    let quiet = run(93_142, &new_prompt, true).matches("<total_tokens>").count();
+    let usual = run(93_143, &new_prompt, false).matches("<total_tokens>").count();
+    assert_eq!(usual, quiet + 1, "新输入之后不再跟那一条");
 }

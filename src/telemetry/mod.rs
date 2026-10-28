@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::config;
 
 mod bash_ast;
+mod bash_kinds;
 mod call;
 mod compact;
 mod events;

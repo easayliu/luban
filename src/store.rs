@@ -30,6 +30,7 @@ use crate::credentials::{Credential, PRIORITY_DEFAULT, PRIORITY_MAX, PRIORITY_MI
 mod bans;
 mod billing;
 mod bindings;
+mod client_data;
 mod credential;
 pub mod db;
 mod flags;

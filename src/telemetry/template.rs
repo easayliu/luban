@@ -213,7 +213,9 @@ pub(super) static TEMPLATE_2_1_303_SDK: std::sync::LazyLock<Template> =
 /// 变的几处（摘要器收尾的 writer、auto 判决的 `skippedOnAllowRule`、压缩尝试的 `keepNoRound`、拒绝时的
 /// `tengu_safety_event`）都在按请求现算的事件里，见 `TurnFacts::v307`。2.1.308 也沿用：两版内嵌 JS 除版本号 /
 /// 构建时间外逐字相同，`cap/auto-2.1.308-20261022-full` 与 2.1.307-full 比多出的几个键都是场景分支。
-/// 2.1.309、2.1.310 也沿用；2.1.310 的 `org_config_gate_shadow` 多五项，在 [`emit_template`] 里按版本补。
+/// 2.1.309、2.1.310、2.1.311 也沿用；2.1.310 的 `org_config_gate_shadow` 多五项，2.1.311 的 `tengu_init` 多
+/// `config_dir_kind`、`<total_tokens>` 那档由 `client_data` 给出时多一条 `tengu_lapis_anchor_from_client_data`，都在
+/// [`emit_template`] 里按版本补。
 ///
 /// 这两份里 `org_config_gate_shadow` 跟服务端配置走的几项（`decision`、`exclusion_now`、`flag_*`、`grace_ttl_hours`、
 /// 两侧 `*_reason`）按 `cap/auto-2.1.310-20261024-full` 交互式启动那 14 条的主流值改过（`pass` / `rollout_percent` /
@@ -234,7 +236,7 @@ pub(super) static TEMPLATE_2_1_305_SDK: std::sync::LazyLock<Template> =
             .expect("assets/cc_telemetry_template_2_1_305_sdk.json must parse")
     });
 
-/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306 ~ 2.1.310）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
+/// 出站版本用哪一份模板：2.1.305 起（含 2.1.306 ~ 2.1.311）用 [`TEMPLATE_2_1_305`]，2.1.303 ~ 2.1.304 用 [`TEMPLATE_2_1_303`]，2.1.300 ~ 2.1.302 用 [`TEMPLATE_2_1_300`]，2.1.299 用 [`TEMPLATE_2_1_299`]，2.1.296 ~ 2.1.298 用 [`TEMPLATE_2_1_296`]，2.1.293 ~ 2.1.295 用 [`TEMPLATE_2_1_293`]，2.1.291 ~ 2.1.292 用
 /// [`TEMPLATE_2_1_291`]，2.1.285 ~ 2.1.290 用 [`TEMPLATE_2_1_285`]（`-p` 打印模式各用对应的 SDK
 /// 那份），之前的仍是 2.1.260 那份。
 pub(super) fn template_for(version: &str, sdk: bool) -> &'static Template {
@@ -438,7 +440,7 @@ pub(super) fn sample_dd_at(entry: &mut Value, roll: f64) -> bool {
     if roll >= rate {
         return false;
     }
-    insert_before(entry, "user_bucket", vec![("sample_rate", json!(rate))]);
+    insert_before(entry, "user_bucket", vec![("sample_rate", js_number(rate))]);
     true
 }
 
@@ -491,6 +493,12 @@ pub(super) struct Subst<'a> {
     /// 精简提示词」见 [`crate::proxy::lucky_cerf_exposures`]，一个进程每个一次见
     /// [`super::session::TurnFacts::lucky_cerf`]。
     pub(super) lucky_cerf: Vec<crate::proxy::LuckyCerfExposure>,
+    /// 这个会话的 `<total_tokens>` 那一族由 bootstrap 的 `client_data` 给出的几项（[`crate::proxy::lapis_anchor`]）：
+    /// 交互式在首次输入那段的 `tengu_mcp_instructions_pool_change` 之后、`-p` 在启动段的
+    /// `tengu_fork_subagent_enabled` 之前，按序各报一条 `tengu_lapis_anchor_from_client_data`（同一毫秒，
+    /// `cap/auto-2.1.311-20261027-full` 的 opus / sonnet 会话 12/14 有 `{mode}` 那条，交互式 `00072`、`-p` `01448`；
+    /// `{userTurn}` / `{budget}` 没有样本，跟在它后面）。
+    pub(super) lapis: Vec<Value>,
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -546,6 +554,9 @@ fn artifact_schema_delta(version: &str) -> u64 {
         // 那份 `Artifact.input_schema` 15438→15620 字符（compact JSON，官方按 round(字符/4) 估），3860→3905，
         // 交互式各族的 `non_mcp_tools_tokens` 15457→15502。真实 CC 经网关那份 schema 短，同一处改动是 +46，
         // 那边另算，见 [`gateway_tool_tokens`]。Bash 加的那句 `@name` 提示不进这个估算（`-p` 带 Bash 却仍是 7742）。
+        // 2.1.311 改写 `intent` 参数说明 +37：同一份资产 15620→15766 字符，3905→3942（`cap/auto-2.1.311-20261027-full`
+        // 交互式各族 15502→15539，`-p` 仍是 7742）。Bash 那句 `cd` 说明同样不进这个估算。
+        _ if version_at_least(version, "2.1.311") => 274 - 2 + 8 + 45 + 37,
         _ if version_at_least(version, "2.1.309") => 274 - 2 + 8 + 45,
         _ if version_at_least(version, "2.1.303") => 274 - 2 + 8,
         _ if version_at_least(version, "2.1.301") => 274 - 2,
@@ -581,6 +592,9 @@ fn gateway_tool_tokens(
     }
     let artifact_shortfall = match () {
         _ if sdk || artifact_off => 0,
+        // 2.1.311 没有网关样本：`intent` 说明那 146 字符在两种形态里是同一段，网关那份按 12614+146=12760 → 3190，
+        // 订阅端 3942，少 752（推算）。
+        _ if version_at_least(version, "2.1.311") => 752,
         _ if version_at_least(version, "2.1.309") => 751,
         _ => 752,
     };
@@ -955,6 +969,19 @@ where
                 ];
                 insert_after(&mut meta, "settings_cache_age_ms", pairs);
             }
+            // 2.1.311 起启动那条 `tengu_init` 在 `rendererEntryPath` 之后多一项 `config_dir_kind`：`CLAUDE_CONFIG_DIR`
+            // 没设时恒为 `unset`（`cap/auto-2.1.311-20261027-full` 交互式 16 条、`-p` 7 条都是；设了且与设置目录不同时
+            // 才再多一项 `config_dir_settings_kind`）。
+            if e.name == "tengu_init"
+                && version_at_least(subst.version, "2.1.311")
+                && meta.get("config_dir_kind").is_none()
+            {
+                insert_after(
+                    &mut meta,
+                    "rendererEntryPath",
+                    vec![("config_dir_kind", json!("unset"))],
+                );
+            }
             // 用户用环境变量关掉了这几个工具：启动遥测按名字排序列出全部已设的 `CLAUDE_CODE_*`
             // 变量（可执行文件里 `HCo()` 那段：收集后 `sort()`，`cap/auto-2.1.291-20261006` 三个都关
             // 的四个会话正是这三个名字），关了哪个列哪个。
@@ -978,7 +1005,18 @@ where
                 continue;
             }
             let c = ctx(t);
+            let lapis = |c: &EventCtx<'_>| {
+                let name = "tengu_lapis_anchor_from_client_data";
+                let at = |m: &Value| (t, id.event_at(e.stage, name, t, c, m.clone()));
+                subst.lapis.iter().map(at).collect::<Vec<_>>()
+            };
+            if subst.sdk && e.name == "tengu_fork_subagent_enabled" {
+                events.extend(lapis(&c));
+            }
             events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
+            if !subst.sdk && e.name == "tengu_mcp_instructions_pool_change" {
+                events.extend(lapis(&c));
+            }
             // 关掉 Artifact 的会话，启动计时那条之后紧跟一条「本会话 Artifact 已停用」（四族关掉的
             // 会话各一条，`mechanism: env`）。
             if v291
