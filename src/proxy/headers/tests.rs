@@ -1530,3 +1530,31 @@ fn explicit_display_drops_the_display_updates_beta() {
     let ctx = BetaCtx::of(Main, updates.to_string().as_bytes(), Some(&updates), &[]);
     assert!(!ctx.display_explicit, "updates 是默认态，不算显式");
 }
+
+/// 2.1.311 的 haiku-4.5 缺 `advanced-tool-use`（ToolSearch 标准模式）又没有 `effort`：补在 `advisor-tool` 后面那个
+/// `thinking-token-count` 之后，同官方 `cap/auto-2.1.311-20261027-full/00609`；2.1.310 那串里两者相邻，照旧紧跟。
+#[test]
+fn advanced_tool_use_follows_the_311_ttc() {
+    let haiku = Some("claude-haiku-4-5-20251001");
+    let ttc = config::CC_BETA_THINKING_TOKEN_COUNT;
+    let official = config::cc_profile_at(config::CcProfileKind::MainHaiku, Some((2, 1, 311))).beta;
+    let incoming: Vec<&str> = official
+        .split(',')
+        .map(str::trim)
+        .filter(|p| *p != config::CC_BETA_ADVANCED_TOOL_USE)
+        .collect();
+    let out = merge_beta(Some(&incoming.join(",")), haiku, Some((2, 1, 311)));
+    let want =
+        format!("{},{ttc},{}", config::CC_BETA_ADVISOR_TOOL, config::CC_BETA_ADVANCED_TOOL_USE);
+    assert!(out.contains(&want), "{out}");
+
+    let official = config::cc_profile_at(config::CcProfileKind::MainHaiku, Some((2, 1, 310))).beta;
+    let incoming: Vec<&str> = official
+        .split(',')
+        .map(str::trim)
+        .filter(|p| *p != config::CC_BETA_ADVANCED_TOOL_USE)
+        .collect();
+    let out = merge_beta(Some(&incoming.join(",")), haiku, Some((2, 1, 310)));
+    let want = format!("{},{}", config::CC_BETA_ADVISOR_TOOL, config::CC_BETA_ADVANCED_TOOL_USE);
+    assert!(out.contains(&want), "{out}");
+}

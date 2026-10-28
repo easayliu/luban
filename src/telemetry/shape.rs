@@ -1381,7 +1381,18 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
                 t.trim_start().starts_with("The user stepped away and is coming back.")
             });
             if shape.compact {
-                shape.compact_stats = Some(super::compact::compact_stats_of(msgs));
+                let mut st = super::compact::compact_stats_of(msgs);
+                // 重宣告的延迟工具池里已经没有的（断开的 MCP 之类）不点名：官方拿池子新增的那几个求交。
+                let pool: std::collections::HashSet<&str> = v
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| t.get("defer_loading").and_then(|d| d.as_bool()) == Some(true))
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                    .collect();
+                st.loaded_deferred.retain(|n| pool.contains(n.as_str()));
+                shape.compact_stats = Some(st);
             }
             // 进度摘要（官方 `di()` 那句提示：short 跟在笔记后头，full 单独一条）。
             if text.is_some_and(|t| t.contains("most recent action in 3-5 words")) {

@@ -82,8 +82,10 @@ pub(super) struct CompactStats {
     pub(super) kept_reads: Vec<String>,
     /// ToolSearch 加载过几次（`attachment_deferred_tools_record_count` 的估值）。
     pub(super) tool_search_loads: usize,
-    /// ToolSearch 结果里加载进来的延迟工具（`tool_reference` 的名字，去重、按先后）：2.1.311 压缩后重宣告延迟工具池时
-    /// 报它们的个数（`feature_sad{compact_names_loaded_tools}`，`cap/auto-2.1.311-20261027-full/00214` 三个）。
+    /// ToolSearch 结果里加载进来的延迟工具（`tool_reference` 的名字，去重、按先后），保留那组里还看得见的不算：2.1.311
+    /// 压缩后重宣告延迟工具池时报它们的个数（`feature_sad{compact_names_loaded_tools}`，
+    /// `cap/auto-2.1.311-20261027-full/00214` 三个）。官方 `EXt` 只数池子新增的里头、不在保留消息已加载
+    /// （`loadedNames`）的那几个；与池子求交在 [`super::shape::parse_shape`] 里做。
     pub(super) loaded_deferred: Vec<String>,
 }
 
@@ -260,6 +262,18 @@ pub(super) fn compact_stats_of(msgs: &[Value]) -> CompactStats {
                 })
                 .count()
         });
+        // 保留那组里 ToolSearch 结果还在，压完之后这些工具照样算已加载，官方不点名。
+        let kept_refs: HashSet<&str> = kept
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter_map(|b| b.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("tool_reference"))
+            .filter_map(|r| r.get("tool_name").and_then(|n| n.as_str()))
+            .collect();
+        st.loaded_deferred.retain(|n| !kept_refs.contains(n.as_str()));
         let mut dedup_ids: HashSet<&str> = HashSet::new();
         for m in &kept[1..] {
             if let Some(blocks) = m.get("content").and_then(|c| c.as_array()) {
@@ -368,7 +382,12 @@ mod tests {
             json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"ToolSearch","input":{}}]}),
             json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":refs(&["B","A","B"])}]}),
         ];
-        assert_eq!(compact_stats_of(&msgs).loaded_deferred, ["B", "A"]);
+        let mut earlier = msgs.clone();
+        earlier.push(json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}));
+        earlier.push(json!({"role":"user","content":[{"type":"text","text":"next"}]}));
+        assert_eq!(compact_stats_of(&earlier).loaded_deferred, ["B", "A"]);
+        // 保留那组（最后一条 assistant 起）里结果还在：一个都不点名。
+        assert!(compact_stats_of(&msgs).loaded_deferred.is_empty());
 
         let n = 200_000;
         let uses: Vec<Value> = (0..n)
@@ -383,6 +402,7 @@ mod tests {
         let msgs = vec![
             json!({"role":"assistant","content":uses}),
             json!({"role":"user","content":results}),
+            json!({"role":"assistant","content":[{"type":"text","text":"ok"}]}),
         ];
         let started = std::time::Instant::now();
         let st = compact_stats_of(&msgs);

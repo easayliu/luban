@@ -573,3 +573,13 @@ fn real_cc_handshake_uses_the_outbound_session_id() {
     assert_eq!(start(Some("outbound-sid")).session_id, "outbound-sid");
     assert_eq!(start(None).session_id, "client-sid", "没改写时就是客户端那个");
 }
+
+/// 额度探测的 beta 跟着会话版本：2.1.310 的会话照旧带 `thinking-token-count`，2.1.311 起不带。
+#[test]
+fn quota_probe_profile_follows_the_session_version() {
+    let ttc = config::CC_BETA_THINKING_TOKEN_COUNT;
+    assert!(super::quota_probe_profile("2.1.310").beta.contains(ttc));
+    assert_eq!(super::quota_probe_profile("2.1.310").version, "2.1.310");
+    assert!(!super::quota_probe_profile("2.1.311").beta.contains(ttc));
+    assert!(!super::quota_probe_profile("garbage").beta.contains(ttc), "读不出按当前模拟版本");
+}

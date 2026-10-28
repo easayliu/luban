@@ -727,6 +727,15 @@ pub(crate) async fn handshake_sequence(
     );
 }
 
+/// 额度探测的 profile 跟着会话版本取（与 [`send_quota_probe`] 里的 UA 同理）：2.1.311 起这条不带
+/// `thinking-token-count`，2.1.310 及更早的会话里照旧带。读不出版本时按当前模拟版本。
+fn quota_probe_profile(version: &str) -> &'static config::CcProfile {
+    match super::parse_version(version) {
+        Some(v) => config::cc_profile_at(config::CcProfileKind::QuotaProbe, Some(v)),
+        None => config::cc_profile(config::CcProfileKind::QuotaProbe),
+    }
+}
+
 /// 官方启动串里那条额度探测：`POST /v1/messages?beta=true`，haiku、`max_tokens:1`、
 /// 正文就一个词 `quota`（`cap/2.1.260-2/00004`）。
 ///
@@ -752,10 +761,11 @@ pub(crate) async fn send_quota_probe(
     flags: store::ForwardFlags,
 ) {
     let model = QUOTA_PROBE_MODEL;
+    let profile = quota_probe_profile(version);
     let sim = Simulation {
         base: None,
-        profile: config::cc_profile(config::CcProfileKind::QuotaProbe),
-        beta: config::cc_profile(config::CcProfileKind::QuotaProbe).beta.into(),
+        profile,
+        beta: profile.beta.into(),
         session_id: session_id.to_string(),
         // 额度探测不在会话链上：官方那条既没有 billing header，也没有 `diagnostics`。
         link: CcSessionLink::default(),

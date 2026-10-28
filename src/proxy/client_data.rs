@@ -5,6 +5,7 @@
 //! 回来之前就按上一份定了。luban 原先只记在内存，重启后到这个号这个模型下一次握手之前都是空的——进行中的会话中途
 //! 换档（system 末块、首轮环境说明、每轮提醒一起变，整段缓存重写），每个（号, 模型）重启后的第一个新会话也定错。
 //! 现在整份落库（`client_data` 表）：回包与上次落库的那份不同才写（[`save_bootstrap`]），启动时读回（[`restore`]）。
+//! 同一个号的握手可以并发，登记、挤出删库与写库按号串行（[`CRED_LOCKS`]），免得慢的旧操作后落库盖掉新的。
 //!
 //! 模型名是来访给的（握手拿请求体里的 `model` 去拉 bootstrap），换着名字开会话就能造出任意多份。官方本机最多存 12 个
 //! 槽位（`rM`，槽位还分入口与版本，满了丢最旧的）；luban 只分模型，每个号留最近拉过的 [`MODELS_PER_CRED`] 个，挤出去的
@@ -15,7 +16,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::store::CredentialStore;
@@ -31,6 +32,16 @@ struct Slot {
     model: String,
     persisted: Option<serde_json::Value>,
     seen: Instant,
+}
+
+/// 号 → 它的落库锁：[`save_bootstrap`] 从记下回包到挤出删库、写库整段拿着。锁不放在槽位里——槽位会被挤掉再建，
+/// 新建的槽位若带新锁，挤出前还在库上 await 的旧写入 / 删除就绕过了它（旧值盖新值、删掉刚写的那行）。
+/// 号的个数有限，条目不回收。
+static CRED_LOCKS: LazyLock<parking_lot::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+fn cred_lock(cred_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    CRED_LOCKS.lock().entry(cred_id).or_default().clone()
 }
 
 /// 号 → 它记着的那几个模型（至多 [`MODELS_PER_CRED`] 个）。
@@ -107,12 +118,17 @@ fn touch(cred_id: i64, model: &str, data: &serde_json::Value, now: Instant) -> (
 
 /// 同 [`note_bootstrap`]，并且与上次落库的那份不同就写进 `client_data` 表；这个号记着的模型超过
 /// [`MODELS_PER_CRED`] 个就挤掉最久没拉过的那个（内存与库一起）。写失败只告警，下一份回包再试。
+///
+/// 整段拿着这个号的落库锁（[`CRED_LOCKS`]），内存里的开关、槽位与库按拿到锁的先后一份一份变。不串行的话，库里已是
+/// A、旧回包 B 正在写时最新的 A 又到了，比的还是 A 便跳过，B 写完库里就成了旧的；挤出删库与重新写入同理。
 pub(crate) async fn save_bootstrap(
     store: &CredentialStore,
     cred_id: i64,
     model: &str,
     body: &[u8],
 ) {
+    let lock = cred_lock(cred_id);
+    let _guard = lock.lock().await;
     let Some(data) = note_bootstrap(cred_id, model, body) else { return };
     let key = model_key(model);
     let (write, evicted) = touch(cred_id, &key, &data, Instant::now());
@@ -300,6 +316,93 @@ mod tests {
         let want = serde_json::json!({ "cedar_basin": "2027-08-31" });
         assert_eq!(stored().await, vec![(id, "claude-opus-5-5".to_string(), want)]);
         assert!(lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5").reminders());
+    }
+
+    /// 同一个号的回包并发落库：按拿到号锁的先后一份一份来，后到的 A 落在先到的 B 之后，库里与内存都是 A。
+    #[sqlx::test]
+    async fn a_stale_concurrent_bootstrap_does_not_win(pool: sqlx::PgPool) {
+        let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+        let id = 93_406;
+        sqlx::query(
+            "INSERT INTO credentials (id, access_token, refresh_token, expires_at) \
+             VALUES ($1, 'a', 'r', 0)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let model = "claude-opus-5-5";
+        let a = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+        let b = br#"{"client_data":{}}"#;
+        save_bootstrap(&store, id, model, a).await;
+
+        // 占住号锁，相当于前一份正在写；B 先到、A 后到，都排在锁后面。
+        let lock = cred_lock(id);
+        let guard = lock.lock().await;
+        let tb = tokio::spawn({
+            let store = store.clone();
+            async move { save_bootstrap(&store, id, model, b).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ta = tokio::spawn({
+            let store = store.clone();
+            async move { save_bootstrap(&store, id, model, a).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(guard);
+        tb.await.unwrap();
+        ta.await.unwrap();
+
+        let rows = store.all_client_data().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let stored: serde_json::Value = serde_json::from_str(&rows[0].2).unwrap();
+        assert_eq!(stored, serde_json::json!({ "tengu_lapis_anchor": "off" }));
+        assert_eq!(persisted(id, model), Some(stored));
+    }
+
+    /// 挤出与重新拉到同一个模型并发：挤掉 M 的那次（删库）排在前、重新拉到 M 的那次（写库）排在后，库里留着 M，
+    /// 内存里记的「已落库」与库一致。
+    #[sqlx::test]
+    async fn an_eviction_racing_a_reinsert_keeps_the_new_row(pool: sqlx::PgPool) {
+        let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+        let id = 93_407;
+        sqlx::query(
+            "INSERT INTO credentials (id, access_token, refresh_token, expires_at) \
+             VALUES ($1, 'a', 'r', 0)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let off = br#"{"client_data":{"tengu_lapis_anchor":"off"}}"#;
+        // M 最早拉过，号上正好记满。
+        save_bootstrap(&store, id, "claude-m", off).await;
+        for i in 1..MODELS_PER_CRED {
+            save_bootstrap(&store, id, &format!("claude-other-{i}"), off).await;
+        }
+
+        let lock = cred_lock(id);
+        let guard = lock.lock().await;
+        let evict = tokio::spawn({
+            let store = store.clone();
+            async move { save_bootstrap(&store, id, "claude-new", off).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reinsert = tokio::spawn({
+            let store = store.clone();
+            async move { save_bootstrap(&store, id, "claude-m", off).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(guard);
+        evict.await.unwrap();
+        reinsert.await.unwrap();
+
+        let models: Vec<String> =
+            store.all_client_data().await.unwrap().into_iter().map(|(_, m, _)| m).collect();
+        assert!(models.contains(&"claude-m".to_string()), "{models:?}");
+        assert!(models.contains(&"claude-new".to_string()), "{models:?}");
+        assert_eq!(models.len(), MODELS_PER_CRED);
+        assert!(persisted(id, "claude-m").is_some());
     }
 
     /// 一个号换着模型名拉 bootstrap：只留最近拉过的 [`MODELS_PER_CRED`] 个，最久没拉过的那个连同内存里开关的条目

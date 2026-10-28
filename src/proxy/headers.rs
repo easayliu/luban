@@ -23,10 +23,9 @@ use super::uuid_from_bytes;
 ///
 /// - [`config::OAUTH_BETA_HEADER`]：OAuth 鉴权必需。客户端串以
 ///   [`config::CC_BETA_CLAUDE_CODE`] 开头就插它后面，否则插最前（haiku 即后者）。
-/// - [`config::CC_BETA_ADVANCED_TOOL_USE`]：有 [`config::CC_BETA_EFFORT`] 就插它前面；没有
-///   （haiku）就插在 [`config::CC_BETA_ADVISOR_TOOL`] 之后（2.1.251 起 haiku 的官方串是
-///   `…claude-code,advisor-tool,advanced-tool-use,server-side-fallback…`）；两个都没有
-///   （2.1.220 的 haiku）才跟在客户端自有串之后。
+/// - [`config::CC_BETA_ADVANCED_TOOL_USE`]：插在 [`config::CC_BETA_ADVISOR_TOOL`] 之后（2.1.251 起各族官方串
+///   都是 `…advisor-tool,advanced-tool-use…`；2.1.311 起中间夹着 `thinking-token-count`，就插它后面）；没有
+///   `advisor-tool` 就插 [`config::CC_BETA_EFFORT`] 前面；两个都没有（2.1.220 的 haiku）才跟在客户端自有串之后。
 /// - [`config::CC_BETA_PROMPT_CACHING_SCOPE`]：补在 [`config::CC_BETA_CONTEXT_MANAGEMENT`] 之后（直连官方的位置），没有那一项
 ///   才追加队尾。2.1.306 及以前客户端都自带；2.1.307 起经自定义 BASE_URL 来的不带，每条都走到这里，只补 `oauth`
 ///   的辅助调用也一样补（只认自报 2.1.307 及以上的；`count_tokens` 官方不带，不补）。
@@ -171,8 +170,14 @@ pub(crate) fn merge_beta_for(
         parts.insert(at, config::OAUTH_BETA_HEADER.to_string());
     }
     if !has(&parts, config::CC_BETA_ADVANCED_TOOL_USE) {
-        let at = pos(&parts, config::CC_BETA_EFFORT)
-            .or_else(|| pos(&parts, config::CC_BETA_ADVISOR_TOOL).map(|i| i + 1))
+        // 官方各版都紧跟 `advisor-tool`；2.1.311 起两者之间夹着 `thinking-token-count`，跳过它。
+        let at = pos(&parts, config::CC_BETA_ADVISOR_TOOL)
+            .map(|i| {
+                let ttc =
+                    parts.get(i + 1).is_some_and(|p| p == config::CC_BETA_THINKING_TOKEN_COUNT);
+                i + 1 + usize::from(ttc)
+            })
+            .or_else(|| pos(&parts, config::CC_BETA_EFFORT))
             .or_else(|| pos(&parts, config::CC_BETA_PER_TURN_CONTROL).map(|i| i + 1))
             .unwrap_or(parts.len());
         parts.insert(at, config::CC_BETA_ADVANCED_TOOL_USE.to_string());
