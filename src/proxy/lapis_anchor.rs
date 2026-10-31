@@ -27,6 +27,14 @@
 //! 两处都没见过的（号, 模型）按默认那档。
 //! luban 只做得出 `padded-countdown` 与 `off` 两档，下发了别的档（`infinite` / `fixed` / `countdown`）时照
 //! `padded-countdown` 发；eval 给的预算不是整数时按没下发算（倒数按整数记）。
+//!
+//! 档位还要看模型有没有 `total_tokens_reminder` 这项能力（官方 `wZ()` / 2.1.314 `Fee()`：`client_data` 给了档位就用它，
+//! 否则有这项能力才轮到 eval 与默认，没有就是 `off`；eval 那条管不到没有能力的模型）。2.1.312 及以前内置模型目录里
+//! 每个模型都带它；2.1.314 的目录把 opus-5-5、sonnet-5-5 的去掉了（haiku、fable 等照旧），于是这两个模型没有下发档位
+//! 时不发提醒——`cap/auto-2.1.314-20261030-full` 里 fable 会话（bootstrap 不带档位）派出的 opus 子代理少了
+//! `<total_tokens>15000000 tokens left</total_tokens>`，2.1.312 那次同一场景照带。能力本身也能由 bootstrap 的
+//! `client_data` 打开（官方 `NP`：这一项恰为 `true` 才算，另报 `tengu_model_capability_from_client_data`；没见过这种
+//! 下发，不报），见 [`has_capability`]。
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -40,6 +48,8 @@ const FEATURE: &str = "tengu_lapis_anchor";
 const BUDGET_FEATURE: &str = "tengu_lapis_anchor_budget";
 /// 用户输入之后跟不跟。
 const USER_TURN_FEATURE: &str = "tengu_lapis_anchor_user_turn";
+/// 模型能力名（内置目录里的 `capabilities`，`client_data` 里同名一项能把它打开）。
+const CAPABILITY: &str = "total_tokens_reminder";
 
 /// 默认预算（官方 `tnn`）：1500 万，同 [`super::session_link::TOTAL_TOKENS_BUDGET`]。
 pub(crate) const DEFAULT_BUDGET: u64 = super::session_link::TOTAL_TOKENS_BUDGET;
@@ -112,6 +122,8 @@ struct Delivered {
     mode: Option<Mode>,
     budget: Option<u64>,
     user_turn: Option<bool>,
+    /// `client_data` 把 [`CAPABILITY`] 打开了（恰为 `true`）。eval 那份没有这一项。
+    capability: bool,
 }
 
 impl Delivered {
@@ -121,6 +133,7 @@ impl Delivered {
             mode: Mode::parse(data.get(FEATURE)),
             budget: data.get(BUDGET_FEATURE).and_then(positive_integer),
             user_turn: data.get(USER_TURN_FEATURE).and_then(Value::as_bool),
+            capability: data.get(CAPABILITY) == Some(&Value::Bool(true)),
         }
     }
 
@@ -133,6 +146,7 @@ impl Delivered {
             mode: Mode::parse(value(FEATURE).filter(|v| v.is_string())),
             budget: value(BUDGET_FEATURE).and_then(positive_integer),
             user_turn: value(USER_TURN_FEATURE).map(js_truthy),
+            capability: false,
         }
     }
 }
@@ -240,8 +254,19 @@ pub(crate) fn note_eval(cred_id: i64, features: &serde_json::Map<String, Value>)
     EVAL.write().insert(cred_id, Delivered::of_eval(features));
 }
 
-/// 这个号用 `model` 当主模型时现在该是哪一档（不钉住，见 [`session_mode`]）。
-fn current(cred_id: i64, model: &str) -> SessionMode {
+/// `version` 那一版官方客户端的内置模型目录里，`model` 带不带 [`CAPABILITY`]：2.1.314 起 opus-5-5、sonnet-5-5 不带
+/// （认规范名，`[1m]`、日期这类尾巴照认），别的模型与更早的版本都带。读不出版本的按最新那版。
+fn has_capability(model: &str, version: &str) -> bool {
+    if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 314)) {
+        return true;
+    }
+    let canon = super::curious_tower::canonical_model(model);
+    let canon = canon.strip_suffix("[1m]").unwrap_or(&canon);
+    !matches!(canon, "claude-opus-5-5" | "claude-sonnet-5-5")
+}
+
+/// 这个号用 `model` 当主模型、客户端是 `version` 时现在该是哪一档（不钉住，见 [`session_mode`]）。
+fn current(cred_id: i64, model: &str, version: &str) -> SessionMode {
     let client = CLIENT_DATA.read().get(&(cred_id, model_key(model))).copied().unwrap_or_default();
     let eval = EVAL.read().get(&cred_id).copied().unwrap_or_default();
     fn pick<T: Copy>(client: Option<T>, eval: Option<T>, default: T) -> (T, bool) {
@@ -250,7 +275,13 @@ fn current(cred_id: i64, model: &str) -> SessionMode {
             None => (eval.unwrap_or(default), false),
         }
     }
-    let (mode, from_client_data) = pick(client.mode, eval.mode, Mode::PaddedCountdown);
+    // 没有这项能力时 eval 与默认都轮不到，`client_data` 没给档位就是 off（官方 `Fee()` 的 `NP(…) ? … : "off"`）。
+    let eval_mode = if client.capability || has_capability(model, version) {
+        eval.mode
+    } else {
+        Some(Mode::Off)
+    };
+    let (mode, from_client_data) = pick(client.mode, eval_mode, Mode::PaddedCountdown);
     let (budget, budget_from_client_data) = pick(client.budget, eval.budget, DEFAULT_BUDGET);
     let (user_turn, user_turn_from_client_data) = pick(client.user_turn, eval.user_turn, true);
     SessionMode {
@@ -280,16 +311,34 @@ static PINS: LazyLock<parking_lot::Mutex<HashMap<(i64, String), Pinned>>> =
 /// 只该由会话**主线程**的请求来钉：官方按进程启动时的主模型拉 bootstrap、读那个模型的 `client_data`，同一会话里的
 /// 标题、侧查询用的是别的模型（haiku），让它们抢先钉住就把主线程定成了那个模型的档。别的请求用
 /// [`peek_session_mode`]。
-pub(crate) fn session_mode(cred_id: i64, session_id: &str, model: &str) -> SessionMode {
-    session_mode_at(cred_id, session_id, model, true)
+///
+/// `version` 是这个会话的客户端版本（模拟路径是 profile 那一版），见 [`has_capability`]。
+pub(crate) fn session_mode(
+    cred_id: i64,
+    session_id: &str,
+    model: &str,
+    version: &str,
+) -> SessionMode {
+    session_mode_at(cred_id, session_id, model, version, true)
 }
 
 /// 同 [`session_mode`]，但会话还没钉时只看现在该是哪一档、不钉住（标题、侧查询这类非主线程请求用）。
-pub(crate) fn peek_session_mode(cred_id: i64, session_id: &str, model: &str) -> SessionMode {
-    session_mode_at(cred_id, session_id, model, false)
+pub(crate) fn peek_session_mode(
+    cred_id: i64,
+    session_id: &str,
+    model: &str,
+    version: &str,
+) -> SessionMode {
+    session_mode_at(cred_id, session_id, model, version, false)
 }
 
-fn session_mode_at(cred_id: i64, session_id: &str, model: &str, pin: bool) -> SessionMode {
+fn session_mode_at(
+    cred_id: i64,
+    session_id: &str,
+    model: &str,
+    version: &str,
+    pin: bool,
+) -> SessionMode {
     let now = Instant::now();
     let mut map = PINS.lock();
     let key = (cred_id, session_id.to_string());
@@ -299,7 +348,7 @@ fn session_mode_at(cred_id: i64, session_id: &str, model: &str, pin: bool) -> Se
                 entry.1 = now;
                 entry.0
             }
-            _ => current(cred_id, model),
+            _ => current(cred_id, model, version),
         };
     }
     if map.len() >= PIN_CAP {
@@ -311,9 +360,9 @@ fn session_mode_at(cred_id: i64, session_id: &str, model: &str, pin: bool) -> Se
             map.retain(|_, (_, s)| *s >= cut);
         }
     }
-    let entry = map.entry(key).or_insert_with(|| (current(cred_id, model), now));
+    let entry = map.entry(key).or_insert_with(|| (current(cred_id, model, version), now));
     if now.duration_since(entry.1) >= PIN_IDLE {
-        entry.0 = current(cred_id, model);
+        entry.0 = current(cred_id, model, version);
     }
     entry.1 = now;
     entry.0
@@ -349,7 +398,7 @@ mod tests {
     #[test]
     fn follows_what_the_server_delivered() {
         let id = -93_311;
-        let fresh = current(id, "claude-opus-5-5");
+        let fresh = current(id, "claude-opus-5-5", "2.1.312");
         assert_eq!(fresh, SessionMode::DEFAULT);
         assert!(fresh.reminders(), "没见过 bootstrap / eval 按默认那档发");
 
@@ -358,29 +407,32 @@ mod tests {
         note_client_data(id, "claude-opus-5-5", &off);
         let plain = json!({ "cedar_basin": "2027-08-31" });
         note_client_data(id, "claude-haiku-5-5", &plain);
-        let got = current(id, "claude-opus-5-5[1m]");
+        let got = current(id, "claude-opus-5-5[1m]", "2.1.312");
         assert_eq!(mode_of(got), (Mode::Off, true));
         assert!(!got.reminders());
-        assert!(current(id, "claude-haiku-5-5").reminders(), "client_data 按模型记");
+        assert!(current(id, "claude-haiku-5-5", "2.1.312").reminders(), "client_data 按模型记");
 
         // eval 只在 client_data 没给时起作用，且只认合法的模式串（官方 `rnn()`）：`false` 在这里不算 off。
         let eval = json!({ FEATURE: { "value": "off" } });
         note_eval(id, eval.as_object().unwrap());
-        assert_eq!(mode_of(current(id, "claude-haiku-5-5")), (Mode::Off, false));
+        assert_eq!(mode_of(current(id, "claude-haiku-5-5", "2.1.312")), (Mode::Off, false));
         let eval = json!({ FEATURE: { "value": false } });
         note_eval(id, eval.as_object().unwrap());
-        assert_eq!(current(id, "claude-haiku-5-5").mode, Mode::PaddedCountdown);
+        assert_eq!(current(id, "claude-haiku-5-5", "2.1.312").mode, Mode::PaddedCountdown);
         // client_data 那份的 `false` 才记作 off（官方 `snn()`）。
         note_client_data(id, "claude-haiku-5-5", &json!({ FEATURE: false }));
-        assert_eq!(mode_of(current(id, "claude-haiku-5-5")), (Mode::Off, true));
+        assert_eq!(mode_of(current(id, "claude-haiku-5-5", "2.1.312")), (Mode::Off, true));
 
         // 不认识的值当没下发。
         note_client_data(id, "claude-fable-5-1", &json!({ FEATURE: "sometimes" }));
-        assert!(!current(id, "claude-fable-5-1").from_client_data);
+        assert!(!current(id, "claude-fable-5-1", "2.1.312").from_client_data);
 
         // 挤出去的那份忘掉，回到 eval / 默认。
         forget_client_data(id, "claude-opus-5-5");
-        assert_eq!(mode_of(current(id, "claude-opus-5-5")), (Mode::PaddedCountdown, false));
+        assert_eq!(
+            mode_of(current(id, "claude-opus-5-5", "2.1.312")),
+            (Mode::PaddedCountdown, false)
+        );
     }
 
     /// 预算与用户轮两项：`client_data` 优先，eval 兜底，各自独立于档位；取值规则照官方 `Utr()` / `jtr()`。
@@ -393,7 +445,7 @@ mod tests {
             USER_TURN_FEATURE: { "value": 0 },
         });
         note_eval(id, eval.as_object().unwrap());
-        let m = current(id, model);
+        let m = current(id, model, "2.1.312");
         assert_eq!((m.budget, m.budget_from_client_data), (2_000_000, false));
         assert_eq!(
             (m.user_turn, m.user_turn_from_client_data),
@@ -406,20 +458,20 @@ mod tests {
             model,
             &json!({ BUDGET_FEATURE: 500_000.0, USER_TURN_FEATURE: true, FEATURE: "padded-countdown" }),
         );
-        let m = current(id, model);
+        let m = current(id, model, "2.1.312");
         assert_eq!((m.budget, m.budget_from_client_data), (500_000, true), "整数值的浮点也算");
         assert_eq!((m.user_turn, m.user_turn_from_client_data), (true, true));
         assert_eq!(mode_of(m), (Mode::PaddedCountdown, true));
 
         // client_data 里不合法的（非整数、非正、不是布尔）当没下发，落回 eval。
         note_client_data(id, model, &json!({ BUDGET_FEATURE: 1.5, USER_TURN_FEATURE: "no" }));
-        let m = current(id, model);
+        let m = current(id, model, "2.1.312");
         assert_eq!((m.budget, m.user_turn), (2_000_000, false));
         // eval 的 `null` 与没有这一项一样落到默认。
         let eval =
             json!({ BUDGET_FEATURE: { "value": null }, USER_TURN_FEATURE: { "value": null } });
         note_eval(id, eval.as_object().unwrap());
-        let m = current(id, model);
+        let m = current(id, model, "2.1.312");
         assert_eq!((m.budget, m.user_turn), (DEFAULT_BUDGET, true));
     }
 
@@ -460,14 +512,56 @@ mod tests {
         assert_eq!(all.client_data_events(seen(true, Some(500_000))).len(), 2);
     }
 
+    /// 2.1.314 的内置目录里 opus-5-5、sonnet-5-5 不带 `total_tokens_reminder`：没有下发档位时这两个模型是 off，
+    /// eval 的档位也管不到它们；别的模型、更早的版本照旧。`client_data` 的档位照样优先，能力也能由它打开
+    /// （恰为 `true` 才算）。
+    #[test]
+    fn opus_and_sonnet_lose_the_capability_at_2_1_314() {
+        let id = -93_315;
+        for model in ["claude-opus-5-5", "claude-opus-5-5[1m]", "claude-sonnet-5-5"] {
+            assert_eq!(mode_of(current(id, model, "2.1.314")), (Mode::Off, false), "{model}");
+            assert!(current(id, model, "2.1.312").reminders(), "{model}: 2.1.312 照旧有");
+        }
+        for model in ["claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5-1", "claude-opus-4-8"]
+        {
+            assert_eq!(current(id, model, "2.1.314"), SessionMode::DEFAULT, "{model}");
+        }
+        // eval 下发的档位管不到没有能力的模型（官方 `Fee()` 里 eval 那条在能力判断之后）。
+        let eval = json!({ FEATURE: { "value": "padded-countdown" } });
+        note_eval(id, eval.as_object().unwrap());
+        assert!(!current(id, "claude-opus-5-5", "2.1.314").reminders());
+        // `client_data` 给了档位就按它。
+        note_client_data(id, "claude-sonnet-5-5", &json!({ FEATURE: "padded-countdown" }));
+        assert_eq!(
+            mode_of(current(id, "claude-sonnet-5-5", "2.1.314")),
+            (Mode::PaddedCountdown, true)
+        );
+        // 能力由 `client_data` 打开：恰为 `true` 才算，之后档位照 eval / 默认。
+        note_client_data(id, "claude-opus-5-5", &json!({ CAPABILITY: "yes" }));
+        assert!(!current(id, "claude-opus-5-5", "2.1.314").reminders());
+        note_client_data(id, "claude-opus-5-5", &json!({ CAPABILITY: true }));
+        assert_eq!(
+            mode_of(current(id, "claude-opus-5-5", "2.1.314")),
+            (Mode::PaddedCountdown, false)
+        );
+        // 会话照样按头一回问到的那档钉住。
+        let id = -93_316;
+        assert!(!session_mode(id, "s-1", "claude-opus-5-5", "2.1.314").reminders());
+        assert!(session_mode(id, "s-2", "claude-opus-5-5", "2.1.312").reminders());
+    }
+
     #[test]
     fn a_session_keeps_the_mode_it_started_with() {
         let id = -93_312;
-        let first = session_mode(id, "s-1", "claude-sonnet-5-5");
+        let first = session_mode(id, "s-1", "claude-sonnet-5-5", "2.1.312");
         assert!(first.reminders());
         note_client_data(id, "claude-sonnet-5-5", &json!({ FEATURE: "off" }));
-        assert_eq!(session_mode(id, "s-1", "claude-sonnet-5-5"), first, "已开的会话不跟");
-        assert!(!session_mode(id, "s-2", "claude-sonnet-5-5").reminders(), "新会话跟");
+        assert_eq!(
+            session_mode(id, "s-1", "claude-sonnet-5-5", "2.1.312"),
+            first,
+            "已开的会话不跟"
+        );
+        assert!(!session_mode(id, "s-2", "claude-sonnet-5-5", "2.1.312").reminders(), "新会话跟");
     }
 
     /// 非主线程的请求只看不钉：标题那条（haiku）抢在主线程之前到，主线程照样按自己的模型定档；钉住之后它们也拿钉住的那档。
@@ -476,12 +570,15 @@ mod tests {
         let id = -93_314;
         note_client_data(id, "claude-opus-5-5", &json!({ FEATURE: "off" }));
         assert!(
-            peek_session_mode(id, "s-1", "claude-haiku-4-5").reminders(),
+            peek_session_mode(id, "s-1", "claude-haiku-4-5", "2.1.312").reminders(),
             "没钉时按它自己的模型看"
         );
-        assert!(!session_mode(id, "s-1", "claude-opus-5-5").reminders(), "主线程按 opus 那份定");
         assert!(
-            !peek_session_mode(id, "s-1", "claude-haiku-4-5").reminders(),
+            !session_mode(id, "s-1", "claude-opus-5-5", "2.1.312").reminders(),
+            "主线程按 opus 那份定"
+        );
+        assert!(
+            !peek_session_mode(id, "s-1", "claude-haiku-4-5", "2.1.312").reminders(),
             "钉住之后跟着钉住的那档"
         );
     }

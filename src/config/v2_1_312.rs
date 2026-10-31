@@ -1,9 +1,9 @@
-//! 2.1.312 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.312 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.312 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.312 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.312 的 profile 表：2.1.312 来访的 beta 参照（[`cc_profile_at`]）。2.1.314 的表（[`CC_PROFILES`]）
+/// 各行除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.311（[`CC_PROFILES_2_1_311`]）完全相同**，所以直接引用那张表的行，只换
 /// `version`。依据 `cap/auto-2.1.312-20261028-full`（场景同 2.1.311-full，测试项目换了干净的
@@ -22,7 +22,7 @@ use super::*;
 /// 服务端开关 `tengu_snug_mitten` 10-28 才打开（同日 2.1.311 对照照样带），见
 /// [`crate::proxy::sandy_plover`]；`tengu_snoopy_creek` 服务端也改成显式下发关；本机 settings.json 多了
 /// `model` 键（启动事件 `startup_manual_model_config` 多两项）；MCP 与插件环境。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_312: &[CcProfile] = &[
     at_312(CC_PROFILES_2_1_311[0]),
     at_312(CC_PROFILES_2_1_311[1]),
     at_312(CC_PROFILES_2_1_311[2]),

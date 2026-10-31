@@ -478,6 +478,9 @@ impl Telemetry {
         // 2.1.312：权限与 auto 判定事件带 tool_use 的 id、`context_announcement` 多 `assumed_utc` 等，见
         // [`TurnFacts::v312`]；`tengu_snoopy_creek` 读不到时也改按关（[`crate::proxy::snoopy_creek`]）。
         let v312 = version_at_least(&version, "2.1.312");
+        // 2.1.314：`api_success` 多新旧图片与线程类型那五项、auto 判定多连接方式、压缩两条多 `leaveOutPasses`，错误栈
+        // 又换了块，见 [`TurnFacts::v314`]（2.1.313 没有发布）。
+        let v314 = version_at_least(&version, "2.1.314");
         let safety_events =
             v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id, &version);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
@@ -567,12 +570,18 @@ impl Telemetry {
         let own_system = call.client_tools || call.bare;
         let lapis = if v309 {
             let m = if is_main {
-                crate::proxy::lapis_anchor::session_mode(call.cred_id, &session_id, &display_model)
+                crate::proxy::lapis_anchor::session_mode(
+                    call.cred_id,
+                    &session_id,
+                    &display_model,
+                    &version,
+                )
             } else {
                 crate::proxy::lapis_anchor::peek_session_mode(
                     call.cred_id,
                     &session_id,
                     &display_model,
+                    &version,
                 )
             };
             m.client_data_events(own_system.then_some(crate::proxy::lapis_anchor::Observed {
@@ -581,6 +590,53 @@ impl Telemetry {
             }))
         } else {
             Vec::new()
+        };
+        // 模型能力被号的 `client_data` 改了默认（2.1.314 起的原创游戏那段，[`crate::proxy::original_games`]）：官方组装
+        // 主线程 system 时头一回用到就报一条来源事件，按会话、按「能力 + 模型」去重（`y()` 的 `-cap:model` / `cap:model`），
+        // 所以会话中途切到一个被改了默认的模型，切过去那条也报。体归客户端自己的同样看实际出站：那段在不在体里得与
+        // 下发的一致，经网关、拿不到号 client_data 的客户端不报。这条要发启动 / 首次输入模板、模板里有那一处（交互式
+        // 首次输入那段的 `mcp_instructions_pool_change` 之后、`-p` 启动段的 `fork_subagent_enabled` 之前）就跟
+        // `<total_tokens>` 那一族一起走模板（[`Subst::capability_events`]），否则在这条请求前补
+        // （[`TurnFacts::capability_inline`]）。
+        let capability = is_main
+            .then(|| {
+                crate::proxy::original_games::client_data_event(
+                    call.cred_id,
+                    &display_model,
+                    &version,
+                )
+            })
+            .flatten()
+            .filter(|(name, _)| {
+                let text = crate::proxy::original_games::TEXT.as_bytes();
+                let has = call.body.windows(text.len()).any(|w| w == text);
+                !own_system || has == (*name == "tengu_model_capability_from_client_data")
+            })
+            .filter(|(name, m)| {
+                let off = if *name == "tengu_model_capability_from_client_data" { "" } else { "-" };
+                let key = format!("{off}{}:{}", m["capability"], m["model"]);
+                sess.capability_logged.insert(key)
+            });
+        let via_template = if shape.sdk {
+            continued_from.is_some() || (cleared_from.is_none() && is_new_session)
+        } else {
+            first_prompt_tpl
+        };
+        let (capability_events, capability_inline): (Vec<_>, Vec<_>) = match capability {
+            Some(x) if via_template => (vec![x], Vec::new()),
+            Some(x) => (Vec::new(), vec![x]),
+            None => (Vec::new(), Vec::new()),
+        };
+        // 组织配置那道闸：2.1.310 起、见过这个号的 eval 才按它改启动模板那条影子判定、在闸内再补真判定
+        // （[`Subst::org_gate`]）。分桶按这台机器（`device_id`）算。
+        let org_gate = if v310 {
+            crate::proxy::org_config_gate::flag(call.cred_id).map(|flag| super::template::OrgGate {
+                flag,
+                tier: crate::proxy::org_config_gate::tier_of(call.org_type.as_deref()),
+                bucket: crate::proxy::org_config_gate::bucket(&identity.device_id),
+            })
+        } else {
+            None
         };
         let heron = (v293 && is_main && (new_prompt || post_compaction) && !sess.heron_done)
             .then(|| crate::proxy::heron_brook::applied(call.cred_id, &display_model))
@@ -776,6 +832,7 @@ impl Telemetry {
             v310,
             v311,
             v312,
+            v314,
             tools_used_header_first,
             tools_used_truncation,
             safety_events,
@@ -799,6 +856,9 @@ impl Telemetry {
             sleepy,
             heron,
             lapis,
+            capability_events,
+            capability_inline,
+            org_gate,
             tether,
             usage_before,
             ignored_suggestion,

@@ -319,15 +319,17 @@ impl Simulation {
             (Some(sid), SimSessionSeed::Slot(_)) if !flags.spoof_identity => sid,
             (_, SimSessionSeed::Slot(s) | SimSessionSeed::Prefix(s)) => session_id_for(cred, s),
         };
-        // 没有 prompt 头可认重发：按新输入的指纹认（[`CcSessionLink::load_retryable`]）。
+        // 没有 prompt 头可认重发：按新输入的指纹认（[`CcSessionLink::load_with_origin`]）。
         let new_prompt = crate::telemetry::last_is_new_prompt_body(v);
-        let link = CcSessionLink::load_retryable(
+        let link = CcSessionLink::load_with_origin(
             CcSessionKey { cred_id: cred.id, session_id: &session_id },
             new_prompt,
             false,
             profile.has_billing_header(),
             None,
             new_prompt.then(|| super::session_link::turn_fp(v)).flatten(),
+            super::session_link::TurnOrigin::Human,
+            Some(v),
         );
         // 那台「机器」：来访自己写了工作目录就用它那份（[`client_env`]），没写才按账号 + 设备派生
         // 一台（[`sim_env_for`]）。第四块的记忆目录与首轮环境说明（在 `messages` 里，不受第四块开关
@@ -344,13 +346,20 @@ impl Simulation {
                 | super::CcRequestKind::Suggestion
         );
         let lapis = if main_thread {
-            super::lapis_anchor::session_mode(cred.id, &session_id, model)
+            super::lapis_anchor::session_mode(cred.id, &session_id, model, profile.version)
         } else {
-            super::lapis_anchor::peek_session_mode(cred.id, &session_id, model)
+            super::lapis_anchor::peek_session_mode(cred.id, &session_id, model, profile.version)
         };
+        // 2.1.314 起 opus-5-5 的第四块多一段原创游戏的说明（[`super::original_games`]），插在 `<total_tokens>` 之前，
+        // 再按这一档剪掉提醒。
+        let original_games = super::original_games::applies(cred.id, model, profile.version);
         let rest = env.as_ref().filter(|_| flags.simulate_full_system).and_then(|env| {
             cc_system_rest(model).map(|template| {
-                super::lapis_anchor::fit_system_rest(render_system_rest(template, env), lapis)
+                let rest = super::original_games::fit_system_rest(
+                    render_system_rest(template, env),
+                    original_games,
+                );
+                super::lapis_anchor::fit_system_rest(rest, lapis)
             })
         });
         let inbound_1m = has_beta(&inbound_beta, config::CC_BETA_CONTEXT_1M);
@@ -857,7 +866,8 @@ static CC_SYSTEM_REST_FABLE_5: std::sync::LazyLock<String> = std::sync::LazyLock
 ///    （[`thread_tools_changed`]）：ToolSearch 刚载入延迟工具（新增消息里有 `tool_reference`
 ///    的工具结果，`cap/auto-2.1.285-20260930/00054`、`00061`、`00164`），或 MCP 工具中途上线
 ///    （`role:system` 消息里的 `tool_addition` 块，`00795`）。这时官方把完整 `tools` 重发一遍，
-///    要非空、含官方工具名，且来访 beta 带 [`config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES`]；
+///    要非空、含官方工具名，且来访 beta 带 [`config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES`]（官方串里本就没有这一项的
+///    模型——haiku-4.5——不要求，`cap/auto-2.1.314-20261030-full/00627`）；
 /// 5. 来访 `anthropic-beta` 带 [`config::CC_BETA_MESSAGE_THREADS`]（续轮是这项 beta 的能力，
 ///    没声明它却发 `thread` 是官方不产生的组合）；
 /// 6. `messages` 非空。
@@ -895,10 +905,17 @@ pub(crate) fn is_official_thread_continuation(v: &serde_json::Value, beta: &[Str
         return false;
     }
     if let Some(tools) = v.get("tools") {
+        // 那项 beta 只认官方本来就发它的模型：haiku-4.5 的官方串里没有它，工具集变了照样重发 `tools`、头上没有这一项
+        // （`cap/auto-2.1.314-20261030-full/00627`：ToolSearch 载入延迟工具之后那条续轮）。
+        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+        let wants_beta = {
+            let official = config::cc_model_beta(cc_profile_for(model), model);
+            official.split(',').any(|b| b.trim() == config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES)
+        };
         let resent = tools.as_array().is_some_and(|t| !t.is_empty())
             && has_cc_tool_profile(v)
             && thread_tools_changed(v)
-            && has_beta(beta, config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES);
+            && (!wants_beta || has_beta(beta, config::CC_BETA_MID_CONVERSATION_TOOL_CHANGES));
         if !resent {
             return false;
         }
@@ -2062,8 +2079,8 @@ pub(crate) fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulat
         if sim.link.prompt_index > 0
             && super::parse_version(p.version).is_some_and(|v| v >= (2, 1, 285))
         {
-            let n = sim.link.prompt_index;
-            s.push_str(&format!(" cc_prompt_index={n}; cc_turn_index={n};"));
+            let (n, t) = (sim.link.prompt_index, sim.link.turn_index);
+            s.push_str(&format!(" cc_prompt_index={n}; cc_turn_index={t};"));
         }
     }
     s

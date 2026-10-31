@@ -118,6 +118,9 @@ pub(crate) struct ReqLog {
     ///
     /// 第三项是这条所属的一轮与新输入指纹（[`TurnMark`]）：失败记进会话、成功清掉，认紧接着的重发。
     pub(super) cc_session: Option<(String, ChainLane, Option<TurnMark>)>,
+    /// 真实 CC 的 `/compact` 摘要请求（[`CcSessionLink::compaction`]）：会话 id 与它发出时读到的主链尾巴（回复的
+    /// `message.id`）。完整成功时据此记下压缩前那条，见 [`CcSessionLink::note_compaction`]。
+    pub(super) cc_compaction: Option<(String, Option<String>)>,
     /// 模拟路径这条请求按 message thread 改写后等回程提交的那份（[`ThreadPending`]）：完整成功
     /// 才记成线程状态，失败把它接的那条线程作废。取自 [`super::Simulation::take_thread`]；
     /// 非模拟路径与没写 `thread` 的为 `None`。
@@ -470,15 +473,53 @@ impl Drop for ReqLog {
             let main_turn = turn.as_ref().filter(|_| *lane == ChainLane::Main);
             let (req_id, message_id) =
                 (self.upstream_request_id.as_deref(), self.sniffer.message_id.as_deref());
-            if ok {
+            // 主线程拒答：入链与结清压缩前那条都要看客户端转不转备用模型（官方转了就当场 `return`，两样都不做），
+            // 这一层看不出，挂到下一条主线程请求再判，见 [`CcSessionLink::hold_refusal`]。
+            let refused = self.sniffer.stop_reason.as_deref() == Some("refusal");
+            if let Some(t) = main_turn
+                && refused
+            {
+                CcSessionLink::hold_refusal(
+                    key,
+                    t,
+                    ok.then_some((req_id, message_id)),
+                    self.sniffer.reply_fp(),
+                );
+            } else if ok {
                 // 主线程按发出先后挡掉迟到的旧响应，见 [`CcSessionLink::record_main`]。
                 match main_turn {
-                    Some(t) => CcSessionLink::record_main(key, t, req_id, message_id),
+                    Some(t) => {
+                        CcSessionLink::record_main(key, t, req_id, message_id);
+                        if let Some(m) = message_id {
+                            CcSessionLink::note_main_reply(key, t, m, self.sniffer.reply_fp());
+                        }
+                    }
                     None => CcSessionLink::record(key, lane, req_id, message_id),
                 }
             } else if let (Some(t), Some(_)) = (main_turn, &failure) {
                 CcSessionLink::mark_failed(key, t);
             }
+            // 收到回复了（见过 `message_start`），不论之后完整、取消还是断流：压缩前那条到此结清，见
+            // [`CcSessionLink::settle_compaction`]。拒答的挂着，见上。
+            if let Some(t) = main_turn
+                && message_id.is_some()
+                && !refused
+            {
+                CcSessionLink::settle_compaction(key, t);
+            }
+            if let Some(t) = main_turn
+                && aborted
+            {
+                CcSessionLink::mark_aborted(key, t);
+            }
+        }
+        // 摘要请求完整成功、而且摘要有正文（官方 `k$` 取出的正文为空就是 `no_summary`，压缩失败）才记压缩前那条。
+        if ok
+            && self.sniffer.text_nonblank
+            && let Some((sid, tail)) = &self.cc_compaction
+        {
+            let key = CcSessionKey { cred_id: self.cred_id, session_id: sid };
+            CcSessionLink::note_compaction(key, tail.as_deref());
         }
         // message thread：只有完整成功、拿到 `message.id` 的才能被下一轮接着 `continue`；上游报错
         // 或断流的把它接的那条线程作废（线程过期之类的错接着 `continue` 只会一直错）。被客户端
@@ -1289,6 +1330,8 @@ pub(crate) struct UsageSniffer {
     /// 截 500 字永远够不到——0.3.93 之前学到的 refusal 规则文案就全是一段 usage JSON。
     refusal_details: Option<String>,
     pub(super) text_chars: usize,
+    /// 正文里有不是空白的字（官方压缩取摘要正文时 `trim` 之后为空就判失败，见 [`ReqLog::cc_compaction`]）。
+    pub(super) text_nonblank: bool,
     pub(super) thinking_chars: usize,
     /// 回复里出现过 `thinking` / `redacted_thinking` 块。
     ///
@@ -1539,6 +1582,7 @@ impl UsageSniffer {
         if let Some(d) = v.get("delta") {
             if let Some(t) = d.get("text").and_then(|t| t.as_str()) {
                 self.text_chars += t.encode_utf16().count();
+                self.text_nonblank |= !t.trim().is_empty();
             }
             if let Some(t) = d.get("thinking").and_then(|t| t.as_str()) {
                 self.thinking_chars += t.encode_utf16().count();
@@ -1661,6 +1705,7 @@ impl UsageSniffer {
             for (i, b) in blocks.iter().enumerate() {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                     self.text_chars += t.encode_utf16().count();
+                    self.text_nonblank |= !t.trim().is_empty();
                 }
                 if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
                     self.thinking_chars += t.encode_utf16().count();

@@ -7221,6 +7221,183 @@ fn version_2_1_310_telemetry_shape() {
     }
 }
 
+/// 组织配置那道闸跟号的 eval（`tengu_org_config_required`）与这台机器的分桶走（`cap/auto-2.1.314-20261030-full`：
+/// 25%、那台机器分桶 21，24 条影子判定都在闸内，23 条真判定都是 `pass_cached` 紧跟 `feature_sad`）：
+/// - 在闸内：影子 `candidate_now: true`、不带 `exclusion_now`，比例与宽限期照下发；交互式紧跟启动计时、`-p` 紧跟启动段
+///   那条 `tengu_exit` 补一条真判定与 `feature_sad{org_config_gate}`（后者进 Datadog）；
+/// - 分桶不小于比例：`rollout_percent`，没有真判定；比例换了，进出跟着变；
+/// - 个人档（max / pro）：开不开都 `tier_unknown`（`candidate_if_armed` 也是 false），没有真判定；
+/// - 下发关：`flag_off`，`flag_enabled: false`；
+/// - 没见过 eval 的号、2.1.310 之前：模板原样。
+#[test]
+fn org_config_gate_follows_the_accounts_eval_and_the_machine_bucket() {
+    let run = |cred: i64, org: &str, ver: &str, sdk: bool| {
+        let t = Telemetry::default();
+        let mut body =
+            String::from_utf8(body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        if sdk {
+            body = body.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+        }
+        let mut c = call(body.into_bytes(), "req_gate", "end_turn");
+        c.cred_id = cred;
+        c.org_type = Some(org.into());
+        c.ua_out = format!("claude-cli/{ver} (external, {})", if sdk { "sdk-cli" } else { "cli" });
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = &st.pending[&(cred, SESSION.to_string())];
+        let ev: Vec<(String, Value)> =
+            p.events.iter().map(|(_, e)| (ev_name(e).to_string(), e.clone())).collect();
+        (ev, p.dd.clone())
+    };
+    let eval = |cred: i64, flag: Value| {
+        let body = json!({"features": {"tengu_org_config_required": {"value": flag}}});
+        crate::proxy::note_eval_features(cred, body.to_string().as_bytes());
+    };
+    let served = |percent: u32| {
+        json!({"enabled": true, "plans": ["team", "enterprise"], "percent": percent,
+               "graceTtlHours": 24, "budgetMs": 10000, "exemptReasons": ["not_attempted"],
+               "refuseNotEntitled": false, "hostTokens": false})
+    };
+    let shadow = |ev: &[(String, Value)]| {
+        ev.iter()
+            .find(|(n, _)| n == "tengu_org_config_gate_shadow")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let gate_at =
+        |ev: &[(String, Value)]| ev.iter().position(|(n, _)| n == "tengu_org_config_gate");
+
+    // 机器分桶：同一个号的 device_id 每次都一样，先跑一遍取出来。
+    let cred = -93_901;
+    let (ev, _) = run(cred, "claude_team", "2.1.314", false);
+    let device = ev[0].1["event_data"]["device_id"].as_str().unwrap().to_string();
+    let bucket = crate::proxy::org_config_gate::bucket(&device);
+    let template = shadow(&ev);
+    assert_eq!(template["flag_percent"], json!(1), "没见过 eval 的号，模板原样");
+    assert!(gate_at(&ev).is_none());
+
+    // 在闸内（比例刚好比分桶大一）：交互式。
+    eval(cred, served(bucket + 1));
+    let (ev, dd) = run(cred, "claude_team", "2.1.314", false);
+    let m = shadow(&ev);
+    assert_eq!(
+        (&m["candidate_if_armed"], &m["candidate_now"], &m["flag_enabled"]),
+        (&json!(true), &json!(true), &json!(true))
+    );
+    assert!(m.get("exclusion_now").is_none() && m.get("exclusion_if_armed").is_none(), "{m}");
+    assert_eq!((&m["flag_percent"], &m["grace_ttl_hours"]), (&json!(bucket + 1), &json!(24)));
+    assert_eq!(m["tier"], json!("team"));
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "candidate_if_armed").unwrap();
+    assert_eq!(
+        keys[at..at + 6],
+        [
+            "candidate_if_armed",
+            "candidate_now",
+            "flag_enabled",
+            "flag_source",
+            "flag_percent",
+            "grace_ttl_hours"
+        ]
+    );
+    let g = gate_at(&ev).expect("在闸内要有真判定");
+    let timer = &ev[g - 1];
+    assert_eq!(
+        (timer.0.as_str(), meta_of(&timer.1)["event"].clone()),
+        ("tengu_timer", json!("startup"))
+    );
+    let gm = meta_of(&ev[g].1);
+    assert_eq!(
+        gm.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "subscription_type",
+            "decision",
+            "surface",
+            "blocked_ms",
+            "attempt",
+            "decided_without_waiting",
+            "tier",
+            "flag_source",
+            "flag_percent",
+            "grace_ttl_hours",
+            "budget_ms",
+            "policy_reason",
+            "policy_has_cache",
+            "policy_cache_age_ms",
+            "settings_reason",
+            "settings_has_cache",
+            "settings_cache_age_ms"
+        ]
+    );
+    assert_eq!(
+        (&gm["decision"], &gm["surface"], &gm["flag_percent"], &gm["budget_ms"], &gm["tier"]),
+        (
+            &json!("pass_cached"),
+            &json!("startup"),
+            &json!(bucket + 1),
+            &json!(10000),
+            &json!("team")
+        )
+    );
+    let sad = meta_of(&ev[g + 1].1);
+    assert_eq!(ev[g + 1].0, "tengu_feature_sad");
+    assert_eq!(
+        (&sad["feature_name"], &sad["error_code"]),
+        (&json!("org_config_gate"), &json!("pass_cached"))
+    );
+    assert_eq!(ev_ts(&ev[g].1), ev_ts(&ev[g + 1].1), "同一毫秒");
+    assert!(
+        dd.iter()
+            .any(|d| d["message"] == "tengu_feature_sad" && d["feature_name"] == "org_config_gate")
+    );
+
+    // `-p`：紧跟启动段那条 `tengu_exit`，surface 是 noninteractive。
+    let (ev, _) = run(cred, "claude_team", "2.1.314", true);
+    let g = gate_at(&ev).expect("-p 也有");
+    assert_eq!(ev[g - 1].0, "tengu_exit");
+    assert_eq!(meta_of(&ev[g].1)["surface"], json!("noninteractive"));
+
+    // 比例降到分桶本身：出闸。
+    eval(cred, served(bucket));
+    let (ev, _) = run(cred, "claude_team", "2.1.314", false);
+    let m = shadow(&ev);
+    assert_eq!(
+        (&m["candidate_now"], &m["exclusion_now"], &m["flag_percent"]),
+        (&json!(false), &json!("rollout_percent"), &json!(bucket))
+    );
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "candidate_now").unwrap();
+    assert_eq!(keys[at + 1], "exclusion_now");
+    assert!(gate_at(&ev).is_none(), "不在闸内没有真判定");
+
+    // 个人档：开关全开也进不了。
+    eval(cred, served(100));
+    let (ev, _) = run(cred, "claude_max", "2.1.314", false);
+    let m = shadow(&ev);
+    assert_eq!(
+        (&m["candidate_if_armed"], &m["exclusion_if_armed"], &m["exclusion_now"], &m["tier"]),
+        (&json!(false), &json!("tier_unknown"), &json!("tier_unknown"), &json!("max"))
+    );
+    assert!(gate_at(&ev).is_none());
+
+    // 下发关。
+    eval(cred, json!({"enabled": false}));
+    let (ev, _) = run(cred, "claude_team", "2.1.314", false);
+    let m = shadow(&ev);
+    assert_eq!(
+        (&m["flag_enabled"], &m["exclusion_now"], &m["flag_percent"], &m["grace_ttl_hours"]),
+        (&json!(false), &json!("flag_off"), &json!(0), &json!(96))
+    );
+    assert_eq!(m["candidate_if_armed"], json!(true));
+    assert!(gate_at(&ev).is_none());
+
+    // 2.1.310 之前（305 ~ 309 共用的那份模板）不跟。
+    eval(cred, served(100));
+    let (ev, _) = run(cred, "claude_team", "2.1.309", false);
+    assert_eq!(shadow(&ev)["flag_percent"], json!(1));
+    assert!(gate_at(&ev).is_none());
+}
+
 /// `tengu_lapis_anchor_from_client_data` 只在请求体真按那一档发的时候报（号的 bootstrap 都下发了 off）：完整模拟
 /// 按钉住的那一档报；billing-only 与真实 CC 透传发的是客户端自己的 system 与 messages，看出站体里（system 那段，
 /// 或换了 system 的客户端只在 messages 里跟的那条）有没有 `<total_tokens>`，与 off 对得上（没有）才报。
@@ -7278,6 +7455,130 @@ fn lapis_event_follows_what_the_body_actually_did() {
         0,
         "换了 system 的客户端（Agent SDK / --system-prompt）提醒只在 messages 里，照样对不上"
     );
+}
+
+/// 原创游戏那段被号的 `client_data` 改了默认（2.1.314 `NP`）：sonnet 下发 `true` 打开报
+/// `tengu_model_capability_from_client_data`、opus 下发 `false` 关掉报 `…_off_from_client_data`，`{capability, model}`，
+/// 落在首次输入那段 `mcp_instructions_pool_change` 之后、与 `<total_tokens>` 那一族同一处；与默认一致不报。体归客户端自己
+/// 的（透传）看那段在不在体里，与下发对不上不报。
+#[test]
+fn capability_events_follow_client_data_overrides() {
+    let first_turn = |cred_id: i64, model: &str, served: bool, client_tools: bool, text: bool| {
+        let boot = json!({"client_data": {"original_games_guidance": served}}).to_string();
+        crate::proxy::client_data::note_bootstrap(cred_id, model, boot.as_bytes());
+        let mut body: Value =
+            serde_json::from_slice(&body_for(model, Some("medium"), true)).unwrap();
+        if text {
+            let last = body["system"].as_array_mut().unwrap().last_mut().unwrap();
+            let t = last["text"].as_str().unwrap().to_string();
+            last["text"] = json!(format!("{t}\n\n{}", crate::proxy::original_games::TEXT));
+        }
+        let t = Telemetry::default();
+        let mut c = call(body.to_string().into_bytes(), "req_games", "end_turn");
+        c.ua_out = "claude-cli/2.1.314 (external, cli)".into();
+        c.cred_id = cred_id;
+        c.client_tools = client_tools;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&(cred_id, SESSION.to_string())]
+            .events
+            .iter()
+            .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+            .collect::<Vec<_>>()
+    };
+    let find = |ev: &[(String, Value)]| {
+        ev.iter()
+            .position(|(n, _)| n.starts_with("tengu_model_capability_"))
+            .map(|i| (i, ev[i].0.clone(), ev[i].1.clone()))
+    };
+    let ev = first_turn(93_931, "claude-sonnet-5-5", true, false, false);
+    let (at, name, m) = find(&ev).expect("sonnet 下发 true 要报");
+    assert_eq!(name, "tengu_model_capability_from_client_data");
+    assert_eq!(m["capability"], json!("original_games_guidance"));
+    assert_eq!(m["model"], json!("claude-sonnet-5-5"));
+    let pool = ev.iter().position(|(n, _)| n == "tengu_mcp_instructions_pool_change").unwrap();
+    assert!(
+        at > pool
+            && ev[pool + 1..at].iter().all(|(n, _)| n == "tengu_lapis_anchor_from_client_data")
+    );
+    assert_eq!(ev.iter().filter(|(n, _)| n.starts_with("tengu_model_capability_")).count(), 1);
+
+    let ev = first_turn(93_932, "claude-opus-5-5", false, false, false);
+    let (_, name, m) = find(&ev).expect("opus 下发 false 要报");
+    assert_eq!(name, "tengu_model_capability_off_from_client_data");
+    assert_eq!(m["model"], json!("claude-opus-5-5"));
+
+    assert!(
+        find(&first_turn(93_933, "claude-opus-5-5", true, false, false)).is_none(),
+        "与默认一致"
+    );
+    assert!(
+        find(&first_turn(93_934, "claude-sonnet-5-5", true, true, true)).is_some(),
+        "透传的体里有那段，与下发对得上"
+    );
+    assert!(
+        find(&first_turn(93_935, "claude-sonnet-5-5", true, true, false)).is_none(),
+        "透传的体里没有那段，客户端没读到号的 client_data"
+    );
+}
+
+/// 能力来源事件按会话、按「能力 + 模型」在头一回用到时报，与首轮模板解耦：会话从默认的 opus-5-5 开头（不报），中途
+/// 切到号的 `client_data` 打开了原创游戏那段的 sonnet-5-5，切过去那次输入在请求前补一条 `from_client_data`；之后
+/// 再用 sonnet、切回 opus 都不再报。`-p` 首条就是被改了默认的模型时走启动模板那一处，不重复补。
+#[test]
+fn capability_event_reported_when_a_mid_session_model_first_uses_it() {
+    const CRED: i64 = 93_941;
+    let boot = json!({"client_data": {"original_games_guidance": true}}).to_string();
+    crate::proxy::client_data::note_bootstrap(CRED, "claude-sonnet-5-5", boot.as_bytes());
+    let turn = |model: &str, req: &str, at: SystemTime, sdk: bool| {
+        let mut body = String::from_utf8(body_for(model, Some("medium"), true)).unwrap();
+        if sdk {
+            body = body.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+        }
+        let mut c = call(body.into_bytes(), req, "end_turn");
+        c.cred_id = CRED;
+        c.ua_out =
+            format!("claude-cli/2.1.314 (external, {})", if sdk { "sdk-cli" } else { "cli" });
+        c.resp_model = Some(model.into());
+        c.started_at = at;
+        c
+    };
+    let events = |t: &Telemetry| -> Vec<(String, String)> {
+        let st = t.0.state.lock();
+        st.pending[&(CRED, SESSION.to_string())]
+            .events
+            .iter()
+            .map(|(_, e)| (ev_name(e).to_string(), ev_ts(e).to_string()))
+            .collect()
+    };
+    let caps = |ev: &[(String, String)]| {
+        ev.iter()
+            .filter(|(n, _)| n.starts_with("tengu_model_capability_"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let t = Telemetry::default();
+    t.ingest(turn("claude-opus-5-5", "req_1", frozen_now() - Duration::from_secs(45), false));
+    assert!(caps(&events(&t)).is_empty(), "opus 走默认");
+    t.ingest(turn("claude-sonnet-5-5", "req_2", frozen_now() - Duration::from_secs(30), false));
+    let ev = events(&t);
+    let c = caps(&ev);
+    assert_eq!(c.len(), 1, "切到 sonnet 那次输入补一条");
+    assert_eq!(c[0].0, "tengu_model_capability_from_client_data");
+    let input = ev.iter().rfind(|(n, _)| n == "tengu_input_prompt").unwrap();
+    assert!(c[0].1 > input.1, "落在这次输入之后、请求之前");
+    t.ingest(turn("claude-sonnet-5-5", "req_3", frozen_now() - Duration::from_secs(15), false));
+    t.ingest(turn("claude-opus-5-5", "req_4", frozen_now(), false));
+    assert_eq!(caps(&events(&t)).len(), 1, "同一会话同一模型只报一次");
+
+    // `-p` 首条就是 sonnet：走启动模板那一处，补的那一路不再报。
+    let t = Telemetry::default();
+    t.ingest(turn("claude-sonnet-5-5", "req_5", frozen_now(), true));
+    let ev = events(&t);
+    assert_eq!(caps(&ev).len(), 1);
+    let at = ev.iter().position(|(n, _)| n.starts_with("tengu_model_capability_")).unwrap();
+    assert_eq!(ev[at + 1].0, "tengu_fork_subagent_enabled", "在启动段 fork_subagent_enabled 之前");
 }
 
 /// 预算与用户轮两项也由 `client_data` 给出时，首次输入那段在档位那条之后按序再各报一条（`{userTurn}`、`{budget}`）。
@@ -7677,6 +7978,158 @@ fn version_2_1_312_telemetry_shape() {
     assert_eq!(m["outcome"], "restored");
     let old = restore("claude-cli/2.1.311 (external, cli)").unwrap();
     assert_eq!(old["is_eap"], false);
+}
+
+/// 2.1.314（`cap/auto-2.1.314-20261030-*`；2.1.313 没有发布）：5xx 的栈换块（行号 11 → 5，仍不带构造名）；`api_success`
+/// 在 `estimatedInputTokens` 后多新旧图片四项与 `sentThreadType`；auto 判定里服务端判过的那种在 `serverClassifierRole`
+/// 后多 `serverClassifierConnection`（快路径那种没有）；`/compact` 的尝试与成功两条在 `headTruncations` 后多
+/// `leaveOutPasses`。2.1.312 这几处都没有。
+#[test]
+fn version_2_1_314_telemetry_shape() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.314 (external, sdk-cli)");
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        assert!(m.get("error_constructor").is_none(), "2.1.314 {n} 不带 error_constructor");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-rbc434em.js:5:1510")),
+            "2.1.314 {n}"
+        );
+    }
+
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    // `api_success`：线程类型跟这条出站体（没写 `thread` 的是 none），四个计数没有图片时都是 0。
+    let success = |ver: &str, cred_id: i64, thread: Option<&str>| {
+        let t = Telemetry::default();
+        let mut body: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        if let Some(kind) = thread {
+            body["thread"] = json!({ "type": kind });
+        }
+        let mut c = call(body.to_string().into_bytes(), "req_314", "end_turn");
+        c.ua_out = format!("claude-cli/{ver} (external, cli)");
+        c.cred_id = cred_id;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&(cred_id, SESSION.to_string())]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    for (cred_id, thread, want) in [(93_317, None, "none"), (93_318, Some("create"), "create")] {
+        let m = success("2.1.314", cred_id, thread);
+        let k = keys(&m);
+        let at = k.iter().position(|x| x == "estimatedInputTokens").unwrap();
+        assert_eq!(
+            k[at + 1..at + 7],
+            [
+                "imageNewBlockCount",
+                "imageNewBytes",
+                "imageResentBlockCount",
+                "imageResentBytes",
+                "sentThreadType",
+                "systemCharLength"
+            ],
+            "{m}"
+        );
+        assert_eq!(m["sentThreadType"], want);
+        assert_eq!((&m["imageNewBlockCount"], &m["imageResentBytes"]), (&json!(0), &json!(0)));
+    }
+    assert!(success("2.1.312", 93_319, None).get("sentThreadType").is_none(), "2.1.312 不带");
+
+    // auto 模式判定：服务端判过的那种紧跟 `serverClassifierRole` 多一项，模拟的是不设代理的直连；快路径那种两项都没有。
+    let mut judged = json!({"decision": "allowed", "toolName": "Bash", "isMcp": false,
+        "classifierQueueWaitMs": 0, "classifierSource": "server", "skippedOnAllowRule": false,
+        "classifierTotalWaitMs": 900});
+    super::tools::auto_mode_decision_v312(&mut judged, "toolu_a");
+    super::tools::auto_mode_decision_v314(&mut judged);
+    let k = keys(&judged);
+    let at = k.iter().position(|x| x == "serverClassifierRole").unwrap();
+    assert_eq!(k[at + 1..at + 3], ["serverClassifierConnection", "skippedOnAllowRule"]);
+    assert_eq!(judged["serverClassifierConnection"], "direct");
+    let mut fast = json!({"decision": "allowed", "toolName": "Edit", "isMcp": false,
+        "fastPath": "acceptEdits", "classifierSource": "server",
+        "serverClassifierNoVerdict": "server_call_skipped", "classifierTotalWaitMs": 36});
+    super::tools::auto_mode_decision_v312(&mut fast, "toolu_b");
+    let before = fast.clone();
+    super::tools::auto_mode_decision_v314(&mut fast);
+    assert_eq!(fast, before, "快路径不带");
+
+    // `/compact`：尝试那条 `headTruncations` 之后是 `leaveOutPasses` 再到 `keepNoRound`，成功那条之后接着保留数。
+    let compact = |ua: &str| {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(120);
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        first.ua_out = ua.into();
+        first.started_at = base;
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"text","text":"hi"}]},
+            {"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30);
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let find = |name: &str| {
+            st.pending[&key()]
+                .events
+                .iter()
+                .find(|(_, e)| ev_name(e) == name)
+                .map(|(_, e)| meta_of(e))
+                .unwrap()
+        };
+        (find("tengu_reactive_compact_attempt"), find("tengu_reactive_compact_succeeded"))
+    };
+    let (attempt, succeeded) = compact("claude-cli/2.1.314 (external, cli)");
+    let k = keys(&attempt);
+    let at = k.iter().position(|x| x == "headTruncations").unwrap();
+    assert_eq!(k[at + 1..], ["leaveOutPasses", "keepNoRound"], "{attempt}");
+    assert_eq!(attempt["leaveOutPasses"], 0);
+    let k = keys(&succeeded);
+    let at = k.iter().position(|x| x == "headTruncations").unwrap();
+    assert_eq!(k[at + 1..at + 3], ["leaveOutPasses", "preservedUuidCount"], "{succeeded}");
+    let (attempt, succeeded) = compact("claude-cli/2.1.312 (external, cli)");
+    assert!(attempt.get("leaveOutPasses").is_none() && succeeded.get("leaveOutPasses").is_none());
+}
+
+/// 2.1.314 `api_success` 新旧图片四项的口径（官方 `kdn`）：只数 base64 来源的图片，工具结果内容里的也数（只下一层）；
+/// 最后一条助手消息之前的算重发，之后的算新的；续轮只发新增那几条、里面没有助手消息，全算新的。
+#[test]
+fn sent_images_split_new_from_resent() {
+    let png = "iVBORw0KGgo="; // 12 个字符、一个 `=`：8 字节。
+    let img =
+        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png}});
+    let url = json!({"type":"image","source":{"type":"url","url":"https://example.com/a.png"}});
+    let msgs = vec![
+        json!({"role":"user","content":[img.clone(), url.clone(), {"type":"text","text":"look"}]}),
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"Read","input":{}}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","content":[img.clone()]}, img.clone()]}),
+    ];
+    let got = super::shape::sent_images(&msgs);
+    assert_eq!(
+        got,
+        super::shape::SentImages {
+            new_blocks: 2,
+            new_bytes: 16,
+            resent_blocks: 1,
+            resent_bytes: 8
+        }
+    );
+    // 续轮那种：只有新增的工具结果。
+    let tail = vec![msgs[2].clone()];
+    let got = super::shape::sent_images(&tail);
+    assert_eq!((got.new_blocks, got.resent_blocks), (2, 0));
+    assert_eq!(super::shape::sent_images(&[]), super::shape::SentImages::default());
 }
 
 /// `x-claude-code-sandy-plover` 的首次使用按进程报一次（官方 `ri().once`）：首条没带（握手的 eval 没赶上）、续轮才头一回
@@ -8708,6 +9161,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.314 (external, cli)", "d67c18908567", "chunk-sq7yspzm.js:3529:7027"),
         ("claude-cli/2.1.312 (external, cli)", "9eb7b5f2f5a2", "chunk-r5cyd28m.js:3545:6820"),
         ("claude-cli/2.1.311 (external, cli)", "11211b82294f", "chunk-2ht8z368.js:3554:6820"),
         ("claude-cli/2.1.310 (external, cli)", "b26c68ea74b5", "chunk-31gxg38t.js:3618:6047"),

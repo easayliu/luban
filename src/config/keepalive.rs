@@ -16,7 +16,7 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.312";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.314";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。原取自 `cap/2.1.258/00032`
@@ -30,8 +30,8 @@ pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.312";
 /// `cap/auto-2.1.308-20261022-full`；逐请求那份多出的 `cache-keepalive` 不进会话级），2.1.309 / 2.1.310 也同
 /// （`cap/auto-2.1.309-20261023-full`、`cap/auto-2.1.310-20261024-full`）。2.1.311 起官方按公共 beta 规则表算会话级
 /// 那份，`thinking-token-count` 移出了那张表（[`CC_BETA_THINKING_TOKEN_COUNT`](super::CC_BETA_THINKING_TOKEN_COUNT)），
-/// 会话级那份不再带它、出站头里照带（`cap/auto-2.1.311-20261027-full` 一万多条会话级事件无一带它），2.1.312 同
-/// （`cap/auto-2.1.312-20261028-full`）。有测试钉着它
+/// 会话级那份不再带它、出站头里照带（`cap/auto-2.1.311-20261027-full` 一万多条会话级事件无一带它），2.1.312 / 2.1.314 同
+/// （`cap/auto-2.1.312-20261028-full`、`cap/auto-2.1.314-20261030-full`）。有测试钉着它
 /// 等于保活那一版 sonnet-5 主线程的会话级那份，升版时跟着换。
 pub const KEEPALIVE_EVENT_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
     interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
@@ -424,6 +424,27 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
         ],
     },
 ];
+
+/// 2.1.314 起 `event_logging`（`/api/event_logging/v2/batch`）的主上报**不再走 axios**：改用 Bun 的长连接会话
+/// （`Bun.FetchSession("analytics")`），`Connection: keep-alive`、`Accept-Encoding` 是 Messages API 那份
+/// [`CC_ACCEPT_ENCODING`](super::CC_ACCEPT_ENCODING)，`Accept` 照旧是 axios 那串，头序整个换了
+/// （`cap/auto-2.1.314-20261030-full` UA 为 `claude-code/<版本>` 的 51 条全是这个形态；2.1.312 那 48 条是
+/// [`AXIOS_SHAPES`] 里 `event_logging` 那行、`Connection: close`）。UA 为 `Bun/1.4.4` 的另一路上报两版相同，luban 不发。
+pub const EVENT_LOGGING_FETCH_ORDER: &[&str] = &[
+    "Accept",
+    "Authorization",
+    "Content-Type",
+    "User-Agent",
+    "anthropic-beta",
+    "x-service-name",
+    "Connection",
+    "Host",
+    "Accept-Encoding",
+    "Content-Length",
+];
+
+/// 从哪一版起 `event_logging` 是 [`EVENT_LOGGING_FETCH_ORDER`] 那种形态（含）。2.1.313 没有发布。
+pub const EVENT_LOGGING_FETCH_SINCE: (u64, u64, u64) = (2, 1, 314);
 
 /// eval（`/api/eval/sdk-…`）**不是 axios**：它走 Bun 自带的 fetch，`Connection: keep-alive`、`Accept: */*`，
 /// `Accept-Encoding` 也是 Messages API 那份 [`CC_ACCEPT_ENCODING`](super::CC_ACCEPT_ENCODING)。整条与 axios 那套没有一处

@@ -252,6 +252,15 @@ impl EventBuilder<'_> {
             put("documentTotalBytes", json!(shape.doc_bytes));
             put("inputTextCharLength", json!(shape.input_text_chars));
             put("estimatedInputTokens", json!(shape.estimated_tokens));
+            // 2.1.314 起紧跟着这条发出的新旧图片与线程类型（官方 `kdn`，与上面那组同条件；
+            // `cap/auto-2.1.314-20261030-full` 162 条 `api_success` 全都有，线程类型 none / create / continue）。
+            if env.f.v314 {
+                put("imageNewBlockCount", json!(shape.image_new_blocks));
+                put("imageNewBytes", json!(shape.image_new_bytes));
+                put("imageResentBlockCount", json!(shape.image_resent_blocks));
+                put("imageResentBytes", json!(shape.image_resent_bytes));
+                put("sentThreadType", json!(shape.thread_type.as_deref().unwrap_or("none")));
+            }
             put("systemCharLength", json!(shape.system_chars));
             if let Some((source, hash)) = &snapshot {
                 put("systemPromptSource", json!(source));

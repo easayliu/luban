@@ -104,6 +104,8 @@ pub(crate) mod glowing_lark;
 pub(crate) mod heron_brook;
 pub(crate) mod lapis_anchor;
 mod lucky_cerf;
+pub(crate) mod org_config_gate;
+pub(crate) mod original_games;
 pub(crate) mod sandy_plover;
 pub(crate) mod snoopy_creek;
 pub(crate) use lucky_cerf::{

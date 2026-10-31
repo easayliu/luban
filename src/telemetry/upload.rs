@@ -9,23 +9,44 @@ pub async fn post_event_logging(
     version: &str,
     events: &[Value],
 ) -> Option<u16> {
-    let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_EVENT_LOGGING);
-    crate::oauth::axios(
-        client
-            .post(&url)
-            .header("Accept", config::AXIOS_ACCEPT)
-            .header("Content-Type", "application/json")
-            .header("User-Agent", format!("claude-code/{version}"))
-            .header("x-service-name", "claude-code")
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("anthropic-beta", config::OAUTH_BETA_HEADER)
-            .json(&json!({ "events": events })),
-        "event_logging",
-    )
-    .send()
-    .await
-    .ok()
-    .map(|r| r.status().as_u16())
+    event_logging_request(client, config::UPSTREAM_BASE_URL, access_token, version, events)
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16())
+}
+
+/// [`post_event_logging`] 发往 `base` 的那条，形态跟会话版本：2.1.314 起走 Bun 的长连接会话（`Connection: keep-alive`、
+/// Messages API 那份 `Accept-Encoding`，头序 [`config::EVENT_LOGGING_FETCH_ORDER`]），更早的是 axios 那套。
+pub(crate) fn event_logging_request(
+    client: &wreq::Client,
+    base: &str,
+    access_token: &str,
+    version: &str,
+    events: &[Value],
+) -> wreq::RequestBuilder {
+    let url = format!("{base}{}", config::KEEPALIVE_EVENT_LOGGING);
+    let fetch = crate::proxy::parse_version(version)
+        .is_some_and(|v| v >= config::EVENT_LOGGING_FETCH_SINCE);
+    let req = client
+        .post(&url)
+        .header("Accept", config::AXIOS_ACCEPT)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", format!("claude-code/{version}"))
+        .header("anthropic-beta", config::OAUTH_BETA_HEADER)
+        .header("x-service-name", "claude-code")
+        .json(&json!({ "events": events }));
+    if !fetch {
+        return crate::oauth::axios(req, "event_logging");
+    }
+    let req = req
+        .header("Connection", "keep-alive")
+        .header("Accept-Encoding", config::CC_ACCEPT_ENCODING)
+        .orig_headers(crate::oauth::orig_headers(config::EVENT_LOGGING_FETCH_ORDER))
+        .timeout(crate::oauth::SIDE_REQUEST_TIMEOUT);
+    crate::oauth::side_dump(&req, "event_logging");
+    req
 }
 
 /// Datadog 日志摄入。真实客户端用 axios 直发，不带 Authorization。

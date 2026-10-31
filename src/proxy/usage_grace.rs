@@ -71,6 +71,8 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::heron_brook::note_eval(cred_id, features);
     // `<total_tokens>` 提醒的那一档（bootstrap 的 `client_data` 优先，这里是兜底那份）。
     super::lapis_anchor::note_eval(cred_id, features);
+    // 组织配置那道闸的开关（`tengu_org_config_required`），启动遥测的影子判定与真判定照它报。
+    super::org_config_gate::note_eval(cred_id, features);
     let flag = |k: &str| {
         features.get(k).and_then(|f| f.get("value")).and_then(|b| b.as_bool()).unwrap_or(false)
     };
@@ -132,24 +134,48 @@ fn is_tool_continuation(v: &serde_json::Value) -> bool {
 /// `00086`：通知那块后面跟着用户的新输入，billing 写 `cc_turn_origin=human`）——那是一次新的用户
 /// 输入，官方不带这个头。
 fn is_task_notification_turn(v: &serde_json::Value) -> bool {
-    let Some(last) = last_message(v) else { return false };
+    injected_turn(v) == Some(InjectedTurn::TaskNotification)
+}
+
+/// 客户端自己注入、不是用户敲的那几种轮次（官方 `cc_turn_origin` 的 `task_notification` / `peer`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InjectedTurn {
+    /// 后台任务通知（[`is_task_notification_turn`]）。
+    TaskNotification,
+    /// 另一个会话（子代理交回、同伴会话）发来的消息：`Another Claude session sent a message:` 接一段
+    /// `<agent-message …>`（`cap/auto-2.1.314-20261030-full/00116`、`00958`，billing 写 `cc_turn_origin=peer`）。
+    Peer,
+}
+
+/// 末条非 system 消息是不是一次**纯**注入的轮次：用户消息里只有那段注入的正文（任务通知整段裹在
+/// `<system-reminder>` 里，同伴消息是裸的那段）与别的 `<system-reminder>`，没有用户自己敲的字。挤进了用户新输入的
+/// 那种（通知到时用户正好敲了下一句）是一次新的用户输入，不算。
+pub(crate) fn injected_turn(v: &serde_json::Value) -> Option<InjectedTurn> {
+    let last = last_message(v)?;
     if last.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
+        return None;
     }
     let is_notice = |t: &str| {
         t.contains("[SYSTEM NOTIFICATION - NOT USER INPUT]") && t.contains("<task-notification>")
+    };
+    let is_peer = |t: &str| {
+        t.trim_start().starts_with("Another Claude session sent a message:\n<agent-message")
     };
     let texts: Vec<&str> = match last.get("content") {
         Some(serde_json::Value::String(t)) => vec![t.as_str()],
         Some(serde_json::Value::Array(blocks)) => {
             if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) != Some("text")) {
-                return false;
+                return None;
             }
             blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
         }
-        _ => return false,
+        _ => return None,
     };
-    texts.iter().any(|t| is_notice(t)) && texts.iter().all(|t| only_reminders(t))
+    if texts.iter().any(|t| is_notice(t)) && texts.iter().all(|t| only_reminders(t)) {
+        return Some(InjectedTurn::TaskNotification);
+    }
+    (texts.iter().any(|t| is_peer(t)) && texts.iter().all(|t| is_peer(t) || only_reminders(t)))
+        .then_some(InjectedTurn::Peer)
 }
 
 /// 去掉所有 `<system-reminder>…</system-reminder>` 区段之后只剩空白。只看开头不够：同一个文本块

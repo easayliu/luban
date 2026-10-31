@@ -48,6 +48,9 @@ pub(super) struct TurnFields {
     pub(super) origin: bool,
     /// `cc_prompt_index=N; cc_turn_index=N;`（2.1.285 起）。
     pub(super) index: bool,
+    /// 压缩后的主线程请求在末尾补 `cc_prev_msg=…; cc_prev_prompt_index=M; cc_prev_turn_index=M;`（2.1.314 起），
+    /// 见 [`CcSessionLink::before_compaction`]。
+    pub(super) prev_msg: bool,
 }
 
 /// `system[0]` 是不是一条 billing header。
@@ -69,10 +72,11 @@ pub(in crate::proxy) fn has_billing_header(v: &serde_json::Value) -> bool {
 ///
 /// 客户端**自己已经写了**哪一项就不动那一项——它比我们更清楚自己的链。
 ///
-/// `turn` 决定 `cc_prompt_id` 之后再补不补 `cc_turn_origin=human` 与
-/// `cc_prompt_index` / `cc_turn_index`，见 [`TurnFields`]。只在这条已经有 `cc_prompt_id`（客户端
-/// 自己的或刚补的）时补：官方这几项与它同条件出现。`cc_turn_origin` 恒写 `human`——后台任务
-/// 通知那种轮次（`task_notification`，`cap/2.1.285/00149`）代理分辨不出。
+/// `turn` 决定 `cc_prompt_id` 之后再补不补 `cc_turn_origin` 与 `cc_prompt_index` / `cc_turn_index`，见 [`TurnFields`]。
+/// 官方主线程这几项与有没有 `cc_prompt_id` 无关：`!` 那种本地命令轮次不写 prompt id，照写这几项
+/// （`cap/auto-2.1.314-20261030-full/00222`：`cc_turn_origin=human; cc_prompt_index=16; cc_turn_index=20;`）。
+/// origin 与两个序号取会话链上这一轮的（[`CcSessionLink::turn_origin`]）：后台任务通知、同伴消息那种轮次是
+/// `task_notification` / `peer`、只有轮次序号加一，`-p` 是 `sdk`、0 / 1。
 pub(super) fn append_billing_link(
     v: &mut serde_json::Value,
     link: &CcSessionLink,
@@ -106,16 +110,31 @@ pub(super) fn append_billing_link(
         s.push_str(&format!(" cc_prompt_id={pid};"));
         changed = true;
     }
-    if s.contains("cc_prompt_id=") {
-        if turn.origin && !s.contains("cc_turn_origin=") {
-            s.push_str(" cc_turn_origin=human;");
-            changed = true;
-        }
-        if turn.index && link.prompt_index > 0 && !s.contains("cc_prompt_index=") {
-            let n = link.prompt_index;
-            s.push_str(&format!(" cc_prompt_index={n}; cc_turn_index={n};"));
-            changed = true;
-        }
+    // 客户端自己写了这一轮的位置（订阅端 OAuth 直连的官方客户端），压缩前那条也由它自己写，不替它补。
+    let client_wrote_turn = s.contains("cc_turn_origin=");
+    // 不在会话链上的（`turn_index` 为 0）没有这一轮可言，这几项都不写。
+    let on_chain = link.turn_index > 0;
+    if turn.origin && on_chain && !s.contains("cc_turn_origin=") {
+        s.push_str(&format!(" cc_turn_origin={};", link.turn_origin.as_str()));
+        changed = true;
+    }
+    if turn.index && on_chain && !s.contains("cc_prompt_index=") {
+        let (p, t) = (link.prompt_index, link.turn_index);
+        s.push_str(&format!(" cc_prompt_index={p}; cc_turn_index={t};"));
+        changed = true;
+    }
+    // 2.1.314：压缩前主链最后一条回复与它那一轮的两个序号，排在官方段序的末尾（`cc_turn_index`、`cc_gateway`、
+    // `cc_project` 之后，`cap/auto-2.1.314-20261030-full/00211`：`cc_prev_prompt_index=13; cc_prev_turn_index=16;`）。
+    if turn.prev_msg
+        && !client_wrote_turn
+        && let Some(reply) = &link.before_compaction
+        && !s.contains("cc_prev_msg=")
+    {
+        s.push_str(&format!(
+            " cc_prev_msg={}; cc_prev_prompt_index={}; cc_prev_turn_index={};",
+            reply.message_id, reply.prompt_index, reply.turn_index
+        ));
+        changed = true;
     }
     if !changed {
         return false;

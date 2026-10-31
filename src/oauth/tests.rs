@@ -869,6 +869,74 @@ fn split_raw(
     (request_line, names, values, body.to_string())
 }
 
+/// `event_logging` 的**线上**形态跟会话版本走，真发到本地监听口看原始字节：2.1.314 起是 Bun 长连接会话那套
+/// （`cap/auto-2.1.314-20261030-full` UA 为 `claude-code/2.1.314` 的 51 条：头序 [`config::EVENT_LOGGING_FETCH_ORDER`]、
+/// `Connection: keep-alive`、Messages API 那份 `Accept-Encoding`），2.1.312 的照旧是 axios 那套
+/// （`cap/auto-2.1.312-20261028-full` 48 条：`Connection: close`、`gzip, compress, deflate, br`）。
+#[tokio::test]
+async fn event_logging_wire_shape_follows_the_session_version() {
+    let client = crate::clients::upstream_client(None).unwrap();
+    let events = [serde_json::json!({"event_type": "ClaudeCodeInternalEvent", "event_data": {}})];
+    let cases = [
+        (
+            "2.1.314",
+            [
+                "Accept",
+                "Authorization",
+                "Content-Type",
+                "User-Agent",
+                "anthropic-beta",
+                "x-service-name",
+                "Connection",
+                "Host",
+                "Accept-Encoding",
+                "Content-Length",
+            ],
+            "keep-alive",
+            config::CC_ACCEPT_ENCODING,
+        ),
+        (
+            "2.1.312",
+            [
+                "Accept",
+                "Content-Type",
+                "User-Agent",
+                "x-service-name",
+                "Authorization",
+                "anthropic-beta",
+                "Content-Length",
+                "Accept-Encoding",
+                "Host",
+                "Connection",
+            ],
+            config::AXIOS_CONNECTION,
+            config::AXIOS_ACCEPT_ENCODING,
+        ),
+    ];
+    for (version, order, connection, encoding) in cases {
+        let (addr, server) = serve_once("{}");
+        crate::telemetry::event_logging_request(
+            &client,
+            &format!("http://{addr}"),
+            "AT",
+            version,
+            &events,
+        )
+        .send()
+        .await
+        .unwrap();
+        let raw = server.join().unwrap();
+        let (request_line, names, values, _) = split_raw(&raw);
+        assert_eq!(request_line, "POST /api/event_logging/v2/batch HTTP/1.1", "{version}");
+        assert_eq!(names, order, "{version}\n{raw}");
+        assert_eq!(values["accept"], config::AXIOS_ACCEPT, "{version}");
+        assert_eq!(values["user-agent"], format!("claude-code/{version}"), "{version}");
+        assert_eq!(values["connection"], connection, "{version}");
+        assert_eq!(values["accept-encoding"], encoding, "{version}");
+        assert_eq!(values["x-service-name"], "claude-code", "{version}");
+    }
+}
+
 /// 握手里随版本变过的四条（eval、penguin_mode、mcp_servers、policy_limits）**线上**的头序与 UA 跟会话版本走，真发到
 /// 本地监听口、看原始字节：2.1.312 的会话照 `cap/auto-2.1.312-20261028-full`（全是 `claude-code/2.1.312`，
 /// policy_limits 带 `Cache-Control` / `Pragma`），2.1.285 的照 `cap/2.1.285`（eval 是 Bun 补的 UA、penguin_mode 与

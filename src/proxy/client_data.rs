@@ -1,7 +1,8 @@
 //! 服务端 bootstrap 回包里的 `client_data`：拆给按它走的几个开关，并按（号, 模型）落库。
 //!
 //! 官方客户端把 `client_data` 按槽位存在本机配置里（`clientDataCacheSlots`，2.1.311 `xh()`），进程一启动就读得到：
-//! `<total_tokens>` 那一族（[`super::lapis_anchor`]）与 `tengu_heron_brook`（[`super::heron_brook`]）在这次 bootstrap
+//! `<total_tokens>` 那一族（[`super::lapis_anchor`]）、`tengu_heron_brook`（[`super::heron_brook`]）与 2.1.314 起的
+//! `original_games_guidance`（[`super::original_games`]）在这次 bootstrap
 //! 回来之前就按上一份定了。luban 原先只记在内存，重启后到这个号这个模型下一次握手之前都是空的——进行中的会话中途
 //! 换档（system 末块、首轮环境说明、每轮提醒一起变，整段缓存重写），每个（号, 模型）重启后的第一个新会话也定错。
 //! 现在整份落库（`client_data` 表）：回包与上次落库的那份不同才写（[`save_bootstrap`]），启动时读回（[`restore`]）。
@@ -69,12 +70,14 @@ pub(crate) fn bootstrap_model(model: &str) -> Cow<'static, str> {
 fn apply(cred_id: i64, model: &str, data: &serde_json::Value) {
     super::heron_brook::note_client_data(cred_id, model, data);
     super::lapis_anchor::note_client_data(cred_id, model, data);
+    super::original_games::note_client_data(cred_id, model, data);
 }
 
 /// 那几个开关里这个（号, 模型）的条目一并清掉。
 fn forget(cred_id: i64, model: &str) {
     super::heron_brook::forget_client_data(cred_id, model);
     super::lapis_anchor::forget_client_data(cred_id, model);
+    super::original_games::forget_client_data(cred_id, model);
 }
 
 /// 记下一份 bootstrap 回包（`GET /api/claude_cli/bootstrap?model=<model>` 的 200 体）里的 `client_data`（只动内存），
@@ -222,19 +225,19 @@ mod tests {
             "tengu_heron_brook":"  hi  "}}"#;
         let data = note_bootstrap(id, "claude-opus-5-5", body).unwrap();
         assert_eq!(data["tengu_lapis_anchor"], "off");
-        assert!(!lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5").reminders());
+        assert!(!lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5", "2.1.312").reminders());
         assert_eq!(heron_brook::applied(id, "claude-opus-5-5"), Some((2, true)));
 
         // 回包里没有 `client_data`：空对象，两个开关都按没下发记（覆盖掉上一份）。
         let bare = note_bootstrap(id, "claude-opus-5-5", br#"{"oauth_account":{}}"#);
         assert_eq!(bare, Some(serde_json::json!({})));
         assert_eq!(heron_brook::applied(id, "claude-opus-5-5"), None);
-        assert!(lapis_anchor::session_mode(id, "s-2", "claude-opus-5-5").reminders());
+        assert!(lapis_anchor::session_mode(id, "s-2", "claude-opus-5-5", "2.1.312").reminders());
 
         // 解析不了的体不动旧值。
         note_bootstrap(id, "claude-opus-5-5", body);
         assert_eq!(note_bootstrap(id, "claude-opus-5-5", b"<html>"), None);
-        assert!(!lapis_anchor::session_mode(id, "s-3", "claude-opus-5-5").reminders());
+        assert!(!lapis_anchor::session_mode(id, "s-3", "claude-opus-5-5", "2.1.312").reminders());
     }
 
     /// 启动时读回的那份与刚拉到的一样算数：重启前定成 off 的号，重启后的会话（含进行中会话的下一条）照样 off；
@@ -249,9 +252,9 @@ mod tests {
             row("claude-sonnet-5-5", "not json"),
         ];
         assert_eq!(restore_rows(rows), (2, vec![]), "坏掉的那条跳过");
-        let mode = lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5");
+        let mode = lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5", "2.1.312");
         assert!(!mode.reminders() && mode.from_client_data);
-        assert!(lapis_anchor::session_mode(id, "s-2", "claude-haiku-5-5").reminders());
+        assert!(lapis_anchor::session_mode(id, "s-2", "claude-haiku-5-5", "2.1.312").reminders());
         assert!(persisted(id, "claude-opus-5-5").is_some());
         assert!(persisted(id, "claude-sonnet-5-5").is_none());
 
@@ -315,7 +318,7 @@ mod tests {
         save_bootstrap(&store, id, "claude-opus-5-5", plain).await;
         let want = serde_json::json!({ "cedar_basin": "2027-08-31" });
         assert_eq!(stored().await, vec![(id, "claude-opus-5-5".to_string(), want)]);
-        assert!(lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5").reminders());
+        assert!(lapis_anchor::session_mode(id, "s-1", "claude-opus-5-5", "2.1.312").reminders());
     }
 
     /// 同一个号的回包并发落库：按拿到号锁的先后一份一份来，后到的 A 落在先到的 B 之后，库里与内存都是 A。
@@ -438,8 +441,10 @@ mod tests {
         assert!(!kept.contains(&"claude-junk-0".to_string()), "最久没拉过的挤掉: {kept:?}");
         assert!(kept.contains(&"claude-opus-5-5".to_string()));
         assert!(persisted(id, "claude-junk-0").is_none());
-        let gone = lapis_anchor::session_mode(id, "s-junk", "claude-junk-0");
+        let gone = lapis_anchor::session_mode(id, "s-junk", "claude-junk-0", "2.1.312");
         assert!(gone.reminders() && !gone.from_client_data, "内存里那份也清了");
-        assert!(!lapis_anchor::session_mode(id, "s-opus", "claude-opus-5-5").reminders());
+        assert!(
+            !lapis_anchor::session_mode(id, "s-opus", "claude-opus-5-5", "2.1.312").reminders()
+        );
     }
 }

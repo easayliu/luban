@@ -1073,6 +1073,21 @@ pub(super) fn auto_mode_decision_v312(v: &mut Value, tool_use_id: &str) {
     }
 }
 
+/// 2.1.314 的 `tengu_auto_mode_decision`：服务端判过的那种（带 `serverClassifierRole`）紧跟着多
+/// `serverClassifierConnection`，即这个进程连 API 的方式（官方 `LGt()`：第一方直连没设代理是 `direct`，设了 HTTP 代理
+/// `direct_http_proxy`，自定义 `ANTHROPIC_BASE_URL` `custom_base_url`，非第一方 `platform`）。`cap/auto-2.1.314-20261030-full`
+/// 判过的 26 条都有（经抓包代理，是 `direct_http_proxy`），acceptEdits 快路径那 6 条两项都没有。模拟的是不设代理的
+/// 订阅端直连，报 `direct`。
+pub(super) fn auto_mode_decision_v314(v: &mut Value) {
+    if v.get("serverClassifierRole").is_some() {
+        insert_after(
+            v,
+            "serverClassifierRole",
+            vec![("serverClassifierConnection", json!("direct"))],
+        );
+    }
+}
+
 /// 2.1.312 的权限两条（`tengu_tool_use_can_use_tool_allowed` / `rejected`）在 `messageID` 后多 `toolUseID`，
 /// 即这次调用的 tool_use id（`cap/auto-2.1.312-20261028-full` 的 60 条 allowed 与 B1 那条 rejected）。
 pub(super) fn can_use_tool_v312(v: &mut Value, tool_use_id: &str) {

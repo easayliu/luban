@@ -507,6 +507,100 @@ pub(super) struct Subst<'a> {
     /// 同一处、首次使用那条之前先报 `feature_sad{sent, dropped, api_tools_used_header, incomplete_list}`（官方拼头时
     /// 先报它，再记首次使用）。
     pub(super) tools_used_truncation: Option<(usize, usize)>,
+    /// 组织配置那道闸（[`crate::proxy::org_config_gate`]）按这个号的 eval 与这台机器判出来的样子：启动模板那条
+    /// `org_config_gate_shadow` 的开关与在不在闸内几项照它改，在闸内再补一条真判定。2.1.310 起、见过这个号的 eval 才有，
+    /// 否则模板原样。
+    pub(super) org_gate: Option<OrgGate>,
+    /// 模型能力被 bootstrap 的 `client_data` 改了默认时官方报的那几条（`tengu_model_capability_from_client_data` /
+    /// `…_off_from_client_data`，事件名与 `{capability, model}`），与 [`Self::lapis`] 同一处、跟在它后面。
+    pub(super) capability_events: Vec<(&'static str, Value)>,
+}
+
+/// 组织配置那道闸的输入，见 [`Subst::org_gate`]。
+#[derive(Debug, Clone)]
+pub(super) struct OrgGate {
+    pub(super) flag: crate::proxy::org_config_gate::Flag,
+    /// 订阅档（[`crate::proxy::org_config_gate::tier_of`]），取不到为 `None`。
+    pub(super) tier: Option<&'static str>,
+    /// 这台机器的分桶（[`crate::proxy::org_config_gate::bucket`]）。
+    pub(super) bucket: u32,
+}
+
+impl OrgGate {
+    fn now(&self) -> crate::proxy::org_config_gate::Candidacy {
+        crate::proxy::org_config_gate::candidacy(&self.flag, self.tier, self.bucket)
+    }
+
+    fn if_armed(&self) -> crate::proxy::org_config_gate::Candidacy {
+        let armed = crate::proxy::org_config_gate::armed(&self.flag);
+        crate::proxy::org_config_gate::candidacy(&armed, self.tier, self.bucket)
+    }
+
+    /// 影子判定里跟开关与这台机器走的那几项（官方 2.1.314 `ae`）：`candidate_if_armed` / `candidate_now` 与不在闸内时
+    /// 紧跟的排除原因，`flag_enabled` / `flag_percent` / `grace_ttl_hours`，`tier`（取不到档位的不带，`credential_shape`
+    /// 换成 `untiered_login`）。判定、两侧原因与缓存那些是这台机器的本地状态，照模板。
+    fn apply_shadow(&self, meta: &mut Value) {
+        use crate::proxy::org_config_gate::Candidacy;
+        let Some(o) = meta.as_object_mut() else { return };
+        for k in ["exclusion_if_armed", "exclusion_now"] {
+            o.shift_remove(k);
+        }
+        let (armed, now) = (self.if_armed(), self.now());
+        o.insert("candidate_if_armed".into(), json!(matches!(armed, Candidacy::Candidate(_))));
+        o.insert("candidate_now".into(), json!(matches!(now, Candidacy::Candidate(_))));
+        o.insert("flag_enabled".into(), json!(self.flag.enabled));
+        o.insert("flag_percent".into(), js_number(self.flag.percent));
+        o.insert("grace_ttl_hours".into(), js_number(self.flag.grace_ttl_hours));
+        match self.tier {
+            Some(t) => {
+                o.insert("tier".into(), json!(t));
+            }
+            None => {
+                o.shift_remove("tier");
+                o.insert("credential_shape".into(), json!("untiered_login"));
+            }
+        }
+        if let Candidacy::Excluded(x) = armed {
+            insert_after(meta, "candidate_if_armed", vec![("exclusion_if_armed", json!(x))]);
+        }
+        if let Candidacy::Excluded(x) = now {
+            insert_after(meta, "candidate_now", vec![("exclusion_now", json!(x))]);
+        }
+    }
+
+    /// 在闸内时的那条真判定（官方 `zWe`）与紧跟的 `feature_sad{org_config_gate}`。这台机器上一个进程已经存过两侧的
+    /// 配置、这一回还没拉回来（两侧 `unavailable_pending`），缓存没过宽限期，于是不等、直接按缓存放行（`pass_cached`）——
+    /// `cap/auto-2.1.314-20261030-full` 23 条里 22 条是这样（交互式 15、`-p` 7；另一条是那台机器头一回启动、没有缓存）。
+    /// 缓存的岁数按调用散列在几分钟里取。
+    fn verdict(&self, sdk: bool, seed: u32) -> Option<[(&'static str, Value); 2]> {
+        let crate::proxy::org_config_gate::Candidacy::Candidate(tier) = self.now() else {
+            return None;
+        };
+        let gate = json!({
+            "decision": "pass_cached",
+            "surface": if sdk { "noninteractive" } else { "startup" },
+            "blocked_ms": 0,
+            "attempt": 0,
+            "decided_without_waiting": true,
+            "tier": tier,
+            "flag_source": "disk",
+            "flag_percent": js_number(self.flag.percent),
+            "grace_ttl_hours": js_number(self.flag.grace_ttl_hours),
+            "budget_ms": js_number(self.flag.budget_ms),
+            "policy_reason": "unavailable_pending",
+            "policy_has_cache": true,
+            "policy_cache_age_ms": 240_000 + seed % 600_000,
+            "settings_reason": "unavailable_pending",
+            "settings_has_cache": true,
+            "settings_cache_age_ms": 60_000 + seed % 60_000
+        });
+        let sad = json!({
+            "feature_name": "org_config_gate",
+            "error_code": "pass_cached",
+            "tengu_quizzical_giraffe": "unset"
+        });
+        Some([("tengu_org_config_gate", gate), ("tengu_feature_sad", sad)])
+    }
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -774,7 +868,9 @@ where
     // `mcp_connect` / `mcp_list_tools` 整组不发——这几份模板里这两条 feature_ok 只属于它。
     let ide_mcp =
         version_at_least(subst.version, "2.1.285") && tpl.iter().any(|e| is_ide_transport(&e.meta));
+    let mut prev_name = "";
     for e in tpl {
+        let after = std::mem::replace(&mut prev_name, e.name.as_str());
         if ide_mcp
             && (is_ide_transport(&e.meta)
                 || (e.name == "tengu_feature_ok"
@@ -977,6 +1073,12 @@ where
                 ];
                 insert_after(&mut meta, "settings_cache_age_ms", pairs);
             }
+            // 开关与在不在闸内跟这个号的 eval、这台机器的分桶走（[`Subst::org_gate`]）。
+            if e.name == "tengu_org_config_gate_shadow"
+                && let Some(g) = &subst.org_gate
+            {
+                g.apply_shadow(&mut meta);
+            }
             // 2.1.311 起启动那条 `tengu_init` 在 `rendererEntryPath` 之后多一项 `config_dir_kind`：`CLAUDE_CONFIG_DIR`
             // 没设时恒为 `unset`（`cap/auto-2.1.311-20261027-full` 交互式 16 条、`-p` 7 条都是；设了且与设置目录不同时
             // 才再多一项 `config_dir_settings_kind`）。
@@ -1027,12 +1129,19 @@ where
                 let at = |m: &Value| (t, id.event_at(e.stage, name, t, c, m.clone()));
                 subst.lapis.iter().map(at).collect::<Vec<_>>()
             };
+            let capabilities = |c: &EventCtx<'_>| {
+                let at =
+                    |(name, m): &(&str, Value)| (t, id.event_at(e.stage, name, t, c, m.clone()));
+                subst.capability_events.iter().map(at).collect::<Vec<_>>()
+            };
             if subst.sdk && e.name == "tengu_fork_subagent_enabled" {
                 events.extend(lapis(&c));
+                events.extend(capabilities(&c));
             }
             events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
             if !subst.sdk && e.name == "tengu_mcp_instructions_pool_change" {
                 events.extend(lapis(&c));
+                events.extend(capabilities(&c));
             }
             let tools_used_at_route = e.name == "tengu_feature_ok"
                 && meta.get("feature_name").and_then(|f| f.as_str()) == Some("provider_route");
@@ -1073,6 +1182,33 @@ where
                     }
                 }
                 dd.push(id.dd_entry_at(e.stage, &e.name, &c, resp_model, flat));
+            }
+            // 组织配置那道闸的真判定（在闸内才有，[`OrgGate::verdict`]）：交互式紧跟启动计时那条、`-p` 紧跟启动段
+            // `version_lock_failed` 之后那条 `tengu_exit`，晚 2 ~ 6ms，`feature_sad` 与它同一毫秒，进 Datadog。
+            let gate_here = if subst.sdk {
+                e.name == "tengu_exit" && after == "tengu_version_lock_failed"
+            } else {
+                e.name == "tengu_timer"
+                    && meta.get("event").and_then(|x| x.as_str()) == Some("startup")
+            };
+            if gate_here
+                && let Some(pair) =
+                    subst.org_gate.as_ref().and_then(|g| g.verdict(subst.sdk, subst.seed))
+            {
+                let tg = t + chrono::Duration::milliseconds(if subst.sdk { 2 } else { 4 });
+                let cg = ctx(tg);
+                for (name, m) in pair {
+                    if name == "tengu_feature_sad" {
+                        dd.push(id.dd_entry_at(
+                            MetaStage::Startup,
+                            name,
+                            &cg,
+                            resp_model,
+                            m.clone(),
+                        ));
+                    }
+                    events.push((tg, id.event_at(MetaStage::Startup, name, tg, &cg, m)));
+                }
             }
             if tools_used_at_route {
                 let ta = t + chrono::Duration::milliseconds(1);

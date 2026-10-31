@@ -2799,7 +2799,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.312."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.314."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -4908,11 +4908,205 @@ fn parses_version_strings() {
     assert!(v("2.1.9") < v("2.1.220"));
 }
 
+/// 2.1.314：压缩之后、主线程收到回复之前的主线程请求，billing header 末尾多压缩前主链最后一条回复与它那一轮的两个序号
+/// （`cap/auto-2.1.314-20261030-full/00211`：`…cc_turn_index=17; cc_prev_msg=msg_…; cc_prev_prompt_index=13;
+/// cc_prev_turn_index=16;`）。API Key 接入的真实 CC 由 luban 补会话链字段时一并补：两个序号各记各的——后台任务通知、
+/// 同伴消息那种轮次只加轮次序号（`00187` / `00116`），`-p` 是 sdk、0 / 1，`!` 那种本地命令轮次没有 prompt id 也照写
+/// origin 与序号（`00222`）。`/compact` 成功之后才记，只有主线程带，而且那条得是压缩过的样子（首条是摘要），不是就作废；
+/// 2.1.314 之前的客户端不补。收到回复就结清、摘要为空不记，在回程那层，见 handler 的端到端用例。
+#[test]
+fn api_key_cc_billing_carries_the_reply_before_compaction() {
+    use crate::proxy::session_link::{CcSessionKey, CcSessionLink};
+    let cred = test_cred();
+    let summary = "This session is being continued from a previous conversation that ran out of context. \
+                   The summary below covers the earlier portion of the conversation.\n\nSummary: …";
+    let body = |sid: &str, first: &str, last: &str| {
+        serde_json::json!({
+            "model": "claude-opus-5-5", "max_tokens": 64000,
+            "messages": [{"role":"user","content":first},{"role":"assistant","content":"y"},
+                {"role":"user","content":last}],
+            "system": [{"type":"text",
+                "text":"x-anthropic-billing-header: cc_version=2.1.314.cfe; cc_entrypoint=cli;"}],
+            "tools": [{"name":"Bash"}],
+            "metadata": {"user_id": serde_json::json!({"session_id": sid}).to_string()},
+        })
+    };
+    let link_ua = |sid: &str, first: &str, last: &str, ua: &str| {
+        let mut headers = crate::proxy::HeaderMap::new();
+        headers.insert("x-claude-code-session-id", HeaderValue::from_str(sid).unwrap());
+        headers.insert("anthropic-beta", HeaderValue::from_static("claude-code-20250219"));
+        headers.insert(axum::http::header::USER_AGENT, HeaderValue::from_str(ua).unwrap());
+        let v = body(sid, first, last);
+        crate::proxy::client_session_link(Some(&v), &headers, None, all_on(), true, &cred)
+            .unwrap()
+            .1
+    };
+    let link = |sid: &str, first: &str, last: &str| {
+        link_ua(sid, first, last, "claude-cli/2.1.314 (external, cli)")
+    };
+    // 工具续轮：末条是工具结果，不开新一轮。
+    let tool_turn = |sid: &str| {
+        let mut headers = crate::proxy::HeaderMap::new();
+        headers.insert("x-claude-code-session-id", HeaderValue::from_str(sid).unwrap());
+        headers.insert("anthropic-beta", HeaderValue::from_static("claude-code-20250219"));
+        let mut v = body(sid, "hi", "x");
+        v["messages"][2]["content"] =
+            serde_json::json!([{"type":"tool_result","tool_use_id":"t1","content":"ok"}]);
+        crate::proxy::client_session_link(Some(&v), &headers, None, all_on(), true, &cred)
+            .unwrap()
+            .1
+    };
+    let billing = |l: &CcSessionLink, prev_msg: bool| {
+        let mut v = body("s", "hi", "x");
+        let turn = super::TurnFields { origin: true, index: true, prev_msg };
+        super::append_billing_link(&mut v, l, turn);
+        v["system"][0]["text"].as_str().unwrap().to_string()
+    };
+    let tail = |text: &str| text.split_once("cc_entrypoint=cli;").unwrap().1.to_string();
+    let compact = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
+    let notice = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b1</task-id>\n\
+                  </task-notification>\n</system-reminder>";
+    let peer = "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport\n</agent-message>";
+
+    let sid = crate::proxy::uuid_v4();
+    let key = || CcSessionKey { cred_id: cred.id, session_id: &sid };
+    // 用户 → 任务通知 → 同伴消息 → 用户：prompt 1、1、1、2，turn 1、2、3、4。
+    let mut turns = Vec::new();
+    for (i, last) in ["first question", notice, peer, "second question"].into_iter().enumerate() {
+        let l = link(&sid, "hi", last);
+        let msg = format!("msg_{i}");
+        CcSessionLink::record_main(key(), l.turn.as_ref().unwrap(), Some("req"), Some(&msg));
+        turns.push(tail(&billing(&l, true)));
+        if last == notice {
+            // 这一轮的工具续轮沿用本轮的 origin 与序号（`00187` → `00189`）。
+            let c = tool_turn(&sid);
+            assert_eq!(
+                (c.turn_origin.as_str(), c.prompt_index, c.turn_index),
+                ("task_notification", 1, 2)
+            );
+        }
+    }
+    assert!(
+        turns[0].contains("cc_turn_origin=human; cc_prompt_index=1; cc_turn_index=1;"),
+        "{turns:?}"
+    );
+    assert!(
+        turns[1].contains("cc_turn_origin=task_notification; cc_prompt_index=1; cc_turn_index=2;"),
+        "{turns:?}"
+    );
+    assert!(
+        turns[2].contains("cc_turn_origin=peer; cc_prompt_index=1; cc_turn_index=3;"),
+        "{turns:?}"
+    );
+    assert!(
+        turns[3].contains("cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=4;"),
+        "{turns:?}"
+    );
+    // 上一条成功了，同一句再来是新的一轮。
+    let cont = link(&sid, "hi", "second question");
+    assert_eq!((cont.prompt_index, cont.turn_index), (3, 5));
+    CcSessionLink::record_main(key(), cont.turn.as_ref().unwrap(), Some("req"), Some("msg_4"));
+
+    let c = link(&sid, "hi", compact);
+    assert!(c.compaction && c.before_compaction.is_none(), "摘要请求自己不带");
+    assert_eq!(c.prev_message_id.as_deref(), Some("msg_4"));
+    CcSessionLink::note_compaction(key(), c.prev_message_id.as_deref());
+    let after = link(&sid, summary, "after compact");
+    let want = crate::proxy::session_link::CompactedReply {
+        message_id: "msg_4".into(),
+        prompt_index: 3,
+        turn_index: 5,
+    };
+    assert_eq!(after.before_compaction.as_ref(), Some(&want));
+    let text = billing(&after, true);
+    assert!(
+        text.ends_with(
+            " cc_turn_origin=human; cc_prompt_index=4; cc_turn_index=6; cc_prev_msg=msg_4; \
+             cc_prev_prompt_index=3; cc_prev_turn_index=5;"
+        ),
+        "{text}"
+    );
+    assert!(!billing(&after, false).contains("cc_prev_msg"), "2.1.314 之前不补");
+    // 客户端自己写了这一轮的位置（OAuth 直连的官方客户端）：压缩前那条也由它自己写，不替它补。
+    let mut own = body("s", "hi", "x");
+    own["system"][0]["text"] = serde_json::json!(
+        "x-anthropic-billing-header: cc_version=2.1.314.cfe; cc_entrypoint=cli; cch=00000; \
+         cc_turn_origin=human; cc_prompt_index=9; cc_turn_index=9;"
+    );
+    let turn = super::TurnFields { origin: true, index: true, prev_msg: true };
+    super::append_billing_link(&mut own, &after, turn);
+    assert!(!own["system"][0]["text"].as_str().unwrap().contains("cc_prev_msg"), "{own}");
+    // 别的类别不带；收到回复就结清，之后的不再带。
+    let sugg = link(&sid, summary, "[SUGGESTION MODE: Suggest what the user might type next.]");
+    assert!(sugg.before_compaction.is_none());
+    CcSessionLink::settle_compaction(key(), after.turn.as_ref().unwrap());
+    assert!(link(&sid, summary, "next").before_compaction.is_none());
+
+    // 压缩成功了，下一条主线程却不是压缩过的样子（客户端没用上那次摘要）：不带，记下的作废。
+    let sid = crate::proxy::uuid_v4();
+    let key = || CcSessionKey { cred_id: cred.id, session_id: &sid };
+    let first = link(&sid, "hi", "q1");
+    CcSessionLink::record_main(key(), first.turn.as_ref().unwrap(), Some("req_x"), Some("msg_x"));
+    let c = link(&sid, "hi", compact);
+    CcSessionLink::note_compaction(key(), c.prev_message_id.as_deref());
+    assert!(link(&sid, "hi", "q2").before_compaction.is_none());
+    assert!(
+        link(&sid, summary, "q3").before_compaction.is_none(),
+        "作废了，之后压缩过的样子也不带"
+    );
+
+    // 压缩期间主链又推进了（压缩起点读到的尾巴已不是最后一条）：不记。
+    let sid = crate::proxy::uuid_v4();
+    let key = || CcSessionKey { cred_id: cred.id, session_id: &sid };
+    let first = link(&sid, "hi", "q1");
+    CcSessionLink::record_main(key(), first.turn.as_ref().unwrap(), Some("req_x"), Some("msg_x"));
+    let c = link(&sid, "hi", compact);
+    let moved = link(&sid, "hi", "q2");
+    CcSessionLink::record_main(key(), moved.turn.as_ref().unwrap(), Some("req_y"), Some("msg_y"));
+    CcSessionLink::note_compaction(key(), c.prev_message_id.as_deref());
+    assert!(link(&sid, summary, "q3").before_compaction.is_none());
+
+    // 压缩期间又发出、还没回来的主线程请求不算推进：照记，序号是那条回复所在的那一轮，不是会话当前的。
+    let sid = crate::proxy::uuid_v4();
+    let key = || CcSessionKey { cred_id: cred.id, session_id: &sid };
+    let first = link(&sid, "hi", "q1");
+    CcSessionLink::record_main(key(), first.turn.as_ref().unwrap(), Some("req_p"), Some("msg_p"));
+    let c = link(&sid, "hi", compact);
+    let pending = link(&sid, "hi", "q2");
+    assert!(pending.before_compaction.is_none(), "压缩还没成功");
+    CcSessionLink::note_compaction(key(), c.prev_message_id.as_deref());
+    // 那条迟到的、压缩之前发出的回复不结清它。
+    CcSessionLink::settle_compaction(key(), pending.turn.as_ref().unwrap());
+    let after = link(&sid, summary, "q3");
+    assert_eq!(
+        after.before_compaction.map(|r| (r.message_id, r.prompt_index, r.turn_index)),
+        Some(("msg_p".to_string(), 1, 1))
+    );
+
+    // `-p`：sdk 起的头，0 / 1；`!` 本地命令那轮没有 prompt id，origin 与序号照写。
+    let sid = crate::proxy::uuid_v4();
+    let p = link_ua(&sid, "hi", "q", "claude-cli/2.1.314 (external, sdk-cli)");
+    assert!(
+        tail(&billing(&p, true))
+            .contains("cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;"),
+        "{}",
+        billing(&p, true)
+    );
+    let sid = crate::proxy::uuid_v4();
+    let key = || CcSessionKey { cred_id: cred.id, session_id: &sid };
+    let first = link(&sid, "hi", "q1");
+    CcSessionLink::record_main(key(), first.turn.as_ref().unwrap(), Some("req"), Some("msg"));
+    let bang = link(&sid, "hi", "<bash-input>ls</bash-input>");
+    let text = billing(&bang, true);
+    assert!(!text.contains("cc_prompt_id="), "{text}");
+    assert!(text.contains(" cc_turn_origin=human; cc_prompt_index=2; cc_turn_index=2;"), "{text}");
+}
+
 /// UA 里的 CC 版本：认 `claude-cli/<版本>`，后面跟什么都不影响；别的客户端读不出版本。
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 312)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 314)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

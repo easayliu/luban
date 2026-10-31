@@ -134,7 +134,7 @@ const FAMILY_SUBSTRINGS: &[(&str, &str)] = &[
 ///
 /// 官方 `p0` 先查目录的 provider id 反查表（`c_e`）；目录里的 provider id 走第 1 步得到的是同一个规范名（测试拿官方
 /// 原函数逐个对过），这里不另存那张表。结果是小写，可能还带着 `[1m]`，由调用方去掉。
-fn canonical_model(model: &str) -> String {
+pub(crate) fn canonical_model(model: &str) -> String {
     let e = model.to_lowercase();
     if let Some(id) = parse_model_id(&e).filter(|id| id.trailer_ok) {
         let known = CATALOG_IDS

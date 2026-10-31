@@ -456,6 +456,7 @@ pub(crate) fn rewrite_body_out_parsed(
             let turn = TurnFields {
                 origin: main && ver.is_some_and(|v| v >= (2, 1, 277)),
                 index: main && ver.is_some_and(|v| v >= (2, 1, 285)),
+                prev_msg: main && ver.is_some_and(|v| v >= (2, 1, 314)),
             };
             let billing = append_billing_link(&mut v, l, turn);
             // `diagnostics` 同样是订阅端才有的（`cap/2.1.258-api` 六份一个都没有）。

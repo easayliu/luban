@@ -180,6 +180,8 @@ pub(super) struct Session {
     pub(super) waiting_titles: Vec<(SystemTime, String)>,
     /// 本会话已经报过 `tengu_heron_brook_applied`（haiku-5-5 主线程会话一条）。
     pub(super) heron_done: bool,
+    /// 本会话报过的模型能力来源事件（官方 `y()` 的去重键：关掉的 `-能力:模型`、打开的 `能力:模型`）。
+    pub(super) capability_logged: std::collections::HashSet<String>,
     /// 主线程的 tether 线程状态，见 [`TetherThread`]；子代理的各记在 [`AgentState`] 里。
     pub(super) tether_main: Option<TetherThread>,
     /// 每条线程上一条完整请求的形态，键是 `main` 或 `agent:<支线号>`，见 [`ThreadBase`]。
@@ -697,6 +699,10 @@ pub(super) struct TurnFacts {
     /// 服务端判过的那种多 `serverClassifierRole`，`context_announcement` 多 `assumed_utc`，
     /// `resume_model_restore` 去掉 `is_eap`，失败 Bash 与 5xx 的错误栈换块（`cap/auto-2.1.312-20261028-*`）。
     pub(super) v312: bool,
+    /// 2.1.314：`api_success` 在 `estimatedInputTokens` 后多新旧图片四项与 `sentThreadType`，auto 模式判定在
+    /// `serverClassifierRole` 后多 `serverClassifierConnection`，`reactive_compact_attempt` / `succeeded` 在
+    /// `headTruncations` 后多 `leaveOutPasses`，失败 Bash 与 5xx 的错误栈换块（`cap/auto-2.1.314-20261030-*`）。
+    pub(super) v314: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
     /// [`State::tools_used_header_sent`]），而这个进程还没报过（[`Session::tools_used_header_reported`]）：这条报
     /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`
@@ -741,6 +747,13 @@ pub(super) struct TurnFacts {
     /// `tengu_lapis_anchor_from_client_data`，这里是它们的内容（`{mode}` / `{userTurn}` / `{budget}`，按官方的先后，
     /// [`crate::proxy::lapis_anchor::SessionMode::client_data_events`]，见 [`super::template::Subst::lapis`]）。
     pub(super) lapis: Vec<Value>,
+    /// 见 [`super::template::Subst::capability_events`]。
+    pub(super) capability_events: Vec<(&'static str, Value)>,
+    /// 模型能力的来源事件里这条没赶上模板那一处的（会话中途切到被改了默认的模型）：在这条请求前补，见
+    /// [`super::template::Subst::capability_events`]。
+    pub(super) capability_inline: Vec<(&'static str, Value)>,
+    /// 见 [`super::template::Subst::org_gate`]。
+    pub(super) org_gate: Option<super::template::OrgGate>,
     pub(super) tether: Option<Tether>,
     pub(super) usage_before: [i64; 4],
     pub(super) ignored_suggestion: Option<(String, SystemTime, usize)>,
@@ -995,6 +1008,7 @@ impl Session {
             sleepy_models: Vec::new(),
             waiting_titles: Vec::new(),
             heron_done: false,
+            capability_logged: Default::default(),
             tether_main: None,
             thread_bases: HashMap::new(),
             agents: HashMap::new(),

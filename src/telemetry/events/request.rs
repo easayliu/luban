@@ -149,6 +149,10 @@ impl EventBuilder<'_> {
                 "splitKind": "round",
                 "headTruncations": 0
             });
+            // 2.1.314 在 `headTruncations` 后多 `leaveOutPasses`（`cap/auto-2.1.314-20261030-full` A18 那条是 0）。
+            if env.f.v314 {
+                attempt["leaveOutPasses"] = json!(0);
+            }
             // 2.1.307 末尾多 `keepNoRound`（`cap/auto-2.1.307-20261022-full` A18 那条是 `false`）。
             if env.f.v307 {
                 attempt["keepNoRound"] = json!(false);

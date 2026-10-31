@@ -160,6 +160,12 @@ pub(super) struct RequestShape {
     pub(super) image_bytes: usize,
     /// 各图片宽×高之和（`imageTotalPixels`），见 [`image_dims`]。
     pub(super) image_pixels: u64,
+    /// 2.1.314 `api_success` 的新旧图片四项（`imageNewBlockCount` / `imageNewBytes` / `imageResentBlockCount` /
+    /// `imageResentBytes`），见 [`sent_images`]。
+    pub(super) image_new_blocks: usize,
+    pub(super) image_new_bytes: usize,
+    pub(super) image_resent_blocks: usize,
+    pub(super) image_resent_bytes: usize,
     pub(super) doc_blocks: usize,
     pub(super) doc_bytes: usize,
     pub(super) temperature: f64,
@@ -735,6 +741,10 @@ pub(super) fn error_trace(
         ("2.1.312", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-b95e8fn6.js:11:1510"))
         }
+        // 2.1.314 摘要照旧，顶帧换了块、行号 11 → 5，仍不带构造名（`cap/auto-2.1.314-20261030-retry` R1/R2）。
+        ("2.1.314", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-rbc434em.js:5:1510"))
+        }
         _ => None,
     }
 }
@@ -943,6 +953,51 @@ fn jpeg_frame(n: &[u8]) -> Option<usize> {
         e += 2 + r;
     }
     None
+}
+
+/// 这条请求发出去的图片里哪些是新的、哪些是重发的（[`sent_images`]）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SentImages {
+    pub(super) new_blocks: usize,
+    pub(super) new_bytes: usize,
+    pub(super) resent_blocks: usize,
+    pub(super) resent_bytes: usize,
+}
+
+/// 2.1.314 `api_success` 那四项的口径（官方 `kdn`）：只数这条请求实际发出的消息（线程续轮只发新增那几条），块数组里的
+/// 图片与工具结果（`tool_result` / `mcp_tool_result`）内容数组里的图片（只下一层），来源须是 base64 的字符串；字节按
+/// base64 解出的长度（同 `imageTotalBytes`）。位于最后一条助手消息之前的算重发，其余算新的——续轮里没有助手消息，
+/// 发出的全算新的，与官方按整段对话找那条助手消息的结果相同。
+pub(super) fn sent_images(msgs: &[Value]) -> SentImages {
+    let last_assistant =
+        msgs.iter().rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+    let mut out = SentImages::default();
+    for (i, m) in msgs.iter().enumerate() {
+        let Some(blocks) = m.get("content").and_then(|c| c.as_array()) else { continue };
+        for b in blocks {
+            let nested = matches!(
+                b.get("type").and_then(|t| t.as_str()),
+                Some("tool_result" | "mcp_tool_result")
+            )
+            .then(|| b.get("content").and_then(|c| c.as_array()))
+            .flatten();
+            for img in nested.map_or(std::slice::from_ref(b), Vec::as_slice) {
+                if img.get("type").and_then(|t| t.as_str()) != Some("image") {
+                    continue;
+                }
+                let Some(data) = base64_data(img) else { continue };
+                let bytes = base64_decoded_len(data);
+                if last_assistant.is_some_and(|a| i < a) {
+                    out.resent_blocks += 1;
+                    out.resent_bytes += bytes;
+                } else {
+                    out.new_blocks += 1;
+                    out.new_bytes += bytes;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 一条消息的 content：字符串或块数组。
@@ -1273,6 +1328,13 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
             shape.tail_all_system = !tail.is_empty()
                 && tail.iter().all(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"));
         }
+        let sent = sent_images(msgs);
+        (
+            shape.image_new_blocks,
+            shape.image_new_bytes,
+            shape.image_resent_blocks,
+            shape.image_resent_bytes,
+        ) = (sent.new_blocks, sent.new_bytes, sent.resent_blocks, sent.resent_bytes);
         for m in msgs {
             if let Some(c) = m.get("content") {
                 walk_content(c, &mut shape);

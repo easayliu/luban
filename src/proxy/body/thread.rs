@@ -662,7 +662,7 @@ pub(super) fn thread_system_shape(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-fn fingerprint_without_cache_control(v: &serde_json::Value) -> u64 {
+pub(crate) fn fingerprint_without_cache_control(v: &serde_json::Value) -> u64 {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_without_cache_control(v, &mut h);

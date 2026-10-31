@@ -376,6 +376,9 @@ impl EventBuilder<'_> {
             if v312 {
                 auto_mode_decision_v312(&mut decision, &tu.id);
             }
+            if env.f.v314 {
+                auto_mode_decision_v314(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`
@@ -539,6 +542,7 @@ impl EventBuilder<'_> {
             v310,
             v311,
             v312,
+            v314,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -811,8 +815,12 @@ impl EventBuilder<'_> {
             // `ls` 不存在的目录补抓，同法在 2.1.309 上复现出 1a36b34122c0）摘要、行列、块名都换了，2.1.311
             // （`cap/auto-2.1.311-20261027-bashfail`，同法补抓，同一次跑的 2.1.310 对照复现出 b26c68ea74b5）也都换了，2.1.312
             // （`cap/auto-2.1.312-20261028-bashfail` 与全量包里那条，同一次跑的 2.1.311 对照复现出 11211b82294f）摘要、行、块名
-            // 又换了、列没变。
-            if v312 {
+            // 又换了、列没变，2.1.314（`cap/auto-2.1.314-20261030-bashfail` 与全量包里那条，两处同值；2.1.313 没有发布）
+            // 摘要、行列、块名都换了。
+            if v314 {
+                err["error_stack_hash"] = json!("d67c18908567");
+                err["error_top_frame"] = json!("chunk-sq7yspzm.js:3529:7027");
+            } else if v312 {
                 err["error_stack_hash"] = json!("9eb7b5f2f5a2");
                 err["error_top_frame"] = json!("chunk-r5cyd28m.js:3545:6820");
             } else if v311 {

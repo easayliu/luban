@@ -2203,6 +2203,559 @@ async fn known_third_party_signature_is_rejected_locally(pool: sqlx::PgPool) {
     assert_eq!(mock.seen().len(), 1);
 }
 
+/// API Key 接入的真实 CC 2.1.314 主线程那种来访：可信 UA、头体同一个会话 id、billing header 是 API Key 端那种光秃秃的
+/// （只有 `cc_version` / `cc_entrypoint`，会话链字段由 luban 补）、身份句与基座齐全、带官方工具名，原样转发不进模拟。
+fn api_key_cc_request(session: &str, messages: serde_json::Value) -> (HeaderMap, Bytes) {
+    let user_id = serde_json::json!({
+        "device_id": "a".repeat(64),
+        "account_uuid": "",
+        "session_id": session,
+    })
+    .to_string();
+    let body = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 32000,
+        "stream": true,
+        "system": [
+            {"type": "text",
+             "text": "x-anthropic-billing-header: cc_version=2.1.314.cfe; cc_entrypoint=cli;"},
+            {"type": "text", "text": crate::config::CC_SYSTEM_IDENTITY},
+            {"type": "text", "text": crate::config::CC_SYSTEM_BASE},
+        ],
+        "tools": [{"name": "Bash", "description": "Run a command",
+                   "input_schema": {"type": "object"}}],
+        "metadata": {"user_id": user_id},
+        "messages": messages,
+    });
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_str("claude-cli/2.1.314 (external, cli)").unwrap(),
+    );
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    headers.insert("x-claude-code-session-id", HeaderValue::from_str(session).unwrap());
+    (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
+}
+
+/// 压缩那一轮的三条消息：压缩前、`/compact` 的摘要请求、压缩后（首条是摘要）。
+fn compaction_turns() -> [serde_json::Value; 3] {
+    let summary = "This session is being continued from a previous conversation that ran out of context. \
+                   The summary below covers the earlier portion of the conversation.\n\nSummary: we wrote calc.py.";
+    [
+        serde_json::json!([{"role": "user", "content": "write calc.py"}]),
+        serde_json::json!([
+            {"role": "user", "content": "write calc.py"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."},
+        ]),
+        serde_json::json!([
+            {"role": "user", "content": summary},
+            {"role": "user", "content": "now add tests"},
+        ]),
+    ]
+}
+
+/// 上游收到的第 `i` 条 `/v1/messages` 的 billing header。
+fn outbound_billing(mock: &MockUpstream, i: usize) -> String {
+    let seen = mock.seen();
+    let msgs: Vec<&Seen> = seen.iter().filter(|s| s.path.starts_with("/v1/messages")).collect();
+    let v: serde_json::Value = serde_json::from_slice(&msgs[i].body).unwrap();
+    v["system"][0]["text"].as_str().unwrap().to_string()
+}
+
+/// 2.1.314 压缩后的 billing 三项只在压缩真的成功时记：摘要请求完整 200、摘要有正文。正文为空（官方 `no_summary`，
+/// 压缩失败）就不记，压缩后那条不带；有正文的对照组带上压缩前那条（`msg_mock`，第 1 轮）。
+#[sqlx::test]
+async fn an_empty_summary_does_not_arm_the_reply_before_compaction(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok("done"),
+        sse_ok(""),
+        sse_ok("ok"),
+        sse_ok("done"),
+        sse_ok("we wrote calc.py"),
+        sse_ok("ok"),
+    ])
+    .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let [before, compact, after] = compaction_turns();
+    for (round, session) in
+        ["1b7c2d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d", "2c8d3e5f-6071-4b2c-9d3e-4f5a6b7c8d9e"]
+            .into_iter()
+            .enumerate()
+    {
+        for messages in [&before, &compact, &after] {
+            let (status, _, body) =
+                send(&state, api_key_cc_request(session, messages.clone())).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+        let first = outbound_billing(&mock, round * 3);
+        assert!(
+            first.contains(" cc_turn_origin=human; cc_prompt_index=1;"),
+            "走的是补链字段那条路: {first}"
+        );
+        let billing = outbound_billing(&mock, round * 3 + 2);
+        if round == 0 {
+            assert!(!billing.contains("cc_prev_msg"), "摘要为空，压缩没成: {billing}");
+        } else {
+            assert!(
+                billing.ends_with(
+                    " cc_prev_msg=msg_mock; cc_prev_prompt_index=1; cc_prev_turn_index=1;"
+                ),
+                "{billing}"
+            );
+        }
+    }
+}
+
+/// 压缩后第一条主线程请求已经收到回复（见过 `message_start`）却没有完整收尾（客户端按 Esc、流断在半截）：官方请求收尾时
+/// 照样清掉压缩前那条，下一条不再带。
+#[sqlx::test]
+async fn a_reply_cut_after_message_start_settles_the_reply_before_compaction(pool: sqlx::PgPool) {
+    let cut = {
+        let events = [
+            serde_json::json!({"type": "message_start", "message": {
+                "id": "msg_cut", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+                "content": [], "stop_reason": null, "usage": {"input_tokens": 12, "output_tokens": 1}}}),
+            serde_json::json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            serde_json::json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "Adding te"}}),
+        ];
+        let body: String = events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect();
+        Reply {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: body.into_bytes(),
+        }
+    };
+    let mock =
+        MockUpstream::start(vec![sse_ok("done"), sse_ok("we wrote calc.py"), cut, sse_ok("ok")])
+            .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let session = "3d9e4f60-7182-4c3d-8e4f-5a6b7c8d9e0f";
+    let [before, compact, after] = compaction_turns();
+    for messages in [&before, &compact, &after, &after] {
+        let _ = send(&state, api_key_cc_request(session, messages.clone())).await;
+    }
+    let first_after = outbound_billing(&mock, 2);
+    assert!(first_after.contains(" cc_prev_msg=msg_mock;"), "压缩后第一条带: {first_after}");
+    let next = outbound_billing(&mock, 3);
+    assert!(!next.contains("cc_prev_msg"), "收到过回复就结清了: {next}");
+}
+
+/// 一条只到 `message_start` 加半截正文、没有 `message_stop` 的流式回复。
+fn sse_cut(text: &str) -> Reply {
+    let events = [
+        serde_json::json!({"type": "message_start", "message": {
+            "id": "msg_cut", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [], "stop_reason": null, "usage": {"input_tokens": 12, "output_tokens": 1}}}),
+        serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": text}}),
+    ];
+    let body: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "text/event-stream".into())],
+        body: body.into_bytes(),
+    }
+}
+
+/// [`sse_ok`] 换成自己的 `message.id` 与 `request-id`（`req_011C` + `tag`），链上每一环分得清。
+fn sse_ok_as(text: &str, tag: &str) -> Reply {
+    let mut r = sse_ok(text);
+    let body = String::from_utf8(r.body).unwrap().replace("msg_mock", &format!("msg_{tag}"));
+    r.body = body.into_bytes();
+    r.with_headers(&[("request-id", format!("req_011C{tag}"))])
+}
+
+/// [`sse_ok_as`] 换成拒答收尾（`stop_reason: refusal`）。
+fn sse_refusal_as(tag: &str) -> Reply {
+    let mut r = sse_ok_as("", tag);
+    let body = String::from_utf8(r.body).unwrap().replace("\"end_turn\"", "\"refusal\"");
+    r.body = body.into_bytes();
+    r
+}
+
+/// 发一条，读到第一块回复就断开（客户端按 Esc 取消）：上游那头没读到头，luban 收尾按客户端取消记。
+async fn send_and_cancel(state: &AppState, req: (HeaderMap, Bytes)) -> StatusCode {
+    use futures_util::StreamExt;
+    let (mut headers, body) = req;
+    headers.insert("x-api-key", HeaderValue::from_static(AppState::TEST_CLIENT_KEY));
+    let resp = crate::proxy::handle(
+        axum::extract::State(state.clone()),
+        axum::http::Method::POST,
+        "/v1/messages".parse::<Uri>().unwrap(),
+        headers,
+        axum::body::Body::from(body),
+    )
+    .await;
+    let status = resp.status();
+    let mut stream = resp.into_body().into_data_stream();
+    let _ = stream.next().await;
+    drop(stream);
+    status
+}
+
+/// 首轮出了半截回复被取消、客户端把这句退回输入框改了重发（`cap/auto-2.1.314-20261030-full` 00703 → 00706）：历史里没有
+/// 被取消那句了，官方 `Z4n` 按保留的历史重算，重发仍是 1 / 1，之后一轮 2 / 2。对照：取消后另敲一句（历史里留着被取消
+/// 那句）照常加；取消后原样重发（换了 prompt id）同改了重发；这一轮已经成功过一条再取消的，不退。
+#[sqlx::test]
+async fn a_cancelled_turn_edited_and_resent_keeps_its_position(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_cut("Calcul"),
+        sse_ok("ok"),
+        sse_ok("done"),
+        sse_cut("Calcul"),
+        sse_ok("ok"),
+        sse_cut("Calcul"),
+        sse_ok("ok"),
+        sse_ok("step"),
+        sse_cut("Calcul"),
+        sse_ok("ok"),
+    ])
+    .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let reminder =
+        serde_json::json!({"type": "text", "text": "<system-reminder>\nctx\n</system-reminder>"});
+    let input = |text: &str| {
+        serde_json::json!({"role": "user", "content": [reminder.clone(),
+            {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]})
+    };
+    let with_prompt = |session: &str, prompt: &str, messages: serde_json::Value| {
+        let (mut headers, body) = api_key_cc_request(session, messages);
+        headers.insert("x-claude-code-prompt-id", HeaderValue::from_str(prompt).unwrap());
+        (headers, body)
+    };
+    const P1: &str = "69c04242-b0c8-4d0f-9b65-5baaa54a6cef";
+    const P2: &str = "90019800-940c-4ea5-b4a7-c8340fa50190";
+    const P3: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let position = |i: usize| {
+        let b = outbound_billing(&mock, i);
+        let at = b.find(" cc_prompt_index=").expect(&b);
+        b[at..].to_string()
+    };
+    const ONE: &str = " cc_prompt_index=1; cc_turn_index=1;";
+    const TWO: &str = " cc_prompt_index=2; cc_turn_index=2;";
+
+    // 改了重发：1 / 1，下一轮 2 / 2。
+    let s = "4e5f6071-8293-4d4e-9f50-6b7c8d9e0f1a";
+    let essay = "write a 600 word essay about the history of calculators";
+    send_and_cancel(&state, with_prompt(s, P1, serde_json::json!([input(essay)]))).await;
+    let edited = format!("{essay}never");
+    let resent = serde_json::json!([input(&edited)]);
+    send(&state, with_prompt(s, P2, resent)).await;
+    let next = serde_json::json!([input(&edited), {"role": "assistant", "content": "ok"},
+                                  input("/init")]);
+    send(&state, with_prompt(s, P3, next)).await;
+    assert_eq!(position(0), ONE);
+    assert_eq!(position(1), ONE, "改了重发仍是首轮");
+    assert_eq!(position(2), TWO);
+
+    // 取消后另敲一句：历史里留着被取消那句，照常加。
+    let s = "5f607182-93a4-4e5f-a061-7c8d9e0f1a2b";
+    send_and_cancel(&state, with_prompt(s, P1, serde_json::json!([input(essay)]))).await;
+    let more = serde_json::json!([input(essay),
+        {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]},
+        input("shorter please")]);
+    send(&state, with_prompt(s, P2, more)).await;
+    assert_eq!(position(3), ONE);
+    assert_eq!(position(4), TWO, "被取消那句还在历史里");
+
+    // 取消后原样重发（客户端换了 prompt id）：同改了重发。
+    let s = "60718293-a4b5-4f60-b172-8d9e0f1a2b3c";
+    send_and_cancel(&state, with_prompt(s, P1, serde_json::json!([input(essay)]))).await;
+    send(&state, with_prompt(s, P2, serde_json::json!([input(essay)]))).await;
+    assert_eq!(position(5), ONE);
+    assert_eq!(position(6), ONE);
+
+    // 这一轮已经有一条成功（工具续轮），之后才取消：不退。
+    let s = "718293a4-b5c6-4071-82c3-9e0f1a2b3c4d";
+    send(&state, with_prompt(s, P1, serde_json::json!([input(essay)]))).await;
+    send_and_cancel(
+        &state,
+        with_prompt(
+            s,
+            P1,
+            serde_json::json!([input(essay),
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash",
+                                           "input": {"command": "ls"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                                      "content": "calc.py"}]}]),
+        ),
+    )
+    .await;
+    send(&state, with_prompt(s, P2, serde_json::json!([input(&edited)]))).await;
+    assert_eq!(position(7), ONE);
+    assert_eq!(position(8), ONE, "工具续轮沿用");
+    assert_eq!(position(9), TWO, "这一轮成功过，不退");
+}
+
+/// 被取消的那句与更早历史里的一句同名（第一轮「continue」成功，第二轮又敲「continue」、取消后改成「add tests」）：
+/// 只看那句原来位置往后的历史，不拿第一轮的同名输入充数，第二轮仍是 2 / 2。接线程（只发增量）的同样认。
+#[sqlx::test]
+async fn a_cancelled_input_repeating_an_earlier_one_still_rolls_back(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok_as("on it", "C1"),
+        sse_cut("Work"),
+        sse_ok_as("ok", "T1"),
+        sse_ok_as("on it", "C2"),
+        sse_cut("Work"),
+        sse_ok_as("ok", "T2"),
+        sse_ok_as("on it", "C3"),
+        sse_cut("Work"),
+        sse_ok_as("ok", "T3"),
+        sse_ok_as("on it", "C4"),
+        sse_cut("Work"),
+        sse_ok_as("ok", "T4"),
+    ])
+    .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let user = |t: &str| serde_json::json!({"role": "user", "content": t});
+    let reply = serde_json::json!({"role": "assistant", "content": "on it"});
+    let position = |i: usize| {
+        let b = outbound_billing(&mock, i);
+        b[b.find(" cc_prompt_index=").expect(&b)..].to_string()
+    };
+    let with_thread = |req: (HeaderMap, Bytes), prev: Option<&str>| {
+        let mut v: serde_json::Value = serde_json::from_slice(&req.1).unwrap();
+        if let Some(p) = prev {
+            v["thread"] = serde_json::json!({"type": "continue", "previous_message_id": p});
+        }
+        (req.0, Bytes::from(serde_json::to_vec(&v).unwrap()))
+    };
+
+    // 整段历史。
+    let s = "a4b5c6d7-e8f9-4a04-b5f6-2b3c4d5e6f70";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let round2 = |t: &str| serde_json::json!([user("continue"), reply.clone(), user(t)]);
+    send_and_cancel(&state, api_key_cc_request(s, round2("continue"))).await;
+    send(&state, api_key_cc_request(s, round2("add tests"))).await;
+    assert_eq!(position(0), " cc_prompt_index=1; cc_turn_index=1;");
+    assert_eq!(position(1), " cc_prompt_index=2; cc_turn_index=2;");
+    assert_eq!(position(2), " cc_prompt_index=2; cc_turn_index=2;", "前一轮的同名输入不算");
+
+    // 接线程：第二轮只发增量。
+    let s = "b5c6d7e8-f90a-4b15-86a7-3c4d5e6f7081";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let delta =
+        |t: &str| with_thread(api_key_cc_request(s, serde_json::json!([user(t)])), Some("msg_C2"));
+    send_and_cancel(&state, delta("continue")).await;
+    send(&state, delta("add tests")).await;
+    assert_eq!(position(5), " cc_prompt_index=2; cc_turn_index=2;");
+
+    // 第二轮接线程发出、取消后改了重发，官方判 `history_reshaped` 改成整段历史 `create`：按第一轮那条回复的内容在
+    // 整段历史里找回原位置，仍是 2 / 2。
+    let s = "c6d7e8f9-0a1b-4c26-97b8-4d5e6f708192";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let delta =
+        |t: &str| with_thread(api_key_cc_request(s, serde_json::json!([user(t)])), Some("msg_C3"));
+    send_and_cancel(&state, delta("continue")).await;
+    send(&state, api_key_cc_request(s, round2("add tests"))).await;
+    assert_eq!(position(8), " cc_prompt_index=2; cc_turn_index=2;", "continue→create 仍退回");
+
+    // 对照：取消后另敲一句、整段历史里留着被取消那句，照常加。
+    let s = "d7e8f90a-1b2c-4d37-a8c9-5e6f708192a3";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let delta =
+        |t: &str| with_thread(api_key_cc_request(s, serde_json::json!([user(t)])), Some("msg_C4"));
+    send_and_cancel(&state, delta("continue")).await;
+    let kept = serde_json::json!([
+        user("continue"),
+        reply.clone(),
+        user("continue"),
+        user("[Request interrupted by user]"),
+        user("add tests")
+    ]);
+    send(&state, api_key_cc_request(s, kept)).await;
+    assert_eq!(position(11), " cc_prompt_index=3; cc_turn_index=3;", "被取消那句还在");
+}
+
+/// 被取消那轮留下了与前一轮一模一样的半截助手回复（都是「on it」），客户端保留了那句输入和半截回复，下一轮另敲一句：
+/// 按绝对位置找回被取消那句原来的位置，不按内容搜最后一条「on it」，那句仍在历史里，照常加到 3 / 3。第二轮接线程、
+/// 第三轮整段历史 `create`，与全程整段历史两种都认。
+#[sqlx::test]
+async fn an_identical_partial_reply_does_not_move_the_cancelled_input(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![
+        sse_ok_as("on it", "D1"),
+        sse_cut("on it"),
+        sse_ok_as("ok", "E1"),
+        sse_ok_as("on it", "D2"),
+        sse_cut("on it"),
+        sse_ok_as("ok", "E2"),
+    ])
+    .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let user = |t: &str| serde_json::json!({"role": "user", "content": t});
+    let on_it = serde_json::json!({"role": "assistant", "content": "on it"});
+    let position = |i: usize| {
+        let b = outbound_billing(&mock, i);
+        b[b.find(" cc_prompt_index=").expect(&b)..].to_string()
+    };
+    let third = serde_json::json!([
+        user("continue"),
+        on_it.clone(),
+        user("do it"),
+        on_it.clone(),
+        user("what next?")
+    ]);
+
+    // 第二轮接线程发出、第三轮整段历史 `create`。
+    let s = "e8f90a1b-2c3d-4e48-b9da-6f708192a3b4";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let (headers, body) = api_key_cc_request(s, serde_json::json!([user("do it")]));
+    let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["thread"] = serde_json::json!({"type": "continue", "previous_message_id": "msg_D1"});
+    send_and_cancel(&state, (headers, Bytes::from(serde_json::to_vec(&v).unwrap()))).await;
+    send(&state, api_key_cc_request(s, third.clone())).await;
+    assert_eq!(position(1), " cc_prompt_index=2; cc_turn_index=2;");
+    assert_eq!(position(2), " cc_prompt_index=3; cc_turn_index=3;", "接线程→create");
+
+    // 全程整段历史。
+    let s = "f90a1b2c-3d4e-4f59-8aeb-708192a3b4c5";
+    send(&state, api_key_cc_request(s, serde_json::json!([user("continue")]))).await;
+    let second = serde_json::json!([user("continue"), on_it.clone(), user("do it")]);
+    send_and_cancel(&state, api_key_cc_request(s, second)).await;
+    send(&state, api_key_cc_request(s, third)).await;
+    assert_eq!(position(4), " cc_prompt_index=2; cc_turn_index=2;");
+    assert_eq!(position(5), " cc_prompt_index=3; cc_turn_index=3;", "整段历史");
+}
+
+/// 抓包回归：`cap/auto-2.1.314-20261030-full` 00703（首轮出了半截被取消）→ 00706（改过重发）照 API Key 接入那样走一遍
+/// （billing header 剥回只有 `cc_version` / `cc_entrypoint`，链字段由 luban 补），补出的两个序号对官方：都是 1 / 1。
+#[sqlx::test]
+async fn cancel_and_edit_of_the_first_turn_matches_the_2_1_314_capture(pool: sqlx::PgPool) {
+    let dir = format!("{}/cap/auto-2.1.314-20261030-full", env!("CARGO_MANIFEST_DIR"));
+    let read = |prefix: &str| {
+        let path =
+            std::fs::read_dir(&dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".req.raw"))
+            })?;
+        let raw = std::fs::read(path).ok()?;
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let head = String::from_utf8_lossy(&raw[..sep]).to_string();
+        let v: serde_json::Value = serde_json::from_slice(&raw[sep..]).ok()?;
+        Some((head, v))
+    };
+    let (Some(cancelled), Some(resent)) = (read("00703_"), read("00706_")) else {
+        eprintln!("skipped: cap/auto-2.1.314-20261030-full not present");
+        return;
+    };
+    let mock = MockUpstream::start(vec![sse_cut("Calcul"), sse_ok("ok")]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let official = |v: &serde_json::Value| {
+        let b = v["system"][0]["text"].as_str().unwrap();
+        b[b.find(" cc_prompt_index=").unwrap()..].to_string()
+    };
+    let as_api_key = |(head, mut v): (String, serde_json::Value)| {
+        v["system"][0]["text"] =
+            "x-anthropic-billing-header: cc_version=2.1.314.54a; cc_entrypoint=cli;".into();
+        let mut headers = HeaderMap::new();
+        for line in head.lines().skip(1) {
+            let Some((k, val)) = line.split_once(": ") else { continue };
+            let k = k.to_ascii_lowercase();
+            if k == "user-agent" || k.starts_with("anthropic-") || k.starts_with("x-claude-code-") {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    HeaderValue::from_str(val).unwrap(),
+                );
+            }
+        }
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        (headers, Bytes::from(serde_json::to_vec(&v).unwrap()))
+    };
+    let want = [official(&cancelled.1), official(&resent.1)];
+    assert_eq!(want[1], " cc_prompt_index=1; cc_turn_index=1;");
+    send_and_cancel(&state, as_api_key(cancelled)).await;
+    let (status, _, body) = send(&state, as_api_key(resent)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    for (i, want) in want.iter().enumerate() {
+        let b = outbound_billing(&mock, i);
+        assert!(b.contains(" cc_turn_origin=human;"), "走的是补链字段那条路: {b}");
+        assert!(b.ends_with(want.as_str()), "{i}: {b}");
+    }
+}
+
+/// 压缩后第一条主线程请求收到的是拒答。官方 2.1.314 转备用模型时当场 `return`：拒答那条不记进主链、压缩前那条也不清
+/// （`Z6`），备用模型那条仍接拒答之前那一环（`cc_prev_req`、`diagnostics.previous_message_id`）并带 `cc_prev_msg`。没有
+/// 备用模型之类的最终拒答照常收尾：拒答那条进链、压缩前那条结清，下一轮接的是拒答那条、不带 `cc_prev_msg`。每条回复各用
+/// 各的 `message.id` / `request-id`，分得清接的是哪一环。
+#[sqlx::test]
+async fn a_final_refusal_settles_the_reply_before_compaction_but_a_fallback_resend_keeps_it(
+    pool: sqlx::PgPool,
+) {
+    let mock = MockUpstream::start(vec![
+        sse_ok_as("done", "A1"),
+        sse_ok_as("we wrote calc.py", "S1"),
+        sse_refusal_as("R1"),
+        sse_ok_as("ok", "N1"),
+        sse_ok_as("done", "A2"),
+        sse_ok_as("we wrote calc.py", "S2"),
+        sse_refusal_as("R2"),
+        sse_ok_as("ok", "F2"),
+        sse_ok_as("ok", "N2"),
+    ])
+    .await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let [before, compact, after] = compaction_turns();
+    let outbound = |i: usize| {
+        let seen = mock.seen();
+        let msgs: Vec<&Seen> = seen.iter().filter(|s| s.path.starts_with("/v1/messages")).collect();
+        let v: serde_json::Value = serde_json::from_slice(&msgs[i].body).unwrap();
+        let billing = v["system"][0]["text"].as_str().unwrap().to_string();
+        let prev_msg = v["diagnostics"]["previous_message_id"].clone();
+        (billing, prev_msg)
+    };
+
+    // 最终拒答：下一轮接拒答那条、不带压缩前那条。
+    let session = "8293a4b5-c6d7-4182-93d4-0f1a2b3c4d5e";
+    for messages in [&before, &compact, &after] {
+        send(&state, api_key_cc_request(session, messages.clone())).await;
+    }
+    let (b, prev) = outbound(2);
+    assert!(b.contains(" cc_prev_req=req_011CA1;") && b.contains(" cc_prev_msg=msg_A1;"), "{b}");
+    assert_eq!(prev, "msg_A1");
+    let mut next = after.as_array().unwrap().clone();
+    next.push(serde_json::json!({"role": "user", "content": "try something else"}));
+    send(&state, api_key_cc_request(session, serde_json::Value::Array(next))).await;
+    let (b, prev) = outbound(3);
+    assert!(!b.contains("cc_prev_msg"), "最终拒答已清: {b}");
+    assert!(b.contains(" cc_prev_req=req_011CR1;"), "最终拒答进了主链: {b}");
+    assert_eq!(prev, "msg_R1");
+
+    // 转备用模型重发同一句：接拒答之前那一环、带压缩前那条；重发收到回复之后接它、结清。
+    let session = "93a4b5c6-d7e8-4293-a4e5-1a2b3c4d5e6f";
+    for messages in [&before, &compact, &after] {
+        send(&state, api_key_cc_request(session, messages.clone())).await;
+    }
+    let (headers, body) = api_key_cc_request(session, after.clone());
+    let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["model"] = "claude-sonnet-5-5".into();
+    send(&state, (headers, Bytes::from(serde_json::to_vec(&v).unwrap()))).await;
+    let (b, prev) = outbound(7);
+    assert!(b.contains(" cc_prev_msg=msg_A2;"), "备用模型重发照带: {b}");
+    assert!(b.contains(" cc_prev_req=req_011CA2;"), "拒答那条没进主链: {b}");
+    assert_eq!(prev, "msg_A2");
+    let mut next = after.as_array().unwrap().clone();
+    next.push(serde_json::json!({"role": "assistant", "content": "ok"}));
+    next.push(serde_json::json!({"role": "user", "content": "thanks"}));
+    send(&state, api_key_cc_request(session, serde_json::Value::Array(next))).await;
+    let (b, prev) = outbound(8);
+    assert!(!b.contains("cc_prev_msg"), "重发收到回复后结清: {b}");
+    assert!(b.contains(" cc_prev_req=req_011CF2;"), "{b}");
+    assert_eq!(prev, "msg_F2");
+}
+
 /// 第三方客户端的两个对话先后占到号上同一个会话槽位（A 的绑定释放后 B 进来）：B 出站是一个新的
 /// 会话 id，会话链从头开始——首轮 `diagnostics.previous_message_id` 为 null、billing header 里没有
 /// `cc_prev_req`、`cc_prompt_index` 从 1 起，与官方 `/clear` 开新对话一致

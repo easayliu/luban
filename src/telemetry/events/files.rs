@@ -428,7 +428,7 @@ impl EventBuilder<'_> {
     pub(super) fn emit_compact_succeeded(&mut self, t3: DateTime<Utc>, restored_files: usize) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
-        let TurnFacts { message_tokens, ref attachment_counts, v305, .. } = *env.f;
+        let TurnFacts { message_tokens, ref attachment_counts, v305, v314, .. } = *env.f;
         if !env.f.v285 {
             return;
         }
@@ -501,6 +501,10 @@ impl EventBuilder<'_> {
         put("totalGroups", json!(groups));
         put("splitKind", json!("round"));
         put("headTruncations", json!(0));
+        // 2.1.314 起多一项（`cap/auto-2.1.314-20261030-full` A18 那条是 0）。
+        if v314 {
+            put("leaveOutPasses", json!(0));
+        }
         put("preservedUuidCount", json!(st.preserved));
         put("preservedMessageCount", json!(st.preserved));
         put("keptThinkingBlockCount", json!(st.kept_thinking));

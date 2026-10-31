@@ -345,6 +345,7 @@ impl EventBuilder<'_> {
             first_prompt_tpl,
             sleepy,
             heron,
+            ref capability_inline,
             ref ignored_suggestion,
             ref interrupted_message_id,
             ..
@@ -537,6 +538,10 @@ impl EventBuilder<'_> {
                 "tengu_heron_brook_applied",
                 json!({ "len": len, "fromClientData": from_client_data }),
             );
+        }
+        // 模型能力的来源事件没赶上模板那一处（会话中途切到被改了默认的模型）：组装这条 system 时报，在请求发出前。
+        for (name, m) in capability_inline {
+            self.push(ms(t0, -9), name, m.clone());
         }
     }
 }

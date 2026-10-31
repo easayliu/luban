@@ -51,19 +51,31 @@ pub(crate) struct CcSessionLink {
     /// `diagnostics`（`cap/2.1.260/00024`），「猜下一句」两个都没有（`2.1.260-2/00063`）。
     /// 一个开关管两件事就会给它们各补出一个官方没有的字段。判在 [`CcRequestKind`]。
     pub(super) diagnostics: bool,
-    /// 这是本会话的第几次用户输入（从 1 起），写进 2.1.285 起 billing header 的
-    /// `cc_prompt_index` / `cc_turn_index`。官方的 `promptIndex` 只在 `turn_origin=human` 的新
-    /// 输入上加一，`turnIndex` 每个新 turn 加一（可执行文件里的 `OQt`）；模拟路径的每一轮都是
-    /// human，两者恒等。0 即不在会话链上（额度探测、连通性测试），不写。
+    /// 这是本会话的第几次用户输入，写进 2.1.285 起 billing header 的 `cc_prompt_index`。官方的
+    /// `promptIndex` 只在 `turn_origin=human` 的新一轮上加一（2.1.314 `Z4n`；会话首轮是 human 为 1、别的为 0），
+    /// [`Self::turn_index`] 每个新一轮都加一：后台任务通知、同伴消息那种轮次两者就分开了
+    /// （`cap/auto-2.1.314-20261030-full` 那个会话到压缩时是 13 / 16），`-p` 的 sdk 轮是 0 / 1。模拟路径的每一轮都是
+    /// human，两者恒等。
     pub(super) prompt_index: u32,
+    /// 这是本会话的第几轮（不论谁起的头），写进 `cc_turn_index`，见 [`Self::prompt_index`]。0 即不在会话链上
+    /// （额度探测、连通性测试），不写。
+    pub(super) turn_index: u32,
+    /// 这一轮是谁起的头（`cc_turn_origin`），工具续轮沿用本轮的（`00187` → `00189` 都是 `task_notification`）。
+    pub(super) turn_origin: TurnOrigin,
     /// 回程把这条的 `request-id` / `message.id` 记到哪条链上，`None` 即不记。见 [`ChainLane`]。
     pub(super) lane: Option<ChainLane>,
     /// 这条请求属于会话的哪一轮、新输入的指纹是什么，回程据此记失败或清失败（[`Self::mark_failed`] /
     /// [`Self::record_main`]），用来认出紧接着原样重发的那一条。见 [`TurnMark`]。
     pub(super) turn: Option<TurnMark>,
+    /// 压缩之后、主线程还没收到回复之前的主线程请求：压缩前主链最后一条回复（[`CompactedReply`]）。2.1.314 起官方
+    /// 把它写进 billing header（`cc_prev_msg` / `cc_prev_prompt_index` / `cc_prev_turn_index`，
+    /// `cap/auto-2.1.314-20261030-full/00211`，拼在 body 那边的 `append_billing_link`）。只有主线程拿得到。
+    pub(super) before_compaction: Option<CompactedReply>,
+    /// 这条是 `/compact`（含自动压缩）那条摘要请求：完整成功时回程按 [`Self::note_compaction`] 记下压缩前那条。
+    pub(super) compaction: bool,
 }
 
-/// 一条主线程请求在 [`CcSessionLink::load_retryable`] 那一刻的位置：所属的一轮（会话当时的
+/// 一条主线程请求在 [`CcSessionLink::load_with_origin`] 那一刻的位置：所属的一轮（会话当时的
 /// prompt id）、新输入的指纹（[`turn_fp`]，不是新输入为 `None`）与发出的先后（`seq`）。回程据此
 /// 挡掉迟到的旧响应：成功只在比已写进链的那条更新时才写（[`CcSessionLink::record_main`]），失败
 /// 只记在仍未成功的当前这一轮上（[`CcSessionLink::mark_failed`]）。
@@ -72,6 +84,46 @@ pub(crate) struct TurnMark {
     prompt_id: String,
     fp: Option<u64>,
     pub(super) seq: u64,
+    /// 这一轮在会话里的两个序号（[`CcSessionLink::prompt_index`] / [`CcSessionLink::turn_index`]）：主线程回复记进链时
+    /// 一并记下，压缩前那条要报它们（官方 `lastMainResponse.turnPosition`）。
+    prompt_index: u32,
+    turn_index: u32,
+    /// 这条请求的整段历史有几条（历史起点 [`history_base`] 加 `messages` 条数），即它的回复在整段历史里的下标；算不出
+    /// 或没给请求体时为 `None`。见 [`CcSessionEntry::prev_reply`]。
+    history_len: Option<usize>,
+}
+
+/// 一轮是谁起的头，即 billing header 里的 `cc_turn_origin`（官方 2.1.314 `Z4n` 只有 `human` 让 `promptIndex` 加一）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnOrigin {
+    /// 用户敲的（含 `!` 与提示词型斜杠命令那种本地命令轮次）。
+    #[default]
+    Human,
+    /// 后台任务通知（[`super::usage_grace::injected_turn`]）。
+    TaskNotification,
+    /// 另一个会话（子代理交回、同伴会话）发来的消息。
+    Peer,
+    /// `-p` / Agent SDK 的输入（UA 的入口是 `sdk-*`，`cap/auto-2.1.314-20261030-full/01479`：`sdk`、0 / 1）。
+    Sdk,
+}
+
+impl TurnOrigin {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::TaskNotification => "task_notification",
+            Self::Peer => "peer",
+            Self::Sdk => "sdk",
+        }
+    }
+}
+
+/// 压缩前主链最后一条回复：`message.id` 与它那一轮的两个序号（官方 `responseBeforeCompaction`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactedReply {
+    pub(super) message_id: String,
+    pub(super) prompt_index: u32,
+    pub(super) turn_index: u32,
 }
 
 /// 一条新输入的指纹：消息条数 + 从最后一条 user 消息起到末尾的几条。失败后原样重发两样都不变；
@@ -93,6 +145,128 @@ pub(super) fn turn_fp(v: &serde_json::Value) -> Option<u64> {
         serde_json::to_string(m).ok()?.hash(&mut h);
     }
     Some(h.finish())
+}
+
+/// 一轮的新输入在整段历史里的位置与内容，用来认它被取消后还在不在历史里（[`CcSessionEntry::turn_input`]）。
+///
+/// 位置是绝对下标（整段历史里的第几条，见 [`history_base`]），之后的请求据此直接落到那个位置、核对紧前面那条还是原样，
+/// 只看那里往后的消息。不按内容在历史里搜：更早的同名输入（前一轮也敲过一句「continue」）、同样内容的助手回复（被取消
+/// 那轮留下的半截回复也是「on it」）都会让搜到的位置错开。
+#[derive(Debug, Clone, Default)]
+struct TurnInput {
+    /// 那条 user 消息在整段历史里的下标；这条请求的历史起点算不出（接了一条位置不明的线程）时为 `None`。
+    at: Option<usize>,
+    /// 它紧前面是什么，见 [`InputPrev`]。
+    prev: InputPrev,
+    /// 那条 user 消息各内容块的指纹（不计 `cache_control`，断点每轮挪）。
+    blocks: Vec<u64>,
+}
+
+/// 新输入那条 user 消息紧前面的东西，回到那个位置时核对用。
+#[derive(Debug, Clone, Default)]
+enum InputPrev {
+    /// 对话开头，前面没有消息。
+    #[default]
+    Start,
+    /// 前一条消息的指纹（不计 `cache_control`）。
+    Msg(u64),
+    /// 它是接续线程（`thread: continue`）增量的头一条，前一条是线程里那条回复，不在请求里：那条回复的内容指纹
+    /// （[`CcSessionEntry::prev_reply`]），客户端之后改成整段历史 `create`（取消后改了重发，官方判 `history_reshaped`）
+    /// 时拿它核对。
+    Reply(ReplyFp),
+}
+
+/// 主链最后一条回复：`message.id`、内容指纹与它在整段历史里的下标（产出它的那条请求的历史长度，见 [`history_base`]）。
+#[derive(Debug, Clone)]
+struct PrevReply {
+    message_id: String,
+    reply: ReplyFp,
+    at: Option<usize>,
+}
+
+/// 请求接的线程（`thread: {type: continue, previous_message_id}`）的那条回复 id。
+fn continued_thread(v: &serde_json::Value) -> Option<&str> {
+    let t = v.get("thread")?;
+    (t.get("type")?.as_str()? == "continue").then(|| t.get("previous_message_id")?.as_str())?
+}
+
+/// 这条请求的 `messages[0]` 在整段历史里的下标：不接线程即 0；接线程（只发增量）就是它接的那条回复的下标加一——那条得是
+/// 主链记着、位置已知的最后一条回复（[`CcSessionEntry::prev_reply`]），否则算不出。
+fn history_base(v: &serde_json::Value, prev: Option<&PrevReply>) -> Option<usize> {
+    match continued_thread(v) {
+        None => Some(0),
+        Some(id) => prev.filter(|p| p.message_id == id).and_then(|p| p.at).map(|at| at + 1),
+    }
+}
+
+/// 这条请求的新输入（同 [`turn_fp`]，最后一条 user 消息）：位置、紧前面那条与各块指纹。
+fn turn_input(v: &serde_json::Value, prev: Option<&PrevReply>) -> TurnInput {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else {
+        return TurnInput::default();
+    };
+    let Some(local) = msgs.iter().rposition(is_user) else { return TurnInput::default() };
+    let base = history_base(v, prev);
+    let prev = match (local, base) {
+        (0, Some(0)) => InputPrev::Start,
+        (0, Some(_)) => match prev {
+            Some(p) => InputPrev::Reply(p.reply),
+            None => return TurnInput::default(),
+        },
+        (0, None) => return TurnInput::default(),
+        _ => InputPrev::Msg(super::body::fingerprint_without_cache_control(&msgs[local - 1])),
+    };
+    TurnInput { at: base.map(|b| b + local), prev, blocks: user_blocks(&msgs[local]) }
+}
+
+fn is_user(m: &serde_json::Value) -> bool {
+    m.get("role").and_then(|r| r.as_str()) == Some("user")
+}
+
+fn user_blocks(m: &serde_json::Value) -> Vec<u64> {
+    match m.get("content") {
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().map(super::body::fingerprint_without_cache_control).collect()
+        }
+        Some(other) => vec![super::body::fingerprint_without_cache_control(other)],
+        None => Vec::new(),
+    }
+}
+
+/// 这条请求（历史起点 `base`，[`history_base`]）的历史里还有没有那句输入：落到它原来的下标，紧前面那条还是原样
+/// （[`InputPrev`]）才算找回了位置，只看那里往后的 user 消息——它的每个内容块都在其中某条里（取消后另敲一句时，官方
+/// 可能把两句并成一条 user 消息的几个块，所以按块认、不按整条）。那里往后只剩这条自己的新输入、而且恰好就是那句（取消
+/// 后原样重发）不算。位置算不出、对不上的（历史被改过、压缩过、接了别的线程）认不出，当还在；没记下那句的也当还在。
+fn retains_input(v: &serde_json::Value, input: &TurnInput, base: Option<usize>) -> bool {
+    let (Some(at), Some(base)) = (input.at, base) else { return true };
+    if input.blocks.is_empty() || at < base {
+        return true;
+    }
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return true };
+    let from = at - base;
+    let anchored = match (&input.prev, from) {
+        (InputPrev::Start, 0) => base == 0,
+        // 增量正好从那个位置起：接的就是那条回复之后（`base` 由它的下标算来）。
+        (InputPrev::Msg(_) | InputPrev::Reply(_), 0) => base > 0,
+        (_, from) if from > msgs.len() => false,
+        (InputPrev::Msg(fp), from) => {
+            super::body::fingerprint_without_cache_control(&msgs[from - 1]) == *fp
+        }
+        (InputPrev::Reply(reply), from) => {
+            let m = super::body::thread_msg_of(&msgs[from - 1]);
+            m.assistant && m.reply.matches(reply)
+        }
+        (InputPrev::Start, _) => false,
+    };
+    if !anchored {
+        return true;
+    }
+    let mut users: Vec<Vec<u64>> =
+        msgs[from..].iter().filter(|m| is_user(m)).map(user_blocks).collect();
+    if users.len() == 1 && users[0] == input.blocks {
+        users.pop();
+    }
+    let seen: std::collections::HashSet<u64> = users.into_iter().flatten().collect();
+    input.blocks.iter().all(|b| seen.contains(b))
 }
 
 /// 会话里的一条关联链：`cc_prev_req` / `diagnostics.previous_message_id` 指的是**同一条链**
@@ -121,8 +295,12 @@ impl CcSessionLink {
 /// 按会话 id 索引的模拟会话链条状态。
 pub(crate) struct CcSessionEntry {
     prompt_id: String,
-    /// 见 [`CcSessionLink::prompt_index`]：换一轮 prompt id 就加一。
+    /// 见 [`CcSessionLink::prompt_index`]：human 起头的新一轮加一。
     prompt_index: u32,
+    /// 见 [`CcSessionLink::turn_index`]：每个新一轮都加一。
+    turn_index: u32,
+    /// 当前这一轮是谁起的头，工具续轮沿用，见 [`CcSessionLink::turn_origin`]。
+    turn_origin: TurnOrigin,
     prev_req: Option<String>,
     prev_message_id: Option<String>,
     /// 这一轮是本地命令起的头（`!` 跑的 shell 命令、`/init` 这类提示词型斜杠命令，见
@@ -143,7 +321,37 @@ pub(crate) struct CcSessionEntry {
     issued_seq: u64,
     /// 主链上最近写进去的那条成功请求的 [`TurnMark::seq`]：更早发出、迟到的成功不再覆盖它。
     recorded_seq: u64,
+    /// 主链最后一条回复（[`Self::prev_message_id`]）的内容指纹与在整段历史里的下标（[`PrevReply`]）：接线程的请求
+    /// 据此算出历史起点（[`history_base`]），取消前那句接的是线程时也靠它核对位置（[`InputPrev::Reply`]）。
+    prev_reply: Option<PrevReply>,
+    /// 主链最后一条回复（[`Self::prev_message_id`]）是哪一轮的两个序号，见 [`Self::before_compaction`]。
+    prev_position: (u32, u32),
+    /// 见 [`CcSessionLink::before_compaction`]：压缩成功时记下，之后发出的主线程请求收到回复就清掉；第二项是记下那一刻的
+    /// [`Self::issued_seq`]，压缩之前发出、迟到的主线程回复不清它。
+    before_compaction: Option<(CompactedReply, u64)>,
+    /// 主线程回复是拒答（`stop_reason: refusal`），还没定它算不算数，见 [`HeldRefusal`]。
+    refusal_held: Option<HeldRefusal>,
+    /// 这一轮开头那两个序号加一之前的值：这一轮被取消、客户端把这句退回输入框改了重发（历史里没有它了）时退回这里，
+    /// 同官方 `Z4n` 按保留下来的历史重算。见 [`CcSessionLink::mark_aborted`]。
+    turn_before: (u32, u32),
+    /// 这一轮新输入那条 user 消息的位置与内容（[`TurnInput`]）。
+    turn_input: TurnInput,
+    /// 这一轮还没有一条主线程请求完整成功，最近那条就被客户端取消了。
+    turn_aborted: bool,
     last_seen: std::time::Instant,
+}
+
+/// 主线程一条拒答（`stop_reason: refusal`）的回程，先挂着：官方 2.1.314 拒答时客户端若有备用模型就转过去重发
+/// （`fallback_request`），当场 `return`，既不把拒答那条记进主链（跳过收尾后的 `T_s`）、也不清压缩前那条（`Z6`）；
+/// 没有备用模型、回退关着、回退链已耗尽的最终拒答则照常收尾，两样都做。这一层看不出客户端转不转，留到下一条主线程
+/// 请求再判（[`CcSessionLink::load_with_origin`]）：仍是拒答那一轮即是转备用模型重发，挂着的作废；开了新一轮即是最终
+/// 拒答，补做。中间来的别的类别按最终拒答读主链，不定案。
+struct HeldRefusal {
+    turn: TurnMark,
+    /// 拒答那条完整收尾时它的 `request-id` / `message.id`（[`CcSessionLink::record_main`] 要记的）；没收尾的不记链。
+    record: Option<(Option<String>, Option<String>)>,
+    /// 那条回复的内容指纹，入链时一并记（[`CcSessionEntry::prev_reply`]）。
+    reply: ReplyFp,
 }
 
 /// 一个子代理自己那条链的上一环，见 [`ChainLane`]。
@@ -177,6 +385,48 @@ impl CcSessionEntry {
         if let Some(m) = message_id {
             *prev_message_id = Some(m.to_string());
         }
+    }
+
+    /// 见 [`CcSessionLink::record_main`]。
+    fn record_main(&mut self, turn: &TurnMark, req_id: Option<&str>, message_id: Option<&str>) {
+        if self.prompt_id == turn.prompt_id {
+            self.turn_done = true;
+            self.failed_turn = None;
+        }
+        if turn.seq <= self.recorded_seq {
+            return;
+        }
+        self.recorded_seq = turn.seq;
+        if message_id.is_some() {
+            self.prev_position = (turn.prompt_index, turn.turn_index);
+        }
+        self.write_link(&ChainLane::Main, req_id, message_id);
+    }
+
+    /// 见 [`CcSessionLink::note_main_reply`]。
+    fn note_reply(&mut self, turn: &TurnMark, message_id: &str, reply: ReplyFp) {
+        if self.prev_message_id.as_deref() == Some(message_id) {
+            let message_id = message_id.to_string();
+            self.prev_reply = Some(PrevReply { message_id, reply, at: turn.history_len });
+        }
+    }
+
+    /// 见 [`CcSessionLink::settle_compaction`]。
+    fn settle_compaction(&mut self, turn: &TurnMark) {
+        if self.before_compaction.as_ref().is_some_and(|(_, armed)| turn.seq > *armed) {
+            self.before_compaction = None;
+        }
+    }
+
+    /// 挂着的拒答原来是最终拒答：补做它收尾时官方做的两样——完整收尾的记进主链，压缩前那条结清。
+    fn settle_refusal(&mut self, held: &HeldRefusal) {
+        if let Some((req, msg)) = &held.record {
+            self.record_main(&held.turn, req.as_deref(), msg.as_deref());
+            if let Some(m) = msg {
+                self.note_reply(&held.turn, m, held.reply);
+            }
+        }
+        self.settle_compaction(&held.turn);
     }
 
     /// 子代理 `agent_id` 那条链，没有就以主线程当前这一轮新建；用过的挪到末尾，满了先丢最久未用的。
@@ -1060,7 +1310,8 @@ impl CcSessionLink {
     }
 
     /// [`Self::load_turn`] 外加这条新输入的指纹 `fp`（[`turn_fp`]）：主线程上一条失败、这条
-    /// 指纹与它相同，即是失败后原样重发，与报了同一个 prompt 头一样不换轮。
+    /// 指纹与它相同，即是失败后原样重发，与报了同一个 prompt 头一样不换轮。每一轮都当 human 起的头。
+    #[cfg(test)]
     pub(super) fn load_retryable(
         key: CcSessionKey<'_>,
         new_prompt: bool,
@@ -1068,6 +1319,35 @@ impl CcSessionLink {
         wants_prompt_id: bool,
         client_prompt_id: Option<&str>,
         fp: Option<u64>,
+    ) -> Self {
+        Self::load_with_origin(
+            key,
+            new_prompt,
+            local_turn,
+            wants_prompt_id,
+            client_prompt_id,
+            fp,
+            TurnOrigin::Human,
+            None,
+        )
+    }
+
+    /// 取这条请求的三个关联字段（同 `load_retryable`：按需换轮、`fp` 认失败后原样重发），外加这一轮是谁起的头（`origin`，只在开新一轮与会话首条时用，工具续轮沿用本轮的）：
+    /// human 起头的新一轮两个序号都加一，别的只加 [`Self::turn_index`]（官方 2.1.314 `Z4n`）；会话首轮 human 是 1 / 1，
+    /// 别的是 0 / 1。
+    ///
+    /// `body` 是这条请求体，用来认上一轮是不是被取消后退回输入框改了重发（见 [`CcSessionEntry::turn_before`]）；
+    /// 不给就不认。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_with_origin(
+        key: CcSessionKey<'_>,
+        new_prompt: bool,
+        local_turn: bool,
+        wants_prompt_id: bool,
+        client_prompt_id: Option<&str>,
+        fp: Option<u64>,
+        origin: TurnOrigin,
+        body: Option<&serde_json::Value>,
     ) -> Self {
         let now = std::time::Instant::now();
         let mut map = CC_SESSIONS.lock();
@@ -1082,7 +1362,9 @@ impl CcSessionLink {
         let known = map.contains_key(&key);
         let entry = map.entry(key).or_insert_with(|| CcSessionEntry {
             prompt_id: uuid_v4(),
-            prompt_index: 1,
+            prompt_index: u32::from(origin == TurnOrigin::Human),
+            turn_index: 1,
+            turn_origin: origin,
             prev_req: None,
             prev_message_id: None,
             local_turn: false,
@@ -1092,23 +1374,67 @@ impl CcSessionLink {
             turn_done: false,
             issued_seq: 0,
             recorded_seq: 0,
+            prev_reply: None,
+            prev_position: (0, 0),
+            before_compaction: None,
+            refusal_held: None,
+            turn_before: (0, 0),
+            turn_input: TurnInput::default(),
+            turn_aborted: false,
             last_seen: now,
         });
         // 新建的那份 id 就是这一轮的，别再换一次；客户端报的还是这一轮、或与刚失败那条指纹相同，
         // 即是重发，也不换。
+        // 拒答之后同一句的指纹也算重发：转备用模型那条与拒答那条是同一轮（[`HeldRefusal`]）。
         let retry = match client_prompt_id {
             Some(id) => id == entry.prompt_id,
-            None => fp.is_some() && fp == entry.failed_turn,
+            None => {
+                fp.is_some()
+                    && (fp == entry.failed_turn
+                        || entry.refusal_held.as_ref().is_some_and(|h| h.turn.fp == fp))
+            }
         };
         let new_prompt = new_prompt && !retry;
+        // 主线程（给了 `body` 的）才给挂着的拒答定案：没换轮即是转备用模型重发，作废；换了轮即是最终拒答，补记。
+        if body.is_some()
+            && let Some(held) = entry.refusal_held.take()
+            && (known && new_prompt || entry.prompt_id != held.turn.prompt_id)
+        {
+            entry.settle_refusal(&held);
+        }
+        // 这条请求的历史起点与整段历史长度（[`history_base`]），主线程（给了 `body` 的）才算。
+        let base = body.and_then(|v| history_base(v, entry.prev_reply.as_ref()));
+        let history_len = body
+            .and_then(|v| v.get("messages")?.as_array().map(Vec::len))
+            .zip(base)
+            .map(|(n, b)| b + n);
         if known && new_prompt {
+            // 上一轮一条都没成功就被取消了、它那句也不在这条的历史里：客户端把它退回输入框改了（或原样）重发，那一轮
+            // 连同它的序号作废，退回它之前（`cap/auto-2.1.314-20261030-full` 00703 出了半截回复被取消，00706 改过重发仍是
+            // 1 / 1）。取消后另敲一句的，历史里留着被取消那句，照常加。
+            if entry.turn_aborted
+                && !entry.turn_done
+                && body.is_some_and(|v| !retains_input(v, &entry.turn_input, base))
+            {
+                (entry.prompt_index, entry.turn_index) = entry.turn_before;
+            }
+            entry.turn_before = (entry.prompt_index, entry.turn_index);
             entry.prompt_id = uuid_v4();
-            entry.prompt_index = entry.prompt_index.saturating_add(1);
+            if origin == TurnOrigin::Human {
+                entry.prompt_index = entry.prompt_index.saturating_add(1);
+            }
+            entry.turn_index = entry.turn_index.saturating_add(1);
+            entry.turn_origin = origin;
         }
         // 开了新一轮，上一轮的失败标记作废：它的重发再来就是一句新输入。
         if new_prompt {
             entry.failed_turn = None;
             entry.turn_done = false;
+        }
+        if new_prompt || !known {
+            entry.turn_input =
+                body.map(|v| turn_input(v, entry.prev_reply.as_ref())).unwrap_or_default();
+            entry.turn_aborted = false;
         }
         entry.issued_seq += 1;
         if new_prompt || !known {
@@ -1118,23 +1444,46 @@ impl CcSessionLink {
             entry.prompt_id = id.to_string();
         }
         entry.last_seen = now;
+        // 别的类别碰上挂着的拒答：按最终拒答读（它多半是最终拒答之后才来的标题、建议），不定案。
+        let (prev_req, prev_message_id) = match &entry.refusal_held {
+            Some(HeldRefusal { turn, record: Some((req, msg)), .. })
+                if body.is_none() && turn.seq > entry.recorded_seq =>
+            {
+                (
+                    req.clone().or_else(|| entry.prev_req.clone()),
+                    msg.clone().or_else(|| entry.prev_message_id.clone()),
+                )
+            }
+            _ => (entry.prev_req.clone(), entry.prev_message_id.clone()),
+        };
         Self {
             prompt_id: (wants_prompt_id && !entry.local_turn).then(|| entry.prompt_id.clone()),
-            prev_req: entry.prev_req.clone(),
-            prev_message_id: entry.prev_message_id.clone(),
+            prev_req,
+            prev_message_id,
             first_seen: !known,
             // 缺省写：模拟路径只造主线程 profile，它是要 diagnostics 的。真实 CC 那条路由
             // [`CcSessionLink::with_diagnostics`] 按 [`CcRequestKind`] 覆写。
             diagnostics: true,
             prompt_index: entry.prompt_index,
+            turn_index: entry.turn_index,
+            turn_origin: entry.turn_origin,
             // 缺省记主线程：模拟路径只造主线程。真实 CC 那条路由 [`client_session_link`] 按类别覆写。
             lane: Some(ChainLane::Main),
-            turn: Some(TurnMark { prompt_id: entry.prompt_id.clone(), fp, seq: entry.issued_seq }),
+            turn: Some(TurnMark {
+                prompt_id: entry.prompt_id.clone(),
+                fp,
+                seq: entry.issued_seq,
+                prompt_index: entry.prompt_index,
+                turn_index: entry.turn_index,
+                history_len,
+            }),
+            before_compaction: entry.before_compaction.as_ref().map(|(r, _)| r.clone()),
+            compaction: false,
         }
     }
 
     /// 主线程这条失败了（上游报错，或连上游都没到）：记下它的新输入指纹，供
-    /// [`Self::load_retryable`] 认出紧接着的原样重发。会话已经换到别的轮、或这一轮已经有一条成功了
+    /// [`Self::load_with_origin`] 认出紧接着的原样重发。会话已经换到别的轮、或这一轮已经有一条成功了
     /// （迟到的旧响应、并行的另一次重发）就不记。
     pub(super) fn mark_failed(key: CcSessionKey<'_>, turn: &TurnMark) {
         let Some(fp) = turn.fp else { return };
@@ -1155,17 +1504,83 @@ impl CcSessionLink {
         req_id: Option<&str>,
         message_id: Option<&str>,
     ) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.record_main(turn, req_id, message_id);
+        }
+    }
+
+    /// 主线程这条收到了回复（见到 `message_start`，不论之后完整收尾、被客户端取消还是断流）：压缩之后发出的那条到这一步，
+    /// 官方就把压缩前那条清掉（2.1.314 请求收尾的 `finally`：`Sg`/`AI` 有一个就 `qlo()`），之后的不再带。拒答转备用模型
+    /// 那种（`Z6`）不清，调用方判。压缩之前发出、迟到的那条不清。
+    pub(super) fn settle_compaction(key: CcSessionKey<'_>, turn: &TurnMark) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.settle_compaction(turn);
+        }
+    }
+
+    /// 主线程这条收到的是拒答（`stop_reason: refusal`）：入链与结清压缩前那条都先挂着，见 [`HeldRefusal`]。`record`
+    /// 是完整收尾时要记进主链的 `request-id` / `message.id`。比已写进链的那条更早发出的（迟到的旧响应）不挂。
+    pub(super) fn hold_refusal(
+        key: CcSessionKey<'_>,
+        turn: &TurnMark,
+        record: Option<(Option<&str>, Option<&str>)>,
+        reply: ReplyFp,
+    ) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned())
+            && turn.seq > entry.recorded_seq
+        {
+            let record = record.map(|(r, m)| (r.map(str::to_string), m.map(str::to_string)));
+            entry.refusal_held = Some(HeldRefusal { turn: turn.clone(), record, reply });
+        }
+    }
+
+    /// 主线程这条成功回复（`message_id`）的内容指纹：它确实成了主链最后一环（迟到的旧响应没写进去）才记，见
+    /// [`CcSessionEntry::prev_reply`]。
+    pub(super) fn note_main_reply(
+        key: CcSessionKey<'_>,
+        turn: &TurnMark,
+        message_id: &str,
+        reply: ReplyFp,
+    ) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.note_reply(turn, message_id, reply);
+        }
+    }
+
+    /// 主线程这条被客户端取消了（流没收尾就断开）：这一轮还没有一条成功的，记下，供下一轮认退回重发
+    /// （[`CcSessionEntry::turn_before`]）。会话已换到别的轮、或这一轮已经成功过一条就不记。
+    pub(super) fn mark_aborted(key: CcSessionKey<'_>, turn: &TurnMark) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned())
+            && entry.prompt_id == turn.prompt_id
+            && !entry.turn_done
+        {
+            entry.turn_aborted = true;
+        }
+    }
+
+    /// 记下的压缩前那条作废：压缩后的主线程请求却不是压缩过的样子（[`continues_after_compaction`]），说明客户端没有
+    /// 用上那次摘要（官方没用上就不会记），之后的也都不带。
+    fn disarm_compaction(key: CcSessionKey<'_>) {
+        if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+            entry.before_compaction = None;
+        }
+    }
+
+    /// `/compact` 那条摘要请求完整成功、摘要有正文（调用方判，同官方 `no_summary` 那道）：照官方（2.1.314 `u0n`），
+    /// 压缩开始时读到的主链尾巴（那条请求发出时的
+    /// `previous_message_id`，`tail_at_start`）仍是主链最后一条回复，就把它与它那一轮的序号记下，压缩后的主线程请求
+    /// 带上（[`CcSessionLink::before_compaction`]）；主链在压缩期间又推进过、或压缩之前主线程还没有过回复的不记。
+    /// 同一段压缩之间又压缩一次，记的仍是那一条（主链没动）。
+    pub(super) fn note_compaction(key: CcSessionKey<'_>, tail_at_start: Option<&str>) {
         let mut map = CC_SESSIONS.lock();
         let Some(entry) = map.get_mut(&key.owned()) else { return };
-        if entry.prompt_id == turn.prompt_id {
-            entry.turn_done = true;
-            entry.failed_turn = None;
-        }
-        if turn.seq <= entry.recorded_seq {
+        let Some(msg) = entry.prev_message_id.clone() else { return };
+        if tail_at_start != Some(msg.as_str()) {
             return;
         }
-        entry.recorded_seq = turn.seq;
-        entry.write_link(&ChainLane::Main, req_id, message_id);
+        let (prompt_index, turn_index) = entry.prev_position;
+        let reply = CompactedReply { message_id: msg, prompt_index, turn_index };
+        entry.before_compaction = Some((reply, entry.issued_seq));
     }
 
     /// 改接到子代理 `agent_id` 自己那条链上：`cc_prev_req` 与 `previous_message_id` 换成它
@@ -1612,14 +2027,16 @@ pub(crate) fn client_session_link(
     // 来访报的 prompt id 只有主线程的记进会话；其余几类可能属于更早的一轮（后台子代理），只用在
     // 这一条上，见 [`CcSessionLink::load_turn`]。
     let main = kind == CcRequestKind::Main;
-    let mut link = CcSessionLink::load_retryable(
+    let mut link = CcSessionLink::load_with_origin(
         key,
         new_prompt,
         starts_local_turn(v),
         kind.wants_prompt_id(),
         client_prompt_id.filter(|_| main),
-        // 主线程带了 prompt 头就按头认重发（[`CcSessionLink::load_retryable`]），指纹用不上，不必算。
+        // 主线程带了 prompt 头就按头认重发（[`CcSessionLink::load_with_origin`]），指纹用不上，不必算。
         (new_prompt && !(main && client_prompt_id.is_some())).then(|| turn_fp(v)).flatten(),
+        turn_origin_of(v, headers),
+        main.then_some(v),
     );
     // 只有主线程与子代理的回复推进链条，各推各的（[`ChainLane`]）；其余几类只读主线程那一环。
     // 子代理认不出支线号（2.1.277 之前不发 `x-claude-code-agent-id`）就不接任何链。
@@ -1646,6 +2063,16 @@ pub(crate) fn client_session_link(
     {
         link.prompt_id = Some(id.to_string());
     }
+    // 压缩前那条只有主线程带，且这条得是压缩过的样子（客户端确实用上了那次摘要）；不是就作废，之后的也不带。
+    // `/compact` 那条摘要请求回程时记它（[`CcSessionLink::note_compaction`]）。
+    if !main {
+        link.before_compaction = None;
+    } else if link.before_compaction.is_some() && !continues_after_compaction(v) {
+        link.before_compaction = None;
+        CcSessionLink::disarm_compaction(key);
+    }
+    link.compaction = kind == CcRequestKind::Fork
+        && last_user_text_starts_with(v, "CRITICAL: Respond with TEXT ONLY");
     if !kind.wants_prev_req() {
         link.prev_req = None;
     }
@@ -1654,6 +2081,50 @@ pub(crate) fn client_session_link(
         .and_then(|v| v.to_str().ok())
         .and_then(super::body::trusted_cc_version);
     Some((session_id, link.with_diagnostics(kind.wants_diagnostics(version))))
+}
+
+/// 来访这一轮是谁起的头（[`TurnOrigin`]）：纯后台任务通知、纯同伴消息按注入的那种（[`super::usage_grace::injected_turn`]），
+/// UA 的入口是 `sdk-*`（`-p`、Agent SDK）的输入是 sdk，其余是用户敲的。只在开新一轮时用，见
+/// [`CcSessionLink::load_with_origin`]。
+fn turn_origin_of(v: &serde_json::Value, headers: &HeaderMap) -> TurnOrigin {
+    match super::usage_grace::injected_turn(v) {
+        Some(super::usage_grace::InjectedTurn::TaskNotification) => TurnOrigin::TaskNotification,
+        Some(super::usage_grace::InjectedTurn::Peer) => TurnOrigin::Peer,
+        None => {
+            let sdk = headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|h| h.to_str().ok())
+                .and_then(super::body::cc_ua_entrypoint)
+                .is_some_and(|ep| ep.starts_with("sdk-"));
+            if sdk { TurnOrigin::Sdk } else { TurnOrigin::Human }
+        }
+    }
+}
+
+/// 这条是不是压缩过的对话：首条用户消息是压缩摘要那段（开头是固定的开场白，前面可能有一行他人编写内容的标记与它
+/// 后面那一行，同 [`super::sandy_plover`] 认摘要的口径；`cap/auto-2.1.314-20261030-full/00211` 的 `messages[0]`）。
+fn continues_after_compaction(v: &serde_json::Value) -> bool {
+    let Some(first) = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| m.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")))
+    else {
+        return false;
+    };
+    let text = match first.get("content") {
+        Some(serde_json::Value::String(t)) => Some(t.as_str()),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str()),
+        _ => None,
+    };
+    let Some(mut text) = text else { return false };
+    if let Some(rest) = text.strip_prefix("<artifact-content-authored-by-others/>\n") {
+        text = rest.split_once('\n').map_or("", |(_, after)| after);
+    }
+    text.starts_with(super::sandy_plover::SUMMARY_PREAMBLE)
 }
 
 /// `system` 里（块数组的任一 text 块，或字符串形态的整段）是否包含 `needle`。

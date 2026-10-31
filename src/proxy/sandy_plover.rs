@@ -85,7 +85,7 @@ const TOOL_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// 压缩摘要那条用户消息的开头（官方 `AKe`）：后面紧跟用过的工具清单（[`listed_tools`]）。
-const SUMMARY_PREAMBLE: &str = "This session is being continued from a previous conversation that ran out of context. \
+pub(crate) const SUMMARY_PREAMBLE: &str = "This session is being continued from a previous conversation that ran out of context. \
      The summary below covers the earlier portion of the conversation.";
 
 /// 摘要开头那段的形态（官方 `x`）：可选一行他人编写内容的标记 → 固定开头 → 空行 → 可选一行 → `<system-reminder>` 包着的

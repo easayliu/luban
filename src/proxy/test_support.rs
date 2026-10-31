@@ -86,7 +86,18 @@ pub(super) fn gzip(data: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
+/// 共用的测试号（id 1）。2.1.314 起 opus-5-5 / sonnet-5-5 没有下发 `<total_tokens>` 档位时不发提醒
+/// （[`crate::proxy::lapis_anchor`]），而大批线程、提醒、环境说明的用例拿 opus / sonnet 测提醒怎么发：这个号一次性喂一份
+/// bootstrap，`client_data` 里把这两个模型的 `total_tokens_reminder` 打开（官方认的下发形态），它们照旧按默认那档发。
+/// 2.1.314 默认关的行为由各自用独立号的用例钉着。
 pub(super) fn test_cred() -> crate::credentials::Credential {
+    static CAPABLE: std::sync::Once = std::sync::Once::new();
+    CAPABLE.call_once(|| {
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let boot = br#"{"client_data":{"total_tokens_reminder":true}}"#;
+            crate::proxy::client_data::note_bootstrap(1, model, boot);
+        }
+    });
     crate::credentials::Credential {
         id: 1,
         label: "t".into(),
