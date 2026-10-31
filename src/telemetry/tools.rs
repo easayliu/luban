@@ -365,8 +365,15 @@ impl ShellUsage {
 ///   `was_backgrounded` 之后，失败事件（没有那一项）排在 `had_sandbox_violation` 之后。
 ///
 /// 在 [`bash_meta_v299`] 之后、失败事件去掉 `was_backgrounded` 之后调。
-pub(super) fn bash_meta_v311(meta: &mut Value, command: &str, usage: Option<ShellUsage>) {
-    let run = super::bash_kinds::shell_run(command);
+///
+/// `v316`（2.1.315 起）按 2.1.316 的表认 kind。返回这次的解析结果，[`bash_meta_v316`] 接着用。
+pub(super) fn bash_meta_v311(
+    meta: &mut Value,
+    command: &str,
+    usage: Option<ShellUsage>,
+    v316: bool,
+) -> super::bash_kinds::ShellRun {
+    let run = super::bash_kinds::shell_run(command, v316);
     let kinds = vec![("bash_command_kinds", json!(run.kinds))];
     if meta.get("bash_subcommand").is_some() {
         insert_after(meta, "bash_subcommand", kinds);
@@ -391,6 +398,63 @@ pub(super) fn bash_meta_v311(meta: &mut Value, command: &str, usage: Option<Shel
         "had_sandbox_violation"
     };
     insert_after(meta, after, vec![("same_as_running_background", json!(false))]);
+    run
+}
+
+/// 2.1.315 起 Bash 执行 / 失败事件多的几项（`cap/auto-2.1.316-20261031-full` 28 条、`-bashfail` 那条）：
+/// - `bash_programs`（[`super::bash_kinds::ShellRun::programs`]）紧跟 `bash_command_kinds`，跑测试的再跟
+///   `bash_test_scope`；
+/// - `interrupted` 之后五项输出 / 内存提示状态：输出末尾有没有另附「最后几行」、命中了第几条命令提示规则、提示有没有
+///   附上、执行期间内核有没有因内存杀进程、那段说明有没有附上。代理看不到也触发不了这几样，抓包 28 条全是
+///   false / 0 / false / false / false；
+/// - `bash_word_split_use` 之后 `bash_test_outcome`（[`super::bash_kinds::bash_test_outcome`]，`output` 是工具结果正文；
+///   `run_in_background` 转到后台的不报）；
+/// - 末尾那组重复命令统计（`repeat` 起，[`super::bash_repeat::BashMeter::begin`] 算好的 `repeat_fields`）。
+///   读自己落盘输出的 `reads_own_output` 与落盘的 `output_total_bytes` / `output_persisted` 代理看不到，不报。
+///
+/// 在 [`bash_meta_v311`] 之后调。
+pub(super) fn bash_meta_v316(
+    meta: &mut Value,
+    run: &super::bash_kinds::ShellRun,
+    output: &str,
+    exit_code: i64,
+    backgrounded: bool,
+    repeat_fields: serde_json::Map<String, Value>,
+) {
+    let mut programs = vec![("bash_programs", json!(run.programs))];
+    if let Some(scope) = run.test_scope {
+        programs.push(("bash_test_scope", json!(scope)));
+    }
+    insert_after(meta, "bash_command_kinds", programs);
+    insert_after(
+        meta,
+        "interrupted",
+        vec![
+            ("output_end_shown", json!(false)),
+            ("triggered_note_rule", json!(0)),
+            ("triggered_note_shown", json!(false)),
+            ("oom_kill_during_command", json!(false)),
+            ("oom_kill_note_shown", json!(false)),
+        ],
+    );
+    // `wrr`：转到后台的（有 `backgroundTaskId`）当场没有结果，不报。
+    if !backgrounded
+        && let Some(outcome) = super::bash_kinds::bash_test_outcome(run, output, exit_code, false)
+    {
+        insert_after(meta, "bash_word_split_use", vec![("bash_test_outcome", json!(outcome))]);
+    }
+    if let Some(o) = meta.as_object_mut() {
+        o.extend(repeat_fields);
+    }
+}
+
+/// 2.1.315 起事件最末那项 `reads_own_output`（[`reads_own_output`]），在 [`bash_meta_v316`] 之后调。
+pub(super) fn bash_meta_v316_reads(meta: &mut Value, command: &str, session_id: &str) {
+    if let Some(r) = reads_own_output(command, session_id)
+        && let Some(o) = meta.as_object_mut()
+    {
+        o.insert("reads_own_output".into(), json!(r));
+    }
 }
 
 /// `bash_pipestatus_use`：命令里真的用了 `$PIPESTATUS`（照官方 2.1.299 的
@@ -879,6 +943,42 @@ pub(super) fn bash_read_only(p: &BashProfile, cwd: Option<&str>) -> bool {
     (matches!(p.class, "file_search" | "file_read") || git_read_only(p))
         && !p.has_redirect
         && p.argv0s.iter().all(|a| READ_ONLY_COMMANDS.contains(&a.as_str()))
+}
+
+/// 重复命令计量器拆语句时用的只读判定（官方 Bash 工具的 `isReadOnly`）：[`bash_read_only`] 之外，几样不读写文件、
+/// 不弹框也照样算只读的命令（`sleep`、`true`、`date`……）整条都是它们的也算（`cap/auto-2.1.316-20261031-full` A0：
+/// 两条 `unittest` 之间那条 `echo … ; sleep …` 官方没算一次可能写过）。
+pub(super) fn bash_read_only_for_meter(command: &str, cwd: Option<&str>) -> bool {
+    let p = bash_profile(command);
+    bash_read_only(&p, cwd)
+        || (!p.has_redirect
+            && !p.argv0s.is_empty()
+            && p.argv0s.iter().all(|a| {
+                READ_ONLY_COMMANDS.contains(&a.as_str()) || SIDE_EFFECT_FREE.contains(&a.as_str())
+            }))
+}
+
+/// [`bash_read_only_for_meter`] 另认的无副作用命令。
+const SIDE_EFFECT_FREE: &[&str] = &[
+    "sleep", "true", "false", "date", "whoami", "uname", "id", "hostname", "printenv", "env",
+    "basename", "dirname", "realpath", "readlink", "test", "[", "printf", "wait",
+];
+
+/// `Lne`（2.1.316 `reads_own_output`）：命令里引用了这个会话自己的输出——后台任务的输出目录（`<会话>/tasks/`，报
+/// `background_output`）或落盘的大结果（`<会话>/tool-results/`，报 `saved_result`），两样都有报 `both`，都没有不报。
+/// 官方比的是那两个目录的绝对路径，代理不知道客户端的临时目录与项目目录，按会话 id 那一段认。
+pub(super) fn reads_own_output(command: &str, session_id: &str) -> Option<&'static str> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let background = command.contains(&format!("/{session_id}/tasks/"));
+    let saved = command.contains(&format!("/{session_id}/tool-results/"));
+    match (background, saved) {
+        (true, true) => Some("both"),
+        (false, true) => Some("saved_result"),
+        (true, false) => Some("background_output"),
+        (false, false) => None,
+    }
 }
 
 /// [`bash_read_only`] 认的只读命令（`git` 还得是只读的子命令，见 [`git_read_only`]）。

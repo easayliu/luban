@@ -315,6 +315,8 @@ pub(super) struct AgentState {
     pub(super) model: Option<String>,
     /// 换了 writer 的 short 摘要失败过（官方 `le`）：摘要器之后不再换，收尾报 `writer_failed: true`。
     pub(super) summary_writer_failed: bool,
+    /// 那次失败的 short 摘要结束的时刻（2.1.315 起逐次推计时器触发时，在它之后的触发 writer 已停用、按 full 发）。
+    pub(super) summary_writer_failed_at: Option<SystemTime>,
     /// short 摘要换上过的 writer（请求模型与子代理不同）。官方只在配的 writer 等于客户端的小快模型时换
     /// （`fe()`），而小快模型由环境变量与 provider 定（`lS()`），会话里不变：换上过一次就确认了，之后没换的
     /// 那几条（配置改成了别的）不推翻它。
@@ -462,6 +464,7 @@ impl ThreadBase {
                         persisted_from: r.persisted,
                         is_error: r.is_error,
                         result_head: r.head.clone(),
+                        result_tail: r.tail.clone(),
                         tool_error: r.tool_error.clone(),
                         stripped_bytes: r.stripped_bytes,
                         image_b64: r.image_b64,
@@ -703,6 +706,12 @@ pub(super) struct TurnFacts {
     /// `serverClassifierRole` 后多 `serverClassifierConnection`，`reactive_compact_attempt` / `succeeded` 在
     /// `headTruncations` 后多 `leaveOutPasses`，失败 Bash 与 5xx 的错误栈换块（`cap/auto-2.1.314-20261030-*`）。
     pub(super) v314: bool,
+    /// 2.1.315 起（2.1.316 抓包，2.1.315 与它 JS 层只差一个 plist 串）：Bash 执行 / 失败事件多 `bash_programs`、
+    /// `bash_test_scope`、`bash_test_outcome`、五个输出 / 内存提示状态与一组重复命令统计
+    /// （[`super::tools::bash_meta_v316`]），`bash_command_kinds` 按 2.1.316 的表认，`agent_summary_stopped` 去掉
+    /// `max_input_tokens` / `config_flag`、加 `config_writer`，失败 Bash 与 5xx 的错误栈换块
+    /// （`cap/auto-2.1.316-20261031-*`）。
+    pub(super) v316: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
     /// [`State::tools_used_header_sent`]），而这个进程还没报过（[`Session::tools_used_header_reported`]）：这条报
     /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`

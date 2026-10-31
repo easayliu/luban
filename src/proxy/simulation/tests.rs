@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.314."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.316."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -46,7 +46,7 @@ fn simulates_official_system_for_plain_request() {
     assert_eq!(sys[2]["cache_control"]["scope"], "global");
     // 第四块是官方「其余」段（模板填好占位），客户端自己的 system 不再占一块。
     let rest = sys[3]["text"].as_str().unwrap();
-    assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块: {rest:.80}");
+    assert!(rest.starts_with("When you use a pronoun for someone"), "2.1.285 第四块: {rest:.80}");
     assert!(!unfilled(rest), "占位要全填掉: {rest}");
     let env = crate::proxy::sim_env_for(&test_cred(), "fp");
     assert!(
@@ -354,7 +354,7 @@ fn simulates_system_when_client_sent_none() {
     assert_eq!(sys[2]["text"], config::CC_SYSTEM_BASE);
     assert_eq!(sys[2]["cache_control"]["scope"], "global");
     let rest = sys[3]["text"].as_str().unwrap();
-    assert!(rest.starts_with("Write code that reads like"), "2.1.285 第四块");
+    assert!(rest.starts_with("When you use a pronoun for someone"), "2.1.285 第四块");
     let env = crate::proxy::sim_env_for(&test_cred(), "fp");
     assert!(
         rest.contains(&format!("`{}/.claude/projects/{}/memory/`", env.home, env.slug)),
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.314."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.316."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -939,7 +939,9 @@ fn respects_cache_breakpoint_budget() {
     assert!(v["system"][2].get("cache_control").is_none(), "预算用完时基座不带断点");
     assert_eq!(v["system"][2]["text"], config::CC_SYSTEM_BASE);
     assert!(v["system"][3].get("cache_control").is_none(), "预算用完时第四块也不带断点");
-    assert!(v["system"][3]["text"].as_str().unwrap().starts_with("Write code that reads like"));
+    assert!(
+        v["system"][3]["text"].as_str().unwrap().starts_with("When you use a pronoun for someone")
+    );
 }
 
 /// 客户端把 `system` 拆成多块时并成**一块**——3+N 块会被上游判第三方应用、改扣超额池
@@ -962,7 +964,7 @@ fn merges_client_system_blocks_into_one_trailing_block() {
 
     assert_eq!(sys.len(), 5, "官方四块 + 并成一块的客户端 system: {v}");
     let rest = sys[3]["text"].as_str().unwrap();
-    assert!(rest.starts_with("Write code that reads like"), "第四块开头是官方正文");
+    assert!(rest.starts_with("When you use a pronoun for someone"), "第四块开头是官方正文");
     assert!(rest.ends_with("</total_tokens>"), "第四块末尾照抓包，客户端的不掺进来");
     assert_eq!(sys[4]["text"], "a\n\nb\n\nc\n\nd", "四块并成一块、一个字都不丢: {v}");
     assert_eq!(sys[3]["cache_control"], serde_json::json!({"type": "ephemeral", "ttl": "1h"}));
@@ -1627,12 +1629,12 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.314-20261030-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.316-20261031-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、`x-claude-code-sandy-plover`、顶层键序、
 /// `thinking`、`context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方
-/// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00706` 是中断后重开那轮；
-/// `00381`、`00625`、`00470` 是各自首轮；2.1.312 那次是 `00681`、`00369`、`00603`、`00456`）；
-/// fable 只有 auto 模式的（`00947`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00666`、`00362`、`00596`、`00445`
+/// 都是各自首轮；2.1.314 那次是 `00706`（中断后重开那轮）、`00381`、`00625`、`00470`）；
+/// fable 只有 auto 模式的（`00903`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
 /// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`；2.1.310 起这个号服务端已把
 /// 那个开关关了，官方串里本就没有）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
@@ -1647,10 +1649,10 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_314_captures() {
-    let dir = format!("{}/cap/auto-2.1.314-20261030-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_316_captures() {
+    let dir = format!("{}/cap/auto-2.1.316-20261031-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.314-20261030-full not present");
+        eprintln!("skipped: cap/auto-2.1.316-20261031-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
@@ -1681,7 +1683,7 @@ fn simulated_main_threads_match_the_2_1_314_captures() {
         cred
     };
     for (i, (n, auto_mode)) in
-        [("00706", false), ("00381", false), ("00470", false), ("00625", false), ("00947", true)]
+        [("00666", false), ("00362", false), ("00445", false), ("00596", false), ("00903", true)]
             .into_iter()
             .enumerate()
     {
@@ -1784,7 +1786,7 @@ fn simulated_main_threads_match_the_2_1_314_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.314."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.316."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1793,7 +1795,7 @@ fn simulated_main_threads_match_the_2_1_314_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/4286dee2-8e30-40d7-8a37-314ab6dd45f1/scratchpad/cal6",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/1bac673b-96a9-4a5f-93b2-c61c0508e1a8/scratchpad/cal7",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -2085,16 +2087,18 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.314 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布）同样一条不进
-/// 模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，照样认作官方。
+/// **2.1.309 ~ 2.1.316 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315 没抓）
+/// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
+/// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，照样认作官方。
 #[test]
-fn every_auto_2_1_309_to_314_official_request_passes_through() {
+fn every_auto_2_1_309_to_316_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
         ("auto-2.1.311-20261027-full", (2, 1, 311)),
         ("auto-2.1.312-20261028-full", (2, 1, 312)),
         ("auto-2.1.314-20261030-full", (2, 1, 314)),
+        ("auto-2.1.316-20261031-full", (2, 1, 316)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");
@@ -2581,14 +2585,16 @@ fn system_rest_assets_are_verbatim() {
     // （模板，字节数，开头）：抓包原文去掉 EndConversation 那段（haiku 那份本来就没有）与
     // `<total_tokens>` 之后的 WebSearch 那段，再把记忆目录换成两个占位。
     for (asset, len, head) in [
-        (config::CC_SYSTEM_REST, 4677, "Write code that reads like the surrounding code"),
+        // 2.1.315 起 opus / sonnet / haiku-5-5 删了开头那句 `Write code that reads like…`（`cap/auto-2.1.316-20261031-full`
+        // 三个模型的第四块都正好少 96 字节），以代词那句开头。
+        (config::CC_SYSTEM_REST, 4581, "When you use a pronoun for someone"),
         (
             config::CC_SYSTEM_REST_FABLE,
             10771,
             "Before you start, say in a line what you're about to do",
         ),
         (config::CC_SYSTEM_REST_HAIKU, 16697, "# Text output (does not apply to tool calls)"),
-        (config::CC_SYSTEM_REST_HAIKU_5_5, 7469, "Write code that reads like the surrounding code"),
+        (config::CC_SYSTEM_REST_HAIKU_5_5, 7373, "When you use a pronoun for someone"),
     ] {
         assert_eq!(asset.len(), len, "{head}");
         assert!(asset.starts_with(head), "{head}");

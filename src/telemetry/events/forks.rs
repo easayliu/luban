@@ -415,6 +415,11 @@ impl EventBuilder<'_> {
             let rid = call.request_id.as_deref().unwrap_or("");
             let mut tu = ToolUse { id: hb.id.clone(), ..Default::default() };
             tu.apply_call(&hb.name, &hb.input, hb.verdict.as_ref());
+            // 2.1.315 起 `SubagentHandback` 不只读，重复命令计量器记一次可能写过（与主线程共用同一个计量器：
+            // `cap/auto-2.1.316-20261031-full` A0 那条重复的 `unittest` 报 4 次，正是两次 Python 加两次交还）。
+            if env.f.v316 {
+                self.files.bash_meter.note_other_tool(&hb.name);
+            }
             let th = ms(t_end, -32);
             if shape.permission_mode == "auto"
                 && let Some(verdict) = tu.verdict.as_deref()
@@ -667,6 +672,120 @@ impl EventBuilder<'_> {
                             ("calls_overtaken", json!(0)),
                         ]);
                         insert_after(&mut stopped, "lines_accepted", keys);
+                    }
+                    // 2.1.315 起摘要器重写了（`cap/auto-2.1.316-20261031-full` 六条）：配置不再按会话主模型族挑开关，
+                    // 一律读 `tengu_groovy_ember` 且只认 `mode`（`config_flag`、`max_input_tokens` 与两个等待都不报了，等待
+                    // 固定 30 秒）；writer 恒是客户端的小快模型（官方 `Yss()`，不再按子代理的族取），`config_writer`
+                    // 总报它；short 只看配置是不是 short、writer 有没有失败过，不再要求子代理是 opus / fable。
+                    if env.f.v316 {
+                        // 2.1.315 起计时器固定 30 秒（`refreshSeconds` 不读了），读配置的时刻按这个逐次推：最后一次
+                        // 落在收尾之前的触发；一次没有就是最后一条摘要发出（或起跑）那一刻。
+                        let anchor = done.summary_last_end.unwrap_or(spawn);
+                        let fires = crate::proxy::agent_summary_config::fires_316(anchor, stop);
+                        let read_at = fires
+                            .last()
+                            .copied()
+                            .unwrap_or(done.summary_last_sent.unwrap_or(spawn));
+                        let cfg316 = crate::proxy::agent_summary_config::config_at(
+                            call.cred_id,
+                            "opus",
+                            read_at,
+                        );
+                        let same_as_last_send = done.summary_last_sent.is_some_and(|sent| {
+                            !crate::proxy::agent_summary_config::changed_between(
+                                call.cred_id,
+                                sent,
+                                read_at,
+                            )
+                        });
+                        let last_short = done.summary_last_short.filter(|_| same_as_last_send);
+                        let config_short = cfg316.short || last_short == Some(true);
+                        // 官方 `Ie()`：配置是 short、writer 没失败过才有 writer（失败了就停用，回退子代理自己的模型）；
+                        // `mode` 报最后一次触发用的模式（官方 `ce = be` 在查消息够不够之前，跳过没发的那次也算）：最后一条
+                        // 摘要之后还有触发的，按最后那次触发时的配置与 writer 失败与否；没有的才沿用最后一条摘要的模式，
+                        // 一次没触发才看 `Ie()`。`mode_changed` 比的是真发出过的请求的模式。
+                        let writer_on = config_short && !done.summary_writer_failed;
+                        // 那一刻的配置与 `config_short` 同一套证据：号的 eval 说是 short，或者最后一条摘要是 short 发的、
+                        // 那之后到这一刻没收到新的 eval（没见过 eval 的号配置表只能给默认 full，不能拿它推翻实际发出的
+                        // short）；再叠上 writer 是否已失败。
+                        let short_at = |t: std::time::SystemTime| {
+                            let config_says = crate::proxy::agent_summary_config::config_at(
+                                call.cred_id,
+                                "opus",
+                                t,
+                            )
+                            .short;
+                            let seen_short = done.summary_last_short == Some(true)
+                                && done.summary_last_sent.is_some_and(|sent| {
+                                    sent <= t
+                                        && !crate::proxy::agent_summary_config::changed_between(
+                                            call.cred_id,
+                                            sent,
+                                            t,
+                                        )
+                                });
+                            (config_says || seen_short)
+                                && !done.summary_writer_failed_at.is_some_and(|f| f <= t)
+                        };
+                        let mode_short = match fires.last() {
+                            Some(&t) => short_at(t),
+                            None => last_short.unwrap_or(writer_on),
+                        };
+                        let mode_changed = if mode_short {
+                            calls > done.summaries_short
+                        } else {
+                            done.summaries_short > 0
+                        };
+                        let small_fast = done
+                            .small_fast
+                            .clone()
+                            .unwrap_or_else(|| crate::config::CC_SMALL_FAST_MODEL.to_string());
+                        let writer_model =
+                            if writer_on { small_fast.as_str() } else { display_model.as_str() };
+                        let mode_name = |short: bool| if short { "short" } else { "full" };
+                        if let Some(o) = stopped.as_object_mut() {
+                            for k in [
+                                "max_input_tokens",
+                                "config_flag",
+                                "first_wait_ms",
+                                "next_wait_ms",
+                                "holds_fork",
+                                "cold_after_ms",
+                                "config_writer",
+                            ] {
+                                o.shift_remove(k);
+                            }
+                            o.insert("mode".into(), json!(mode_name(mode_short)));
+                            o.insert("config_mode".into(), json!(mode_name(config_short)));
+                            o.insert("mode_changed".into(), json!(mode_changed));
+                            o.insert("config_source".into(), json!(&cfg316.source));
+                            o.insert(
+                                "writer_model".into(),
+                                json!(telemetry_model_name(writer_model)),
+                            );
+                        }
+                        insert_after(
+                            &mut stopped,
+                            "writer_model",
+                            vec![("config_writer", json!(telemetry_model_name(&small_fast)))],
+                        );
+                        // `holds_fork` / `cold_after_ms` 只在按 full 触发过一次（官方 `Ae ??= bi(...)` 在 full 分支里）时才有：
+                        // 发过 full 摘要的，或最后一条摘要之后某次触发按 full（那一刻配置不是 short、或 writer 已失败）。
+                        // 逐次看最后那几次触发当时的模式：那一刻配置是 short、writer 还没失败过才按 short，否则按 full。
+                        let fired_full = done.summaries > done.summaries_short
+                            || fires.iter().any(|&t| !short_at(t));
+                        if fired_full {
+                            let (holds, cold) = crate::proxy::agent_summary_config::hold_policy(
+                                call.cred_id,
+                                session_family,
+                                false,
+                            );
+                            insert_after(
+                                &mut stopped,
+                                "lines_accepted",
+                                vec![("holds_fork", json!(holds)), ("cold_after_ms", json!(cold))],
+                            );
+                        }
                     }
                 }
                 self.push(t2, "tengu_agent_summary_stopped", stopped);

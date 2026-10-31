@@ -238,6 +238,22 @@ pub(crate) fn last_read_at(
     read
 }
 
+/// 2.1.315 起摘要器的计时器固定每 30 秒触发一次（官方 `v = waitsMs?.[0] ?? 30000`，`refreshSeconds` 不再读），
+/// 请求结束后才排下一次：从 `anchor`（最后一条摘要结束，一条没发就是起跑）往后每 30 秒一次、落在 `stop` 之前（含）
+/// 的那些触发时刻。之后没再发出摘要，说明这些触发都被跳过了（跳过时立即重排下一次）。
+pub(crate) fn fires_316(anchor: SystemTime, stop: SystemTime) -> Vec<SystemTime> {
+    let mut out = Vec::new();
+    let mut t = anchor;
+    for _ in 0..1_000 {
+        t += std::time::Duration::from_millis(30_000);
+        if t > stop {
+            break;
+        }
+        out.push(t);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

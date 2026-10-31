@@ -479,7 +479,33 @@ impl EventBuilder<'_> {
                     }
                     if v311 {
                         let h = i64::from(env.req_hash % 100);
-                        bash_meta_v311(&mut meta, cmd, Some(ShellUsage::typed(h)));
+                        let v316 = env.f.v316;
+                        let run = bash_meta_v311(&mut meta, cmd, Some(ShellUsage::typed(h)), v316);
+                        // 2.1.315 起同样多那几项；`!` 跑的没有 tool_use id，计量器只记一次在跑、不比重复
+                        // （`cap/auto-2.1.316-20261031-full` 那条没有 `repeat` 那组）。
+                        if v316 {
+                            let at: std::time::SystemTime = t0.into();
+                            let begun = self.files.bash_meter.begin(
+                                super::super::bash_repeat::BeginArgs {
+                                    command: cmd,
+                                    rest_input: &json!({ "dangerouslyDisableSandbox": true }),
+                                    cwd: env.f.session_cwd.as_deref().unwrap_or(""),
+                                    agent_id: "",
+                                    tool_use_id: None,
+                                    now: at,
+                                    prompt_seq: env.f.prompt_seq,
+                                },
+                                |_| false,
+                            );
+                            bash_meta_v316(&mut meta, &run, "", 0, false, begun.fields.clone());
+                            self.files.bash_meter.settle(
+                                begun,
+                                "succeeded",
+                                true,
+                                at,
+                                env.f.prompt_seq,
+                            );
+                        }
                     }
                     self.push_dd_snake(ms(t0, -6), "tengu_bash_tool_command_executed", meta);
                 }

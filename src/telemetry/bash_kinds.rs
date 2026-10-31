@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 use super::bash_ast;
 
+mod v316;
+
 /// 原文 `pM`：超过这么多 UTF-16 码元的命令不解析（报 `unparsed`）。
 const MAX_PARSE_LEN: usize = 10_000;
 /// 原文 `u1r`：`LB` 递归超过这一层就放弃（报 `incomplete`）。
@@ -46,6 +48,10 @@ struct Tool {
     verb_may_be_script: bool,
     value_flags: &'static [&'static str],
     runs_the_rest: bool,
+    /// 2.1.316 `ownVerbs`：第一个操作数是这些词时这条命令就到此为止（`c8 report`、`nyc merge` 不是跑测试）。
+    own_verbs: &'static [&'static str],
+    /// 2.1.316 `verbIsTarget`：动作位置上的词是这个工具自己的目标（`make foo`、`just foo`），再认一层时不算一个程序。
+    verb_is_target: bool,
 }
 
 /// 原文的 `{}`：没列在 `IMn` 里的工具。
@@ -58,15 +64,17 @@ const NO_TOOL: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 
 /// 一条 shell 命令的 `bash_command_kinds`（`yte(e).bash_command_kinds`）。
 #[cfg(test)]
 pub(super) fn bash_command_kinds(cmd: &str) -> String {
-    shell_run(cmd).kinds
+    shell_run(cmd, false).kinds
 }
 
-/// 一条 shell 命令在 2.1.311 Bash 事件里由语法树判出的两样，一次解析得出（[`shell_run`]）。
+/// 一条 shell 命令在 Bash 事件里由语法树判出的几样，一次解析得出（[`shell_run`]）。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ShellRun {
     /// `bash_command_kinds`。
@@ -76,15 +84,32 @@ pub(super) struct ShellRun {
     /// `disown` 也不换组，所以就是「树里（含 `bash -c` / `eval` 里那段）有 `&`、又没有一条 `wait`」。`setsid`
     /// 换了会话的、后台任务恰好在 shell 退出前跑完的分不出来，按留着算；解析不了的按没留算。
     pub(super) leaves_running: bool,
+    /// 2.1.315 起的 `bash_programs`：认得的程序名（[`v316::program_of`]），认不得的是 `other`，按 JS 默认排序用逗号
+    /// 连起来；一个都没有是 `none`，放弃了或超过 [`v316::MAX_PROGRAMS`] 个是 `incomplete`，解析不了是 `unparsed`。
+    /// 按 2.1.311 的规则认（`v316` 为假）时是空串，事件里不报。
+    pub(super) programs: String,
+    /// 2.1.315 起的 `bash_test_scope`：kind 里有 `runs_tests`（且没放弃）时才有，取各条测试命令范围里
+    /// [`v316::SCOPE_ORDER`] 最靠前的那个，一个都没算出来是 `unknown`（[`test_scope`]）。
+    pub(super) test_scope: Option<&'static str>,
 }
 
-/// 解析一遍，交出 [`ShellRun`]。
-pub(super) fn shell_run(cmd: &str) -> ShellRun {
+/// 一条 shell 命令的 [`ShellRun`]（`Cfe(e)` / 2.1.311 `yte(e)` 里语法树那几项）。`v316` 是会话版本 ≥2.1.315：
+/// 按 2.1.316 的表与规则认，另算 `bash_programs` 与 `bash_test_scope`；否则照 2.1.311（直到 2.1.314 都没变）。
+pub(super) fn shell_run(cmd: &str, v316: bool) -> ShellRun {
     let Some(parsed) = scan(cmd) else {
-        return ShellRun { kinds: "unparsed".into(), leaves_running: false };
+        return ShellRun {
+            kinds: "unparsed".into(),
+            leaves_running: false,
+            programs: if v316 { "unparsed".into() } else { String::new() },
+            test_scope: None,
+        };
     };
     let mut st = State {
+        v316,
         kinds: BTreeSet::new(),
+        programs: BTreeSet::new(),
+        test_scopes: BTreeSet::new(),
+        fed_more_words: false,
         script_depth: 0,
         script_chars_left: SCRIPT_CHARS,
         script_deadline: None,
@@ -97,11 +122,24 @@ pub(super) fn shell_run(cmd: &str) -> ShellRun {
     if st.kinds.is_empty() {
         st.kinds.insert("shell_word");
     }
+    // `fa`：JS 默认排序（UTF-16 码元序），kind 与程序名全是 ASCII，与字节序相同。
+    let join = |set: &BTreeSet<&'static str>| set.iter().copied().collect::<Vec<_>>().join(",");
+    let programs = if !v316 {
+        String::new()
+    } else if st.gave_up || st.programs.len() > v316::MAX_PROGRAMS {
+        "incomplete".into()
+    } else if st.programs.is_empty() {
+        "none".into()
+    } else {
+        join(&st.programs)
+    };
     if st.gave_up {
-        return ShellRun { kinds: "incomplete".into(), leaves_running };
+        return ShellRun { kinds: "incomplete".into(), leaves_running, programs, test_scope: None };
     }
-    // `ha`：JS 默认排序（UTF-16 码元序），kind 全是 ASCII，与字节序相同。
-    ShellRun { kinds: st.kinds.into_iter().collect::<Vec<_>>().join(","), leaves_running }
+    let test_scope = (v316 && st.kinds.contains("runs_tests")).then(|| {
+        v316::SCOPE_ORDER.iter().copied().find(|s| st.test_scopes.contains(s)).unwrap_or("unknown")
+    });
+    ShellRun { kinds: join(&st.kinds), leaves_running, programs, test_scope }
 }
 
 /// 解析结果里 `bash_command_kinds` 用得到的两样（原文 `BMn` 收集的那个对象）。
@@ -177,9 +215,19 @@ fn unquote(y: &[u16]) -> String {
     String::from_utf16_lossy(&body)
 }
 
-/// 原文 `yte` 里那个 `y`：收集中的 kind 与内嵌脚本的预算。后两项是 [`ShellRun::leaves_running`] 的材料，原文没有。
+/// 原文 `Cfe` / `yte` 里那个 `d` / `y`：收集中的 kind、程序与测试范围，与内嵌脚本的预算。最后两项是
+/// [`ShellRun::leaves_running`] 的材料，原文没有。
 struct State {
+    /// 按 2.1.316 的表与规则认（[`shell_run`]）。
+    v316: bool,
     kinds: BTreeSet<&'static str>,
+    /// `programs`（只在 `v316` 时收集）。
+    programs: BTreeSet<&'static str>,
+    /// `testScopes`（只在 `v316` 时收集）。
+    test_scopes: BTreeSet<&'static str>,
+    /// `fedMoreWords`：这条简单命令前面有 `xargs` / `parallel` 一类会再塞参数进来的前缀，操作数读不全。每条简单命令
+    /// 开始时清掉（`Ve`）。
+    fed_more_words: bool,
     script_depth: u32,
     script_chars_left: i64,
     script_deadline: Option<Instant>,
@@ -201,7 +249,8 @@ impl State {
             if words.first().is_some_and(|w| w == "wait") {
                 self.waits = true;
             }
-            self.classify(words, 0, None);
+            self.fed_more_words = false;
+            self.classify(words, 0, None, false);
         }
     }
 
@@ -224,8 +273,24 @@ impl State {
         self.script_depth -= 1;
     }
 
-    /// `LB`：一条简单命令（已分好词）。`want` 是原文第四个参数：只认生态 kind 等于它（或是浏览器）的命令。
-    fn classify(&mut self, e: &[String], depth: u32, want: Option<&'static str>) {
+    /// 工具名 → 语言 / 生态 kind，按这次用的那一版的表。
+    fn kind_of(&self, name: &str) -> Option<&'static str> {
+        if self.v316 { v316::kind_of(name) } else { kind_of(name) }
+    }
+
+    /// 工具名 → 动作 kind，同上。
+    fn extra_kind(&self, name: &str) -> Option<&'static str> {
+        if self.v316 { v316::extra_kind(name) } else { extra_kind(name) }
+    }
+
+    /// 工具配置，同上。
+    fn tool(&self, name: &str) -> Option<&'static Tool> {
+        if self.v316 { v316::tool(name) } else { tool(name) }
+    }
+
+    /// `H`（2.1.311 `LB`）：一条简单命令（已分好词）。`want` 是原文第四个参数：只认生态 kind 等于它（或是浏览器）的
+    /// 命令；`target` 是第五个参数（2.1.316）：这个词是上一层工具的目标，不算一个程序。
+    fn classify(&mut self, e: &[String], depth: u32, want: Option<&'static str>, target: bool) {
         if depth > MAX_DEPTH {
             self.gave_up = true;
         }
@@ -236,21 +301,30 @@ impl State {
             && e.get(1).is_some_and(|w| w == "-v" || w == "-V")
         {
             self.kinds.insert("shell_word");
+            if self.v316 {
+                self.programs.insert("command");
+            }
             return;
         }
         let y = strip_wrappers(e);
         let Some(first) = y.first() else { return };
         let b = tool_name(first);
-        let w = kind_of(&b);
+        let w = self.kind_of(&b);
         if let Some(want) = want
             && w != Some(want)
             && w != Some("browser")
         {
             return;
         }
+        if self.v316 && !target {
+            self.programs.insert(v316::program_of(&b).unwrap_or("other"));
+        }
         let prefix = &e[..e.len() - y.len()];
         if b == "disown" || prefix.iter().any(|t| DETACHERS.contains(&basename(t))) {
             self.kinds.insert("starts_background_job");
+        }
+        if self.v316 && prefix.iter().any(|t| v316::FEEDS_MORE_WORDS.contains(&basename(t))) {
+            self.fed_more_words = true;
         }
         if SHELLS.contains(&b.as_str()) {
             self.shell(y);
@@ -272,7 +346,7 @@ impl State {
                     while ve < y.len() && y[ve] != ";" && y[ve] != "+" {
                         ve += 1;
                     }
-                    self.classify(&y[te + 1..ve], depth + 1, None);
+                    self.classify(&y[te + 1..ve], depth + 1, None, false);
                     te = ve;
                 }
                 te += 1;
@@ -289,40 +363,66 @@ impl State {
             return;
         };
         self.kinds.insert(w);
+        let coverage_run = self.v316 && b == "coverage" && y.get(1).is_some_and(|t| t == "run");
         if b == "python" {
             self.python(y, depth);
+        } else if coverage_run {
+            // 2.1.316：`coverage run -m pytest` 照 `python -m pytest` 认。
+            self.python(&y[1..], depth);
         }
-        let q = tool(&b).unwrap_or(&NO_TOOL);
+        let q = self.tool(&b).unwrap_or(&NO_TOOL);
         let v = q.value_flags;
         let op = next_operand(y, 1, v);
         let after = next_operand(y, op.index + 1, v);
+        if let Some(tok) = op.token
+            && q.own_verbs.contains(&tok)
+        {
+            return;
+        }
         let mut we = first_cot(q.verbs, |t| op.token == Some(t));
+        // 2.1.316 `R`：测试范围从哪个词起读。
+        let mut from = op.index + 1;
         let rest = |i: usize| &y[i.min(y.len())..];
         if q.runs_the_rest {
-            self.classify(rest(op.index), depth + 1, None);
+            self.classify(rest(op.index), depth + 1, None, false);
         } else if let Some(tok) = op.token {
             if q.script_after.contains(&tok) {
                 we = script_verb(after.token);
+                from = after.index + 1;
             } else if q.command_after.contains(&tok) {
                 we = script_verb(after.token);
+                from = after.index + 1;
                 if we.is_none() {
-                    self.classify(rest(after.index), depth + 1, None);
+                    self.classify(rest(after.index), depth + 1, None, false);
                     return;
                 }
             } else if we.is_none() && q.verb_may_be_script {
                 we = script_verb(Some(tok));
                 if we.is_none() {
-                    self.classify(rest(op.index), depth + 1, Some(w));
+                    self.classify(rest(op.index), depth + 1, Some(w), q.verb_is_target);
                 }
             }
         } else if !INFO_FLAGS.iter().any(|f| y[1..].iter().any(|t| t == f)) {
             we = q.bare;
         }
-        let we = we
-            .or_else(|| first_cot(q.anywhere, |t| y[1..].iter().any(|a| a == t)))
-            .or_else(|| extra_kind(&b));
+        if we.is_none() {
+            // 2.1.316 起跟在取值开关后面的不算（`gradle -x test` 不是跑测试）。
+            we = if self.v316 {
+                first_cot(q.anywhere, |t| {
+                    (1..y.len()).any(|i| y[i] == t && !v.contains(&y[i - 1].as_str()))
+                })
+            } else {
+                first_cot(q.anywhere, |t| y[1..].iter().any(|a| a == t))
+            }
+            .or_else(|| self.extra_kind(&b));
+            from = 1;
+        }
         if let Some(k) = we {
             self.kinds.insert(k);
+        }
+        if self.v316 && we == Some("runs_tests") && !q.runs_the_rest && !coverage_run {
+            let scope = test_scope(&b, y, from, self.fed_more_words);
+            self.test_scopes.insert(scope);
         }
         if WATCH_FLAGS.iter().any(|f| y[1..].iter().any(|t| t == f)) {
             self.kinds.insert("serves_or_watches");
@@ -356,7 +456,7 @@ impl State {
         self.kinds.insert("shell_script");
     }
 
-    /// `N1r`：`python` 后面的开关。`-m` 把模块当命令再认（只认生态是 python 的），`-c`、只有开关、
+    /// `Ne`（2.1.311 `N1r`）：`python` 后面的开关。`-m` 把模块当命令再认（只认生态是 python 的），`-c`、只有开关、
     /// `-` 都算内联代码；碰到脚本文件或 `-V` / `-h` / `--version` 一类就不再报。
     fn python(&mut self, e: &[String], depth: u32) {
         let mut s = 1;
@@ -385,10 +485,19 @@ impl State {
                     let module = d.first().map_or("", String::as_str);
                     if let Some(k) = py_module_kind(module) {
                         self.kinds.insert(k);
+                        // 2.1.316：`python -m unittest` / `doctest` 本身是一个程序，也算一次测试范围。
+                        if self.v316
+                            && let Some(m) =
+                                v316::PY_TEST_MODULES.iter().copied().find(|m| *m == module)
+                        {
+                            self.programs.insert(m);
+                            let scope = test_scope(m, &d, 1, self.fed_more_words);
+                            self.test_scopes.insert(scope);
+                        }
                     } else if PY_TOOL_MODULES.contains(&module) {
-                        self.classify(&d, depth + 1, None);
+                        self.classify(&d, depth + 1, None, false);
                     } else {
-                        self.classify(&d, depth + 1, Some("python"));
+                        self.classify(&d, depth + 1, Some("python"), false);
                     }
                     return;
                 }
@@ -401,6 +510,330 @@ impl State {
         }
         self.kinds.insert("python_inline");
     }
+}
+
+/// `Ye`（2.1.316）：工具 `e` 这次跑测试的范围。`s` 是剥好前缀的整条命令，从 `n` 起是它的参数；`fed` 是前面有
+/// `xargs` 一类会再塞参数的前缀（[`State::fed_more_words`]），读到的操作数不全。
+///
+/// 一个个读参数：开关按 [`v316::TestRunner::flags`] 定性（`--x=false` 当没说；`takes_expression` 看表达式是不是取反），
+/// 会吃值的跳过下一个词；动作词只在第一个操作数位置上认（`verbsOnlyAfter` 要求紧跟在那个词之后）。认出
+/// `runs_no_tests` 直接返回；其余操作数看是不是「整体」的写法（`.`、`tests/`……）、变量或通配、测试名、目录。
+/// 最后按「只跑改动 / 失败的 > 收窄 > 收窄到目录 > 说不清 > 整体」的先后给一个。
+fn test_scope(e: &str, s: &[String], n: usize, fed: bool) -> &'static str {
+    let r = v316::test_runner(e);
+    let lookup = |pairs: Option<Pairs>, w: &str| -> Option<&'static str> {
+        pairs?.iter().find(|(_, words)| words.contains(&w)).map(|(k, _)| *k)
+    };
+    let (mut d, mut m, mut p, mut g, mut y) = (false, false, false, false, false);
+    let mut h = r.is_none() || fed;
+    let mut verb_pos = r.is_none_or(|r| {
+        r.verbs_only_after.is_none_or(|v| n >= 1 && s.get(n - 1).is_some_and(|w| w == v))
+    });
+    let (mut dashes, mut after_long) = (false, false);
+    let mut a = n;
+    while a < s.len() {
+        let w = s[a].as_str();
+        let after_unknown_long = after_long;
+        after_long = false;
+        if !w.is_empty() && w.bytes().all(|c| c.is_ascii_digit()) {
+            a += 1;
+            continue;
+        }
+        let kind: Option<&'static str>;
+        if w.encode_utf16().count() > 1 && w.starts_with('-') {
+            let eq = w.find('=');
+            let name = eq.map_or(w, |i| &w[..i]);
+            let value: Option<&str> = match eq {
+                Some(i) => Some(&w[i + 1..]),
+                None => s.get(a + 1).map(String::as_str),
+            };
+            let mut k = if v316::RUNS_NO_TESTS_FLAGS.contains(&name) {
+                Some("runs_no_tests")
+            } else {
+                lookup(r.map(|r| r.flags), name)
+            };
+            if eq.is_some() && value == Some("false") {
+                k = Some("says_nothing");
+            } else if k == Some("takes_expression") {
+                k = Some(if negated_expression(value.unwrap_or("")) {
+                    "takes_value"
+                } else {
+                    "narrowed"
+                });
+            }
+            if k.is_some_and(|k| k != "says_nothing")
+                && eq.is_none()
+                && !value.is_some_and(|v| v.starts_with('-'))
+            {
+                a += 1;
+            }
+            dashes |= w == "--";
+            after_long = k.is_none() && eq.is_none() && long_flag_not_no(w);
+            kind = k;
+        } else {
+            kind = if verb_pos { lookup(r.map(|r| r.verbs), w) } else { None };
+            verb_pos = false;
+        }
+        if kind == Some("runs_no_tests") {
+            return "runs_no_tests";
+        }
+        d |= kind == Some("changed_or_failed_only");
+        m |= kind == Some("narrowed");
+        p |= kind == Some("narrowed_to_folders");
+        if kind.is_some() || w.starts_with('-') {
+            a += 1;
+            continue;
+        }
+        let b = w.strip_prefix("./").unwrap_or(w);
+        let b = b.strip_suffix('/').unwrap_or(b);
+        if r.is_some_and(|r| r.whole_operands.contains(&b)) {
+            g = true;
+        } else if is_assignment(w) {
+            h |= !s[a - 1].starts_with('-');
+        } else if w.starts_with(['$', '`'])
+            || w.contains('*')
+            || w == "{}"
+            || r.is_some_and(|r| r.operands == v316::Operands::GoToRecipe)
+        {
+            h = true;
+        } else if let Some(r) = r.filter(|r| {
+            r.operands == v316::Operands::NameTests
+                || (r.operands == v316::Operands::NameTestsAfterDashes && dashes)
+        }) {
+            let v = after_unknown_long || fed || r.whole_operands.contains(&basename(b));
+            let folder = !has_extension_or_colon(w)
+                && (r.bare_operands == v316::BareOperands::Folders
+                    || (r.bare_operands == v316::BareOperands::FoldersByForm
+                        && (w.contains('/') || v316::FOLDER_NAMES.contains(&b))));
+            h |= v;
+            p |= !v && folder;
+            m |= !v && !folder;
+        } else if r.and_then(|r| r.less_than_package).is_some_and(|l| less_than_package(l, b)) {
+            y |= !after_unknown_long;
+        }
+        a += 1;
+    }
+    if d {
+        "changed_or_failed_only"
+    } else if m {
+        "narrowed"
+    } else if p {
+        "narrowed_to_folders"
+    } else if h {
+        "unknown"
+    } else if !r.is_some_and(|r| r.whole_needs_operand) || g {
+        "whole"
+    } else if y {
+        "narrowed"
+    } else {
+        "narrowed_to_folders"
+    }
+}
+
+/// `/^['"]?(not |~|!)/`：`-k 'not slow'` 一类取反的表达式。
+fn negated_expression(v: &str) -> bool {
+    let v = v.strip_prefix(['\'', '"']).unwrap_or(v);
+    v.starts_with("not ") || v.starts_with('~') || v.starts_with('!')
+}
+
+/// `/^--(?!no-)[^-]/`：认不得的长开关（不是 `--no-…`），它后面那个词可能是它的值。
+fn long_flag_not_no(w: &str) -> bool {
+    w.strip_prefix("--")
+        .is_some_and(|r| !r.starts_with("no-") && !r.is_empty() && !r.starts_with('-'))
+}
+
+/// `Ft`：`/\.\w+$|:\w/`——带扩展名或 `file:line` 一类的写法，不当目录。
+fn has_extension_or_colon(w: &str) -> bool {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let b = w.as_bytes();
+    let ext = b
+        .iter()
+        .rposition(|&c| c == b'.')
+        .is_some_and(|i| i + 1 < b.len() && b[i + 1..].iter().all(|&c| word(c)));
+    ext || b.windows(2).any(|p| p[0] == b':' && word(p[1]))
+}
+
+/// `lessThanPackage` 的两条正则。go：`/\.go$/`；bazel：
+/// `/:(?!all$|all-targets$)\w|^@?[\w.-]*\/\/(?![^:]*\.\.\.$)[^:]*$/`——`//pkg:target`（不是 `:all` / `:all-targets`）
+/// 或不带 `:`、不以 `...` 收尾的 `//pkg/dir`。带前瞻，regex 库不支持，照意思手写。
+fn less_than_package(l: v316::LessThanPackage, w: &str) -> bool {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    match l {
+        v316::LessThanPackage::GoFile => w.ends_with(".go"),
+        v316::LessThanPackage::BazelTarget => {
+            let b = w.as_bytes();
+            let named = b.iter().enumerate().any(|(i, &c)| {
+                c == b':' && b.get(i + 1).is_some_and(|&n| word(n)) && {
+                    let rest = &w[i + 1..];
+                    rest != "all" && rest != "all-targets"
+                }
+            });
+            if named {
+                return true;
+            }
+            let t = w.strip_prefix('@').unwrap_or(w);
+            let head = t.bytes().take_while(|&c| word(c) || c == b'.' || c == b'-').count();
+            t[head..]
+                .strip_prefix("//")
+                .is_some_and(|rest| !rest.contains(':') && !rest.ends_with("..."))
+        }
+    }
+}
+
+/// `Vt`：测试结果只看输出的最后这么多个 UTF-16 码元（从那之前最近的换行起）。
+const OUTCOME_TAIL: usize = 8192;
+
+/// `Ze`：各家测试工具的「失败」「通过」判据（pytest、unittest、jest、vitest、mocha、node:test、bun、deno、go、cargo、
+/// nextest、maven / gradle、dotnet、ctest、rspec、phpunit……），第三项是「看着像通过、其实有失败」的反证（vitest 的 `›`
+/// 行）。原文是带 `m` 标志的 JS 正则，这里照 JS 语义改写：`\d` / `\w` 只认 ASCII，`.` 不跨 `\n` `\r` U+2028 U+2029，
+/// `^` / `$` 也认 `\r` 行尾（`R`），`\b` 是 ASCII 词边界。
+const OUTCOME_PATTERNS: &[&[&str]] = &[
+    &[
+        r#"(?mR)^(?:=* ?(?:[0-9]+ [A-Za-z0-9_]+, ){0,9}[1-9][0-9]* (?:failed|errors?)(?-u:\b)[^\n\r\x{2028}\x{2029}]{0,200} in [0-9][0-9.]*s(?-u:\b)|FAIL Required test coverage of [0-9.]+% not reached\.)"#,
+        r#"(?mR)^=* ?[0-9]+ passed(?-u:\b)[^\n\r\x{2028}\x{2029}]{0,200} in [0-9][0-9.]*s(?-u:\b)"#,
+    ],
+    &[
+        r#"(?mR)^FAILED \([a-z ]+=[0-9]"#,
+        r#"(?mR)^Ran [0-9]+ tests? in [0-9.]+s[\t\n\x{0B}\x{0C}\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]+OK(?-u:\b)"#,
+    ],
+    &[
+        r#"(?mR)^(?:Tests?(?: Suites)?: +(?:[0-9]+ [A-Za-z0-9_]+, ){0,9}[1-9][0-9]* failed(?-u:\b)|Jest: (?:"[^\n\r\x{2028}\x{2029}]{0,200}" coverage threshold for [A-Za-z0-9_]+ \([^\n\r\x{2028}\x{2029}]{0,20}\) not met: |Uncovered count for [A-Za-z0-9_]+ \([0-9]+\) exceeds |Coverage data for [^\n\r\x{2028}\x{2029}]{0,200} was not found\.))"#,
+        r#"(?mR)^Tests: +(?:[0-9]+ [A-Za-z0-9_]+, ){0,9}[0-9]+ passed, [0-9]+ total(?-u:\b)"#,
+    ],
+    &[
+        r#"(?mR)^ *(?:Tests?(?: Files)? +(?:[0-9]+ [A-Za-z0-9_]+ \| ){0,9}[1-9][0-9]* failed(?-u:\b)[^\n\r\x{2028}\x{2029}]{0,80}\([0-9]+\)|Errors +[1-9][0-9]* errors?(?-u:\b)|ERROR: (?:Coverage for [A-Za-z0-9_]+ \([0-9.]+%\) does not meet |Uncovered [A-Za-z0-9_]+ \([0-9]+\) exceed )[^\n\r\x{2028}\x{2029}]{0,200}threshold \()"#,
+        r#"(?mR)^ *Tests +(?:[0-9]+ [A-Za-z0-9_]+ \| ){0,9}[0-9]+ passed(?-u:\b)[^\n\r\x{2028}\x{2029}]{0,80}\([0-9]+\)"#,
+    ],
+    &[r#"(?mR)^ *[1-9][0-9]* failing(?-u:\b)"#, r#"(?mR)^ *[0-9]+ passing(?-u:\b)"#],
+    &[
+        r#"(?mR)^ *[1-9][0-9]* failed$"#,
+        r#"(?mR)^ *[0-9]+ passed \([0-9.]+(?:ms|s|m|h)\)"#,
+        r#"(?mR)^ {4}\S[^\n\r\x{2028}\x{2029}]{0,400} \x{203A} "#,
+    ],
+    &[
+        r#"(?mR)^ *(?:[1-9][0-9]* fail|[0-9]+ fail\r?\n *[1-9][0-9]* errors?)$"#,
+        r#"(?mR)^ *0 fail$"#,
+    ],
+    &[r#"(?mR)^[#\x{2139}] (?:fail|cancelled) [1-9][0-9]*$"#, r#"(?mR)^[#\x{2139}] fail 0$"#],
+    &[r#"(?mR)^FAILED \| [0-9]+ passed(?-u:\b)"#, r#"(?mR)^ok \| [0-9]+ passed(?-u:\b)"#],
+    &[r#"(?mR)^(?:--- FAIL: |FAIL(?:\t|$))"#, r#"(?mR)^(?:ok {2}\t|PASS$)"#],
+    &[
+        r#"(?mR)^(?:test result: FAILED\.|error: (?:test failed|test run failed|[0-9]+ targets? failed|could not compile)(?-u:\b))"#,
+        r#"(?mR)^test result: ok\."#,
+    ],
+    &[
+        r#"(?mR)^ *Summary \[[^\]\n]{0,40}\] [0-9/]+ tests? run: [^\n\r\x{2028}\x{2029}]{0,200}(?-u:\b)[1-9][0-9]* (?:failed|timed out|exec failed)(?-u:\b)"#,
+        r#"(?mR)^ *Summary \[[^\]\n]{0,40}\] [0-9/]+ tests? run: [0-9]+ passed(?-u:\b)"#,
+    ],
+    &[
+        r#"(?mR)^(?:\[[A-Za-z0-9_]+\] +)?Tests run: [0-9]+, Failures: (?:[1-9][0-9]*, Errors: [0-9]+|0, Errors: [1-9])"#,
+        r#"(?mR)^(?:\[[A-Za-z0-9_]+\] +)?Tests run: [0-9]+, Failures: 0, Errors: 0(?-u:\b)"#,
+    ],
+    &[
+        r#"(?mR)^(?:(?:\[[A-Za-z0-9_]+\] +)?BUILD FAIL(?:URE|ED)(?-u:\b)|[0-9]+ tests? completed, [1-9][0-9]* failed(?-u:\b))"#,
+        r#"(?mR)^(?:\[[A-Za-z0-9_]+\] +)?BUILD SUCCESS(?:FUL)?(?-u:\b)"#,
+    ],
+    &[r#"(?mR)^Failed! +- Failed:"#, r#"(?mR)^Passed! +- Failed:"#],
+    &[
+        r#"(?mR)^[0-9]+% tests passed, [1-9][0-9]* tests? failed out of [0-9]+"#,
+        r#"(?mR)^100% tests passed, 0 tests failed out of [0-9]+"#,
+    ],
+    &[
+        r#"(?mR)^[0-9]+ examples?, (?:[1-9][0-9]* failures?|0 failures, [0-9]+ errors? occurred)(?-u:\b)"#,
+        r#"(?mR)^[0-9]+ examples?, 0 failures(?-u:\b)"#,
+    ],
+    &[r#"(?mR)^(?:FAILURES|ERRORS)!$"#, r#"(?mR)^OK \([0-9]+ tests?, [0-9]+ assertions?\)"#],
+];
+
+static OUTCOME_RES: std::sync::LazyLock<Vec<Vec<regex::Regex>>> = std::sync::LazyLock::new(|| {
+    OUTCOME_PATTERNS
+        .iter()
+        .map(|g| g.iter().map(|r| regex::Regex::new(r).expect("测试结果正则")).collect())
+        .collect()
+});
+
+/// `qt`（2.1.316）：一段测试命令输出的结果，`failed` / `passed` / `unknown`。只看最后 [`OUTCOME_TAIL`] 个码元、去掉
+/// ANSI 转义；任一组的失败判据命中就是失败，否则有一组通过判据命中、且它的反证没命中是通过。
+pub(super) fn test_outcome(output: &str) -> &'static str {
+    let u: Vec<u16> = output.encode_utf16().collect();
+    let tail = if u.len() > OUTCOME_TAIL {
+        let s = u.len() - OUTCOME_TAIL;
+        // `e.slice(e.indexOf("\n", s - 1))`：找不到换行时 `indexOf` 是 -1，`slice(-1)` 只剩最后一个码元。
+        let from = u[s - 1..]
+            .iter()
+            .position(|&c| c == u16::from(b'\n'))
+            .map_or(u.len() - 1, |i| s - 1 + i);
+        String::from_utf16_lossy(&u[from..])
+    } else {
+        output.to_string()
+    };
+    let text = strip_ansi(&tail);
+    let res = &*OUTCOME_RES;
+    if res.iter().any(|g| g[0].is_match(&text)) {
+        return "failed";
+    }
+    let passed =
+        res.iter().any(|g| g[1].is_match(&text) && !g.get(2).is_some_and(|r| r.is_match(&text)));
+    if passed { "passed" } else { "unknown" }
+}
+
+/// `wrr`（2.1.316）：Bash 事件里的 `bash_test_outcome`。只有算出了测试范围（[`ShellRun::test_scope`]）且不是
+/// `runs_no_tests`、没转到后台的才有；判出「通过」但命令非零退出、被打断、超时，或者输出过了 `head`、程序没认全，
+/// 改报 `unknown`。
+pub(super) fn bash_test_outcome(
+    run: &ShellRun,
+    output: &str,
+    exit_code: i64,
+    interrupted: bool,
+) -> Option<&'static str> {
+    let scope = run.test_scope?;
+    if scope == "runs_no_tests" {
+        return None;
+    }
+    let a = test_outcome(output);
+    let programs: Vec<&str> = run.programs.split(',').collect();
+    let doubtful = exit_code != 0
+        || interrupted
+        || programs.contains(&"head")
+        || programs.contains(&"incomplete");
+    Some(if a == "passed" && doubtful { "unknown" } else { a })
+}
+
+/// `Bun.stripANSI`：去掉 CSI（`ESC [ … 终止字节`）、OSC（`ESC ] … BEL / ESC \`）与其余两字节的 ESC 序列。
+fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('[') => {
+                for d in it.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(d) = it.next() {
+                    if d == '\u{7}' {
+                        break;
+                    }
+                    if d == '\u{1b}' && it.peek() == Some(&'\\') {
+                        it.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `jMn`（配 `t1r`）：剥掉打头的前缀命令（`sudo`、`env`、`timeout 5`……）连同它们的开关，最多 4 层；
@@ -902,6 +1335,8 @@ const TOOL_0: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// astro, expo, gatsby, hugo, mkdocs, next, ng, nuxt, nx, react-scripts, remix, storybook, svelte-kit, turbo, vite, vue-cli-service
 const TOOL_1: Tool = Tool {
@@ -913,6 +1348,8 @@ const TOOL_1: Tool = Tool {
     verb_may_be_script: true,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// bazel
 const TOOL_2: Tool = Tool {
@@ -924,6 +1361,8 @@ const TOOL_2: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// bun, npm, pnpm
 const TOOL_3: Tool = Tool {
@@ -966,6 +1405,8 @@ const TOOL_3: Tool = Tool {
         "-F",
     ],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// bundle
 const TOOL_4: Tool = Tool {
@@ -977,6 +1418,8 @@ const TOOL_4: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// bunx
 const TOOL_5: Tool = Tool {
@@ -988,6 +1431,8 @@ const TOOL_5: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: true,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// cargo
 const TOOL_6: Tool = Tool {
@@ -1005,6 +1450,8 @@ const TOOL_6: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &["--manifest-path", "--config", "-Z"],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// composer
 const TOOL_7: Tool = Tool {
@@ -1016,6 +1463,8 @@ const TOOL_7: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// conda, hatch, mamba, micromamba, pdm, pipenv, pipx, poetry, uv
 const TOOL_8: Tool = Tool {
@@ -1063,6 +1512,8 @@ const TOOL_8: Tool = Tool {
         "--env-file",
     ],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// deno
 const TOOL_9: Tool = Tool {
@@ -1080,6 +1531,8 @@ const TOOL_9: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// dotnet
 const TOOL_10: Tool = Tool {
@@ -1096,6 +1549,8 @@ const TOOL_10: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// flask
 const TOOL_11: Tool = Tool {
@@ -1107,6 +1562,8 @@ const TOOL_11: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// gem
 const TOOL_12: Tool = Tool {
@@ -1118,6 +1575,8 @@ const TOOL_12: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// go
 const TOOL_13: Tool = Tool {
@@ -1134,6 +1593,8 @@ const TOOL_13: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &["-C"],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// gradle, gradlew, mvn, mvnw, sbt
 const TOOL_14: Tool = Tool {
@@ -1148,6 +1609,8 @@ const TOOL_14: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// jupyter
 const TOOL_15: Tool = Tool {
@@ -1159,6 +1622,8 @@ const TOOL_15: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// make
 const TOOL_16: Tool = Tool {
@@ -1170,6 +1635,8 @@ const TOOL_16: Tool = Tool {
     verb_may_be_script: true,
     value_flags: &["-C", "-f", "-j"],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// node
 const TOOL_17: Tool = Tool {
@@ -1181,6 +1648,8 @@ const TOOL_17: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// npx
 const TOOL_18: Tool = Tool {
@@ -1192,6 +1661,8 @@ const TOOL_18: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &["-p", "--package", "-c", "--call"],
     runs_the_rest: true,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// pip
 const TOOL_19: Tool = Tool {
@@ -1203,6 +1674,8 @@ const TOOL_19: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// playwright
 const TOOL_20: Tool = Tool {
@@ -1214,6 +1687,8 @@ const TOOL_20: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// swift
 const TOOL_21: Tool = Tool {
@@ -1225,6 +1700,8 @@ const TOOL_21: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// tsc
 const TOOL_22: Tool = Tool {
@@ -1236,6 +1713,8 @@ const TOOL_22: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// tsx
 const TOOL_23: Tool = Tool {
@@ -1247,6 +1726,8 @@ const TOOL_23: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// uvx
 const TOOL_24: Tool = Tool {
@@ -1258,6 +1739,8 @@ const TOOL_24: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &["--from", "--with", "--python", "-p"],
     runs_the_rest: true,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// webpack
 const TOOL_25: Tool = Tool {
@@ -1269,6 +1752,8 @@ const TOOL_25: Tool = Tool {
     verb_may_be_script: false,
     value_flags: &[],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 /// yarn
 const TOOL_26: Tool = Tool {
@@ -1311,6 +1796,8 @@ const TOOL_26: Tool = Tool {
         "-F",
     ],
     runs_the_rest: false,
+    own_verbs: &[],
+    verb_is_target: false,
 };
 
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
@@ -1380,6 +1867,72 @@ mod tests {
             "前几条：\n{}",
             bad.iter().take(30).cloned().collect::<Vec<_>>().join("\n")
         );
+    }
+
+    /// 对拍 2.1.316：逐条比官方 `Cfe` 的 `bash_command_kinds`、`bash_programs`、`bash_test_scope`（node 跑官方原函数
+    /// 产出的 JSONL，每行 `{"cmd", "on": Cfe(cmd)}`）。路径由环境变量 `LUBAN_BASH_KINDS_ORACLE_316` 给，没给或文件不在就跳过。
+    #[test]
+    #[ignore = "依赖本机 node 产出的对拍语料，手动跑"]
+    fn shell_run_matches_the_official_2_1_316_oracle() {
+        use std::io::BufRead;
+        let Ok(path) = std::env::var("LUBAN_BASH_KINDS_ORACLE_316") else {
+            eprintln!("LUBAN_BASH_KINDS_ORACLE_316 没给，跳过");
+            return;
+        };
+        let Ok(f) = std::fs::File::open(&path) else {
+            eprintln!("{path} 不在，跳过");
+            return;
+        };
+        let (mut total, mut bad) = (0usize, Vec::new());
+        for line in std::io::BufReader::new(f).lines() {
+            let v: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let cmd = v["cmd"].as_str().unwrap();
+            let on = &v["on"];
+            total += 1;
+            let run = shell_run(cmd, true);
+            let want = (
+                on["bash_command_kinds"].as_str().unwrap(),
+                on["bash_programs"].as_str().unwrap(),
+                on["bash_test_scope"].as_str(),
+            );
+            if (run.kinds.as_str(), run.programs.as_str(), run.test_scope) != want {
+                bad.push(format!(
+                    "{cmd:?}: want {want:?} got {:?}",
+                    (&run.kinds, &run.programs, run.test_scope)
+                ));
+            }
+        }
+        eprintln!("2.1.316：{total} 条，{} 条不一致", bad.len());
+        assert!(
+            bad.is_empty(),
+            "前几条：\n{}",
+            bad.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    /// 对拍 2.1.316 `qt`：逐条比官方的测试结果判定（node 跑原函数产出的 JSONL，每行 `{"out", "want"}`）。路径由
+    /// 环境变量 `LUBAN_BASH_QT_ORACLE` 给，没给或文件不在就跳过。
+    #[test]
+    #[ignore = "依赖本机 node 产出的对拍语料，手动跑"]
+    fn test_outcome_matches_the_official_oracle() {
+        use std::io::BufRead;
+        let Ok(path) = std::env::var("LUBAN_BASH_QT_ORACLE") else { return };
+        let Ok(f) = std::fs::File::open(&path) else { return };
+        let (mut total, mut bad) = (0usize, Vec::new());
+        for line in std::io::BufReader::new(f).lines() {
+            let v: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let (out, want) = (v["out"].as_str().unwrap(), v["want"].as_str().unwrap());
+            total += 1;
+            let got = test_outcome(out);
+            if got != want {
+                bad.push(format!(
+                    "{:?}: want {want} got {got}",
+                    &out[out.len().saturating_sub(300)..]
+                ));
+            }
+        }
+        eprintln!("qt：{total} 条，{} 条不一致", bad.len());
+        assert!(bad.is_empty(), "{}", bad.iter().take(10).cloned().collect::<Vec<_>>().join("\n"));
     }
 
     /// 期望值都是 node 跑官方 2.1.311 `yte` 得出的。
@@ -1464,7 +2017,7 @@ mod tests {
             ("", false),
         ];
         for (cmd, want) in cases {
-            assert_eq!(shell_run(cmd).leaves_running, *want, "{cmd:?}");
+            assert_eq!(shell_run(cmd, false).leaves_running, *want, "{cmd:?}");
         }
     }
 }

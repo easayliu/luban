@@ -7641,11 +7641,85 @@ fn floats_are_written_like_json_stringify() {
         &mut meta,
         "npm run dev &",
         Some(super::tools::ShellUsage::typed(0)),
+        false,
     );
     let text = meta.to_string();
     assert!(text.contains(r#""duration_ms":25,"#), "{text}");
     assert!(!text.contains(".0,") && !text.contains(".0}"), "{text}");
     assert_eq!(meta["left_process_running"], true);
+}
+
+/// 2.1.316 的 Bash 执行事件（`cap/auto-2.1.316-20261031-full` A0 那几条 `python3 -m unittest -v test_calc`）：程序名与测试范围紧跟
+/// `bash_command_kinds`，五项提示状态紧跟 `interrupted`（在耗时之前），`bash_test_outcome` 紧跟 `bash_word_split_use`，
+/// 重复命令那组落在最末；读了这个会话后台输出目录的报 `reads_own_output`。
+#[test]
+fn bash_meta_v316_key_order() {
+    let mut meta = json!({
+        "model": "claude-opus-5-5", "command_type": "python3", "bash_command_class": "lang_runtime",
+        "bash_argv0": "python", "bash_last_argv0": "python", "has_pipe": false, "stdout_length": 10,
+        "exit_code": 0, "interrupted": false, "executor_shell": "zsh", "zsh_nomatch_error": false,
+        "zsh_equals_error": false, "bash_pipestatus_use": false, "bash_word_split_use": false,
+        "sandboxed": false, "was_backgrounded": false, "permission_mode": "auto",
+    });
+    let cmd = "python3 -m unittest -v test_calc";
+    let run = super::tools::bash_meta_v311(
+        &mut meta,
+        cmd,
+        Some(super::tools::ShellUsage::typed(0)),
+        true,
+    );
+    let mut repeat = serde_json::Map::new();
+    repeat.insert("repeat".into(), json!(false));
+    repeat.insert("compared_statements".into(), json!(1));
+    repeat.insert("unchanged_repeats".into(), json!(0));
+    let out = "test_add ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nOK\n";
+    super::tools::bash_meta_v316(&mut meta, &run, out, 0, false, repeat);
+    let keys: Vec<&str> = meta.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = |k: &str| keys.iter().position(|x| *x == k).unwrap_or_else(|| panic!("{k}: {keys:?}"));
+    assert_eq!(meta["bash_command_kinds"], "python,runs_tests");
+    assert_eq!(meta["bash_programs"], "python,unittest");
+    // 点了测试模块名，官方判收窄（抓包 A0 那两条同样是 `narrowed`）。
+    assert_eq!(meta["bash_test_scope"], "narrowed");
+    assert_eq!(meta["bash_test_outcome"], "passed");
+    assert_eq!(at("bash_programs"), at("bash_command_kinds") + 1);
+    assert_eq!(at("bash_test_scope"), at("bash_programs") + 1);
+    assert_eq!(
+        keys[at("interrupted") + 1..at("interrupted") + 7],
+        [
+            "output_end_shown",
+            "triggered_note_rule",
+            "triggered_note_shown",
+            "oom_kill_during_command",
+            "oom_kill_note_shown",
+            "duration_ms"
+        ]
+    );
+    assert_eq!(at("bash_test_outcome"), at("bash_word_split_use") + 1);
+    assert_eq!(keys[keys.len() - 3..], ["repeat", "compared_statements", "unchanged_repeats"]);
+    // 非零退出时「通过」改报 unknown；不跑测试的命令没有范围也没有结果。
+    let mut m2 = meta.clone();
+    m2.as_object_mut().unwrap().retain(|k, _| !k.starts_with("bash_test") && k != "bash_programs");
+    super::tools::bash_meta_v316(&mut m2, &run, out, 1, false, serde_json::Map::new());
+    assert_eq!(m2["bash_test_outcome"], "unknown");
+    // `run_in_background` 转到后台的当场没有结果（官方 `wrr` 见 `backgroundTaskId` 即返回）。
+    let mut m3 = meta.clone();
+    m3.as_object_mut().unwrap().retain(|k, _| !k.starts_with("bash_test") && k != "bash_programs");
+    super::tools::bash_meta_v316(&mut m3, &run, out, 0, true, serde_json::Map::new());
+    assert!(m3.get("bash_test_outcome").is_none(), "{m3}");
+    assert_eq!(m3["bash_test_scope"], "narrowed", "范围照报");
+    let ls = super::bash_kinds::shell_run("ls -la", true);
+    assert_eq!((ls.programs.as_str(), ls.test_scope), ("ls", None));
+    let sid = "cec1be0e-920c-4210-87fa-b0a900c903a3";
+    let reads = |c: &str| super::tools::reads_own_output(c, sid);
+    assert_eq!(
+        reads(&format!("cat /private/tmp/claude-501/x/{sid}/tasks/b1.output")),
+        Some("background_output")
+    );
+    assert_eq!(
+        reads(&format!("cat ~/.claude/projects/x/{sid}/tool-results/a.txt")),
+        Some("saved_result")
+    );
+    assert_eq!(reads("cat README.md"), None);
 }
 
 /// 2.1.311 的遥测（`cap/auto-2.1.311-20261027-{full,retry,bashfail}`）：
@@ -9317,6 +9391,179 @@ fn agent_summary_stopped_2_1_307_writer_keys() {
 /// 报配的那项；换了 writer 的那条失败过，摘要器之后不再换，收尾报回子代理自己的模型、`writer_failed` 为 true。
 /// 客户端的小快模型可以被环境变量换掉：换上过的就是它（配的 sonnet 换上了就报 sonnet，之后配置改来改去、中间
 /// 有没换上的也不推翻），配着却没换上的不是它（配的 haiku 没换上就报子代理自己的），一条没发过才按默认的猜。
+/// 2.1.316 的摘要器收尾（官方重写后的 `Ie()` / `K`）：
+/// - short 摘要最终失败，writer 停用、`writer_model` 退回子代理自己的模型，`writer_failed` 为 true；
+/// - haiku 子代理的 short 摘要也由 haiku 写（同一个模型），失败照样记 `writer_failed`；
+/// - 配置从头就是 short、跑过 30 秒一条都没发（每次触发都按 short），不报 full 分支才有的 `holds_fork` / `cold_after_ms`；
+///   配置是 full 的照报。
+#[test]
+fn agent_summary_stopped_2_1_316_writer_and_mode() {
+    let base = frozen_now() - Duration::from_secs(200);
+    // `configs`：号的 groovy_ember 在各时刻（秒）换成的值；`summaries`：发出时刻、模型、失败的状态码、是不是 short。
+    let run_with = |cred: i64,
+                    configs: &[(u64, Value)],
+                    session_model: &str,
+                    sub_model: &str,
+                    summaries: &[(u64, &str, Option<u16>, bool)],
+                    end: u64| {
+        for (secs, v) in configs {
+            let cfg = json!({"tengu_groovy_ember": {"value": v, "source": "experiment"}});
+            crate::proxy::agent_summary_config::note_eval_at(
+                cred,
+                cfg.as_object().unwrap(),
+                base + Duration::from_secs(*secs),
+            );
+        }
+        let t = Telemetry::default();
+        let at = |c: &mut ApiCall, secs: u64| {
+            c.ua_out = "claude-cli/2.1.316 (external, cli)".into();
+            c.cred_id = cred;
+            c.started_at = base + Duration::from_secs(secs);
+        };
+        let agent = |class: &str| AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("general-purpose".into()),
+            request_class: Some(class.into()),
+        };
+        let tool = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: json!({}),
+            verdict: None,
+        };
+        let mut main = call(body_for(session_model, Some("high"), true), "req_m", "tool_use");
+        at(&mut main, 0);
+        main.tool_calls = vec![tool("t1", "Agent")];
+        t.ingest(main);
+        let mut s1 = call(body_for(sub_model, Some("high"), true), "req_s1", "tool_use");
+        at(&mut s1, 5);
+        s1.agent = agent("subagent");
+        s1.tool_calls = vec![tool("t2", "Read")];
+        t.ingest(s1);
+        for (i, (secs, model, status, is_short)) in summaries.iter().enumerate() {
+            let meta: Value =
+                serde_json::from_slice::<Value>(&cc_body(true)).unwrap()["metadata"].clone();
+            let file = char::from(b'a' + i as u8);
+            let notes = format!(
+                "<recent_steps>\ndid: Read - {file}.rs\n</recent_steps>\n\nDescribe the agent's most recent action in 3-5 words using present tense (-ing)."
+            );
+            let short = json!({
+                "metadata": meta,
+                "model": model,
+                "max_tokens": 2108,
+                "system": [
+                    {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.316.abc; cc_entrypoint=cli; cch=00000;"},
+                    {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                    {"type":"text","text":"You write a 3-5 word progress label for a background agent, from short notes about what it is doing."}
+                ],
+                "messages": [{"role":"user","content":notes}],
+                "tools": []
+            });
+            let body = if *is_short {
+                short.to_string().into_bytes()
+            } else {
+                body_for(model, Some("high"), true)
+            };
+            let mut c = call(body, &format!("req_sum{i}"), "end_turn");
+            at(&mut c, *secs);
+            c.agent = agent("auxiliary");
+            c.text_chars = 18;
+            t.ingest(match status {
+                None => c,
+                Some(s) => failed(c, Some(*s), "overloaded_error", "Overloaded"),
+            });
+        }
+        let mut s2 = call(body_for(sub_model, Some("high"), false), "req_s2", "end_turn");
+        at(&mut s2, end);
+        s2.agent = agent("subagent");
+        t.ingest(s2);
+        let st = t.0.state.lock();
+        st.pending[&(cred, SESSION.to_string())]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_summary_stopped")
+            .map(|(_, e)| meta_of(e))
+            .expect("子代理收尾报一条")
+    };
+    let run = |cred: i64,
+               mode: &str,
+               session_model: &str,
+               sub_model: &str,
+               summaries: &[(u64, &str, Option<u16>)],
+               end: u64| {
+        let sums: Vec<(u64, &str, Option<u16>, bool)> =
+            summaries.iter().map(|(a, b, c)| (*a, *b, *c, true)).collect();
+        run_with(cred, &[(0, json!({"mode": mode}))], session_model, sub_model, &sums, end)
+    };
+    let (haiku, opus, fable) = ("claude-haiku-5-5", "claude-opus-5-5", "claude-fable-5-1");
+    let pick = |m: &Value| ["writer_model", "config_writer", "writer_failed"].map(|k| m[k].clone());
+    // opus 子代理、haiku 写的 short 摘要最终失败（529 后台不重发）：退回 opus。
+    let failed_opus = run(93_161, "short", opus, opus, &[(40, haiku, Some(529))], 150);
+    assert_eq!(failed_opus["writer_model"], failed_opus["agent_model"], "{failed_opus}");
+    assert_eq!(pick(&failed_opus)[1..], [json!(haiku), json!(true)], "{failed_opus}");
+    // haiku 子代理的 short 摘要也由 haiku 写，失败照样记。
+    let failed_haiku = run(93_162, "short", opus, haiku, &[(40, haiku, Some(529))], 150);
+    assert_eq!(failed_haiku["writer_model"], failed_haiku["agent_model"], "{failed_haiku}");
+    assert_eq!(pick(&failed_haiku)[1..], [json!(haiku), json!(true)], "{failed_haiku}");
+    // 成功的那种照旧由小快模型写。
+    let ok = run(93_163, "short", opus, opus, &[(40, haiku, None)], 150);
+    assert_eq!(pick(&ok), [json!(haiku), json!(haiku), json!(false)]);
+    // fable 会话，配置从头是 short，跑满 30 秒以上一条没发：每次触发都按 short，没有 full 分支那两项。
+    let quiet = run(93_164, "short", fable, opus, &[], 60);
+    assert_eq!(quiet["mode"], "short", "{quiet}");
+    assert!(quiet.get("holds_fork").is_none() && quiet.get("cold_after_ms").is_none(), "{quiet}");
+    // 配置是 full 的同样跑满 30 秒：按 full 触发过，报那两项。
+    let full = run(93_165, "full", fable, opus, &[], 60);
+    assert_eq!(full["mode"], "full");
+    assert!(full.get("holds_fork").is_some() && full.get("cold_after_ms").is_some(), "{full}");
+    for m in [&failed_opus, &quiet, &full] {
+        for k in ["config_flag", "max_input_tokens", "first_wait_ms", "next_wait_ms"] {
+            assert!(m.get(k).is_none(), "2.1.316 不报 {k}: {m}");
+        }
+    }
+    // short 摘要 40 秒发出、随即失败，子代理 51 秒收尾：下一次触发要到 71 秒左右，还没按 full 触发过，不报那两项。
+    let early = run(93_166, "short", opus, opus, &[(40, haiku, Some(529))], 51);
+    assert_eq!(early["writer_failed"], true, "{early}");
+    assert!(early.get("holds_fork").is_none() && early.get("cold_after_ms").is_none(), "{early}");
+    // 同样 40 秒失败、配置没变，71 秒那次触发 writer 已停用、按 full（消息不够跳过、没发），81 秒收尾：报最后那次触发的
+    // full；发过的只有那条 short，所以 `mode_changed` 为 true。
+    let later = run(93_169, "short", opus, opus, &[(40, haiku, Some(529))], 81);
+    assert_eq!((&later["mode"], &later["mode_changed"]), (&json!("full"), &json!(true)), "{later}");
+    // 号没有 eval（配置表只能给默认 full），但转发过一条成功的 short：之后那次触发笔记没变、没发，收尾仍是 short。
+    let no_eval = run_with(93_170, &[], opus, opus, &[(40, haiku, None, true)], 81);
+    assert_eq!(
+        [&no_eval["mode"], &no_eval["config_mode"], &no_eval["mode_changed"]],
+        [&json!("short"), &json!("short"), &json!(false)],
+        "{no_eval}"
+    );
+    // fable 会话配置是 short（groovy_ember，不再按 fable 族读 starry_wall）：short 失败后退回 full 发一条，记一次
+    // `calls_kept_on_full`。
+    let kept = run_with(
+        93_167,
+        &[(0, json!({"mode": "short"}))],
+        fable,
+        opus,
+        &[(40, haiku, Some(529), true), (80, opus, None, false)],
+        150,
+    );
+    assert_eq!(kept["calls_kept_on_full"], 1, "{kept}");
+    // 旧配置带 `refreshSeconds: [45]`（2.1.315 起不读了）、60 秒由 full 改 short，子代理 5 秒起跑 71 秒收尾：计时器
+    // 固定 30 秒，65 秒那次读到 short。
+    let fixed = run_with(
+        93_168,
+        &[(0, json!({"mode": "full", "refreshSeconds": [45]})), (60, json!({"mode": "short"}))],
+        opus,
+        opus,
+        &[],
+        71,
+    );
+    assert_eq!(
+        (&fixed["mode"], &fixed["config_mode"]),
+        (&json!("short"), &json!("short")),
+        "{fixed}"
+    );
+}
+
 #[test]
 fn agent_summary_writer_follows_the_config_and_failures() {
     let base = frozen_now() - Duration::from_secs(200);

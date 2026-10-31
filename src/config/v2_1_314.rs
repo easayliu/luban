@@ -1,9 +1,9 @@
-//! 2.1.314 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.314 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.314 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.314 来访的
-/// beta 参照（[`cc_profile_at`]）。2.1.313 没有发布过（npm、`downloads.claude.ai`、内置与线上 CHANGELOG 都是
+/// 2.1.314 的 profile 表：2.1.314 来访的 beta 参照（[`cc_profile_at`]）。2.1.316 的表（[`CC_PROFILES`]）
+/// 各行除版本号外与这张相同。2.1.313 没有发布过（npm、`downloads.claude.ai`、内置与线上 CHANGELOG 都是
 /// 2.1.312 直接到 2.1.314），落在 2.1.312 那一档。
 ///
 /// **各行除版本号外与 2.1.312（[`CC_PROFILES_2_1_312`]）完全相同**，所以直接引用那张表的行，只换
@@ -21,7 +21,7 @@ use super::*;
 ///
 /// 抓包里与版本无关的差异：eval 打开了 `tengu_org_config_required`（team / enterprise、25%），组织配置闸的影子判定
 /// 换了取值、另多一条真判定事件；`tengu_read_dedup_killswitch` 等七个开关转开；MCP 与插件环境。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_314: &[CcProfile] = &[
     at_314(CC_PROFILES_2_1_312[0]),
     at_314(CC_PROFILES_2_1_312[1]),
     at_314(CC_PROFILES_2_1_312[2]),

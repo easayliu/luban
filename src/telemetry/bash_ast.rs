@@ -4910,7 +4910,7 @@ mod tests {
                 assert!(parse("ls -la").is_none(), "嵌套那段不另开额度，外层用完了就是用完了");
             }
             assert!(parse("git status").is_none());
-            assert_eq!(super::super::bash_kinds::shell_run("git status").kinds, "unparsed");
+            assert_eq!(super::super::bash_kinds::shell_run("git status", false).kinds, "unparsed");
         }
         assert!(parse("git status").is_some(), "那一段过去就不再限");
     }

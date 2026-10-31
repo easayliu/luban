@@ -130,6 +130,9 @@ pub(crate) struct Files {
     /// 不算，所以不能拿输入序号顶替（A0 第 9、11、14 次输入是注入的，快照号就比输入号少）。官方只留最近
     /// 100 张（`XGt`），数到 100 封顶。
     snapshots: u32,
+    /// 2.1.315 起 Bash 事件那组重复命令统计的计量器（[`super::bash_repeat::BashMeter`]），与文件跟踪同生共死
+    /// （`/clear` 换会话即清空）。
+    pub(super) bash_meter: super::bash_repeat::BashMeter,
 }
 
 impl Files {

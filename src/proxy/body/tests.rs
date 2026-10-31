@@ -2320,6 +2320,36 @@ fn cc_request_without_message_breakpoint_gets_one_on_the_last_block() {
 /// 抵不回来；客户端又在 `messages` 里标满三个，出去就是上游那条
 /// `A maximum of 4 blocks with cache_control may be provided. Found 5.`——整条被拒，
 /// 而少拆一次只是少一次基座级缓存命中。
+/// 2.1.315 起 opus-5-5 / sonnet-5-5 / haiku-5-5 的第四块删了开头的 `Write code that reads like…`，改以代词那句开头
+/// （`cap/auto-2.1.316-20261031-full`）。API-key 三块形态的合并块照样切在基座之后：用 2.1.316 的模板拼一块，切出来的
+/// 基座与其余逐字等于两半；2.1.314 那种两句都在的，仍切在更早的 `Write code…` 前。
+#[test]
+fn align_system_shape_finds_the_2_1_316_rest() {
+    let shape = crate::proxy::CacheShape { global: true, ttl_1h: true };
+    let mk = |rest: &str| {
+        serde_json::json!({
+            "model": "claude-opus-5-5",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.316.2e4; cc_entrypoint=cli;"},
+                {"type": "text", "text": crate::config::CC_SYSTEM_IDENTITY, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": format!("{}\n\n{rest}", crate::config::CC_SYSTEM_BASE),
+                    "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+    };
+    let rest = crate::config::CC_SYSTEM_REST;
+    assert!(rest.starts_with("When you use a pronoun for someone"));
+    let mut v = mk(rest);
+    assert!(crate::proxy::align_system_shape(&mut v, shape), "2.1.316 的合并块该拆");
+    assert_eq!(v["system"][2]["text"], crate::config::CC_SYSTEM_BASE);
+    assert_eq!(v["system"][3]["text"], rest);
+    let old = format!("{}\n\n{rest}", crate::config::CC_SYSTEM_BASE_ANCHORS[0]);
+    let mut v = mk(&old);
+    assert!(crate::proxy::align_system_shape(&mut v, shape));
+    assert_eq!(v["system"][3]["text"], old.as_str(), "2.1.314 那种切在 `Write code…` 前");
+}
+
 #[test]
 fn align_system_shape_respects_the_breakpoint_budget() {
     let merged = format!("base text\n\n{}\nrest of it", crate::config::CC_SYSTEM_BASE_ANCHORS[0]);
@@ -2799,7 +2829,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.314."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.316."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -5106,7 +5136,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 314)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 316)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

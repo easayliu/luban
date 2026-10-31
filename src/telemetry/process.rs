@@ -481,6 +481,9 @@ impl Telemetry {
         // 2.1.314：`api_success` 多新旧图片与线程类型那五项、auto 判定多连接方式、压缩两条多 `leaveOutPasses`，错误栈
         // 又换了块，见 [`TurnFacts::v314`]（2.1.313 没有发布）。
         let v314 = version_at_least(&version, "2.1.314");
+        // 2.1.315 起：Bash 事件多程序名、测试范围 / 结果与重复命令统计，错误栈换块，见 [`TurnFacts::v316`]（只抓了
+        // 2.1.316，2.1.315 的 JS 层与它只差一个 plist 串）。
+        let v316 = version_at_least(&version, "2.1.315");
         let safety_events =
             v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id, &version);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
@@ -833,6 +836,7 @@ impl Telemetry {
             v311,
             v312,
             v314,
+            v316,
             tools_used_header_first,
             tools_used_truncation,
             safety_events,
@@ -1245,6 +1249,8 @@ impl Session {
         // 用户取消的压缩不算：官方只在压缩成功时清系统段缓存、换快照。
         if kind == Kind::Compact && !failed && !aborted {
             self.post_compact = true;
+            // 压缩后先前 Bash 调用的结果都不在上下文里了（[`super::bash_repeat::BashMeter::compacted`]）。
+            self.files.bash_meter.compacted();
         }
         let turn_origin = self.turn_origin.clone();
         // 上一轮的链、深度与起点：这次新输入前若有工具被用户拒了，拒绝那串与 `aborted_tools`
@@ -1795,7 +1801,10 @@ impl Session {
             let short = kind == Kind::AgentSummaryShort;
             // 2.1.307：short 摘要的模型与子代理不同，就是换了 writer。换上了，客户端的小快模型就是它；没换、
             // writer 也没失败过，那一刻配着的 writer（有的话）就不是小快模型（收尾那条按这两样推 `fe()`）。
-            let writer = a.model.as_deref().is_some_and(|m| m != shape.model);
+            // 2.1.315 起 short 摘要一律由客户端的小快模型写（官方 `Yss()`），子代理本身就是它（haiku 子代理）也照样
+            // 算换了 writer：失败就记下、之后不再 short（官方 `K ||= ce === "short"`，不看模型同不同）。
+            let writer = (version_at_least(&self.version, "2.1.315") && short)
+                || a.model.as_deref().is_some_and(|m| m != shape.model);
             if short {
                 a.summaries_short += 1;
                 if writer {
@@ -1815,7 +1824,12 @@ impl Session {
                 }
             } else if crate::proxy::agent_summary_config::config_at(
                 call.cred_id,
-                model_family(&a.session_model),
+                // 2.1.315 起摘要器不分模型族，一律读 `tengu_groovy_ember`（`config_at` 里 opus 族对应它）。
+                if version_at_least(&self.version, "2.1.315") {
+                    "opus"
+                } else {
+                    model_family(&a.session_model)
+                },
                 sent,
             )
             .short
@@ -1830,6 +1844,9 @@ impl Session {
                 a.summaries_failed += 1;
                 // 换了 writer 的 short 摘要失败了：摘要器记下，之后不再换。
                 if short && writer {
+                    if !a.summary_writer_failed {
+                        a.summary_writer_failed_at = Some(this_end_wall(call));
+                    }
                     a.summary_writer_failed = true;
                 }
             } else if (1..=100).contains(&call.text_chars) {

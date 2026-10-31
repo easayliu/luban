@@ -35,6 +35,7 @@ use crate::config;
 
 mod bash_ast;
 mod bash_kinds;
+mod bash_repeat;
 mod call;
 mod compact;
 mod events;

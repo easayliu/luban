@@ -205,6 +205,7 @@ impl EventBuilder<'_> {
                 let reader = self.reader();
                 let (added, removed) = self.files.apply_edit(&reader, &path, old, new, replace_all);
                 self.loc.push((added, removed));
+                self.files.bash_meter.note_lines(added, removed);
                 self.push(
                     t_done,
                     "tengu_file_changed",
@@ -235,6 +236,7 @@ impl EventBuilder<'_> {
                 let reader = self.reader();
                 let (added, removed) = self.files.apply_write(&reader, &path, content, created);
                 self.loc.push((added, removed));
+                self.files.bash_meter.note_lines(added, removed);
                 // 写的是 CLAUDE.md 另报一条（`/init`，`cap/auto-2.1.305-20261021-full` B4）。
                 if path.ends_with("/CLAUDE.md") {
                     self.push(t_done, "tengu_write_claudemd", json!({}));

@@ -16,6 +16,9 @@ pub(super) struct ToolUse {
     pub(super) is_error: bool,
     /// `tool_result` 正文的开头（至多 400 字符），认「被用户拒绝」「命令失败」用。
     pub(super) result_head: String,
+    /// `tool_result` 正文的结尾（至多 [`RESULT_TAIL_CHARS`] 个字符），Bash 测试命令判通过 / 失败用
+    /// （[`super::bash_kinds::test_outcome`] 只看最后 8192 个码元）。
+    pub(super) result_tail: String,
     /// 客户端回的 `<tool_use_error>…</tool_use_error>` 里那段话（整段，不截），见 [`tool_error_of`]。
     pub(super) tool_error: Option<String>,
     /// 见 [`ToolResultInfo::stripped_bytes`] / [`ToolResultInfo::image_b64`] /
@@ -328,6 +331,15 @@ pub(super) fn strip_trailing_reminder(text: &str) -> &str {
     t
 }
 
+/// [`ToolUse::result_tail`] 留多少个字符：比官方看的 8192 个码元多留一截，好往前找到换行。
+pub(super) const RESULT_TAIL_CHARS: usize = 9_000;
+
+/// 字符串最后 `n` 个字符。
+fn tail_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    s.chars().skip(count.saturating_sub(n)).collect()
+}
+
 /// 一条 `tool_result` 里遥测要的东西。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ToolResultInfo {
@@ -339,6 +351,8 @@ pub(super) struct ToolResultInfo {
     pub(super) is_error: bool,
     /// 正文开头，见 [`ToolUse::result_head`]。
     pub(super) head: String,
+    /// 正文结尾，见 [`ToolUse::result_tail`]。
+    pub(super) tail: String,
     /// 见 [`ToolUse::tool_error`]。
     pub(super) tool_error: Option<String>,
     /// Read 结果去掉行号前缀后的字节数，见 [`read_content_bytes`]。
@@ -431,6 +445,7 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                         persisted: content.and_then(persisted_original_size),
                         is_error: b.get("is_error").and_then(|e| e.as_bool()) == Some(true),
                         head: text.chars().take(400).collect(),
+                        tail: tail_chars(&text, RESULT_TAIL_CHARS),
                         tool_error: tool_error_of(&text),
                         text: text.clone(),
                         image_hash: match content {
@@ -543,6 +558,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         persisted_from: hit.and_then(|r| r.persisted),
                         is_error: hit.is_some_and(|r| r.is_error),
                         result_head: hit.map(|r| r.head.clone()).unwrap_or_default(),
+                        result_tail: hit.map(|r| r.tail.clone()).unwrap_or_default(),
                         tool_error: hit.and_then(|r| r.tool_error.clone()),
                         stripped_bytes: hit.map_or(0, |r| r.stripped_bytes),
                         image_b64: hit.map_or(0, |r| r.image_b64),
@@ -744,6 +760,11 @@ pub(super) fn error_trace(
         // 2.1.314 摘要照旧，顶帧换了块、行号 11 → 5，仍不带构造名（`cap/auto-2.1.314-20261030-retry` R1/R2）。
         ("2.1.314", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-rbc434em.js:5:1510"))
+        }
+        // 2.1.316 摘要照旧，顶帧又换了块（`cap/auto-2.1.316-20261031-retry` R1/R2）。2.1.315 没抓，块名与 2.1.316 不同、
+        // 猜不出，先沿用 2.1.316 的。
+        ("2.1.315" | "2.1.316", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-hyyf2dgs.js:5:1510"))
         }
         _ => None,
     }

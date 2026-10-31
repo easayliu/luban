@@ -543,6 +543,8 @@ impl EventBuilder<'_> {
             v311,
             v312,
             v314,
+            v316,
+            prompt_seq,
             ..
         } = *env.f;
         let EventEnv { t0, builtin_agent, ref effort, ref effort_value, req_hash, .. } = *env;
@@ -557,6 +559,11 @@ impl EventBuilder<'_> {
             batch_approval,
             ..
         } = *step;
+        // 2.1.315 起：别的工具调用一次，重复命令计量器记一笔（只读的、记事的不算，见
+        // [`crate::telemetry::bash_repeat::BashMeter::note_other_tool`]）。
+        if v316 && tu.name != "Bash" {
+            self.files.bash_meter.note_other_tool(&tu.name);
+        }
         // 工具执行：按调用数把上一条结束到这条发出之间的时间均分。
         let gap = (t0 - prev_end_dt).num_milliseconds().max(50);
         // 2.1.285：工具跑完就发下一条，完成事件贴着这条请求之前（WebFetch 要先等它那条
@@ -617,6 +624,38 @@ impl EventBuilder<'_> {
             }
             let backgrounded =
                 tu.input.get("run_in_background").and_then(|b| b.as_bool()) == Some(true);
+            // 2.1.315 起的重复命令计量器：调用开始时比，结束时记（[`crate::telemetry::bash_repeat`]）。开始的时刻按
+            // 结束减去这次的耗时估。
+            let begun = v316.then(|| {
+                let cwd = env.f.session_cwd.as_deref().unwrap_or("");
+                let mut rest = tu.input.clone();
+                if let Some(o) = rest.as_object_mut() {
+                    for k in ["command", "description", "timeout", "run_in_background"] {
+                        o.shift_remove(k);
+                    }
+                    let dangerous =
+                        o.get("dangerouslyDisableSandbox").and_then(Value::as_bool) == Some(true);
+                    o.insert("dangerouslyDisableSandbox".into(), json!(dangerous));
+                }
+                let started = ms(t_done, -bash_timing.map_or(0, |t| t.external));
+                self.files.bash_meter.begin(
+                    super::super::bash_repeat::BeginArgs {
+                        command,
+                        rest_input: &rest,
+                        cwd,
+                        // 官方键里带的是调用方代理的 id：不同子代理跑同一条命令互不算重复。
+                        agent_id: if is_sub {
+                            call.agent.agent_id.as_deref().unwrap_or("")
+                        } else {
+                            ""
+                        },
+                        tool_use_id: Some(&tu.id),
+                        now: started.into(),
+                        prompt_seq,
+                    },
+                    |c| bash_read_only_for_meter(c, Some(cwd)),
+                )
+            });
             // 官方量的是命令的原始输出，末尾那个换行在 tool_result 里被去掉了（10 对 9、258 对
             // 257……）；转到后台的那种当场只有一个换行（`00146`）。
             let stdout = if backgrounded { 1 } else { tu.result_size() + 1 };
@@ -651,7 +690,22 @@ impl EventBuilder<'_> {
                     o.insert("exit_code".into(), json!(exit_code_of(&tu.result_head)));
                 }
                 if v311 {
-                    bash_meta_v311(&mut bash, command, usage);
+                    let run = bash_meta_v311(&mut bash, command, usage, v316);
+                    if let Some(b) = &begun {
+                        let code = exit_code_of(&tu.result_head);
+                        bash_meta_v316(
+                            &mut bash,
+                            &run,
+                            &tu.result_tail,
+                            code,
+                            backgrounded,
+                            b.fields.clone(),
+                        );
+                        bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
+                    }
+                }
+                if let Some(b) = begun {
+                    self.files.bash_meter.settle(b, "failed", false, t_done.into(), prompt_seq);
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_failed", bash);
                 self.own_betas_scope = false;
@@ -664,7 +718,22 @@ impl EventBuilder<'_> {
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
                 if v311 {
-                    bash_meta_v311(&mut bash, command, usage);
+                    let run = bash_meta_v311(&mut bash, command, usage, v316);
+                    if let Some(b) = &begun {
+                        bash_meta_v316(
+                            &mut bash,
+                            &run,
+                            &tu.result_tail,
+                            0,
+                            backgrounded,
+                            b.fields.clone(),
+                        );
+                        bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
+                    }
+                }
+                if let Some(b) = begun {
+                    let outcome = if backgrounded { "started_in_background" } else { "succeeded" };
+                    self.files.bash_meter.settle(b, outcome, true, t_done.into(), prompt_seq);
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
                 self.own_betas_scope = false;
@@ -817,7 +886,12 @@ impl EventBuilder<'_> {
             // （`cap/auto-2.1.312-20261028-bashfail` 与全量包里那条，同一次跑的 2.1.311 对照复现出 11211b82294f）摘要、行、块名
             // 又换了、列没变，2.1.314（`cap/auto-2.1.314-20261030-bashfail` 与全量包里那条，两处同值；2.1.313 没有发布）
             // 摘要、行列、块名都换了。
-            if v314 {
+            // 2.1.316（`cap/auto-2.1.316-20261031-bashfail` 与全量包里三条，同值）摘要、行列、块名都换了；2.1.315 没抓，
+            // 它的打包块名与 2.1.316 不同，摘要也就猜不出，先沿用 2.1.316 的。
+            if v316 {
+                err["error_stack_hash"] = json!("9396e613b9d8");
+                err["error_top_frame"] = json!("chunk-qd604jgh.js:3538:8129");
+            } else if v314 {
                 err["error_stack_hash"] = json!("d67c18908567");
                 err["error_top_frame"] = json!("chunk-sq7yspzm.js:3529:7027");
             } else if v312 {
