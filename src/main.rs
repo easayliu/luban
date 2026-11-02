@@ -23,6 +23,11 @@ use clap::{Parser, Subcommand};
 
 use store::CredentialStore;
 
+/// 见 Cargo.toml 里 tikv-jemallocator 的说明：避免 glibc 多 arena 碎片导致 RSS 只涨不降。
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// 命令行参数。每一项也能写在数据目录的 `config.toml` 里（见 [`config_file`]），
 /// 命令行 > 环境变量 > 配置文件。
 #[derive(Parser)]

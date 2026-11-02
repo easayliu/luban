@@ -1,6 +1,6 @@
 [package]
 name = "luban"
-version = "0.3.278"
+version = "0.3.279"
 edition = "2024"
 
 [dependencies]
@@ -64,6 +64,11 @@ xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
+
+# 全局分配器换 jemalloc：glibc malloc 在多线程（tokio 工作线程 + 阻塞池）下按线程开 arena，
+# 转发 MB 级请求体后碎片回不去，线上 RSS 只涨不降（500rpm 下 3.4G→3.6G）。msvc 不支持，跳过。
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"
 
 [dev-dependencies]
 # 仅测试用：构造 gzip 响应，验证上游客户端确实会透明解码（见 proxy 的 decodes_gzip_* 测试）。
