@@ -140,7 +140,7 @@ pub(super) async fn admit(
     *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
-    // 只看头的闸都过了才读体，见 [`MAX_BODY_BYTES`]。
+    // 只看头的闸都过了才读体，见 [`max_inbound_bytes`]。
     let body = read_body(body, &method, &path_and_query, &client_ua).await?;
     let mut facts = parse_facts(uri, &body, &client_ua, &session_from_header, log_state);
     // 自报不是 CC 的来访（会走模拟的那类）：趁 body 还是收到时的原样，校验它自带的 billing `cch`，
@@ -313,7 +313,7 @@ pub(super) async fn admit(
     ))
 }
 
-/// 按 [`MAX_BODY_BYTES`] 读完请求体：边读边数，超限立刻停、回 413（与上游同一个
+/// 按这条路径的入站上限（[`max_inbound_bytes`]）读完请求体：边读边数，超限立刻停、回 413（与上游同一个
 /// `request_too_large`），不会先攒满再判；读到一半断开等读失败回 400。
 async fn read_body(
     body: axum::body::Body,
@@ -323,6 +323,7 @@ async fn read_body(
 ) -> Result<Bytes, Response> {
     use futures_util::StreamExt;
     let mut stream = body.into_data_stream();
+    let limit = max_inbound_bytes(path_and_query);
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
@@ -333,12 +334,12 @@ async fn read_body(
                 "failed to read the request body",
             )
         })?;
-        if buf.len() + chunk.len() > MAX_BODY_BYTES {
+        if buf.len() + chunk.len() > limit {
             tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: request body too large");
             return Err(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_large",
-                format!("request body exceeds {} MB", MAX_BODY_BYTES / (1024 * 1024)),
+                format!("request body exceeds {} MB", limit / (1024 * 1024)),
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -474,7 +475,7 @@ fn parse_facts(
     //    此前 extract_device_id / body_has_user_id / request_model / request_speed 各自
     //    `from_slice` 一遍整个 body，`Simulation::detect` 再来一遍，加上 `rewrite_body`
     //    自己那次，一条请求要把同一份 JSON 完整解析 6 次以上（429 换号重试时后两项还按轮次
-    //    翻倍）。body 上限刚放到 64MB，长对话几 MB 是常态，这是白烧的 CPU。
+    //    翻倍）。body 上限已放到 256MB，长对话几 MB 是常态，这是白烧的 CPU。
     //
     //    `rewrite_body` 仍自己解析：它要一份**可变且每轮独立**的副本（每次重试都从客户端
     //    原始体重新改写），共用这份只读的反而要多克隆一次。

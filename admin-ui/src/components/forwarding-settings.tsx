@@ -919,16 +919,16 @@ export function ForwardingSettingsContent() {
         />
         <ForwardingToggle
           k="cap_messages_body"
-          label={t('请求体按上游 32MB 截止', 'Cap request bodies at the upstream 32MB')}
+          label={t('请求体超上游上限即本地拦截', 'Reject bodies over the upstream limit locally')}
           summary={t(
-            '/v1/messages 与 count_tokens 改写后的出站请求体超过 32MB 时，于本地返回上游同一条 413，不再发往上游。',
-            'When the rewritten outbound body of a /v1/messages or count_tokens request exceeds 32MB, return the upstream 413 locally instead of sending it.',
+            '/v1/messages 与 count_tokens 改写后的出站请求体超过上游上限时，于本地返回上游同一条 413，不再发往上游。',
+            'When the rewritten outbound body of a /v1/messages or count_tokens request exceeds the upstream limit, return the upstream 413 locally instead of sending it.',
           )}
           description={
             <>
               {t(
-                '上游 Messages 接口的请求体上限为 32MB，超出即返回 413 request_too_large；官方 Claude Code 2.1.306 按同一数值处理这条 413，引导用户移除图片、附件或压缩对话。判定看改写后实际要发出的那份请求体，而非客户端发来的原件：完整模拟续接 message thread 时，已提交的历史会整段剪去、只发增量，入站超过 32MB 的请求出站可能只剩几 KB，照常转发。启用（默认）：出站请求体超过 32MB 即于本地返回 413，类型同为 request_too_large，省去一次往返。停用：照常发往上游，由上游返回 413。入站请求体始终以 64MB 为限；batches、files 等上游接收更大请求体的接口不受影响。',
-                'The upstream Messages endpoint caps request bodies at 32MB and answers anything larger with 413 request_too_large; the official Claude Code 2.1.306 handles that 413 at the same figure, prompting the user to remove images or attachments or to compact. The check looks at the body actually about to be sent after rewriting, not the one the client sent: when full simulation continues a message thread, the committed history is cut and only the increment is sent, so a request over 32MB inbound may be a few KB outbound and is forwarded as usual. On (default): an outbound body over 32MB gets a 413 of the same request_too_large type locally, saving a round trip. Off: forwarded, and the upstream returns its 413. Inbound bodies are always capped at 64MB; endpoints the upstream accepts larger bodies on, such as batches and files, are unaffected.',
+                '上游 Messages 与 count_tokens 接口的请求体上限为 128MB（官方文档 Request size limits，此前为 32MB），超出即返回 413 request_too_large；官方 Claude Code 收到这条 413 时引导用户移除图片、附件或压缩对话。判定看改写后实际要发出的那份请求体，而非客户端发来的原件：完整模拟续接 message thread 时，已提交的历史会整段剪去、只发增量，入站超过 128MB 的请求出站可能只剩几 KB，照常转发。启用（默认）：出站请求体超过 128MB 即于本地返回 413，类型同为 request_too_large，省去一次往返。停用：照常发往上游，由上游返回 413。入站请求体以 256MB 为限（files 以 500MB 为限）；batches、files 等上游接收更大请求体的接口不受出站截止影响。',
+                'The upstream Messages and count_tokens endpoints cap request bodies at 128MB (official Request size limits, formerly 32MB) and answer anything larger with 413 request_too_large; on that 413 the official Claude Code prompts the user to remove images or attachments or to compact. The check looks at the body actually about to be sent after rewriting, not the one the client sent: when full simulation continues a message thread, the committed history is cut and only the increment is sent, so a request over 128MB inbound may be a few KB outbound and is forwarded as usual. On (default): an outbound body over 128MB gets a 413 of the same request_too_large type locally, saving a round trip. Off: forwarded, and the upstream returns its 413. Inbound bodies are capped at 256MB (500MB for files); endpoints the upstream accepts larger bodies on, such as batches and files, are not subject to the outbound cap.',
               )}
             </>
           }

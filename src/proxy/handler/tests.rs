@@ -1085,7 +1085,7 @@ async fn oversized_bodies_get_413(pool: sqlx::PgPool) {
     assert!(mock.seen().is_empty());
 }
 
-/// 出站 32MB 只管 messages 与 count_tokens、开关开着时；batches 等其余接口不判。
+/// 出站 128MB 只管 messages 与 count_tokens、开关开着时；batches 等其余接口不判。
 #[test]
 fn outbound_too_large_by_path() {
     use crate::proxy::{MAX_MESSAGES_BODY_BYTES, outbound_too_large};
@@ -1098,7 +1098,21 @@ fn outbound_too_large_by_path() {
     assert!(!outbound_too_large("/v1/messages?beta=true", over, false));
 }
 
-/// 入站没过 64MB、出站超 32MB 的 messages 请求：读得进来，改写后就地回 413，不打上游。
+/// 入站上限按路径：files 那组 500MB，其余 256MB；都不低于 messages 出站的 128MB。
+#[test]
+fn inbound_limit_by_path() {
+    use crate::proxy::{
+        MAX_BODY_BYTES, MAX_FILES_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, max_inbound_bytes,
+    };
+    assert_eq!(max_inbound_bytes("/v1/files"), MAX_FILES_BODY_BYTES);
+    assert_eq!(max_inbound_bytes("/v1/files/?beta=true"), MAX_FILES_BODY_BYTES);
+    assert_eq!(max_inbound_bytes("/v1/messages?beta=true"), MAX_BODY_BYTES);
+    assert_eq!(max_inbound_bytes("/v1/messages/batches"), MAX_BODY_BYTES);
+    assert_eq!(max_inbound_bytes("/v1/filesystem"), MAX_BODY_BYTES);
+    assert!(MAX_BODY_BYTES > MAX_MESSAGES_BODY_BYTES);
+}
+
+/// 入站没过 256MB、出站超 128MB 的 messages 请求：读得进来，改写后就地回 413，不打上游。
 #[sqlx::test]
 async fn oversized_outbound_gets_413(pool: sqlx::PgPool) {
     let mock = MockUpstream::start(vec![]).await;

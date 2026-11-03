@@ -78,12 +78,11 @@ use super::{
     unshift_system_index,
 };
 use super::{
-    EarlyUpstreamFailure, MAX_BODY_BYTES, MAX_MESSAGES_BODY_BYTES, ParsedRequestBits,
-    REWRITE_APP_REFUSAL_REPLAY, REWRITE_PROBE_PREWARM, REWRITE_PROBE_REPLY,
-    REWRITE_PROBE_REPLY_FILLED, REWRITE_REFUSAL_REPLAY, RequestLogState, client_access,
-    client_request_id, error_response, header_opt, inbound_beta_list, log_early_upstream_failure,
-    outbound_too_large, rate_limit_response, request_fallback_speeds, request_max_tokens,
-    request_model, request_speed,
+    EarlyUpstreamFailure, MAX_MESSAGES_BODY_BYTES, ParsedRequestBits, REWRITE_APP_REFUSAL_REPLAY,
+    REWRITE_PROBE_PREWARM, REWRITE_PROBE_REPLY, REWRITE_PROBE_REPLY_FILLED, REWRITE_REFUSAL_REPLAY,
+    RequestLogState, client_access, client_request_id, error_response, header_opt,
+    inbound_beta_list, log_early_upstream_failure, max_inbound_bytes, outbound_too_large,
+    rate_limit_response, request_fallback_speeds, request_max_tokens, request_model, request_speed,
 };
 
 mod admit;
@@ -163,7 +162,7 @@ pub(crate) async fn handle_inner(
             Ok(a) => a,
             Err(resp) => return resp,
         };
-        // 出站体超过上游 32MB：发出去也是 413，就地回同一个。判改写后那份，见 [`outbound_too_large`]。
+        // 出站体超过上游 128MB：发出去也是 413，就地回同一个。判改写后那份，见 [`outbound_too_large`]。
         if outbound_too_large(&inb.path_and_query, attempt.sent.len(), inb.flags.cap_messages_body)
         {
             tracing::warn!(method = %inb.method, path = %inb.path_and_query, ua = %inb.client_ua, bytes = attempt.sent.len(), "rejected: outbound request body too large");

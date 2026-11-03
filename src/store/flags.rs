@@ -369,13 +369,13 @@ pub struct ForwardFlags {
     /// - **开**（默认）：命中即本地 400，与 API Key 直连逐字相同。
     /// - **关**：照发，由订阅通道放行。
     pub api_key_parity: bool,
-    /// `/v1/messages` 与 `count_tokens` 改写后的**出站体**按上游的 32MB 卡（2.1.306 客户端
-    /// `mtt=33554432`，超了上游回 413 `request_too_large`），超出即本地回同一个 413，省一次往返。
-    /// 判出站不判入站：完整模拟续 message thread 时已提交的历史整段剪掉，入站超 32MB 的出站
-    /// 可能只剩增量。入站始终按 64MB 挡内存；batches、files 等其余接口不判，见
+    /// `/v1/messages` 与 `count_tokens` 改写后的**出站体**按上游的 128MB 卡（官方文档 Request
+    /// size limits，超了上游回 413 `request_too_large`），超出即本地回同一个 413，省一次往返。
+    /// 判出站不判入站：完整模拟续 message thread 时已提交的历史整段剪掉，入站超 128MB 的出站
+    /// 可能只剩增量。入站按 256MB（files 500MB）挡内存；batches、files 等其余接口不判，见
     /// [`crate::proxy::outbound_too_large`]。
     ///
-    /// - **开**（默认）：messages 那组出站超 32MB 本地 413。
+    /// - **开**（默认）：messages 那组出站超 128MB 本地 413。
     /// - **关**：照发，由上游回 413。
     pub cap_messages_body: bool,
     /// 来访的会话 id 在**头与体两处不一致**时本地拒绝（400），不替它选一个。

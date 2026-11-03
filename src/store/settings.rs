@@ -208,7 +208,7 @@ pub const REJECT_TAMPERED_THINKING: &str = "reject_tampered_thinking";
 /// 见 [`ForwardFlags::api_key_parity`]。
 pub const API_KEY_PARITY: &str = "api_key_parity";
 
-/// messages 请求体按上游 32MB 就地回 413 的 settings 键名。缺省视为开启，
+/// messages 请求体按上游 128MB 就地回 413 的 settings 键名。缺省视为开启，
 /// 见 [`ForwardFlags::cap_messages_body`]。
 pub const CAP_MESSAGES_BODY: &str = "cap_messages_body";
 
