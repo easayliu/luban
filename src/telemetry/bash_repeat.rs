@@ -30,6 +30,10 @@ const MAX_LINES: u64 = 100_000;
 const MAX_COUNT: u64 = 1_000;
 /// `QA`：超过这么多 UTF-16 码元的命令不解析。
 const MAX_PARSE_LEN: usize = 10_000;
+/// `cj`（2.1.317）：同一项活最近由哪几个代理跑完，最多记这么多个。
+const MAX_AGENTS: usize = 4;
+/// `dj`（2.1.317）：不分代理的那把「活」键里代理那一段，官方拿 `"\0"` 占位。
+const ANY_AGENT: &str = "\0";
 
 /// `NG`：语句之间的连接符。
 const JOINERS: &[&str] = &["&&", "||", ";", "&"];
@@ -507,6 +511,100 @@ fn js_trim(s: &str) -> &str {
     s.trim_matches(js_space)
 }
 
+/// `Bun.hash(s)`：Zig 标准库的 Wyhash（种子 0），对字符串的 UTF-8 字节算。`Bun.hash("")` 是 `0x0409638ee2bde459`，与
+/// Zig 的测试向量一致；其余值与 Bun 1.3.11 实算逐个核过（见测试）。
+pub(super) fn bun_hash(input: &[u8]) -> u64 {
+    const SECRET: [u64; 4] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+    ];
+    fn mum(a: u64, b: u64) -> (u64, u64) {
+        let x = u128::from(a).wrapping_mul(u128::from(b));
+        (x as u64, (x >> 64) as u64)
+    }
+    fn mix(a: u64, b: u64) -> u64 {
+        let (a, b) = mum(a, b);
+        a ^ b
+    }
+    fn read(n: usize, b: &[u8]) -> u64 {
+        let mut buf = [0u8; 8];
+        buf[..n].copy_from_slice(&b[..n]);
+        u64::from_le_bytes(buf)
+    }
+    let seed = 0u64;
+    let mut state = [seed ^ mix(seed ^ SECRET[0], SECRET[1]); 3];
+    let (a, b);
+    let len = input.len();
+    if len <= 16 {
+        if len >= 4 {
+            let end = len - 4;
+            let quarter = (len >> 3) << 2;
+            a = (read(4, input) << 32) | read(4, &input[quarter..]);
+            b = (read(4, &input[end..]) << 32) | read(4, &input[end - quarter..]);
+        } else if len > 0 {
+            a = (u64::from(input[0]) << 16)
+                | (u64::from(input[len >> 1]) << 8)
+                | u64::from(input[len - 1]);
+            b = 0;
+        } else {
+            a = 0;
+            b = 0;
+        }
+    } else {
+        let mut i = 0;
+        if len >= 48 {
+            while i + 48 < len {
+                for k in 0..3 {
+                    let x = read(8, &input[i + 16 * k..]);
+                    let y = read(8, &input[i + 16 * k + 8..]);
+                    state[k] = mix(x ^ SECRET[k + 1], y ^ state[k]);
+                }
+                i += 48;
+            }
+            state[0] ^= state[1] ^ state[2];
+        }
+        let rest = &input[i..];
+        let mut j = 0;
+        while j + 16 < rest.len() {
+            state[0] = mix(read(8, &rest[j..]) ^ SECRET[1], read(8, &rest[j + 8..]) ^ state[0]);
+            j += 16;
+        }
+        a = read(8, &input[len - 16..]);
+        b = read(8, &input[len - 8..]);
+    }
+    let (a, b) = mum(a ^ SECRET[1], b ^ state[0]);
+    mix(a ^ SECRET[0] ^ len as u64, b ^ SECRET[1])
+}
+
+/// `JYo(sessionId)`（2.1.317）：这个会话的 Bash 调用记不记重复命令统计——`Bun.hash("bash repeat meter\0" + 会话 id)`
+/// 取低 32 位除以 2³² 小于 `rate`（`tengu_vivid_peach`，读不到 0.1）。没抽中的会话每次都走 `skip()`：不比、不记，
+/// 事件里那组键一个都没有。官方另在不发遥测（`DISABLE_TELEMETRY` 等）时一律不抽，代理这边恒发。
+pub(super) fn metered(session_id: &str, rate: f64) -> bool {
+    let h = bun_hash(format!("bash repeat meter\0{session_id}").as_bytes());
+    ((h & 0xffff_ffff) as f64) / 4_294_967_296.0 < rate
+}
+
+/// 一次调用结束时 `ended()` 交来的那几项（2.1.317）：这条命令算不算「输出交给 `tail`」的候选（`check` / `other`，
+/// 见 `super::tools::tail_input_line`），输出有没有另存一份（转到后台的不记，是 `None`），以及输出有没有落盘
+/// （`longOutput.persisted`：代理看到的那次结果是 `<persisted-output>` 预览）。
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Ended {
+    pub(super) line: Option<&'static str>,
+    pub(super) kept: Option<bool>,
+    pub(super) persisted: bool,
+}
+
+/// 支线上下文里一条 `tool_result` 现在的正文状态（[`super::shape::ResultSeen`]）。
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Readable {
+    /// 官方 `VJo(content)`：没落盘的那次看这个。
+    pub(super) plain: bool,
+    /// `content !== "[Old tool result content cleared]"`：落过盘的那次看这个。
+    pub(super) not_cleared: bool,
+}
+
 /// 先前跑完的一条语句（官方 `#e` 里的一项）。
 #[derive(Clone, Debug)]
 struct Entry {
@@ -522,6 +620,10 @@ struct Entry {
     prompt_seq: u32,
     /// 记下时的上下文代数（之后压缩过就不在上下文里了）。
     epoch: u32,
+    /// 那次调用的 [`Ended`]（2.1.317 报 `earlier_tail_input_*`）。
+    tail: Ended,
+    /// 那次调用的 tool_use id（2.1.317 判别的代理那次的结果在不在当前支线的上下文里）。
+    tool_use_id: Option<String>,
 }
 
 /// 这个会话的计量器（官方 `d_n`，挂在 `toolState` 上，`/clear` 换会话即清空）。
@@ -539,8 +641,15 @@ pub(crate) struct BashMeter {
     /// 成本账上的增删行累计（`oye() + sye()`）与上次开始时读到的值（`#n`）。
     ledger: u64,
     ledger_seen: u64,
-    /// 压缩过几次。
-    epoch: u32,
+    /// `#n`（2.1.317）：不分代理的「活」键 → 正在跑它的代理（开始时记、结束时摘）。
+    running_by: Vec<(String, Vec<String>)>,
+    /// `#t`（2.1.317）：不分代理的「活」键 → 最近跑完它的代理（至多 [`MAX_AGENTS`] 个，越靠后越新）。
+    done_by: Vec<(String, Vec<String>)>,
+    /// 各代理支线（主线程是空串）上下文里的 `tool_result`：tool_use id → 正文状态。完整请求体整份换掉，线程续轮的增量体
+    /// 追加，**那条支线**压缩后清空（[`Self::note_visible`]、[`Self::compacted`]）。
+    visible: Vec<(String, std::collections::HashMap<String, Readable>)>,
+    /// 各代理支线压缩过几次（没有的是 0）。只有被压缩的那条支线变，别的子代理照旧。
+    epochs: Vec<(String, u32)>,
 }
 
 /// 一次调用开始时算好的东西，结束时交回 [`BashMeter::settle`]（官方 `ic`）。
@@ -555,11 +664,63 @@ pub(super) struct Begun {
 
 #[derive(Debug)]
 struct Call {
-    pieces: Vec<(String, String, u64, u64, Option<&'static str>)>,
+    pieces: Vec<PieceRec>,
+    tool_use_id: Option<String>,
+    /// 调用方代理的 id（主线程是空串）。
+    agent: String,
     writes: u64,
     checks: u64,
     goes_on_running: bool,
     background_at_start: u64,
+}
+
+/// 一条参与比较的语句（官方 `Z` 里的一项）。
+#[derive(Debug)]
+struct PieceRec {
+    key: String,
+    /// 不分代理的那把键（2.1.317 `workKey`）。
+    work_key: String,
+    text_hash: String,
+    writes: u64,
+    checks: u64,
+    ran_only_if: Option<&'static str>,
+}
+
+/// `#f` 算出来的一次比较。
+struct Diff {
+    idx: usize,
+    same_text: bool,
+    lines: u64,
+    writes: u64,
+    /// 2.1.317：期间还在跑的会写的调用（`R`），`writes` 里已含。
+    running: u64,
+    checks: u64,
+    unseen: u64,
+}
+
+impl Diff {
+    /// `pE(e, n)`：比 `other` 改动少（行数 + 写），一样多时检查少。
+    fn better_than(&self, other: Option<&Diff>) -> bool {
+        other.is_none_or(|b| {
+            self.lines + self.writes < b.lines + b.writes
+                || (self.lines + self.writes == b.lines + b.writes && self.checks < b.checks)
+        })
+    }
+
+    /// `gE`（2.1.317）：期间改了什么，按轻重取一样。
+    fn changed(&self) -> &'static str {
+        if self.lines > 0 {
+            "lines_changed"
+        } else if self.writes > self.running {
+            "possible_writes"
+        } else if self.running > 0 {
+            "running_commands_only"
+        } else if self.checks > 0 {
+            "tests_and_lints_only"
+        } else {
+            "nothing"
+        }
+    }
 }
 
 /// [`BashMeter::begin`] 的入参。
@@ -573,6 +734,17 @@ pub(super) struct BeginArgs<'a> {
     pub(super) tool_use_id: Option<&'a str>,
     pub(super) now: SystemTime,
     pub(super) prompt_seq: u32,
+    /// 会话版本 ≥2.1.317：按会话抽样（[`metered`]），事件里那组键换成 2.1.317 的布局（多跨代理那组等）。
+    pub(super) v317: bool,
+    /// 这个会话抽中了（[`metered`]），只在 `v317` 时看。
+    pub(super) metered: bool,
+    /// 调用方子代理跑在自己的 worktree 里（Agent 的 `isolation: "worktree"`）；主线程不报。
+    pub(super) in_agent_worktree: bool,
+}
+
+/// 有序表里取 `key` 那一项。
+fn slot<'a>(map: &'a [(String, Vec<String>)], key: &str) -> Option<&'a Vec<String>> {
+    map.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 impl BashMeter {
@@ -581,9 +753,56 @@ impl BashMeter {
         self.ledger += (added + removed) as u64;
     }
 
-    /// 压缩成功：先前的结果都不在上下文里了。
-    pub(super) fn compacted(&mut self) {
-        self.epoch += 1;
+    /// `agent`（主线程是空串）那条支线压缩成功：它先前的结果都不在它的上下文里了；别的支线（各自独立的子代理）不受影响。
+    pub(super) fn compacted(&mut self, agent: &str) {
+        match self.epochs.iter_mut().find(|(a, _)| a == agent) {
+            Some((_, n)) => *n += 1,
+            None => self.epochs.push((agent.to_string(), 1)),
+        }
+        self.visible.retain(|(a, _)| a != agent);
+    }
+
+    /// `agent` 那条支线压缩过几次。
+    fn epoch_of(&self, agent: &str) -> u32 {
+        self.epochs.iter().find(|(a, _)| a == agent).map_or(0, |(_, n)| *n)
+    }
+
+    /// 记下 `agent`（主线程是空串）这条支线这次请求看得见的 `tool_result`：完整体整份换掉，增量体追加。每条主线程 /
+    /// 子代理请求都调（[`super::Session`] 推进一轮时），`ids` 已按官方正文有效性滤过
+    /// （[`super::shape::RequestShape::result_ids`]）。
+    pub(super) fn note_visible(
+        &mut self,
+        agent: &str,
+        seen: &[super::shape::ResultSeen],
+        delta: bool,
+    ) {
+        let at = match self.visible.iter().position(|(a, _)| a == agent) {
+            Some(i) => i,
+            None => {
+                self.visible.push((agent.to_string(), Default::default()));
+                self.visible.len() - 1
+            }
+        };
+        let set = &mut self.visible[at].1;
+        if !delta {
+            set.clear();
+        }
+        set.extend(seen.iter().map(|r| (r.id.clone(), r.readable)));
+    }
+
+    /// `mE(messages, earlier) >= 0`（跨代理那项）：别的代理那次的结果在 `agent` 这条支线看得见的结果里。独立的子代理与
+    /// 主线程互相看不到对方的 Bash 结果，只有带着父线程上下文分出来的才看得到。
+    ///
+    /// 那次落没落盘按调用结束时记下的（[`Ended::persisted`]），不看现在的正文：原本没落盘的旧输出后来被换成
+    /// `<persisted-output>` 预览时，官方走 `VJo`、判不在。
+    fn visible_to(&self, agent: &str, e: &Entry) -> bool {
+        let Some(id) = &e.tool_use_id else { return false };
+        let Some(r) =
+            self.visible.iter().find(|(a, _)| a == agent).and_then(|(_, set)| set.get(id))
+        else {
+            return false;
+        };
+        if e.tail.persisted { r.not_cleared } else { r.plain }
     }
 
     /// `noteOtherToolCall`：别的工具调用一次（只读的不算）。
@@ -608,7 +827,8 @@ impl BashMeter {
         let n = self.ledger;
         self.lines += if n < self.ledger_seen { n } else { n - self.ledger_seen };
         self.ledger_seen = n;
-        if a.tool_use_id.is_none() {
+        // 没有 tool_use id（用户 `!` 跑的），或 2.1.317 起这个会话没抽中：`skip()`，只记一次在跑。
+        if a.tool_use_id.is_none() || (a.v317 && !a.metered) {
             self.running += 1;
             return Begun {
                 fields: Map::new(),
@@ -619,20 +839,16 @@ impl BashMeter {
         };
         let x = pieces(a.command, a.cwd, &read_only);
         let any_heavy = x.iter().any(|p| p.heavy && !p.only_on_failure);
-        let prefix = format!("{}\0{}", a.agent_id, a.rest_input);
+        let key_of = |agent: &str, ie: &Piece| {
+            format!("{agent}\0{}\0{}\0{}", a.rest_input, ie.place, ie.stem)
+        };
         let g = self.counts();
-        let [d, y, q, z] = g;
         let (mut te, mut ae, mut re) = (0u64, 0u64, 0u64);
-        let mut se: Vec<(String, String, u64, u64, Option<&'static str>)> = Vec::new();
-        struct Best {
-            idx: usize,
-            same_text: bool,
-            lines: u64,
-            writes: u64,
-            checks: u64,
-            unseen: u64,
-        }
-        let mut he: Option<Best> = None;
+        let mut se: Vec<PieceRec> = Vec::new();
+        let mut he: Option<Diff> = None;
+        // 2.1.317：同一项活别的代理正跑着（`se`），或别的代理跑完过、挑改动最少的那次（`re`）。
+        let mut running_other: Option<String> = None;
+        let mut done_other: Option<(Diff, String)> = None;
         let fallback;
         let list: &[Piece] = if x.is_empty() {
             let t = js_trim(a.command).to_string();
@@ -652,28 +868,36 @@ impl BashMeter {
         };
         for ie in list {
             let ee = !ie.only_on_failure && (!any_heavy || ie.heavy);
-            let key = format!("{prefix}\0{}\0{}", ie.place, ie.stem);
+            let key = key_of(a.agent_id, ie);
+            let work_key = key_of(ANY_AGENT, ie);
             let text_hash = ie.text.clone();
             if ee && let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
-                let e = &self.entries[idx].1;
-                let we = e.background_at_start + self.running + self.background;
-                let nt = Best {
-                    idx,
-                    same_text: e.text_hashes.contains(&text_hash),
-                    lines: d.saturating_sub(e.lines_changed),
-                    writes: (y + we + te).saturating_sub(e.possible_writes),
-                    checks: (q + ae).saturating_sub(e.tests_and_lints),
-                    unseen: (z + we + te + ae).saturating_sub(e.unseen_writes),
-                };
+                let nt = self.diff(idx, &text_hash, g, te, ae);
                 if nt.lines + nt.writes == 0 {
                     re += 1;
                 }
-                let better = he.as_ref().is_none_or(|b| {
-                    nt.lines + nt.writes < b.lines + b.writes
-                        || (nt.lines + nt.writes == b.lines + b.writes && nt.checks < b.checks)
-                });
-                if better {
+                if nt.better_than(he.as_ref()) {
                     he = Some(nt);
+                }
+            }
+            if ee {
+                if running_other.is_none() {
+                    running_other = slot(&self.running_by, &work_key)
+                        .and_then(|v| v.iter().find(|x| **x != a.agent_id).cloned());
+                }
+                let done: Vec<String> = slot(&self.done_by, &work_key).cloned().unwrap_or_default();
+                for agent in done.iter().rev() {
+                    if agent == a.agent_id {
+                        continue;
+                    }
+                    let k = key_of(agent, ie);
+                    let Some(idx) = self.entries.iter().position(|(x, _)| *x == k) else {
+                        continue;
+                    };
+                    let d = self.diff(idx, &text_hash, g, te, ae);
+                    if d.better_than(done_other.as_ref().map(|(d, _)| d)) {
+                        done_other = Some((d, agent.clone()));
+                    }
                 }
             }
             if ie.tests_or_lints {
@@ -682,39 +906,125 @@ impl BashMeter {
                 te += 1;
             }
             if ee {
-                se.push((key, text_hash, te, ae, ie.ran_only_if));
+                se.push(PieceRec {
+                    key,
+                    work_key,
+                    text_hash,
+                    writes: te,
+                    checks: ae,
+                    ran_only_if: ie.ran_only_if,
+                });
             }
         }
         let mut f = Map::new();
         f.insert("repeat".into(), json!(he.is_some()));
         f.insert("compared_statements".into(), json!(se.len()));
         f.insert("unchanged_repeats".into(), json!(re));
+        if a.v317 {
+            if !a.agent_id.is_empty() {
+                f.insert("subagent_in_agent_worktree".into(), json!(a.in_agent_worktree));
+            }
+            let other =
+                running_other.clone().or_else(|| done_other.as_ref().map(|(_, a)| a.clone()));
+            f.insert("other_agent_repeat".into(), json!(other.is_some()));
+            if let Some(other) = &other {
+                let direction = if a.agent_id.is_empty() {
+                    "main_after_subagent"
+                } else if other.is_empty() {
+                    "subagent_after_main"
+                } else {
+                    "subagent_after_subagent"
+                };
+                f.insert("other_agent_direction".into(), json!(direction));
+                // 官方另把「那次是放到后台、现在还在跑」也算进来，代理分不清后台任务归哪次调用，只认正跑着的。
+                f.insert(
+                    "other_agent_call_running_at_start".into(),
+                    json!(running_other.is_some()),
+                );
+            }
+            if running_other.is_none()
+                && let Some((d, _)) = &done_other
+            {
+                let e = &self.entries[d.idx].1;
+                f.insert("other_agent_same_text_as_earlier_call".into(), json!(d.same_text));
+                f.insert("other_agent_seconds_since_that_call".into(), json!(secs_since(a.now, e)));
+                if d.lines > 0 || d.unseen == 0 {
+                    f.insert(
+                        "other_agent_lines_changed_since_that_call".into(),
+                        json!(d.lines.min(MAX_LINES)),
+                    );
+                }
+                f.insert(
+                    "other_agent_possible_writes_since_that_call".into(),
+                    json!(d.writes.min(MAX_COUNT)),
+                );
+                f.insert(
+                    "other_agent_possible_writes_by_running_commands".into(),
+                    json!(d.running.min(MAX_COUNT)),
+                );
+                f.insert(
+                    "other_agent_tests_and_lints_since_that_call".into(),
+                    json!(d.checks.min(MAX_COUNT)),
+                );
+                f.insert("other_agent_changed_since_that_call".into(), json!(d.changed()));
+                f.insert("other_agent_earlier_call_outcome".into(), json!(e.outcome));
+                f.insert(
+                    "other_agent_earlier_result_in_context".into(),
+                    json!(self.visible_to(a.agent_id, e)),
+                );
+            }
+        }
         if let Some(b) = &he {
             let e = &self.entries[b.idx].1;
             f.insert("same_text_as_earlier_call".into(), json!(b.same_text));
-            let secs =
-                a.now.duration_since(e.returned_at).map_or(0.0, |d| d.as_secs_f64()).round() as i64;
-            f.insert("seconds_since_that_call".into(), json!(secs.clamp(0, MAX_SECONDS)));
+            f.insert("seconds_since_that_call".into(), json!(secs_since(a.now, e)));
+            if a.v317 {
+                f.insert("changed_since_that_call".into(), json!(b.changed()));
+            }
             if b.lines > 0 || b.unseen == 0 {
                 f.insert("lines_changed_since_that_call".into(), json!(b.lines.min(MAX_LINES)));
             }
             f.insert("possible_writes_since_that_call".into(), json!(b.writes.min(MAX_COUNT)));
             f.insert("tests_and_lints_since_that_call".into(), json!(b.checks.min(MAX_COUNT)));
-            let in_context = e.epoch == self.epoch;
+            let in_context = e.epoch == self.epoch_of(a.agent_id);
             if in_context {
                 f.insert("new_message_since_that_call".into(), json!(a.prompt_seq > e.prompt_seq));
             }
             f.insert("earlier_call_outcome".into(), json!(e.outcome));
             f.insert("earlier_result_in_context".into(), json!(in_context));
+            // 2.1.317：那次的输出另存与「交给 tail」状态（落盘的 `earlier_output_*` 代理看不到，不报；
+            // `earlier_tail_input_flag_on` 只在 Linux 上有，模拟的是 macOS）。
+            if a.v317 {
+                f.insert(
+                    "earlier_tail_input_candidate".into(),
+                    json!(e.tail.line == Some("check")),
+                );
+                f.insert(
+                    "earlier_tail_input_candidate_other".into(),
+                    json!(e.tail.line == Some("other")),
+                );
+                if let Some(kept) = e.tail.kept {
+                    f.insert("earlier_tail_input_kept".into(), json!(kept));
+                }
+            }
         }
         let counted_as_running = te + ae > 0;
         if counted_as_running {
             self.running += 1;
         }
+        // 2.1.317：这些活记上「正在跑」，结束时摘掉。
+        for p in &se {
+            match self.running_by.iter_mut().find(|(k, _)| *k == p.work_key) {
+                Some((_, v)) => v.push(a.agent_id.to_string()),
+                None => self.running_by.push((p.work_key.clone(), vec![a.agent_id.to_string()])),
+            }
+        }
         Begun {
             fields: f,
             call: Some(Call {
                 pieces: se,
+                tool_use_id: a.tool_use_id.map(str::to_string),
+                agent: a.agent_id.to_string(),
                 writes: te,
                 checks: ae,
                 goes_on_running: x.iter().any(|p| p.goes_on_running),
@@ -725,8 +1035,24 @@ impl BashMeter {
         }
     }
 
+    /// `#f`：拿记着的第 `idx` 条与现在比。`te` / `ae` 是这条命令里排在前面的语句已经算上的写与检查。
+    fn diff(&self, idx: usize, text_hash: &str, g: [u64; 4], te: u64, ae: u64) -> Diff {
+        let [d, y, q, z] = g;
+        let e = &self.entries[idx].1;
+        let we = e.background_at_start + self.running + self.background;
+        Diff {
+            idx,
+            same_text: e.text_hashes.iter().any(|t| t == text_hash),
+            lines: d.saturating_sub(e.lines_changed),
+            writes: (y + we + te).saturating_sub(e.possible_writes),
+            running: we,
+            checks: (q + ae).saturating_sub(e.tests_and_lints),
+            unseen: (z + we + te + ae).saturating_sub(e.unseen_writes),
+        }
+    }
+
     /// `settle`：调用结束。`outcome` 是 `ended` 判的结果（`succeeded` / `failed` / `interrupted` / 转后台那几种），
-    /// `exited_zero` 退出码为 0。
+    /// `exited_zero` 退出码为 0，`tail` 是这次的 [`Ended`]（2.1.317 记进去，下回报 `earlier_tail_input_*`）。
     pub(super) fn settle(
         &mut self,
         b: Begun,
@@ -734,11 +1060,24 @@ impl BashMeter {
         exited_zero: bool,
         now: SystemTime,
         prompt_seq: u32,
+        tail: Ended,
     ) {
         if b.counted_as_running {
             self.running = self.running.saturating_sub(1);
         }
         let Some(call) = b.call else { return };
+        // 2.1.317：每条语句的活上摘掉这个代理一次。
+        for p in &call.pieces {
+            if let Some(i) = self.running_by.iter().position(|(k, _)| *k == p.work_key) {
+                let v = &mut self.running_by[i].1;
+                if let Some(at) = v.iter().position(|x| *x == call.agent) {
+                    v.remove(at);
+                }
+                if v.is_empty() {
+                    self.running_by.remove(i);
+                }
+            }
+        }
         // 有结果（`r !== void 0`）就按这次的写与检查记；改动行没看到 diff（`diffTaken` 假）记一次没看到的写。
         let (bb, w) = (call.checks, call.writes);
         let r = u64::from(w + bb > 0);
@@ -748,48 +1087,74 @@ impl BashMeter {
         if call.goes_on_running {
             self.background += 1;
         }
+        // 转到后台的不记输出另存那项。
+        let tail =
+            Ended { kept: if outcome.contains("background") { None } else { tail.kept }, ..tail };
         let [x, p, j, g] = b.counts_at_start;
-        for (key, text_hash, writes, checks, ran_only_if) in call.pieces {
+        for pc in call.pieces {
             let keep = if outcome == "succeeded" && exited_zero {
-                ran_only_if != Some("unknown")
+                pc.ran_only_if != Some("unknown")
             } else {
-                ran_only_if.is_none()
-                    && (outcome == "succeeded" || outcome == "failed" || writes + checks <= 1)
+                pc.ran_only_if.is_none()
+                    && (outcome == "succeeded" || outcome == "failed" || pc.writes + pc.checks <= 1)
             };
             if !keep {
                 continue;
             }
-            let same = writes == call.writes && checks == call.checks;
-            let mut texts: Vec<String> = match self.entries.iter().position(|(k, _)| *k == key) {
+            let same = pc.writes == call.writes && pc.checks == call.checks;
+            let mut texts: Vec<String> = match self.entries.iter().position(|(k, _)| *k == pc.key) {
                 Some(i) => {
                     let (_, e) = self.entries.remove(i);
-                    e.text_hashes.into_iter().filter(|t| *t != text_hash).collect()
+                    e.text_hashes.into_iter().filter(|t| *t != pc.text_hash).collect()
                 }
                 None => Vec::new(),
             };
-            texts.push(text_hash);
+            texts.push(pc.text_hash);
             let skip = texts.len().saturating_sub(MAX_TEXTS);
             texts.drain(..skip);
             self.entries.push((
-                key,
+                pc.key,
                 Entry {
                     text_hashes: texts,
                     returned_at: now,
                     lines_changed: x,
-                    possible_writes: p + writes,
-                    tests_and_lints: j + checks,
+                    possible_writes: p + pc.writes,
+                    tests_and_lints: j + pc.checks,
                     unseen_writes: g + if same { r } else { 0 },
                     background_at_start: call.background_at_start,
                     outcome,
                     prompt_seq,
-                    epoch: self.epoch,
+                    epoch: self.epoch_of(&call.agent),
+                    tail,
+                    tool_use_id: call.tool_use_id.clone(),
                 },
             ));
+            // 2.1.317：这项活最近由谁跑完（挪到最新，至多 [`MAX_AGENTS`] 个）。
+            let mut agents: Vec<String> =
+                match self.done_by.iter().position(|(k, _)| *k == pc.work_key) {
+                    Some(i) => {
+                        self.done_by.remove(i).1.into_iter().filter(|a| *a != call.agent).collect()
+                    }
+                    None => Vec::new(),
+                };
+            agents.push(call.agent.clone());
+            let skip = agents.len().saturating_sub(MAX_AGENTS);
+            agents.drain(..skip);
+            self.done_by.push((pc.work_key, agents));
         }
         while self.entries.len() > MAX_ENTRIES {
             self.entries.remove(0);
         }
+        while self.done_by.len() > MAX_ENTRIES {
+            self.done_by.remove(0);
+        }
     }
+}
+
+/// `hE`：距那次结束过了几秒（四舍五入、封顶 [`MAX_SECONDS`]）。
+fn secs_since(now: SystemTime, e: &Entry) -> i64 {
+    let secs = now.duration_since(e.returned_at).map_or(0.0, |d| d.as_secs_f64()).round() as i64;
+    secs.clamp(0, MAX_SECONDS)
 }
 
 #[cfg(test)]
@@ -888,11 +1253,14 @@ mod tests {
                     tool_use_id: Some(id),
                     now: t0,
                     prompt_seq: 1,
+                    v317: false,
+                    metered: false,
+                    in_agent_worktree: false,
                 },
                 |_| false,
             );
             let f = Value::Object(b.fields.clone());
-            m.settle(b, "succeeded", true, t0, 1);
+            m.settle(b, "succeeded", true, t0, 1, Ended::default());
             (f["repeat"].clone(), f["unchanged_repeats"].clone())
         };
         assert_eq!(go("agent-1", "t1"), (json!(false), json!(0)));
@@ -914,13 +1282,16 @@ mod tests {
             tool_use_id: Some(id),
             now: at,
             prompt_seq: seq,
+            v317: false,
+            metered: false,
+            in_agent_worktree: false,
         };
         let b = m.begin(args("t1", t0, 1), ro);
         assert_eq!(
             Value::Object(b.fields.clone()),
             json!({ "repeat": false, "compared_statements": 1, "unchanged_repeats": 0 })
         );
-        m.settle(b, "succeeded", true, t0, 1);
+        m.settle(b, "succeeded", true, t0, 1, Ended::default());
         m.note_lines(25, 0);
         m.note_other_tool("Read");
         m.note_other_tool("mcp__x__y");
@@ -936,5 +1307,232 @@ mod tests {
                 "earlier_call_outcome": "succeeded", "earlier_result_in_context": true,
             })
         );
+    }
+
+    /// 2.1.317 `other_agent_earlier_result_in_context`（官方 `mE`）按当前支线看得见的消息判：独立子代理看不到主线程那次的
+    /// 结果，没压缩也是 false；带着父线程上下文分出来的那种（请求里有那次的 tool_result）是 true；压缩过就都看不到了。
+    #[test]
+    fn other_agent_results_follow_the_branch_context() {
+        let rest = json!({ "dangerouslyDisableSandbox": false });
+        let t0 = SystemTime::UNIX_EPOCH;
+        let cmd = "npm test";
+        let seen = |m: &mut BashMeter, agent: &'static str, id: &'static str| {
+            let b = m.begin(args317(cmd, &rest, agent, id, t0, true), |_| false);
+            let v = b.fields["other_agent_earlier_result_in_context"].clone();
+            m.settle(b, "succeeded", true, t0, 1, Ended::default());
+            v
+        };
+        let r = |id: &str, content: Value| super::super::shape::ResultSeen {
+            id: id.into(),
+            readable: super::super::shape::readable_of(Some(&content)),
+        };
+        let mut m = BashMeter::default();
+        let main = m.begin(args317(cmd, &rest, "", "m1", t0, true), |_| false);
+        m.settle(main, "succeeded", true, t0, 1, Ended::default());
+        let base = m.clone();
+        m.note_visible("agent-1", &[], false);
+        assert_eq!(seen(&mut m, "agent-1", "a1"), false, "独立子代理");
+        // 分叉子代理：首条完整请求带着父线程那次的结果，回复里才调 Bash；下一条增量续轮只带新结果。
+        let mut m2 = base.clone();
+        m2.note_visible("agent-2", &[r("m1", json!("ok"))], false);
+        m2.note_visible("agent-2", &[r("x1", json!("ok"))], true);
+        let mut m3 = m2.clone();
+        assert_eq!(seen(&mut m2, "agent-2", "a2"), true, "增量续轮里那次的结果仍在");
+        // 主线程压缩不动这个子代理的上下文；子代理自己压缩才清。
+        m3.compacted("");
+        let mut m4 = m3.clone();
+        assert_eq!(seen(&mut m3, "agent-2", "a3"), true, "主线程压缩不影响子代理");
+        m4.compacted("agent-2");
+        assert_eq!(seen(&mut m4, "agent-2", "a4"), false, "子代理自己压缩过");
+        // 再来一条完整请求（不带那次的结果）就换掉了。
+        let mut m5 = base.clone();
+        m5.note_visible("agent-5", &[r("m1", json!("ok"))], false);
+        m5.note_visible("agent-5", &[r("x1", json!("ok"))], false);
+        assert_eq!(seen(&mut m5, "agent-5", "a5"), false, "新的完整请求里没有那次的结果");
+        // 那次的正文被清掉了不算；原本没落盘、后来被换成落盘预览也不算（官方按调用时的落盘状态走 `VJo`）。
+        for (content, want) in [
+            (json!("[Old tool result content cleared]"), false),
+            (json!("<persisted-output>\nOutput too large"), false),
+            (json!("<truncated-output>…"), false),
+        ] {
+            let mut m6 = base.clone();
+            m6.note_visible("agent-6", &[r("m1", content.clone())], false);
+            assert_eq!(seen(&mut m6, "agent-6", "a6"), want, "{content}");
+        }
+    }
+
+    /// 那次调用结束时输出就落了盘（`longOutput.persisted`）：现在的正文是落盘预览照算，只有恰被清掉才不算。
+    #[test]
+    fn a_persisted_earlier_call_counts_until_cleared() {
+        let rest = json!({ "dangerouslyDisableSandbox": false });
+        let t0 = SystemTime::UNIX_EPOCH;
+        let cmd = "npm test";
+        let r = |content: Value| super::super::shape::ResultSeen {
+            id: "m1".into(),
+            readable: super::super::shape::readable_of(Some(&content)),
+        };
+        let mut base = BashMeter::default();
+        let main = base.begin(args317(cmd, &rest, "", "m1", t0, true), |_| false);
+        base.settle(main, "succeeded", true, t0, 1, Ended { persisted: true, ..Ended::default() });
+        for (content, want) in [
+            (json!("<persisted-output>\nOutput too large"), true),
+            (
+                json!("<artifact-content-authored-by-others/>\n[Old tool result content cleared]"),
+                true,
+            ),
+            (json!("[Old tool result content cleared]"), false),
+        ] {
+            let mut m = base.clone();
+            m.note_visible("agent-1", &[r(content.clone())], false);
+            let b = m.begin(args317(cmd, &rest, "agent-1", "a1", t0, true), |_| false);
+            assert_eq!(b.fields["other_agent_earlier_result_in_context"], want, "{content}");
+        }
+    }
+
+    /// `Bun.hash` 与 Bun 1.3.11 实算逐个相同（空串是 Zig Wyhash 的测试向量 `0x0409638ee2bde459`）；覆盖不到 4 字节、
+    /// 4 ~ 16 字节、17 ~ 48 字节与跨 48 字节分块几种走法。
+    #[test]
+    fn bun_hash_matches_bun() {
+        for (s, want) in [
+            ("", 290_873_116_282_709_081u64),
+            ("a", 2_941_419_223_392_617_777),
+            ("abc", 190_542_993_387_777_138),
+            ("x", 4_738_888_789_374_899_184),
+            ("message digest", 4_742_346_353_319_458_430),
+            ("bash repeat meter\0ca578f14-6c7b-460c-8519-62174777ccb5", 6_928_636_203_526_860_696),
+            (
+                "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijk",
+                14_983_946_105_717_027_472,
+            ),
+        ] {
+            assert_eq!(bun_hash(s.as_bytes()), want, "{s:?}");
+        }
+        // 低 32 位 / 2³²：这个会话约 0.67，比例 0.1 时没抽中，全抽（1.0）时抽中，0 时谁都不抽。
+        let sid = "ca578f14-6c7b-460c-8519-62174777ccb5";
+        assert!(!metered(sid, 0.1));
+        assert!(metered(sid, 1.0));
+        assert!(!metered(sid, 0.0));
+    }
+
+    fn args317<'a>(
+        command: &'a str,
+        rest: &'a Value,
+        agent: &'a str,
+        id: &'a str,
+        at: SystemTime,
+        metered: bool,
+    ) -> BeginArgs<'a> {
+        BeginArgs {
+            command,
+            rest_input: rest,
+            cwd: "/w",
+            agent_id: agent,
+            tool_use_id: Some(id),
+            now: at,
+            prompt_seq: 1,
+            v317: true,
+            metered,
+            in_agent_worktree: false,
+        }
+    }
+
+    /// 2.1.317 没抽中的会话走 `skip()`：不比、不记，那组键一个都没有，之后抽中的调用也比不到它。
+    #[test]
+    fn an_unmetered_2_1_317_session_reports_nothing() {
+        let mut m = BashMeter::default();
+        let rest = json!({ "dangerouslyDisableSandbox": false });
+        let t0 = SystemTime::UNIX_EPOCH;
+        for id in ["t1", "t2"] {
+            let b = m.begin(args317("npm test", &rest, "", id, t0, false), |_| false);
+            assert!(b.fields.is_empty());
+            m.settle(b, "succeeded", true, t0, 1, Ended::default());
+        }
+        let b = m.begin(args317("npm test", &rest, "", "t3", t0, true), |_| false);
+        assert_eq!(b.fields["repeat"], false, "没抽中的那两次没记下");
+    }
+
+    /// 2.1.317 的布局：首次是 `other_agent_repeat: false`；同一个代理再跑报 `changed_since_that_call` 与那次的
+    /// 「交给 tail」状态；子代理跑主线程跑过的同一条命令，报跨代理那组（方向、那次距今、改了什么）。
+    #[test]
+    fn the_2_1_317_layout_reports_other_agents() {
+        let mut m = BashMeter::default();
+        let rest = json!({ "dangerouslyDisableSandbox": false });
+        let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let cmd = "npm test 2>&1 | tail -5";
+        let b = m.begin(args317(cmd, &rest, "", "t1", t0, true), |_| false);
+        assert_eq!(
+            Value::Object(b.fields.clone()),
+            json!({"repeat": false, "compared_statements": 1, "unchanged_repeats": 0,
+                "other_agent_repeat": false})
+        );
+        m.settle(
+            b,
+            "succeeded",
+            true,
+            t0,
+            1,
+            Ended { line: Some("check"), kept: Some(false), persisted: false },
+        );
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        let b = m.begin(args317(cmd, &rest, "", "t2", t1, true), |_| false);
+        let keys: Vec<&str> = b.fields.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "repeat",
+                "compared_statements",
+                "unchanged_repeats",
+                "other_agent_repeat",
+                "same_text_as_earlier_call",
+                "seconds_since_that_call",
+                "changed_since_that_call",
+                "lines_changed_since_that_call",
+                "possible_writes_since_that_call",
+                "tests_and_lints_since_that_call",
+                "new_message_since_that_call",
+                "earlier_call_outcome",
+                "earlier_result_in_context",
+                "earlier_tail_input_candidate",
+                "earlier_tail_input_candidate_other",
+                "earlier_tail_input_kept",
+            ]
+        );
+        assert_eq!(b.fields["changed_since_that_call"], "nothing");
+        assert_eq!(b.fields["earlier_tail_input_candidate"], true);
+        assert_eq!(b.fields["seconds_since_that_call"], 5);
+        m.settle(
+            b,
+            "succeeded",
+            true,
+            t1,
+            1,
+            Ended { line: Some("check"), kept: Some(false), persisted: false },
+        );
+        // 子代理跑同一条：自己没跑过（`repeat` 假），主线程跑过——跨代理那组。
+        m.note_other_tool("mcp__x__y");
+        let t2 = t1 + std::time::Duration::from_secs(9);
+        let b = m.begin(args317(cmd, &rest, "agent-1", "t3", t2, true), |_| false);
+        let f = Value::Object(b.fields.clone());
+        assert_eq!(f["repeat"], false);
+        assert_eq!(f["subagent_in_agent_worktree"], false);
+        assert_eq!(f["other_agent_repeat"], true);
+        assert_eq!(f["other_agent_direction"], "subagent_after_main");
+        assert_eq!(f["other_agent_call_running_at_start"], false);
+        assert_eq!(f["other_agent_seconds_since_that_call"], 9);
+        assert_eq!(f["other_agent_possible_writes_since_that_call"], 1);
+        assert_eq!(f["other_agent_changed_since_that_call"], "possible_writes");
+        assert_eq!(f["other_agent_earlier_call_outcome"], "succeeded");
+        // 独立的子代理看不到主线程那次的结果：没压缩过也是 false。
+        assert_eq!(f["other_agent_earlier_result_in_context"], false);
+        // 主线程那次还在跑时子代理又跑：只报正跑着，不报那次之后的统计。
+        let main = m.begin(args317(cmd, &rest, "", "t4", t2, true), |_| false);
+        let b2 = m.begin(args317(cmd, &rest, "agent-2", "t5", t2, true), |_| false);
+        let f = Value::Object(b2.fields.clone());
+        assert_eq!(f["other_agent_call_running_at_start"], true, "{f}");
+        assert!(f.get("other_agent_seconds_since_that_call").is_none(), "{f}");
+        m.settle(main, "succeeded", true, t2, 1, Ended::default());
+        m.settle(b2, "succeeded", true, t2, 1, Ended::default());
+        m.settle(b, "succeeded", true, t2, 1, Ended::default());
+        assert!(m.running_by.is_empty(), "结束时都摘掉了");
     }
 }

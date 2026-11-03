@@ -358,6 +358,7 @@ impl Simulation {
                 let rest = super::original_games::fit_system_rest(
                     render_system_rest(template, env),
                     original_games,
+                    profile.version,
                 );
                 super::lapis_anchor::fit_system_rest(rest, lapis)
             })

@@ -108,6 +108,7 @@ pub(crate) mod org_config_gate;
 pub(crate) mod original_games;
 pub(crate) mod sandy_plover;
 pub(crate) mod snoopy_creek;
+pub(crate) mod vivid_peach;
 pub(crate) use lucky_cerf::{
     Exposure as LuckyCerfExposure, LUCKY_CERF_FEATURE, exposures as lucky_cerf_exposures,
 };

@@ -645,6 +645,11 @@ impl ToolFamily {
 /// 估算：sonnet-5-5、haiku-5-5 与 opus 多出来的都只是这 83。
 const READ_ALLOW_LARGE_TOKENS: u64 = 83;
 
+/// 2.1.317 起 `ShareOnboardingGuide` 改写了 `mode` 里 `delete` 那句与 `short_code` 的说明，`input_schema` 多 84 字符，
+/// `non_mcp_tools_tokens` 各族（含 `-p`）一律多 21，工具数不变（`cap/auto-2.1.317-20261103-full`：`-p` 7742→7763，
+/// 交互式另有 Artifact 那 40，见 [`artifact_schema_delta`]）。
+const SHARE_GUIDE_TOKENS_2_1_317: u64 = 21;
+
 /// 2.1.300 起 `Artifact` 的 schema 按版本变，交互式各族（`-p` 没有 Artifact）的 token 跟着变、工具数不变；
 /// 关掉 Artifact 时连这部分一起减。逐版对抓包里 `Artifact.input_schema` 的 `round(长度 / 4)` 差：
 /// 2.1.300 加 `edits` 参数 +274（`cap/auto-2.1.300-20261015-full`：opus 等 14299、haiku-5-5 14269、
@@ -658,6 +663,9 @@ fn artifact_schema_delta(version: &str) -> u64 {
         // 那边另算，见 [`gateway_tool_tokens`]。Bash 加的那句 `@name` 提示不进这个估算（`-p` 带 Bash 却仍是 7742）。
         // 2.1.311 改写 `intent` 参数说明 +37：同一份资产 15620→15766 字符，3905→3942（`cap/auto-2.1.311-20261027-full`
         // 交互式各族 15502→15539，`-p` 仍是 7742）。Bash 那句 `cd` 说明同样不进这个估算。
+        // 2.1.317 `list` 加 `page_token` 参数 +40：同一份资产 15766→15929 字符，3942→3982（`cap/auto-2.1.317-20261103-full`
+        // 交互式各族比 2.1.316 多 61，减去各族共有的 [`SHARE_GUIDE_TOKENS_2_1_317`] 那 21）。
+        _ if version_at_least(version, "2.1.317") => 274 - 2 + 8 + 45 + 37 + 40,
         _ if version_at_least(version, "2.1.311") => 274 - 2 + 8 + 45 + 37,
         _ if version_at_least(version, "2.1.309") => 274 - 2 + 8 + 45,
         _ if version_at_least(version, "2.1.303") => 274 - 2 + 8,
@@ -954,6 +962,9 @@ where
                 continue;
             }
             let mut meta = substitute(&e.meta, subst);
+            if e.name == "tengu_deferred_tools_pool_change" {
+                deferred_pool_v317(&mut meta, subst.version);
+            }
             if e.name == "tengu_tool_search_mode_decision" {
                 meta = subst.tool_search.clone();
             }
@@ -1002,6 +1013,9 @@ where
                     context_tool_counts(v293, subst.sdk, subst.tool_family, off);
                 if version_at_least(subst.version, "2.1.296") {
                     tokens += READ_ALLOW_LARGE_TOKENS;
+                }
+                if version_at_least(subst.version, "2.1.317") {
+                    tokens += SHARE_GUIDE_TOKENS_2_1_317;
                 }
                 if subst.sdk {
                     if version_at_least(subst.version, "2.1.303") {
@@ -1258,3 +1272,12 @@ fn is_ide_transport(meta: &Value) -> bool {
 
 /// [`emit_template`] 的产物：带时间戳的事件与 Datadog 条目。
 pub(super) type TplOutput = (Vec<(DateTime<Utc>, Value)>, Vec<Value>);
+
+/// 2.1.317 起 `tengu_deferred_tools_pool_change` 在 `restoredCount` 后多 `runsAgainCount`（这一轮重新跑起来的延迟工具数，
+/// `cap/auto-2.1.317-20261103-full` 37 条都是 0）：主线程 / 子代理附件那两种（模板）与压缩后那条（[`super::events`]）
+/// 都走这里。
+pub(super) fn deferred_pool_v317(meta: &mut Value, version: &str) {
+    if version_at_least(version, "2.1.317") && meta.get("runsAgainCount").is_none() {
+        super::kind::insert_after(meta, "restoredCount", vec![("runsAgainCount", json!(0))]);
+    }
+}

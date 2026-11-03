@@ -258,6 +258,11 @@
           "minimum": 1,
           "maximum": 200
         },
+        "page_token": {
+          "description": "list only: the `next_page_token` a listing of the same scope gave, to list the artifacts after it.",
+          "type": "string",
+          "maxLength": 8192
+        },
         "scope": {
           "description": "list: which listing to return. 'mine' is the default. The others are 'shared', 'all', 'types', 'files' (with `url`) and 'assets' (with `url`, continued with `after`). See **Calls**.",
           "type": "string",
@@ -849,7 +854,7 @@
       "type": "object",
       "properties": {
         "mode": {
-          "description": "'check' (default): if ONBOARDING.md is present locally, uploads it to the most-recent guide (creates one if none exist); otherwise reports the existing link without uploading. 'update': upload to a specific guide by short_code. 'create': always make a new link. 'delete': remove a guide.",
+          "description": "'check' (default): if ONBOARDING.md is present locally, uploads it to the most-recent guide (creates one if none exist); otherwise reports the existing link without uploading. 'update': upload to a specific guide by short_code. 'create': always make a new link. 'delete': remove the guide named by short_code; with no short_code, nothing is deleted and the user's guides are listed.",
           "default": "check",
           "type": "string",
           "enum": [
@@ -860,7 +865,7 @@
           ]
         },
         "short_code": {
-          "description": "Short code of a specific guide to target (returned by a previous call). Honored by check, update, and delete — skips the org-wide lookup and targets this guide directly.",
+          "description": "Short code of one guide, from an earlier call's result. Required by delete. With check or update, targets that guide instead of the most recently updated one.",
           "type": "string",
           "pattern": "^[A-Za-z0-9_-]{1,64}$"
         }

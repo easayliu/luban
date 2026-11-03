@@ -32,12 +32,18 @@ pub(super) struct ToolUse {
     pub(super) command_len: usize,
     /// 对应 `tool_result` 的内容字符数（请求里那份原样量）；官方量的大小见 [`Self::result_size`]。
     pub(super) result_len: usize,
+    /// `tool_result` 正文（剥掉尾部提醒后）里有以 `head: ` 开头的行（官方 2.1.317 `Jt` 的 `/^head: /m`，按完整正文判，
+    /// [`Self::result_tail`] 只有末尾一截）。
+    pub(super) result_head_error: bool,
     /// 结果是官方的空输出占位时占位里的工具名（[`no_output_placeholder`]），是不是这个工具的空结果见
     /// [`Self::empty_result`]。
     pub(super) no_output_of: Option<String>,
     /// 结果太大被客户端落了盘、请求里只带预览（`<persisted-output>` 开头）时，预览里写的原始
     /// 大小（字节，按 `Output too large (58.9KB)` 还原）。见 [`persisted_original_size`]。
     pub(super) persisted_from: Option<usize>,
+    /// 结果是落盘预览（[`is_persisted_preview`]）：不管原始大小解不解得出（64 MiB 那种预览只写存了多少）。2.1.317 的
+    /// 重复命令统计据此记那次调用的 `longOutput.persisted`。
+    pub(super) result_persisted: bool,
     /// Read 成功时从结果还原出的原文（[`super::files::read_content`]），`file_operation.contentHash`
     /// 与文件历史的大小用它。别的工具、读图片、落了盘的为 `None`。
     pub(super) read_content: Option<String>,
@@ -70,6 +76,26 @@ pub(super) fn read_dedup_of(text: &str) -> Option<ReadDedup> {
     } else {
         None
     }
+}
+
+/// 结果是客户端落盘后的预览：正文（块数组取第一段文字）以 `<persisted-output>` 开头，前面可能另有一行
+/// `<artifact-content-authored-by-others/>`。官方两种落盘预览外层同是这个标记——平常的「Output too large (…). Full
+/// output saved to…」与超过 64 MiB 只存了前面一截的「Output exceeded the 64MB persist limit; only the first … were
+/// saved to…」，后者文件同样存下了；没存成的是 `<truncated-output>`，不算。原始大小解不解得出另看
+/// [`persisted_original_size`]。
+pub(super) fn is_persisted_preview(content: &Value) -> bool {
+    let text = match content {
+        Value::String(t) => t.as_str(),
+        Value::Array(blocks) => {
+            match blocks.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())) {
+                Some(t) => t,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    let text = text.strip_prefix("<artifact-content-authored-by-others/>\n").unwrap_or(text);
+    text.starts_with("<persisted-output>")
 }
 
 /// 被落盘的工具结果在请求里是一段预览：`<persisted-output>\nOutput too large (58.9KB). Full
@@ -244,6 +270,10 @@ pub(super) struct RequestShape {
     /// 的时候才记：message-threads 续轮的增量体就是这个样子，工具调用在上一条回复里，要由
     /// [`ThreadBase::fill`] 配回去。
     pub(super) orphan_results: Vec<ToolResultInfo>,
+    /// 这条请求体里全部 `tool_result`：id 与正文现在的状态（按出现先后，见 [`readable_of`]）。线程续轮的增量体只有新加的
+    /// 那几条。2.1.317 的重复命令统计据此判别的代理那次的结果在不在这条支线的上下文里
+    /// （[`super::bash_repeat::BashMeter::note_visible`]）。
+    pub(super) result_ids: Vec<ResultSeen>,
     pub(super) assistant_messages: usize,
     /// 全部消息的内容块数（字符串内容算一块）：`/compact` 那条 `reactive_compact_attempt` 估待摘要的消息数用。
     pub(super) content_blocks: usize,
@@ -334,6 +364,47 @@ pub(super) fn strip_trailing_reminder(text: &str) -> &str {
 /// [`ToolUse::result_tail`] 留多少个字符：比官方看的 8192 个码元多留一截，好往前找到换行。
 pub(super) const RESULT_TAIL_CHARS: usize = 9_000;
 
+/// 请求体里的一条 `tool_result`：id 与正文现在的状态（[`readable_of`]）。
+#[derive(Clone, Debug)]
+pub(super) struct ResultSeen {
+    pub(super) id: String,
+    pub(super) readable: super::bash_repeat::Readable,
+}
+
+/// 官方 2.1.317 `mE` 认一条 `tool_result` 还在上下文里的正文规则，两支各判一次（用哪支看那次调用结束时落没落盘，
+/// 由 [`super::bash_repeat`] 按记下的状态挑）：
+/// - 没落盘的那次按 `VJo`：正文不能是空串、不能是清掉的占位或落盘预览（`W`，先去掉开头那行
+///   `<artifact-content-authored-by-others/>`）、不能以 `<truncated-output>` 开头；
+/// - 落过盘的那次只要正文不恰是 `[Old tool result content cleared]` 就算。
+///
+/// 内容是块数组的两支都算（`W` 只看字符串、数组恒为真），没有内容的 `VJo` 不算。
+pub(super) fn readable_of(content: Option<&Value>) -> super::bash_repeat::Readable {
+    const CLEARED: &str = "[Old tool result content cleared]";
+    const OTHERS: &str = "<artifact-content-authored-by-others/>\n";
+    match content {
+        Some(Value::String(s)) => {
+            let bare = s.strip_prefix(OTHERS).unwrap_or(s);
+            super::bash_repeat::Readable {
+                plain: !s.is_empty()
+                    && bare != CLEARED
+                    && !bare.starts_with("<persisted-output>")
+                    && !s.starts_with("<truncated-output>"),
+                not_cleared: s != CLEARED,
+            }
+        }
+        Some(Value::Array(_)) => super::bash_repeat::Readable { plain: true, not_cleared: true },
+        Some(_) => super::bash_repeat::Readable { plain: false, not_cleared: true },
+        None => super::bash_repeat::Readable { plain: false, not_cleared: true },
+    }
+}
+
+/// `/^head: /m.test(s)`：某一行以 `head: ` 开头（JS 多行模式的 `^` 也认 `\r`、`\u2028`、`\u2029` 之后）。
+pub(super) fn has_head_error_line(s: &str) -> bool {
+    s.starts_with("head: ")
+        || s.match_indices("head: ")
+            .any(|(i, _)| s[..i].ends_with(['\n', '\r', '\u{2028}', '\u{2029}']))
+}
+
 /// 字符串最后 `n` 个字符。
 fn tail_chars(s: &str, n: usize) -> String {
     let count = s.chars().count();
@@ -346,8 +417,12 @@ pub(super) struct ToolResultInfo {
     pub(super) id: String,
     /// 内容字符数。
     pub(super) len: usize,
+    /// 见 [`ToolUse::result_head_error`]。
+    pub(super) head_error: bool,
     /// 见 [`ToolUse::persisted_from`]。
     pub(super) persisted: Option<usize>,
+    /// 见 [`ToolUse::result_persisted`]。
+    pub(super) persisted_preview: bool,
     pub(super) is_error: bool,
     /// 正文开头，见 [`ToolUse::result_head`]。
     pub(super) head: String,
@@ -442,7 +517,9 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
                     Some(ToolResultInfo {
                         id,
                         len,
+                        head_error: has_head_error_line(&text),
                         persisted: content.and_then(persisted_original_size),
+                        persisted_preview: content.is_some_and(is_persisted_preview),
                         is_error: b.get("is_error").and_then(|e| e.as_bool()) == Some(true),
                         head: text.chars().take(400).collect(),
                         tail: tail_chars(&text, RESULT_TAIL_CHARS),
@@ -554,8 +631,10 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         input_len: tool_input_len(b.get("name")?.as_str()?, &input),
                         command_len,
                         result_len: hit.map_or(0, |r| r.len),
+                        result_head_error: hit.is_some_and(|r| r.head_error),
                         no_output_of: hit.and_then(|r| r.no_output_of.clone()),
                         persisted_from: hit.and_then(|r| r.persisted),
+                        result_persisted: hit.is_some_and(|r| r.persisted_preview),
                         is_error: hit.is_some_and(|r| r.is_error),
                         result_head: hit.map(|r| r.head.clone()).unwrap_or_default(),
                         result_tail: hit.map(|r| r.tail.clone()).unwrap_or_default(),
@@ -765,6 +844,11 @@ pub(super) fn error_trace(
         // 猜不出，先沿用 2.1.316 的。
         ("2.1.315" | "2.1.316", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-hyyf2dgs.js:5:1510"))
+        }
+        // 2.1.317 摘要照旧，顶帧换了块；5xx 类压缩后是 `Onn`，过得了构造名校验，**又带上了 `error_constructor`**
+        // （`cap/auto-2.1.317-20261103-retry` 那条 529）。
+        ("2.1.317", Some(s)) if s >= 500 => {
+            Some((Some("Onn"), "5b32b751db51", "chunk-7fawza1z.js:5:1510"))
         }
         _ => None,
     }
@@ -1464,6 +1548,17 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
                 .map(|(name, _)| name.trim().to_string())
                 .filter(|n| !n.is_empty());
         }
+        shape.result_ids = msgs
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .filter_map(|b| {
+                let id = b.get("tool_use_id")?.as_str()?.to_string();
+                Some(ResultSeen { id, readable: readable_of(b.get("content")) })
+            })
+            .collect();
         if !shape.new_prompt {
             shape.tool_uses = tool_uses_of(msgs);
             if shape.tool_uses.is_empty() {

@@ -5647,6 +5647,9 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
         // 2.1.311 Artifact `intent` 说明改写 +37（`cap/auto-2.1.311-20261027-full` 交互式各族一律 +37；Bash 那句
         // `cd` 说明不进估算）。
         ("2.1.311", 15539 - 1152, 15509 - 1152, 16010 - 1152),
+        // 2.1.317 Artifact 加 `page_token` +40、ShareOnboardingGuide 改写 +21（`cap/auto-2.1.317-20261103-full` 交互式
+        // 各族一律 +61）。
+        ("2.1.317", 15600 - 1152, 15570 - 1152, 16071 - 1152),
     ] {
         assert_eq!(ctx(ver, opus, false), (34, o), "{ver} opus");
         assert_eq!(ctx(ver, h55, false), (33, h), "{ver} haiku-5-5");
@@ -5658,6 +5661,8 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
     assert_eq!(ctx("2.1.309", opus, true), (26, 7742 - 1152));
     // 2.1.311 的 +37 同样不落到 `-p` 头上（抓包仍是 7742）。
     assert_eq!(ctx("2.1.311", opus, true), (26, 7742 - 1152));
+    // 2.1.317 只有 ShareOnboardingGuide 那 21 落到 `-p` 头上（抓包 7763）。
+    assert_eq!(ctx("2.1.317", opus, true), (26, 7763 - 1152));
 
     // 关掉 Artifact（带官方工具集 Agent+Read，留着 ListAgents / SendFeedback，只少 Artifact 一组）时，
     // `artifact_schema_delta` 不加（`!off.artifact` 为假），连 Artifact 的 schema 一起减：opus 主线程
@@ -6377,6 +6382,7 @@ fn lucky_cerf_exposure_is_not_repeated_after_a_clear() {
 #[test]
 fn idle_exit_prints_the_resume_hint_from_2_1_299() {
     for (ua, want) in [
+        ("claude-cli/2.1.317 (external, cli)", true),
         ("claude-cli/2.1.299 (external, cli)", true),
         ("claude-cli/2.1.296 (external, cli)", false),
     ] {
@@ -6398,6 +6404,14 @@ fn idle_exit_prints_the_resume_hint_from_2_1_299() {
                 (&m["arg"], &m["title"], &m["worktree"], &m["advice"]),
                 (&json!("id"), &json!("absent"), &json!("absent"), &json!(false))
             );
+            // 2.1.317 末尾多 `flags`（不带参数起的会话是 false），更早没有。
+            let v317 = ua.contains("2.1.317");
+            assert_eq!(m.get("flags"), v317.then_some(&json!(false)), "{ua}: {m}");
+            if v317 {
+                let keys: Vec<&String> = m.as_object().unwrap().keys().collect();
+                let at = keys.iter().position(|k| *k == "advice").unwrap();
+                assert_eq!(keys[at + 1], "flags", "{m}");
+            }
         }
     }
 }
@@ -7471,7 +7485,7 @@ fn capability_events_follow_client_data_overrides() {
         if text {
             let last = body["system"].as_array_mut().unwrap().last_mut().unwrap();
             let t = last["text"].as_str().unwrap().to_string();
-            last["text"] = json!(format!("{t}\n\n{}", crate::proxy::original_games::TEXT));
+            last["text"] = json!(format!("{t}\n\n{}", crate::proxy::original_games::TEXT_2_1_314));
         }
         let t = Telemetry::default();
         let mut c = call(body.to_string().into_bytes(), "req_games", "end_turn");
@@ -7673,7 +7687,7 @@ fn bash_meta_v316_key_order() {
     repeat.insert("compared_statements".into(), json!(1));
     repeat.insert("unchanged_repeats".into(), json!(0));
     let out = "test_add ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nOK\n";
-    super::tools::bash_meta_v316(&mut meta, &run, out, 0, false, repeat);
+    super::tools::bash_meta_v316(&mut meta, &run, out, 0, false, repeat, None);
     let keys: Vec<&str> = meta.as_object().unwrap().keys().map(String::as_str).collect();
     let at = |k: &str| keys.iter().position(|x| *x == k).unwrap_or_else(|| panic!("{k}: {keys:?}"));
     assert_eq!(meta["bash_command_kinds"], "python,runs_tests");
@@ -7699,12 +7713,12 @@ fn bash_meta_v316_key_order() {
     // 非零退出时「通过」改报 unknown；不跑测试的命令没有范围也没有结果。
     let mut m2 = meta.clone();
     m2.as_object_mut().unwrap().retain(|k, _| !k.starts_with("bash_test") && k != "bash_programs");
-    super::tools::bash_meta_v316(&mut m2, &run, out, 1, false, serde_json::Map::new());
+    super::tools::bash_meta_v316(&mut m2, &run, out, 1, false, serde_json::Map::new(), None);
     assert_eq!(m2["bash_test_outcome"], "unknown");
     // `run_in_background` 转到后台的当场没有结果（官方 `wrr` 见 `backgroundTaskId` 即返回）。
     let mut m3 = meta.clone();
     m3.as_object_mut().unwrap().retain(|k, _| !k.starts_with("bash_test") && k != "bash_programs");
-    super::tools::bash_meta_v316(&mut m3, &run, out, 0, true, serde_json::Map::new());
+    super::tools::bash_meta_v316(&mut m3, &run, out, 0, true, serde_json::Map::new(), None);
     assert!(m3.get("bash_test_outcome").is_none(), "{m3}");
     assert_eq!(m3["bash_test_scope"], "narrowed", "范围照报");
     let ls = super::bash_kinds::shell_run("ls -la", true);
@@ -8174,6 +8188,91 @@ fn version_2_1_314_telemetry_shape() {
     assert_eq!(k[at + 1..at + 3], ["leaveOutPasses", "preservedUuidCount"], "{succeeded}");
     let (attempt, succeeded) = compact("claude-cli/2.1.312 (external, cli)");
     assert!(attempt.get("leaveOutPasses").is_none() && succeeded.get("leaveOutPasses").is_none());
+}
+
+/// 2.1.317（`cap/auto-2.1.317-20261103-*`）：5xx 的栈换块且带上构造名 `Onn`；Bash 执行事件在 `output_end_shown` 后多
+/// 「输出交给 tail」那四项（macOS 不报 `tail_input_flag_on` / `tail_input_kept_bytes`），重复命令统计只在会话抽中时报
+/// （[`super::bash_repeat::metered`]）；`feature_ok{repl_rewind_conversation}` 带 `source`；
+/// `deferred_tools_pool_change` 在 `restoredCount` 后多 `runsAgainCount`；`/compact` 留下的那段没有思考块时不报
+/// `keptThinkingStripDecidedBy`（各版同）。
+#[test]
+fn version_2_1_317_telemetry_shape() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.317 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert_eq!(
+            (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("Onn"), &json!("5b32b751db51"), &json!("chunk-7fawza1z.js:5:1510")),
+            "2.1.317 {n}"
+        );
+    }
+    assert!(seen > 0);
+
+    // Bash：一条跑测试再交给 tail 的命令。
+    let bash_event = |ua: &str, command: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":command,"description":"run"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Ran 4 tests in 0.001s\n\nOK"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_bash_tool_command_executed")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let m = bash_event("claude-cli/2.1.317 (external, cli)", "python3 -m unittest 2>&1 | tail -5");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "output_end_shown").unwrap();
+    assert_eq!(
+        keys[at + 1..at + 5],
+        [
+            "tail_input_candidate",
+            "tail_input_candidate_other",
+            "tail_input_copied",
+            "tail_input_kept"
+        ],
+        "{m}"
+    );
+    assert_eq!(
+        (&m["tail_input_candidate"], &m["tail_input_candidate_other"], &m["tail_input_kept"]),
+        (&json!(true), &json!(false), &json!(false))
+    );
+    assert!(m.get("tail_input_flag_on").is_none() && m.get("tail_input_kept_bytes").is_none());
+    let metered = super::bash_repeat::metered(SESSION, 0.1);
+    assert_eq!(m.get("repeat").is_some(), metered, "重复命令统计只在抽中的会话报: {m}");
+    // 过了 `head` 的「通过」：发出的正文删了首尾空白行，证明不了没截断，报 unknown（不交给 tail，候选两项都是 false）。
+    let m = bash_event("claude-cli/2.1.317 (external, cli)", "python3 -m unittest 2>&1 | head -20");
+    assert_eq!(m["bash_test_outcome"], "unknown", "{m}");
+    let m = bash_event("claude-cli/2.1.317 (external, cli)", "ls -la | tail -3");
+    assert_eq!(
+        (&m["tail_input_candidate"], &m["tail_input_candidate_other"]),
+        (&json!(false), &json!(true))
+    );
+    let m = bash_event("claude-cli/2.1.316 (external, cli)", "python3 -m unittest 2>&1 | tail -5");
+    assert!(m.get("tail_input_candidate").is_none(), "2.1.316 没有: {m}");
+    assert!(m.get("repeat").is_some(), "2.1.316 不抽样: {m}");
+
+    // 压缩后那条池子事件。
+    let mut pool =
+        json!({"addedCount": 0, "removedCount": 0, "restoredCount": 0, "messagesLength": 3});
+    super::template::deferred_pool_v317(&mut pool, "2.1.317");
+    let keys: Vec<&str> = pool.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["addedCount", "removedCount", "restoredCount", "runsAgainCount", "messagesLength"]
+    );
+    let mut old = json!({"restoredCount": 0});
+    super::template::deferred_pool_v317(&mut old, "2.1.316");
+    assert!(old.get("runsAgainCount").is_none());
 }
 
 /// 2.1.314 `api_success` 新旧图片四项的口径（官方 `kdn`）：只数 base64 来源的图片，工具结果内容里的也数（只下一层）；
@@ -9235,6 +9334,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.317 (external, cli)", "9a93a625ab80", "chunk-vrwkjdrd.js:3571:9103"),
+        ("claude-cli/2.1.316 (external, cli)", "9396e613b9d8", "chunk-qd604jgh.js:3538:8129"),
         ("claude-cli/2.1.314 (external, cli)", "d67c18908567", "chunk-sq7yspzm.js:3529:7027"),
         ("claude-cli/2.1.312 (external, cli)", "9eb7b5f2f5a2", "chunk-r5cyd28m.js:3545:6820"),
         ("claude-cli/2.1.311 (external, cli)", "11211b82294f", "chunk-2ht8z368.js:3554:6820"),
@@ -11342,4 +11443,75 @@ fn passthrough_tether_follows_the_thread_beta() {
         crate::config::CC_BETA_MESSAGE_THREADS
     );
     assert!(tethers(&with) > 0, "带线程 beta 照报");
+}
+
+/// 2.1.317 `mE` / `VJo` / `W`：没落盘那支（`plain`）清掉的占位、截断占位、空串、落盘预览都不算，块数组算；落过盘那支
+/// （`not_cleared`）只有正文恰是清掉的占位才不算。请求形态的 `result_ids` 收全部结果、各带这两个判断。
+#[test]
+fn readable_tool_results_follow_the_official_rule() {
+    let r = |v: Value| {
+        let x = super::shape::readable_of(Some(&v));
+        (x.plain, x.not_cleared)
+    };
+    assert_eq!(r(json!("Ran 4 tests\n\nOK")), (true, true));
+    assert_eq!(r(json!("[Old tool result content cleared]")), (false, false));
+    assert_eq!(
+        r(json!("<artifact-content-authored-by-others/>\n[Old tool result content cleared]")),
+        (false, true)
+    );
+    assert_eq!(r(json!("<truncated-output>…")), (false, true));
+    assert_eq!(r(json!("")), (false, true));
+    assert_eq!(r(json!("<persisted-output>\nOutput too large (58.9KB)…")), (false, true));
+    assert_eq!(
+        r(json!([{"type": "text", "text": "[Old tool result content cleared]"}])),
+        (true, true)
+    );
+    let body = json!({"model": "claude-opus-5-5", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "Bash", "input": {}},
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "a", "content": "[Old tool result content cleared]"},
+            {"type": "tool_result", "tool_use_id": "b", "content": "ok"}]}
+    ]});
+    let shape = super::shape::parse_shape(body.to_string().as_bytes()).unwrap();
+    let got: Vec<(&str, bool)> =
+        shape.result_ids.iter().map(|x| (x.id.as_str(), x.readable.plain)).collect();
+    assert_eq!(got, [("a", false), ("b", true)]);
+}
+
+/// 落盘预览按外层标记认，不看原始大小解不解得出：超过 64 MiB 只存了前一截的那种（「Output exceeded the 64MB persist
+/// limit…」）同样是落了盘，解不出原始大小；没存成的 `<truncated-output>` 不算。
+#[test]
+fn persisted_previews_are_recognised_without_a_size() {
+    let big = json!(
+        "<persisted-output>\nOutput exceeded the 64MB persist limit; only the first 64MB were saved to: /tmp/x.txt\n\nPreview (first 2KB):\nabc\n"
+    );
+    assert!(super::shape::is_persisted_preview(&big));
+    assert_eq!(super::shape::persisted_original_size(&big), None);
+    let normal = json!(
+        "<persisted-output>\nOutput too large (58.9KB). Full output saved to: /tmp/y.txt\n\n"
+    );
+    assert!(super::shape::is_persisted_preview(&normal));
+    assert_eq!(super::shape::persisted_original_size(&normal), Some(60_314));
+    let prefixed = json!(
+        "<artifact-content-authored-by-others/>\n<persisted-output>\nOutput too large (1KB)."
+    );
+    assert!(super::shape::is_persisted_preview(&prefixed));
+    assert!(super::shape::is_persisted_preview(
+        &json!([{"type": "text", "text": "<persisted-output>\n…"}])
+    ));
+    assert!(!super::shape::is_persisted_preview(&json!(
+        "<truncated-output>\nOutput too large (2MB). It could not be saved…"
+    )));
+    assert!(!super::shape::is_persisted_preview(&json!("ok")));
+    let body = json!({"model": "claude-opus-5-5", "messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "cat big"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": big}]}
+    ]});
+    let shape = super::shape::parse_shape(body.to_string().as_bytes()).unwrap();
+    let tu = &shape.tool_uses[0];
+    assert!(tu.result_persisted && tu.persisted_from.is_none(), "{tu:?}");
 }

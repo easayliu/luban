@@ -460,8 +460,10 @@ impl ThreadBase {
                         // 原文的（[`ToolCall`]），[`Telemetry::process`] 随后按 id 换成真值。
                         command_len: if name == "Bash" { input_len.saturating_sub(40) } else { 0 },
                         result_len: r.len,
+                        result_head_error: r.head_error,
                         no_output_of: r.no_output_of.clone(),
                         persisted_from: r.persisted,
+                        result_persisted: r.persisted_preview,
                         is_error: r.is_error,
                         result_head: r.head.clone(),
                         result_tail: r.tail.clone(),
@@ -712,6 +714,12 @@ pub(super) struct TurnFacts {
     /// `max_input_tokens` / `config_flag`、加 `config_writer`，失败 Bash 与 5xx 的错误栈换块
     /// （`cap/auto-2.1.316-20261031-*`）。
     pub(super) v316: bool,
+    /// 2.1.317：Bash 执行 / 失败事件在 `output_end_shown` 后多「输出交给 tail」那组（[`super::tools::bash_meta_v317`]），
+    /// `bash_test_outcome` 里 `head` 没截掉东西的照报，重复命令统计按会话抽样（[`Self::bash_metered`]）并换成跨代理的布局，
+    /// 失败 Bash 与 5xx 的错误栈换块、5xx 带上构造名（`cap/auto-2.1.317-20261103-*`）。
+    pub(super) v317: bool,
+    /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
+    pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
     /// [`State::tools_used_header_sent`]），而这个进程还没报过（[`Session::tools_used_header_reported`]）：这条报
     /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`

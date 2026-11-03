@@ -584,16 +584,14 @@ impl Telemetry {
             // 2.1.299 起退出时先打印「Resume this session with: claude --resume <id>」并报一条，与
             // `config_cache_stats` 同一毫秒、排在它前面（`cap/auto-2.1.299-20261014-full` 每个交互式
             // 会话退出时一条：`arg: id`，没起名、不在 worktree、没有额外提示）。
+            // 2.1.317 末尾多 `flags`：重开会话那行命令里有没有带上启动时的参数（`--model` 这类能原样再传的）；代理模拟的
+            // 是不带参数起的 `claude`，恒 false（`cap/auto-2.1.317-20261103-full` 带参数起的会话是 true）。
             if version_at_least(&identity.version, "2.1.299") {
-                events.push((
-                    t0,
-                    identity.event(
-                        "tengu_resume_hint_printed",
-                        t0,
-                        &ctx(t0),
-                        json!({ "arg": "id", "title": "absent", "worktree": "absent", "advice": false }),
-                    ),
-                ));
+                let mut meta = json!({ "arg": "id", "title": "absent", "worktree": "absent", "advice": false });
+                if version_at_least(&identity.version, "2.1.317") {
+                    meta["flags"] = json!(false);
+                }
+                events.push((t0, identity.event("tengu_resume_hint_printed", t0, &ctx(t0), meta)));
             }
             // 配置缓存命中数随会话长短走：抓包里 7 秒的会话 3779、一小时的 11054。
             let cache_hits = 3_000 + u64::from(s.prompt_index) * 2_500;

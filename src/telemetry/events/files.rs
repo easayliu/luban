@@ -389,6 +389,7 @@ impl EventBuilder<'_> {
             meta["attachmentCount"] = json!(0);
             meta["callSite"] = json!("reactive_compact");
             meta["querySource"] = json!("unknown");
+            super::super::template::deferred_pool_v317(&mut meta, self.subst.version);
             self.push(t_deferred, "tengu_deferred_tools_pool_change", meta);
             // 2.1.311：重宣告的延迟工具里有压缩前加载过的，官方想在宣告里点名它们，开关 `tengu_radiant_lemur`
             // 没开（服务端 false），报一条 `feature_sad{flag_off}` 带个数，紧跟在池子那条后面（同一毫秒）。
@@ -511,7 +512,11 @@ impl EventBuilder<'_> {
         put("preservedMessageCount", json!(st.preserved));
         put("keptThinkingBlockCount", json!(st.kept_thinking));
         put("keptThinkingStripped", json!(false));
-        put("keptThinkingStripDecidedBy", json!("flag"));
+        // 留下的那段里没有思考块时官方不判剥不剥（`DQe`：`r === 0` 直接返回 `decidedBy: undefined`），这一项不报
+        // （`cap/auto-2.1.317-20261103-full` A18 那条 0 块；2.1.316 那条 1 块，报 `flag`）。
+        if st.kept_thinking > 0 {
+            put("keptThinkingStripDecidedBy", json!("flag"));
+        }
         put("forkAssistantMessageCount", json!(1));
         put("summaryPromptArm", json!("no_scratchpad"));
         put("trigger", json!("manual"));

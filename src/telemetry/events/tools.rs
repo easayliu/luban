@@ -544,6 +544,8 @@ impl EventBuilder<'_> {
             v312,
             v314,
             v316,
+            v317,
+            bash_metered,
             prompt_seq,
             ..
         } = *env.f;
@@ -652,9 +654,29 @@ impl EventBuilder<'_> {
                         tool_use_id: Some(&tu.id),
                         now: started.into(),
                         prompt_seq,
+                        v317,
+                        metered: bash_metered,
+                        // 子代理跑不跑在自己的 worktree 里代理分不清（Agent 的 `isolation` 在父线程那条调用上），按否。
+                        in_agent_worktree: false,
                     },
                     |c| bash_read_only_for_meter(c, Some(cwd)),
                 )
+            });
+            // 2.1.317：这条命令算不算「输出交给 tail」的候选（模型发起的调用都看；用户 `!` 跑的在别处，恒不算）。
+            let tail_line =
+                v317.then(|| super::super::bash_kinds::tail_input_line(command)).flatten();
+            // 输出落没落盘按这次结果判（客户端第一次把它发上来时就是落盘预览），记进计量器、之后判上下文时用。
+            let tail = super::super::bash_repeat::Ended {
+                line: tail_line,
+                kept: Some(false),
+                persisted: tu.result_persisted,
+            };
+            // 2.1.317 判测试结果时 `head` 截没截东西：要命令原始输出的换行数，客户端发出的正文删了首尾空白行、恢复不出来
+            // （见 [`super::super::bash_kinds::HeadCheck`]），过了 `head` 的「通过」按截了算；报错行按完整正文判。
+            let head = v317.then_some(super::super::bash_kinds::HeadCheck {
+                command,
+                newlines: None,
+                head_error: tu.result_head_error,
             });
             // 官方量的是命令的原始输出，末尾那个换行在 tool_result 里被去掉了（10 对 9、258 对
             // 257……）；转到后台的那种当场只有一个换行（`00146`）。
@@ -700,12 +722,17 @@ impl EventBuilder<'_> {
                             code,
                             backgrounded,
                             b.fields.clone(),
+                            head,
                         );
+                        if v317 {
+                            bash_meta_v317(&mut bash, tail_line);
+                        }
                         bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
                     }
                 }
                 if let Some(b) = begun {
-                    self.files.bash_meter.settle(b, "failed", false, t_done.into(), prompt_seq);
+                    let at = t_done.into();
+                    self.files.bash_meter.settle(b, "failed", false, at, prompt_seq, tail);
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_failed", bash);
                 self.own_betas_scope = false;
@@ -727,13 +754,18 @@ impl EventBuilder<'_> {
                             0,
                             backgrounded,
                             b.fields.clone(),
+                            head,
                         );
+                        if v317 {
+                            bash_meta_v317(&mut bash, tail_line);
+                        }
                         bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
                     }
                 }
                 if let Some(b) = begun {
                     let outcome = if backgrounded { "started_in_background" } else { "succeeded" };
-                    self.files.bash_meter.settle(b, outcome, true, t_done.into(), prompt_seq);
+                    let at = t_done.into();
+                    self.files.bash_meter.settle(b, outcome, true, at, prompt_seq, tail);
                 }
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
                 self.own_betas_scope = false;
@@ -888,7 +920,11 @@ impl EventBuilder<'_> {
             // 摘要、行列、块名都换了。
             // 2.1.316（`cap/auto-2.1.316-20261031-bashfail` 与全量包里三条，同值）摘要、行列、块名都换了；2.1.315 没抓，
             // 它的打包块名与 2.1.316 不同，摘要也就猜不出，先沿用 2.1.316 的。
-            if v316 {
+            // 2.1.317（`cap/auto-2.1.317-20261103-bashfail`，同一次跑的 2.1.316 对照复现出 9396e613b9d8）摘要、行列、块名都换了。
+            if v317 {
+                err["error_stack_hash"] = json!("9a93a625ab80");
+                err["error_top_frame"] = json!("chunk-vrwkjdrd.js:3571:9103");
+            } else if v316 {
                 err["error_stack_hash"] = json!("9396e613b9d8");
                 err["error_top_frame"] = json!("chunk-qd604jgh.js:3538:8129");
             } else if v314 {

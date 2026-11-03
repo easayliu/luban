@@ -33,6 +33,7 @@ mod v2_1_311;
 mod v2_1_312;
 mod v2_1_314;
 mod v2_1_316;
+mod v2_1_317;
 
 pub use betas::*;
 pub use client::*;
@@ -64,6 +65,7 @@ pub use v2_1_311::*;
 pub use v2_1_312::*;
 pub use v2_1_314::*;
 pub use v2_1_316::*;
+pub use v2_1_317::*;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +258,8 @@ mod tests {
             // 2.1.315 与 2.1.316 的 JS 层只差一个 plist 串，读到 2.1.315 也落 2.1.316 那张。
             assert_eq!(cc_profile_at(kind, Some((2, 1, 315))).version, "2.1.316", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 316))).version, "2.1.316", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.316", "模拟路径用 2.1.316 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 317))).version, "2.1.317", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.317", "模拟路径用 2.1.317 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
             let (old, mid) =
                 (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
@@ -363,6 +366,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.313").is_none(), "2.1.313 没有发布");
         assert!(cc_profile_exact(MainOpus, "2.1.316").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.315").is_none(), "2.1.315 没有单独的表");
+        assert!(cc_profile_exact(MainOpus, "2.1.317").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

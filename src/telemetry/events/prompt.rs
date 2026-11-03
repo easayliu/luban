@@ -494,16 +494,36 @@ impl EventBuilder<'_> {
                                     tool_use_id: None,
                                     now: at,
                                     prompt_seq: env.f.prompt_seq,
+                                    v317: env.f.v317,
+                                    metered: env.f.bash_metered,
+                                    in_agent_worktree: false,
                                 },
                                 |_| false,
                             );
-                            bash_meta_v316(&mut meta, &run, "", 0, false, begun.fields.clone());
+                            let v317 = env.f.v317;
+                            let head = v317.then_some(super::super::bash_kinds::HeadCheck {
+                                command: cmd,
+                                newlines: None,
+                                head_error: false,
+                            });
+                            let fields = begun.fields.clone();
+                            bash_meta_v316(&mut meta, &run, "", 0, false, fields, head);
+                            // 2.1.317：用户 `!` 跑的不看「输出交给 tail」，那组恒 false。
+                            if v317 {
+                                bash_meta_v317(&mut meta, None);
+                            }
+                            let tail = super::super::bash_repeat::Ended {
+                                line: None,
+                                kept: Some(false),
+                                persisted: false,
+                            };
                             self.files.bash_meter.settle(
                                 begun,
                                 "succeeded",
                                 true,
                                 at,
                                 env.f.prompt_seq,
+                                tail,
                             );
                         }
                     }

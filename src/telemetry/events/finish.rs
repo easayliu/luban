@@ -716,7 +716,17 @@ impl EventBuilder<'_> {
                         "source": "auto_restore_cancel"
                     }),
                 );
-                self.push_dd(t5, "tengu_feature_ok", feature("repl_rewind_conversation"));
+                // 2.1.317 起带上这次回退的来由（与 `conversation_rewind` 那项同值，`cap/auto-2.1.317-20261103-full` B4）。
+                let ok = if env.f.v317 {
+                    feature_with(
+                        "repl_rewind_conversation",
+                        json!({ "source": "auto_restore_cancel" }),
+                        true,
+                    )
+                } else {
+                    feature("repl_rewind_conversation")
+                };
+                self.push_dd(t5, "tengu_feature_ok", ok);
             }
         } else if is_main && turn_over {
             self.take_tpl(&tpl.turn, t_end);

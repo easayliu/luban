@@ -21,8 +21,21 @@ use std::sync::LazyLock;
 /// 能力名（`client_data` 里同名一项）。
 const CAPABILITY: &str = "original_games_guidance";
 
-/// 那一段正文（2.1.314 `Jsn`，逐字取自可执行文件，与抓包一致）。
-pub(crate) const TEXT: &str = "Do build original games, games in a genre, and games from the user's own designs and assets. Don't build a recreation of a specific existing game, even if it is renamed or called original.";
+/// 那一段正文，2.1.317 起的写法（`cap/auto-2.1.317-20261103-full` 的 opus 会话第四块，比 2.1.316 多 77 字节：「in a genre」后补
+/// 「or with similar mechanics」、「existing game」后补括号里那串）。
+pub(crate) const TEXT: &str = "Do build original games, games in a genre or with similar mechanics, and games from the user's own designs and assets. Don't build a recreation of a specific existing game (its name, characters, art, music, levels or look), even if it is renamed or called original.";
+
+/// 2.1.314 ~ 2.1.316 的写法（2.1.314 `Jsn`，逐字取自可执行文件，与抓包一致）。
+pub(crate) const TEXT_2_1_314: &str = "Do build original games, games in a genre, and games from the user's own designs and assets. Don't build a recreation of a specific existing game, even if it is renamed or called original.";
+
+/// `version` 这一版的正文：2.1.317 起是 [`TEXT`]，更早是 [`TEXT_2_1_314`]。读不出版本的按最新那版。
+pub(crate) fn text_for(version: &str) -> &'static str {
+    if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 317)) {
+        TEXT_2_1_314
+    } else {
+        TEXT
+    }
+}
 
 /// `(号, 模型键)` → bootstrap `client_data` 里这一项显式下发的布尔值（不是布尔、没下发的不记，按模型默认）。
 static CLIENT_DATA: LazyLock<parking_lot::RwLock<HashMap<(i64, String), bool>>> =
@@ -93,19 +106,21 @@ pub(crate) fn client_data_event(
     Some((name, serde_json::json!({ "capability": CAPABILITY, "model": model })))
 }
 
-/// 第四块（[`crate::proxy::render_system_rest`] 渲染出来的）插上这一段：模板末尾是 `<total_tokens>` 那行时插在它前面、
-/// 两段之间空一行；没有那行就接在末尾。`on` 为假原样返回。先于 [`super::lapis_anchor::fit_system_rest`] 调，后者去掉
-/// 那行时连同它前面的空行一起去掉，剩下的正好以这一段收尾（`cap/auto-2.1.314-20261030-full` 的 opus 会话）。
-pub(crate) fn fit_system_rest(rest: String, on: bool) -> String {
+/// 第四块（[`crate::proxy::render_system_rest`] 渲染出来的）插上 `version` 那一版的这一段（[`text_for`]）：模板末尾是
+/// `<total_tokens>` 那行时插在它前面、两段之间空一行；没有那行就接在末尾。`on` 为假原样返回。先于
+/// [`super::lapis_anchor::fit_system_rest`] 调，后者去掉那行时连同它前面的空行一起去掉，剩下的正好以这一段收尾
+/// （`cap/auto-2.1.314-20261030-full`、`cap/auto-2.1.317-20261103-full` 的 opus 会话）。
+pub(crate) fn fit_system_rest(rest: String, on: bool, version: &str) -> String {
     if !on {
         return rest;
     }
+    let text = text_for(version);
     let mut out = rest;
     match out.rfind("<total_tokens>").filter(|at| out[..*at].ends_with("\n\n")) {
-        Some(at) => out.insert_str(at, &format!("{TEXT}\n\n")),
+        Some(at) => out.insert_str(at, &format!("{text}\n\n")),
         None => {
             out.push_str("\n\n");
-            out.push_str(TEXT);
+            out.push_str(text);
         }
     }
     out
@@ -187,13 +202,13 @@ mod tests {
         let tt = "<total_tokens>15000000 tokens left</total_tokens>";
         let rest = format!("…an exhaustive survey\n\n{tt}");
         assert_eq!(
-            fit_system_rest(rest.clone(), true),
+            fit_system_rest(rest.clone(), true, "2.1.317"),
             format!("…an exhaustive survey\n\n{TEXT}\n\n{tt}")
         );
-        assert_eq!(fit_system_rest(rest.clone(), false), rest);
+        assert_eq!(fit_system_rest(rest.clone(), false, "2.1.317"), rest);
         // 没有那行（档位已是 off 的模板）就接在末尾。
         assert_eq!(
-            fit_system_rest("…an exhaustive survey".into(), true),
+            fit_system_rest("…an exhaustive survey".into(), true, "2.1.317"),
             format!("…an exhaustive survey\n\n{TEXT}")
         );
         // 与 `<total_tokens>` 那一档剪裁连用：off 时剩下的以这一段收尾。
@@ -202,9 +217,21 @@ mod tests {
             ..crate::proxy::lapis_anchor::SessionMode::DEFAULT
         };
         assert_eq!(
-            crate::proxy::lapis_anchor::fit_system_rest(fit_system_rest(rest, true), off),
+            crate::proxy::lapis_anchor::fit_system_rest(
+                fit_system_rest(rest.clone(), true, "2.1.317"),
+                off
+            ),
             format!("…an exhaustive survey\n\n{TEXT}")
         );
-        assert_eq!(TEXT.len(), 188, "抓包里多出的 190 字节是这一段加前面的空行");
+        assert_eq!(TEXT_2_1_314.len(), 188, "2.1.314 抓包里多出的 190 字节是这一段加前面的空行");
+        assert_eq!(TEXT.len(), 188 + 77, "2.1.317 比 2.1.316 又多 77 字节");
+        // 2.1.314 ~ 2.1.316 的会话插旧写法。
+        for v in ["2.1.314", "2.1.316"] {
+            assert_eq!(
+                fit_system_rest(rest.clone(), true, v),
+                format!("…an exhaustive survey\n\n{TEXT_2_1_314}\n\n{tt}"),
+                "{v}"
+            );
+        }
     }
 }

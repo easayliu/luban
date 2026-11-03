@@ -484,6 +484,15 @@ impl Telemetry {
         // 2.1.315 起：Bash 事件多程序名、测试范围 / 结果与重复命令统计，错误栈换块，见 [`TurnFacts::v316`]（只抓了
         // 2.1.316，2.1.315 的 JS 层与它只差一个 plist 串）。
         let v316 = version_at_least(&version, "2.1.315");
+        // 2.1.317：Bash 事件多「输出交给 tail」那组、`bash_test_outcome` 的 `head` 放宽、重复命令统计按会话抽样并换布局，
+        // 错误栈换块、5xx 带构造名，见 [`TurnFacts::v317`]。
+        let v317 = version_at_least(&version, "2.1.317");
+        // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
+        let bash_metered = v317
+            && super::bash_repeat::metered(
+                &session_id,
+                crate::proxy::vivid_peach::rate(call.cred_id),
+            );
         let safety_events =
             v307 && crate::proxy::snoopy_creek::account_enabled(call.cred_id, &version);
         // 客户端自己注入的一轮（后台任务通知 / 同伴会话）：没有提交、粘贴、渲染那几条，只有
@@ -611,7 +620,7 @@ impl Telemetry {
             })
             .flatten()
             .filter(|(name, _)| {
-                let text = crate::proxy::original_games::TEXT.as_bytes();
+                let text = crate::proxy::original_games::text_for(&version).as_bytes();
                 let has = call.body.windows(text.len()).any(|w| w == text);
                 !own_system || has == (*name == "tengu_model_capability_from_client_data")
             })
@@ -837,6 +846,8 @@ impl Telemetry {
             v312,
             v314,
             v316,
+            v317,
+            bash_metered,
             tools_used_header_first,
             tools_used_truncation,
             safety_events,
@@ -1246,11 +1257,24 @@ impl Session {
             // `tengu_heron_brook_applied`。
             self.heron_done = false;
         }
+        // 2.1.317 重复命令统计判别的代理那次结果在不在上下文里：每条主线程 / 子代理请求都记下这条支线看得见的结果
+        // （完整体整份换、线程续轮的增量体追加），不只在跑 Bash 的那条上记——子代理首条完整请求带着的父线程结果，
+        // 之后的增量续轮里不会再出现。
+        if matches!(kind, Kind::Main | Kind::Subagent) {
+            let agent = if kind == Kind::Subagent {
+                call.agent.agent_id.as_deref().unwrap_or("")
+            } else {
+                ""
+            };
+            let delta = shape.thread_type.as_deref() == Some("continue");
+            self.files.bash_meter.note_visible(agent, &shape.result_ids, delta);
+        }
         // 用户取消的压缩不算：官方只在压缩成功时清系统段缓存、换快照。
         if kind == Kind::Compact && !failed && !aborted {
             self.post_compact = true;
-            // 压缩后先前 Bash 调用的结果都不在上下文里了（[`super::bash_repeat::BashMeter::compacted`]）。
-            self.files.bash_meter.compacted();
+            // 压缩后这条支线先前 Bash 调用的结果都不在它的上下文里了（[`super::bash_repeat::BashMeter::compacted`]）；
+            // 子代理自己压缩时请求同样带着它的 agent id，主线程压缩不动别的子代理。
+            self.files.bash_meter.compacted(call.agent.agent_id.as_deref().unwrap_or(""));
         }
         let turn_origin = self.turn_origin.clone();
         // 上一轮的链、深度与起点：这次新输入前若有工具被用户拒了，拒绝那串与 `aborted_tools`

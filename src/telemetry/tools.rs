@@ -413,6 +413,8 @@ pub(super) fn bash_meta_v311(
 ///   读自己落盘输出的 `reads_own_output` 与落盘的 `output_total_bytes` / `output_persisted` 代理看不到，不报。
 ///
 /// 在 [`bash_meta_v311`] 之后调。
+///
+/// `head` 是 2.1.317 起判 `bash_test_outcome` 时 `head` 截没截东西要的（[`super::bash_kinds::HeadCheck`]），更早给 `None`。
 pub(super) fn bash_meta_v316(
     meta: &mut Value,
     run: &super::bash_kinds::ShellRun,
@@ -420,6 +422,7 @@ pub(super) fn bash_meta_v316(
     exit_code: i64,
     backgrounded: bool,
     repeat_fields: serde_json::Map<String, Value>,
+    head: Option<super::bash_kinds::HeadCheck<'_>>,
 ) {
     let mut programs = vec![("bash_programs", json!(run.programs))];
     if let Some(scope) = run.test_scope {
@@ -439,13 +442,33 @@ pub(super) fn bash_meta_v316(
     );
     // `wrr`：转到后台的（有 `backgroundTaskId`）当场没有结果，不报。
     if !backgrounded
-        && let Some(outcome) = super::bash_kinds::bash_test_outcome(run, output, exit_code, false)
+        && let Some(outcome) =
+            super::bash_kinds::bash_test_outcome(run, output, exit_code, false, head)
     {
         insert_after(meta, "bash_word_split_use", vec![("bash_test_outcome", json!(outcome))]);
     }
     if let Some(o) = meta.as_object_mut() {
         o.extend(repeat_fields);
     }
+}
+
+/// 2.1.317 起 Bash 执行 / 失败事件在 `output_end_shown` 后多的那组「输出交给 `tail`」状态（`cap/auto-2.1.317-20261103-full`
+/// 22 条、`-bashfail` 那条）：`tail_input_candidate` / `_other` 是 `line`（[`super::bash_kinds::tail_input_line`]，用户 `!` 跑的
+/// 给 `None`）为 `check` / `other`；`tail_input_flag_on` 只在 Linux 上有（模拟的是 macOS，不报）；不在 Linux 上客户端不另存
+/// 一份交给 `tail` 的输入，`tail_input_copied` / `tail_input_kept` 恒 false，`tail_input_kept_bytes` 不报。
+///
+/// 在 [`bash_meta_v316`] 之后调。
+pub(super) fn bash_meta_v317(meta: &mut Value, line: Option<&str>) {
+    insert_after(
+        meta,
+        "output_end_shown",
+        vec![
+            ("tail_input_candidate", json!(line == Some("check"))),
+            ("tail_input_candidate_other", json!(line == Some("other"))),
+            ("tail_input_copied", json!(false)),
+            ("tail_input_kept", json!(false)),
+        ],
+    );
 }
 
 /// 2.1.315 起事件最末那项 `reads_own_output`（[`reads_own_output`]），在 [`bash_meta_v316`] 之后调。

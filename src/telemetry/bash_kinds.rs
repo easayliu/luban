@@ -777,14 +777,18 @@ pub(super) fn test_outcome(output: &str) -> &'static str {
     if passed { "passed" } else { "unknown" }
 }
 
-/// `wrr`（2.1.316）：Bash 事件里的 `bash_test_outcome`。只有算出了测试范围（[`ShellRun::test_scope`]）且不是
-/// `runs_no_tests`、没转到后台的才有；判出「通过」但命令非零退出、被打断、超时，或者输出过了 `head`、程序没认全，
-/// 改报 `unknown`。
+/// `wrr`（2.1.316）/ `mlr`（2.1.317）：Bash 事件里的 `bash_test_outcome`。只有算出了测试范围（[`ShellRun::test_scope`]）
+/// 且不是 `runs_no_tests`、没转到后台的才有；判出「通过」但命令非零退出、被打断、超时、程序没认全，或者输出过了
+/// `head`，改报 `unknown`。
+///
+/// `head` 那条 2.1.317 放宽了（`head` 给 `Some`）：命令里的 `head` 都是截在末尾、没截掉东西（[`head_kept_everything`]），
+/// 也没经 `exec`，就照判出来的报；2.1.316 及以前只要过了 `head` 就是 `unknown`（`head` 给 `None`）。
 pub(super) fn bash_test_outcome(
     run: &ShellRun,
     output: &str,
     exit_code: i64,
     interrupted: bool,
+    head: Option<HeadCheck<'_>>,
 ) -> Option<&'static str> {
     let scope = run.test_scope?;
     if scope == "runs_no_tests" {
@@ -792,11 +796,159 @@ pub(super) fn bash_test_outcome(
     }
     let a = test_outcome(output);
     let programs: Vec<&str> = run.programs.split(',').collect();
-    let doubtful = exit_code != 0
-        || interrupted
-        || programs.contains(&"head")
-        || programs.contains(&"incomplete");
+    let through_head = programs.contains(&"head")
+        && match head {
+            None => true,
+            Some(h) => programs.contains(&"exec") || !head_kept_everything(h),
+        };
+    let doubtful =
+        exit_code != 0 || interrupted || programs.contains(&"incomplete") || through_head;
     Some(if a == "passed" && doubtful { "unknown" } else { a })
+}
+
+/// 2.1.317 判 `head` 截没截掉东西要的：命令原文、命令**原始**输出里的换行数、完整输出里有没有 `head: ` 开头的报错行
+/// （[`super::shape::has_head_error_line`]）。
+///
+/// 原始换行数代理拿不到：客户端发 `tool_result` 前删掉了首尾的空白行（`python3 -m unittest 2>&1 | head -5` 没找到测试时
+/// 原始输出 5 个换行，发出来只剩 3 个），发出的正文只能给出下界，证明不了 `head` 没截掉东西，这时给 `None`，按截了算
+/// （报 `unknown`）。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HeadCheck<'a> {
+    pub(super) command: &'a str,
+    pub(super) newlines: Option<usize>,
+    pub(super) head_error: bool,
+}
+
+/// `Zt`：一整条简单命令就是 `head [-N | -n N] [文件…]`，取出 N（没给是 10）。
+fn head_limit(cmd: &str) -> Option<u64> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^head(?:[ \t]+-(?:n[ \t]*)?([1-9][0-9]{0,8}))?(?:[ \t]+[A-Za-z0-9_./][A-Za-z0-9_./-]*)*$")
+            .expect("head 正则")
+    });
+    let c = RE.captures(cmd)?;
+    Some(c.get(1).map_or(10, |m| m.as_str().parse().unwrap_or(10)))
+}
+
+/// `Jt(command, output)`（2.1.317）：命令里每个 `head` 都是一整条处在「末尾」的简单命令（顶层、列表、子 shell 里，或管道
+/// 的最后一段），且输出的行数比其中最小的 N 还少、没有 `head: ` 开头的报错行——`head` 没截掉任何东西。解析不了、
+/// 有 `ERROR` / 空节点 / `&` 的一律不算。
+fn head_kept_everything(h: HeadCheck<'_>) -> bool {
+    if h.newlines.is_none() || h.head_error {
+        return false;
+    }
+    let Some(tree) = bash_ast::parse(h.command) else { return false };
+    let t = &*tree;
+    let (mut count, mut limit) = (0usize, u64::MAX);
+    let mut stack = vec![(t.root, true)];
+    while let Some((id, tail)) = stack.pop() {
+        let kind = t.kind(id);
+        if kind == "ERROR" || t.text(id).is_empty() || kind == "&" {
+            return false;
+        }
+        if tail
+            && kind == "command"
+            && let Some(n) = head_limit(&String::from_utf16_lossy(t.text(id)))
+        {
+            count += 1;
+            limit = limit.min(n);
+        }
+        let ch = t.children(id);
+        for (i, &c) in ch.iter().enumerate() {
+            let pass = tail
+                && (matches!(kind, "program" | "list" | "subshell")
+                    || (kind == "pipeline" && i + 1 == ch.len()));
+            stack.push((c, pass));
+        }
+    }
+    let Some(newlines) = h.newlines else { return false };
+    count == count_words(h.command, "head") && (newlines as u64) < limit && !h.head_error
+}
+
+/// `e.match(/\bword\b/g).length`：按 ASCII 单词边界数 `word` 出现几次。
+fn count_words(s: &str, word: &str) -> usize {
+    let b = s.as_bytes();
+    let w = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    s.match_indices(word)
+        .filter(|&(i, _)| {
+            let j = i + word.len();
+            (i == 0 || !w(b[i - 1])) && (j == b.len() || !w(b[j]))
+        })
+        .count()
+}
+
+/// `M3n(command)`（2.1.317）：这条命令算不算「输出交给 `tail`」的候选——每个 `tail` 都接在管道后面（只带 `-N` /
+/// `-n N` / `--lines=N`）、`tail` 后面不再接管道、没有 `tee` / `enable` / `coproc`、多个 `tail` 时没有括号与流程控制，
+/// 且不起后台任务。跑测试、构建或检查的是 `check`，别的是 `other`；解析不了、不完整、带 `wait` 或循环的不算。
+pub(super) fn tail_input_line(cmd: &str) -> Option<&'static str> {
+    if !tail_gate(cmd, &TAIL_PIPED, &TAIL_NESTED, &TAIL_OTHER) {
+        return None;
+    }
+    tail_line_by_kinds(cmd)
+}
+
+static TAIL_PIPED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(^|[^|])\|&?\s*tail([ \t]+(-[0-9]+|-n[ \t]*[+-]?[0-9]+|--lines=[+-]?[0-9]+))?[ \t]*($|[;&|)\n])",
+    )
+    .expect("tail 正则")
+});
+static TAIL_NESTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"[(){}`]|(?-u:\b)(do|done|then|fi|esac)(?-u:\b)").expect("流程控制正则")
+});
+static TAIL_OTHER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?-u:\b)(tee|enable|coproc)(?-u:\b)").expect("tee 正则")
+});
+static TAIL_LOOP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(^|[;&|(){}\n!]|(?-u:\b)(then|else|do|time))\s*(for|while|until|select)(\s|\(\()",
+    )
+    .expect("循环正则")
+});
+
+/// 过了正则闸之后按命令类别定：起后台任务的不算，跑测试 / 构建 / 检查的是 `check`，解析不了、不完整、带 `wait` 或循环的
+/// 不算，别的是 `other`。
+fn tail_line_by_kinds(cmd: &str) -> Option<&'static str> {
+    let run = shell_run(cmd, true);
+    let kinds: Vec<&str> = run.kinds.split(',').collect();
+    if kinds.contains(&"starts_background_job") {
+        return None;
+    }
+    if kinds.contains(&"runs_tests") || kinds.contains(&"builds") || kinds.contains(&"lints") {
+        return Some("check");
+    }
+    if kinds.contains(&"unparsed")
+        || kinds.contains(&"incomplete")
+        || kinds.contains(&"wait")
+        || TAIL_LOOP.is_match(cmd)
+    {
+        return None;
+    }
+    Some("other")
+}
+
+/// `M3n` 里看语法树之前那几道正则闸。
+fn tail_gate(cmd: &str, piped: &regex::Regex, nested: &regex::Regex, other: &regex::Regex) -> bool {
+    let n = piped.find_iter(cmd).count();
+    if n == 0 || n != count_words(cmd, "tail") || tail_then_pipe(cmd) || other.is_match(cmd) {
+        return false;
+    }
+    !(n > 1 && nested.is_match(cmd))
+}
+
+/// `/\btail\b[^;&|\n]*\|(?!\|)/`：某个 `tail` 后面（不隔 `;` `&` `|` 换行）接着一个单独的 `|`。
+fn tail_then_pipe(cmd: &str) -> bool {
+    let b = cmd.as_bytes();
+    let w = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    cmd.match_indices("tail").any(|(i, _)| {
+        let j = i + 4;
+        if (i > 0 && w(b[i - 1])) || (j < b.len() && w(b[j])) {
+            return false;
+        }
+        match b[j..].iter().position(|&c| matches!(c, b';' | b'&' | b'|' | b'\n')) {
+            Some(k) => b[j + k] == b'|' && b.get(j + k + 1) != Some(&b'|'),
+            None => false,
+        }
+    })
 }
 
 /// `Bun.stripANSI`：去掉 CSI（`ESC [ … 终止字节`）、OSC（`ESC ] … BEL / ESC \`）与其余两字节的 ESC 序列。
@@ -1871,6 +2023,118 @@ mod tests {
 
     /// 对拍 2.1.316：逐条比官方 `Cfe` 的 `bash_command_kinds`、`bash_programs`、`bash_test_scope`（node 跑官方原函数
     /// 产出的 JSONL，每行 `{"cmd", "on": Cfe(cmd)}`）。路径由环境变量 `LUBAN_BASH_KINDS_ORACLE_316` 给，没给或文件不在就跳过。
+    /// 2.1.317 `M3n`：管道进 `tail`、`tail` 后不再接管道的才算候选；跑测试的是 `check`，别的 `other`。
+    #[test]
+    fn tail_input_candidates_follow_the_2_1_317_rules() {
+        assert_eq!(tail_input_line("python3 -m unittest 2>&1 | tail -5"), Some("check"));
+        assert_eq!(tail_input_line("cargo build |& tail -n 20"), Some("check"));
+        assert_eq!(tail_input_line("ls -la | tail -3"), Some("other"));
+        assert_eq!(tail_input_line("git log | tail"), Some("other"));
+        // 不是管道进 tail、tail 后面还接管道、带 tee、跟着文件名的都不算。
+        assert_eq!(tail_input_line("tail -5 x.log"), None);
+        assert_eq!(tail_input_line("npm test | tail -5 | grep FAIL"), None);
+        assert_eq!(tail_input_line("npm test | tee out.log | tail -5"), None);
+        assert_eq!(tail_input_line("npm test | tail -f"), None);
+        // `||` 不算接着管道。
+        assert_eq!(tail_input_line("npm test | tail -5 || true"), Some("check"));
+        // 循环与后台任务不算。
+        assert_eq!(tail_input_line("for f in *; do cat $f; done | tail -3"), None);
+        assert_eq!(tail_input_line("sleep 9 & ls | tail -2"), None);
+    }
+
+    /// 2.1.317 `mlr`：过了 `head` 的「通过」，`head` 都在末尾、输出比 N 行少、没有 `head: ` 报错行时照报，否则 `unknown`；
+    /// 2.1.316 一律 `unknown`。
+    #[test]
+    fn test_outcome_through_head_follows_2_1_317() {
+        let out = "Ran 4 tests in 0.001s\n\nOK";
+        let check = |cmd: &str, newlines: usize, out: &str| {
+            let run = shell_run(cmd, true);
+            let head_error = super::super::shape::has_head_error_line(out);
+            let head = HeadCheck { command: cmd, newlines: Some(newlines), head_error };
+            (
+                bash_test_outcome(&run, out, 0, false, Some(head)),
+                bash_test_outcome(&run, out, 0, false, None),
+            )
+        };
+        let cmd = "python3 -m unittest 2>&1 | head -20";
+        assert_eq!(check(cmd, 3, out), (Some("passed"), Some("unknown")));
+        // 输出够 N 行（可能截掉了）、或有 `head: ` 报错行就仍是 unknown。
+        assert_eq!(check(cmd, 20, out).0, Some("unknown"));
+        assert_eq!(check(cmd, 3, "head: x: No such file\nOK").0, Some("unknown"));
+        // `head` 不在管道末尾（后面还有东西）也不算。
+        let cmd = "python3 -m unittest 2>&1 | head -20 | cat";
+        assert_eq!(check(cmd, 3, out).0, Some("unknown"));
+        // 原始换行数不知道（代理拿到的正文去掉了首尾空白行）时证明不了，按截了算。
+        let cmd = "python3 -m unittest 2>&1 | head -20";
+        let run = shell_run(cmd, true);
+        let unknown = HeadCheck { command: cmd, newlines: None, head_error: false };
+        assert_eq!(bash_test_outcome(&run, out, 0, false, Some(unknown)), Some("unknown"));
+        // 报错行在完整输出的前段、尾部是通过摘要：仍是 unknown。
+        let long = format!("head: a.log: No such file\n{}{out}", "x\n".repeat(5_000));
+        assert_eq!(check(cmd, 3, &long).0, Some("unknown"));
+        assert_eq!(head_limit("head"), Some(10));
+        assert_eq!(head_limit("head -n 50 a.txt b/c.txt"), Some(50));
+        assert_eq!(head_limit("head -0"), None);
+        assert_eq!(head_limit("head -n -3"), None);
+    }
+
+    /// 对拍：`Jt(command, output)`（[`head_kept_everything`]），逐条比官方 2.1.317 原函数（node 跑，解析器取 2.1.316 那份，
+    /// 语料是 2.1.316 那份里带 `head` 的加上合成的 `| head` 变体，输出从几种里轮着挑）。路径由环境变量 `LUBAN_HEAD_ORACLE`
+    /// 给，没给就跳过。
+    #[test]
+    #[ignore = "依赖本机 node 产出的对拍语料，手动跑"]
+    fn head_check_matches_the_official_2_1_317_oracle() {
+        use std::io::BufRead;
+        let Ok(path) = std::env::var("LUBAN_HEAD_ORACLE") else { return };
+        let Ok(f) = std::fs::File::open(&path) else { return };
+        let (mut total, mut bad) = (0usize, Vec::new());
+        for line in std::io::BufReader::new(f).lines() {
+            let v: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let (cmd, out) = (v["cmd"].as_str().unwrap(), v["out"].as_str().unwrap());
+            total += 1;
+            let got = head_kept_everything(HeadCheck {
+                command: cmd,
+                newlines: Some(out.matches('\n').count()),
+                head_error: super::super::shape::has_head_error_line(out),
+            });
+            if serde_json::json!(got) != v["ok"] && bad.len() < 15 {
+                bad.push(format!("{cmd:?} / {out:?}: want {} got {got}", v["ok"]));
+            }
+        }
+        eprintln!("head 判定：{total} 条，{} 条不一致", bad.len());
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// 对拍：`M3n` 的正则闸、循环正则、`Zt` 与 `\bhead\b` 计数，逐条比官方 2.1.317 原正则（node 跑，语料是 2.1.316 那份加上
+    /// 合成的 `| tail` / `| head` 变体）。路径由环境变量 `LUBAN_TAIL_ORACLE` 给，没给就跳过。
+    #[test]
+    #[ignore = "依赖本机 node 产出的对拍语料，手动跑"]
+    fn tail_gate_matches_the_official_2_1_317_oracle() {
+        use std::io::BufRead;
+        let Ok(path) = std::env::var("LUBAN_TAIL_ORACLE") else { return };
+        let Ok(f) = std::fs::File::open(&path) else { return };
+        let (mut total, mut bad) = (0usize, Vec::new());
+        for line in std::io::BufReader::new(f).lines() {
+            let v: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let cmd = v["cmd"].as_str().unwrap();
+            total += 1;
+            let got = serde_json::json!({
+                "gate": tail_gate(cmd, &TAIL_PIPED, &TAIL_NESTED, &TAIL_OTHER),
+                "loop": TAIL_LOOP.is_match(cmd),
+                "head": head_limit(cmd),
+                "heads": count_words(cmd, "head"),
+            });
+            let want = serde_json::json!({
+                "gate": v["gate"], "loop": v["loop"], "head": v["head"], "heads": v["heads"],
+            });
+            if got != want && bad.len() < 15 {
+                bad.push(format!("{cmd:?}\n  want {want}\n  got  {got}"));
+            }
+        }
+        eprintln!("tail/head 正则：{total} 条，{} 条不一致", bad.len());
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
     #[test]
     #[ignore = "依赖本机 node 产出的对拍语料，手动跑"]
     fn shell_run_matches_the_official_2_1_316_oracle() {

@@ -65,6 +65,8 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::sandy_plover::note_eval(cred_id, features);
     // 握手里 `/v1/mcp_servers` 的 MCP 客户端声明带不带 tasks 扩展（`tengu_glowing_lark` / `tengu_brindle_causeway`）。
     super::glowing_lark::note_eval(cred_id, features);
+    // 2.1.317 起 Bash 重复命令统计按会话抽样的比例（`tengu_vivid_peach`，读不到按 0.1）。
+    super::vivid_peach::note_eval(cred_id, features);
     // tether 固定按无状态发送的模型清单（遥测 `modelHeldStateless`），默认空串。
     super::curious_tower::note_eval(cred_id, features);
     // 拼进 system 的那段 `tengu_heron_brook`（bootstrap 的 `client_data` 优先，这里是兜底那份）。
