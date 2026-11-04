@@ -298,6 +298,8 @@ pub async fn probe(
                 // 探测不补 fallbacks：它要测的是这个号在**这个模型**上通不通，换模型作答等于没测。
                 refusal_fallbacks: None,
                 tools_used_truncation: None,
+                tools_used_capped: None,
+                client_data_wait: None,
             }
         }
     };
@@ -605,6 +607,9 @@ pub(crate) async fn spawn_session_handshake(
     // 那几条（`cap/2.1.258-api` 里它们是客户端直连打的，不经 luban），再补一遍就是同一台
     // 机器把同一批公共端点打了两遍。见 [`crate::oauth::HandshakeRunner::public_traffic`]。
     let simulated = start.simulated;
+    // 这次 bootstrap 一开始就登记成进行中（官方启动预取同样先于首条查询记进 `clientDataFetches`）：冷槽位的模拟请求
+    // 放行后等它回来再组装 system（[`crate::proxy::client_data::wait_for`]），同一槽位并发的请求等同一次。
+    let fetch = crate::proxy::client_data::begin_fetch(cred.id, &h.model);
     let runner = crate::oauth::HandshakeRunner::new(cred, h, org, simulated, state.store.clone());
 
     // 整串握手跑在**一个**后台任务里，按抓包的发出时刻来（`cap/auto-2.1.309-20261023-full`），
@@ -657,7 +662,7 @@ pub(crate) async fn spawn_session_handshake(
                     .await;
                 }
             },
-            runner.rest(&client_for_task, &token_for_task),
+            runner.rest(&client_for_task, &token_for_task, fetch),
             probe_done,
         )
         .await;
@@ -784,6 +789,9 @@ pub(crate) async fn send_quota_probe(
         reason: SimulationReason::Probe,
         // 官方那条没有 `system`，自然也没有第四块。
         rest: None,
+        rest_model: String::new(),
+        lapis_peek: false,
+        rest_gen: 0,
         env: None,
         context_1m: false,
         strip_context_1m: false,
@@ -942,6 +950,9 @@ fn header_simulation(
         link: CcSessionLink::default(),
         reason: SimulationReason::Probe,
         rest: None,
+        rest_model: String::new(),
+        lapis_peek: false,
+        rest_gen: 0,
         env: None,
         context_1m: false,
         strip_context_1m: false,
@@ -1098,6 +1109,8 @@ pub(super) fn prewarm_upstream<'a>(
         // 不补 fallbacks：探的是这个号在**这个模型**上通不通，换模型作答等于没探。
         refusal_fallbacks: None,
         tools_used_truncation: None,
+        tools_used_capped: None,
+        client_data_wait: None,
     }
 }
 

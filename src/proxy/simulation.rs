@@ -77,6 +77,13 @@ pub(crate) struct Simulation {
     /// 不出来（没有模板或没有那行模型名，[`cc_system_rest`]）、或这个 profile 本来就不带
     /// `system`。客户端自己的 system 不掺进这一段，它单独占末块（见 [`simulate_system`]）。
     pub(super) rest: Option<String>,
+    /// 拼 [`Self::rest`] 时用的来访模型名：启动握手刚拉回的 `client_data` / eval 可能改了原创游戏那段与 `heron_brook`，
+    /// 发出前按它重拼一次（[`Self::refresh_system_rest`]）。
+    pub(super) rest_model: String,
+    /// [`Self::lapis`] 只是看了一眼没钉（非主线程请求，[`super::lapis_anchor::peek_session_mode`]）：重拼时照样再看一眼。
+    pub(super) lapis_peek: bool,
+    /// 拼 [`Self::rest`] 时的下发版本（[`super::client_data::generation`]）：发出前变了就重拼。
+    pub(super) rest_gen: u64,
     /// 那台「机器」（[`SimEnv`]）：第四块的记忆目录与首轮环境说明
     /// （[`crate::proxy::body::insert_env_note`]）都照它写。环境说明落在 `messages` 里，不跟第四块的
     /// 开关 `simulate_full_system`；只有官方不发 `system` 的 profile（额度探测）为 `None`。
@@ -113,7 +120,69 @@ pub(crate) struct Simulation {
     pub(super) thread: parking_lot::Mutex<Option<ThreadPending>>,
 }
 
+/// 模拟路径 system 第四块：模板按这台「机器」渲染，末尾按号的下发排原创游戏那段与 `heron_brook`
+/// （[`super::heron_brook::fit_system_rest`]，2.1.314 起 opus-5-5 默认有原创游戏那段；2.1.318 抓包那天 opus 的这段改由
+/// `heron_brook` 下发，`original_games_guidance: false` 加同一段正文，出站字节与能力开着时相同），再按 `<total_tokens>`
+/// 那一档剪掉提醒。认不出模型族（没有模板）是 `None`。
+fn system_rest(
+    cred_id: i64,
+    model: &str,
+    profile: &config::CcProfile,
+    env: &SimEnv,
+    lapis: super::lapis_anchor::SessionMode,
+) -> Option<String> {
+    let template = cc_system_rest(model)?;
+    let games = super::original_games::applies(cred_id, model, profile.version)
+        .then(|| super::original_games::text_for(profile.version));
+    let heron = super::heron_brook::served(cred_id, model).map(|(t, _)| t);
+    let rest = super::heron_brook::fit_system_rest(
+        render_system_rest(template, env),
+        games,
+        heron.as_deref(),
+        profile.version,
+    );
+    Some(super::lapis_anchor::fit_system_rest(rest, lapis))
+}
+
 impl Simulation {
+    /// 等到这个号这个模型的 bootstrap 之后重拼第四块（[`system_rest`]）：刚下发的 `client_data` 可能改了原创游戏那段、
+    /// `heron_brook` 的正文与 `<total_tokens>` 那一档，这条请求得跟着它（`detect` 时还没见过）。这一档也管首轮环境说明与
+    /// 每轮提醒，所以只是它变了也返回 `true`。原本就不补第四块的不重拼。变了返回 `true`，调用方据此重新整形出站体。
+    pub(super) fn refresh_system_rest(&mut self, cred_id: i64) -> bool {
+        self.rest_gen = super::client_data::generation();
+        // `<total_tokens>` 那一档同样是组装时才读下发（[`super::lapis_anchor`]）：会话还没发过请求（暂定钉）的按新下发
+        // 重定、同一会话并发的几条读到同一档（[`super::lapis_anchor::refresh_pin`]），只看的重看。
+        let lapis = if !self.lapis_peek {
+            super::lapis_anchor::refresh_pin(
+                cred_id,
+                &self.session_id,
+                &self.rest_model,
+                self.profile.version,
+            )
+        } else {
+            super::lapis_anchor::peek_session_mode(
+                cred_id,
+                &self.session_id,
+                &self.rest_model,
+                self.profile.version,
+            )
+        };
+        let lapis_changed = lapis != self.lapis;
+        self.lapis = lapis;
+        let (Some(old), Some(env)) = (self.rest.as_ref(), self.env.as_ref()) else {
+            return lapis_changed;
+        };
+        let Some(new) = system_rest(cred_id, &self.rest_model, self.profile, env, self.lapis)
+        else {
+            return false;
+        };
+        if &new == old {
+            return lapis_changed;
+        }
+        self.rest = Some(new);
+        true
+    }
+
     pub(super) fn set_thread(&self, pending: ThreadPending) {
         *self.thread.lock() = Some(pending);
     }
@@ -346,23 +415,20 @@ impl Simulation {
                 | super::CcRequestKind::Suggestion
         );
         let lapis = if main_thread {
-            super::lapis_anchor::session_mode(cred.id, &session_id, model, profile.version)
+            super::lapis_anchor::session_mode_provisional(
+                cred.id,
+                &session_id,
+                model,
+                profile.version,
+            )
         } else {
             super::lapis_anchor::peek_session_mode(cred.id, &session_id, model, profile.version)
         };
-        // 2.1.314 起 opus-5-5 的第四块多一段原创游戏的说明（[`super::original_games`]），插在 `<total_tokens>` 之前，
-        // 再按这一档剪掉提醒。
-        let original_games = super::original_games::applies(cred.id, model, profile.version);
-        let rest = env.as_ref().filter(|_| flags.simulate_full_system).and_then(|env| {
-            cc_system_rest(model).map(|template| {
-                let rest = super::original_games::fit_system_rest(
-                    render_system_rest(template, env),
-                    original_games,
-                    profile.version,
-                );
-                super::lapis_anchor::fit_system_rest(rest, lapis)
-            })
-        });
+        let rest_gen = super::client_data::generation();
+        let rest = env
+            .as_ref()
+            .filter(|_| flags.simulate_full_system)
+            .and_then(|env| system_rest(cred.id, model, profile, env, lapis));
         let inbound_1m = has_beta(&inbound_beta, config::CC_BETA_CONTEXT_1M);
         let wants_1m = context_1m_beta_wanted(model, super::parse_version(profile.version));
         let context_1m = inbound_1m && wants_1m;
@@ -386,6 +452,9 @@ impl Simulation {
             link,
             reason,
             rest,
+            rest_model: model.to_string(),
+            lapis_peek: !main_thread,
+            rest_gen,
             env,
             context_1m,
             strip_context_1m: inbound_1m && !wants_1m,

@@ -477,6 +477,9 @@ impl EventBuilder<'_> {
                     if v299 {
                         bash_meta_v299(&mut meta, cmd, "", &shape.model, true);
                     }
+                    if env.f.v318 {
+                        bash_meta_v318(&mut meta, "");
+                    }
                     if v311 {
                         let h = i64::from(env.req_hash % 100);
                         let v316 = env.f.v316;

@@ -507,6 +507,8 @@ pub(super) struct Subst<'a> {
     /// 同一处、首次使用那条之前先报 `feature_sad{sent, dropped, api_tools_used_header, incomplete_list}`（官方拼头时
     /// 先报它，再记首次使用）。
     pub(super) tools_used_truncation: Option<(usize, usize)>,
+    /// 2.1.318 这条拼头时档位往上走的那几条 `tengu_tools_used_header_size`（[`tools_used_size_events`]），同一处报。
+    pub(super) tools_used_size: Vec<Value>,
     /// 组织配置那道闸（[`crate::proxy::org_config_gate`]）按这个号的 eval 与这台机器判出来的样子：启动模板那条
     /// `org_config_gate_shadow` 的开关与在不在闸内几项照它改，在闸内再补一条真判定。2.1.310 起、见过这个号的 eval 才有，
     /// 否则模板原样。
@@ -965,6 +967,9 @@ where
             if e.name == "tengu_deferred_tools_pool_change" {
                 deferred_pool_v317(&mut meta, subst.version);
             }
+            if e.name == "tengu_version_lock_failed" {
+                version_lock_v318(&mut meta, subst.version);
+            }
             if e.name == "tengu_tool_search_mode_decision" {
                 meta = subst.tool_search.clone();
             }
@@ -1227,11 +1232,15 @@ where
             if tools_used_at_route {
                 let ta = t + chrono::Duration::milliseconds(1);
                 let ca = ctx(ta);
-                for (name, meta) in
-                    tools_used_header_events(subst.tools_used_header, subst.tools_used_truncation)
-                {
+                for (name, meta, to_dd) in tools_used_header_events(
+                    subst.tools_used_header,
+                    subst.tools_used_truncation,
+                    &subst.tools_used_size,
+                ) {
                     events.push((ta, id.event_at(e.stage, name, ta, &ca, meta.clone())));
-                    dd.push(id.dd_entry_at(e.stage, name, &ca, resp_model, meta));
+                    if to_dd {
+                        dd.push(id.dd_entry_at(e.stage, name, &ca, resp_model, meta));
+                    }
                 }
             }
         }
@@ -1245,7 +1254,8 @@ where
 pub(super) fn tools_used_header_events(
     first_use: bool,
     truncation: Option<(usize, usize)>,
-) -> Vec<(&'static str, Value)> {
+    size_events: &[Value],
+) -> Vec<(&'static str, Value, bool)> {
     let mut out = Vec::new();
     if let Some((sent, dropped)) = truncation {
         out.push((
@@ -1257,10 +1267,49 @@ pub(super) fn tools_used_header_events(
                 "error_code": "incomplete_list",
                 "tengu_quizzical_giraffe": "unset"
             }),
+            true,
         ));
     }
+    // 2.1.318：拼完头、报完丢名字之后记档位（官方 `Cf` 里 `Dy` 在 `reportTruncationOnce` 之后），首次使用那条在设头之后，
+    // 所以排在两者之间；只进事件日志（`cap/auto-2.1.318-20261104-full` 的 Datadog 批次里一条都没有）。
+    for m in size_events {
+        out.push(("tengu_tools_used_header_size", m.clone(), false));
+    }
     if first_use {
-        out.push(("tengu_feature_ok", json!({ "feature_name": "api_tools_used_header" })));
+        out.push(("tengu_feature_ok", json!({ "feature_name": "api_tools_used_header" }), true));
+    }
+    out
+}
+
+/// 2.1.318 `tengu_tools_used_header_size` 的分档（官方 `If`）：`n` 占上限 `max` 的百分比落到 10 / 25 / 50 / 75 / 90 哪一档
+/// 以上，不到 10% 是 0。
+fn header_size_step(n: usize, max: usize) -> u32 {
+    [90u32, 75, 50, 25, 10].into_iter().find(|&s| n * 100 >= max * s as usize).unwrap_or(0)
+}
+
+/// 2.1.318 起每次拼 `x-claude-code-sandy-plover` 时官方记一次档位（`Dy` → `raiseHeaderSizeSteps`）：元素数按 64、字节数按
+/// 7168 分档，加上丢没丢过名字；进程头一回，或任一档往上走、或头一回丢名字，报一条
+/// `tengu_tools_used_header_size{count, size_bytes, hit_cap}`（取这一次的原值），否则不报。`steps` 是这个进程到过的档位
+/// （[`super::session::Session::tools_used_steps`]），就地更新；`sizes` 是这条逻辑请求各次出站的头，按先后。
+/// `cap/auto-2.1.318-20261104-full`：每个进程头一条都是 `{count: 0, size_bytes: 2, hit_cap: false}`（启动时的额度探测带 `[]`），
+/// A0 用到第 7 个工具（129 字节，元素数到了 10% 档）时再报一条。
+pub(super) fn tools_used_size_events(
+    steps: &mut Option<(u32, u32, bool)>,
+    sizes: &[super::ToolsUsedSize],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for s in sizes {
+        let now = (header_size_step(s.count, 64), header_size_step(s.bytes, 7168), s.capped);
+        if let Some(prev) = *steps
+            && now.0 <= prev.0
+            && now.1 <= prev.1
+            && (prev.2 || !now.2)
+        {
+            continue;
+        }
+        let prev = steps.unwrap_or((0, 0, false));
+        *steps = Some((now.0.max(prev.0), now.1.max(prev.1), now.2 || prev.2));
+        out.push(json!({ "count": s.count, "size_bytes": s.bytes, "hit_cap": s.capped }));
     }
     out
 }
@@ -1279,5 +1328,19 @@ pub(super) type TplOutput = (Vec<(DateTime<Utc>, Value)>, Vec<Value>);
 pub(super) fn deferred_pool_v317(meta: &mut Value, version: &str) {
     if version_at_least(version, "2.1.317") && meta.get("runsAgainCount").is_none() {
         super::kind::insert_after(meta, "restoredCount", vec![("runsAgainCount", json!(0))]);
+    }
+}
+
+/// 2.1.318 起 PID 锁那支的 `tengu_version_lock_failed` 末尾多 `per_pid_lock_written`：这个进程自己的那份 PID 锁文件写没写成
+/// （`cap/auto-2.1.318-20261104-full` 23 条都是 `{is_pid_based: true, is_lifetime_lock: true, per_pid_lock_written: true}`）。
+/// 模板里只有 PID 锁、常驻那一支，非 PID 锁那几支官方也不报这项。
+pub(super) fn version_lock_v318(meta: &mut Value, version: &str) {
+    let pid_lifetime = meta.get("is_pid_based") == Some(&json!(true))
+        && meta.get("is_lifetime_lock") == Some(&json!(true));
+    if version_at_least(version, "2.1.318")
+        && pid_lifetime
+        && let Some(o) = meta.as_object_mut()
+    {
+        o.entry("per_pid_lock_written").or_insert(json!(true));
     }
 }

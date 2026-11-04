@@ -320,6 +320,16 @@ pub(super) fn bash_meta_v299(
     );
 }
 
+/// 2.1.318 的 Bash 执行 / 失败事件在 `zsh_equals_error` 之后多 `zsh_equals_as_command_error`（官方 `Dkt` 新加的一项，
+/// `cap/auto-2.1.318-20261104-full` 与 `-bashfail` 的 Bash 事件条条都带，抓包里都是 false）：输出里有 zsh 把 `=word`
+/// 当命令跑、找不到命令的那种行（[`zsh_equals_as_command_line`]）。看不到输出的（`!` 直接跑的那种）传空串。在
+/// [`bash_meta_v299`] 之后调。
+pub(super) fn bash_meta_v318(meta: &mut Value, result_head: &str) {
+    let hit =
+        result_head.split(['\n', '\r', '\u{2028}', '\u{2029}']).any(zsh_equals_as_command_line);
+    insert_after(meta, "zsh_equals_error", vec![("zsh_equals_as_command_error", json!(hit))]);
+}
+
 /// 2.1.311 起 Bash 执行 / 失败事件里那次命令自己的耗时与 CPU（官方 `__t(shellUsage)`：`wallMs` 与子进程的
 /// 用户态 / 内核态 CPU，都保留三位小数）。代理看不到命令真跑了多久，从那次调用报的外部时长推
 /// （[`Self::from_external`]）。转到后台的那种没有这一份（官方 `Lzn` 把 `shellUsage` 去掉了）。
@@ -828,33 +838,47 @@ pub(super) fn zsh_equals_line(line: &str) -> bool {
     !word.is_empty() && !word.chars().any(char::is_whitespace)
 }
 
-/// 一行是不是 zsh 的「通配符没匹配上」诊断，照 2.1.293 可执行文件里的判据逐字实现：
-/// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: no matches found: /m`——行首是 `(eval)` 或一个名字
-/// （`zsh`、报错的函数名 `scan_py` 之类），可带 `:行号`，紧跟 `: no matches found: `。只看子串会把
-/// 命令自己的输出（`search: no matches found in index`）也算进去。按 JS 的 `m` 标志，`\n`、`\r`、
-/// `\u{2028}`、`\u{2029}` 之后都算行首。
-pub(super) fn zsh_nomatch_line(line: &str) -> bool {
+/// zsh 诊断行的前缀（2.1.293 起几条判据共用）：行首是 `(eval)` 或一个名字（`zsh`、报错的函数名 `scan_py` 之类，
+/// `[A-Za-z_][\w-]*`），可带 `:行号`，返回其后剩下的那段（应以 `: ` 开头）；行首对不上返回 `None`。
+fn zsh_diag_rest(line: &str) -> Option<&str> {
     let rest = if let Some(r) = line.strip_prefix("(eval)") {
         r
     } else {
         let mut chars = line.char_indices();
         match chars.next() {
             Some((_, c)) if c.is_ascii_alphabetic() || c == '_' => {}
-            _ => return false,
+            _ => return None,
         }
         let end = chars
             .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
             .map_or(line.len(), |(i, _)| i);
         &line[end..]
     };
-    let rest = match rest.strip_prefix(':') {
+    Some(match rest.strip_prefix(':') {
         Some(r) => {
             let digits = r.chars().take_while(char::is_ascii_digit).count();
             if digits > 0 && r[digits..].starts_with(':') { &r[digits..] } else { rest }
         }
         None => rest,
-    };
-    rest.starts_with(": no matches found: ")
+    })
+}
+
+/// 一行是不是 zsh 的「通配符没匹配上」诊断，照 2.1.293 可执行文件里的判据逐字实现：
+/// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: no matches found: /m`——行首是 `(eval)` 或一个名字
+/// （`zsh`、报错的函数名 `scan_py` 之类），可带 `:行号`，紧跟 `: no matches found: `。只看子串会把
+/// 命令自己的输出（`search: no matches found in index`）也算进去。按 JS 的 `m` 标志，`\n`、`\r`、
+/// `\u{2028}`、`\u{2029}` 之后都算行首。
+pub(super) fn zsh_nomatch_line(line: &str) -> bool {
+    zsh_diag_rest(line).is_some_and(|r| r.starts_with(": no matches found: "))
+}
+
+/// 一行是不是 zsh 把 `=word` 当命令跑、找不到那个命令的诊断，照 2.1.318 可执行文件里的判据（`b$s`）：
+/// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: command not found: =\S+$/m`——前缀同 [`zsh_nomatch_line`]，紧跟
+/// `: command not found: =`，其后到行尾是一串不含空白的字符。
+pub(super) fn zsh_equals_as_command_line(line: &str) -> bool {
+    zsh_diag_rest(line)
+        .and_then(|r| r.strip_prefix(": command not found: ="))
+        .is_some_and(|w| !w.is_empty() && !w.chars().any(char::is_whitespace))
 }
 
 /// [`tool_success_extras`] 的文件表里记「上一份计划的 Write 入参长度」用的键（不会是真路径）。

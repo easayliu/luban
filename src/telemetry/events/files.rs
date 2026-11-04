@@ -417,7 +417,7 @@ impl EventBuilder<'_> {
     /// - 分组与保留：组数照 `reactive_compact_attempt` 那条的估法，保留最后一组（`splitKind: round`），
     ///   `preservedUuidCount` / `preservedMessageCount` 是那组的消息数，`keptThinkingBlockCount` 是里面的
     ///   thinking 块数（都从压缩请求正文数，见 [`CompactStats`]）；`forkAssistantMessageCount` 1、
-    ///   `summaryPromptArm: no_scratchpad`、`trigger: manual`（自动压缩与手动在请求上分不出，一律按手动）；
+    ///   `summaryPromptArm: no_scratchpad`（2.1.318 起不报）、`trigger: manual`（自动压缩与手动在请求上分不出，一律按手动）；
     /// - token：`preCompactTokens` = 上一条主线程的用量总和（官方 `Bf`：最后一条带用量的 assistant 消息）加
     ///   它之后那几条按 `Cg` 估的；`postCompactTokens` = 摘要正文 + 保留那组 + 恢复的文件 + 固定那几种附件
     ///   （估值照 [`fill_attachment_estimates`]）；`compaction*` 是这次分叉调用自己的用量；
@@ -431,7 +431,7 @@ impl EventBuilder<'_> {
     pub(super) fn emit_compact_succeeded(&mut self, t3: DateTime<Utc>, restored_files: usize) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
-        let TurnFacts { message_tokens, ref attachment_counts, v305, v314, .. } = *env.f;
+        let TurnFacts { message_tokens, ref attachment_counts, v305, v314, v318, .. } = *env.f;
         if !env.f.v285 {
             return;
         }
@@ -518,7 +518,11 @@ impl EventBuilder<'_> {
             put("keptThinkingStripDecidedBy", json!("flag"));
         }
         put("forkAssistantMessageCount", json!(1));
-        put("summaryPromptArm", json!("no_scratchpad"));
+        // 2.1.318 去掉了这一项，换成只在服务端下发了摘要指令时才报的 `summaryPromptTextHash`（官方 `servedInstructions`，
+        // 抓包里没有下发，不报；`cap/auto-2.1.318-20261104-full` A18 那条）。
+        if !v318 {
+            put("summaryPromptArm", json!("no_scratchpad"));
+        }
         put("trigger", json!("manual"));
         put("preCompactTokens", json!(pre));
         put("postCompactTokens", json!(post));

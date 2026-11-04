@@ -487,6 +487,8 @@ impl Telemetry {
         // 2.1.317：Bash 事件多「输出交给 tail」那组、`bash_test_outcome` 的 `head` 放宽、重复命令统计按会话抽样并换布局，
         // 错误栈换块、5xx 带构造名，见 [`TurnFacts::v317`]。
         let v317 = version_at_least(&version, "2.1.317");
+        // 2.1.318：错误栈换块、5xx 不再带构造名，`/compact` 那条去掉 `summaryPromptArm`，见 [`TurnFacts::v318`]。
+        let v318 = version_at_least(&version, "2.1.318");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -515,6 +517,17 @@ impl Telemetry {
         let used_header = call.chain_tools_used_header() || probe_header;
         let tools_used_header_first = used_header && !sess.tools_used_header_reported;
         sess.tools_used_header_reported |= used_header;
+        // 2.1.318 起拼头时记档位（[`super::template::tools_used_size_events`]）：额度探测那条带的是 `[]`，排在这条之前。
+        let tools_used_size_events = if v318 {
+            let mut sizes = Vec::new();
+            if probe_header {
+                sizes.push(super::ToolsUsedSize::of("[]"));
+            }
+            sizes.extend(call.chain_tools_used_sizes());
+            super::template::tools_used_size_events(&mut sess.tools_used_steps, &sizes)
+        } else {
+            Vec::new()
+        };
         let tools_used_truncation = call.chain_tools_used_truncation();
         if first_prompt_tpl {
             sess.first_prompt_tpl_done = true;
@@ -620,9 +633,13 @@ impl Telemetry {
             })
             .flatten()
             .filter(|(name, _)| {
+                // 体里那段在不在，得与下发一致：能力打开（`from`）时在；关掉（`off`）时只有 `heron_brook` 下发的正文里本就
+                // 含这一段才在（2.1.318 抓包那天 opus 就是这样，[`crate::proxy::original_games::heron_covers`]）。
                 let text = crate::proxy::original_games::text_for(&version).as_bytes();
                 let has = call.body.windows(text.len()).any(|w| w == text);
-                !own_system || has == (*name == "tengu_model_capability_from_client_data")
+                let expect = *name == "tengu_model_capability_from_client_data"
+                    || crate::proxy::original_games::heron_covers(call.cred_id, &display_model);
+                !own_system || has == expect
             })
             .filter(|(name, m)| {
                 let off = if *name == "tengu_model_capability_from_client_data" { "" } else { "-" };
@@ -847,8 +864,10 @@ impl Telemetry {
             v314,
             v316,
             v317,
+            v318,
             bash_metered,
             tools_used_header_first,
+            tools_used_size_events,
             tools_used_truncation,
             safety_events,
             suggestion_fork,

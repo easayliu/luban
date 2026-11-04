@@ -71,6 +71,11 @@ pub(crate) struct Upstream<'a> {
     /// 这条的 `x-claude-code-sandy-plover` 装不下、这个会话的锁存头一回丢名字（[`crate::proxy::sandy_plover::apply_session_header`]）：
     /// 遥测随这条报一次 `tengu_feature_sad{api_tools_used_header, incomplete_list}`。
     pub(super) tools_used_truncation: Option<crate::proxy::sandy_plover::Truncation>,
+    /// luban 自己拼的 `x-claude-code-sandy-plover` 这一次有没有丢名字（[`crate::proxy::sandy_plover::header_size`]）；
+    /// 没拼过（真实客户端自带、或没带头）是 `None`。
+    pub(super) tools_used_capped: Option<bool>,
+    /// 发出前等了这个号这个模型的 `client_data`（[`crate::proxy::client_data::wait_for`]）的结果，遥测随这条报。
+    pub(super) client_data_wait: Option<crate::proxy::client_data::ClientDataWait>,
 }
 
 impl Upstream<'_> {

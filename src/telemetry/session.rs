@@ -72,6 +72,10 @@ pub(super) struct Session {
     /// 这个进程已经报过 `feature_ok{api_tools_used_header}`：官方头一回在请求上补 `x-claude-code-sandy-plover` 时报，
     /// 按进程一次（`ri().once`，`/clear` 与 resume 都不清），所以 `/clear` 接着算、新进程从头算。
     pub(super) tools_used_header_reported: bool,
+    /// 这个进程 `x-claude-code-sandy-plover` 到过的最高档位（官方 2.1.318 `raiseHeaderSizeSteps` 记的 `#s`：
+    /// 元素数档、字节数档、丢没丢过名字），往上走才报 `tengu_tools_used_header_size`。按进程记，`/clear` 接着算
+    /// （官方 `clear()` 只清名字与「丢名字报过」，不清档位）。
+    pub(super) tools_used_steps: Option<(u32, u32, bool)>,
     /// 主线程各轮 `tengu_attachments` 里报过的附件类型与条数（首次出现的先后）：`/compact` 收尾那条
     /// `reactive_compact_succeeded` 按类型报 `attachment_*_count`，官方数的是内部消息表里的附件，与各轮
     /// 宣告过的逐类相等（`cap/auto-2.1.305-20261021-full` A0：33 条 total_tokens_reminder 等 11 类全对上）。
@@ -718,6 +722,9 @@ pub(super) struct TurnFacts {
     /// `bash_test_outcome` 里 `head` 没截掉东西的照报，重复命令统计按会话抽样（[`Self::bash_metered`]）并换成跨代理的布局，
     /// 失败 Bash 与 5xx 的错误栈换块、5xx 带上构造名（`cap/auto-2.1.317-20261103-*`）。
     pub(super) v317: bool,
+    /// 2.1.318：失败 Bash 与 5xx 的错误栈换块，5xx 类压缩后成了 `sln`、过不了构造名校验，**不再带 `error_constructor`**；
+    /// `tengu_reactive_compact_succeeded` 去掉 `summaryPromptArm`（`cap/auto-2.1.318-20261104-*`）。
+    pub(super) v318: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
@@ -725,6 +732,9 @@ pub(super) struct TurnFacts {
     /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`
     /// 之后（握手的 eval 没赶上首条、续轮才头一回带上时就是这样）。
     pub(super) tools_used_header_first: bool,
+    /// 2.1.318 起这条拼头时档位往上走了的那几次（[`super::template::tools_used_size_events`]）各一条 `tengu_tools_used_header_size`
+    /// 的内容，按先后；与首次使用那条同处报（在 `feature_sad` 之后、`feature_ok` 之前），不进 Datadog。
+    pub(super) tools_used_size_events: Vec<serde_json::Value>,
     /// 这条（重发过的看整串，[`super::ApiCall::chain_tools_used_truncation`]）的头装不下、会话锁存头一回丢名字：与首次使用
     /// 同一处先报 `feature_sad{incomplete_list}`。
     pub(super) tools_used_truncation: Option<(usize, usize)>,
@@ -1000,6 +1010,7 @@ impl Session {
             background_done: cleared_prev.map_or(0, |p| p.background_done),
             ide_detect_done: cleared_prev.is_some_and(|p| p.ide_detect_done),
             tools_used_header_reported: cleared_prev.is_some_and(|p| p.tools_used_header_reported),
+            tools_used_steps: cleared_prev.and_then(|p| p.tools_used_steps),
             attachment_counts: Vec::new(),
             last_main_reply_model: None,
             recent_ends: VecDeque::new(),
@@ -1079,6 +1090,8 @@ pub(super) struct ClearedPrev {
     pub(super) ide_detect_done: bool,
     /// 进程里那条 `api_tools_used_header` 已经报过，见 [`Session::tools_used_header_reported`]。
     pub(super) tools_used_header_reported: bool,
+    /// 进程里头大小到过的档位，见 [`Session::tools_used_steps`]。
+    pub(super) tools_used_steps: Option<(u32, u32, bool)>,
     /// 进程里已经发过的 `tengu_lucky_cerf` 一系曝光（按 feature）：GrowthBook 的曝光按进程记，
     /// `/clear` 之后不再发。
     pub(super) lucky_cerf_exposed: Vec<&'static str>,
@@ -1187,6 +1200,7 @@ impl State {
                 background_done: p.background_done,
                 ide_detect_done: p.ide_detect_done,
                 tools_used_header_reported: p.tools_used_header_reported,
+                tools_used_steps: p.tools_used_steps,
                 lucky_cerf_exposed: p.lucky_cerf_exposed.clone(),
                 hb: p.hb.clone(),
                 prompt_id: p.prompt_id.clone(),

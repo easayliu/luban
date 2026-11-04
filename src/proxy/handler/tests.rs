@@ -2942,7 +2942,12 @@ async fn simulated_messages_carry_the_tools_used_header(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sandy(&mock.seen()[2]), None, "count_tokens 不带");
 
-    crate::proxy::sandy_plover::note_eval(ids[0], eval(false).as_object().unwrap());
+    // 2.1.318 起不看 `tengu_snug_mitten`，要关得下发 `tengu_silly_shore: false`。
+    let off = serde_json::json!({
+        "tengu_snug_mitten": {"value": false, "source": "force"},
+        "tengu_silly_shore": {"value": false, "source": "force"}
+    });
+    crate::proxy::sandy_plover::note_eval(ids[0], off.as_object().unwrap());
     let (status, _, _) = send(&state, cc_request(later)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sandy(&mock.seen()[3]), None, "开关关了不带");

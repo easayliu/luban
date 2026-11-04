@@ -283,6 +283,8 @@ pub(super) async fn prepare<'a>(
         cc_kind,
         refusal_fallbacks,
         tools_used_truncation: None,
+        tools_used_capped: None,
+        client_data_wait: None,
     };
     // 改写后的出站体单独留一份：上游把请求判成第三方应用时要把它原样摘要打出来
     // （见 [`log_third_party_rejection`]）。`Bytes` 是引用计数，clone 不拷贝字节。
@@ -411,18 +413,67 @@ pub(super) async fn prepare<'a>(
             }
         }
     }
+    // 握手可能刚拉回这个号这个模型的 `client_data` / eval：原创游戏那段与 `heron_brook` 的正文跟着变了，第四块在发出前
+    // 重拼、出站体重新整形（[`Simulation::refresh_system_rest`]）；没握手的沿用 `detect` 时那份（那时已读到最新的下发）。
+    // 官方每次组装请求前（2.1.318 `UWt` / `SIi`）：这个号这个模型还没有 `client_data` 缓存时，等这个槽位进行中的那次
+    // bootstrap，没有就当场发起一次再等，最多 1.5 秒（`tengu_deep_shore` 关了只拉不等，那次已等超时放下了不等也不拉）——新号、新模型
+    // 的首条请求不然就用不上刚下发的正文。同一槽位并发的请求等同一次。结果交给遥测报（[`ApiCall::client_data_wait`]）。
+    if let Some(model) = upstream.sim.as_ref().map(|s| s.rest_model.clone()) {
+        use crate::proxy::client_data::{WaitPlan, plan, wait, waits};
+        let rx = match plan(cred.id, &model) {
+            WaitPlan::Skip => None,
+            WaitPlan::Wait(rx) => Some(rx),
+            WaitPlan::Start(guard, rx) => {
+                // 当场补拉这个模型的 bootstrap（会话中途换到没拉过的模型那种）：后台跑，回来丢守卫放行；等超时也照跑完。
+                if let Ok(client) = state.clients.for_credential(cred) {
+                    let ctx = crate::oauth::KeepaliveCtx::new(
+                        cred,
+                        0.0,
+                        state.telemetry.org_uuid(cred.id),
+                        None,
+                    );
+                    let (token, store, model) =
+                        (token.to_string(), state.store.clone(), model.clone());
+                    tokio::spawn(async move {
+                        crate::oauth::keepalive_bootstrap(&client, &token, &ctx, &model, &store)
+                            .await;
+                        drop(guard);
+                    });
+                }
+                Some(rx)
+            }
+        };
+        // `tengu_deep_shore` 关了只是不等，上面该发起的拉取照样发起（官方 `SIi` 不看它，`UWt` 才看）。
+        if let Some(rx) = rx.filter(|_| waits(cred.id)) {
+            upstream.client_data_wait = Some(wait(cred.id, &model, rx).await);
+        }
+    }
+    // 组装时读的是现在的下发：等过的、或 `detect` 之后下发变过的（bootstrap 赶在等之前回来那种），按新下发重拼第四块
+    // （原创游戏、`heron_brook`、会话还没发过请求时的 `<total_tokens>` 那一档，[`Simulation::refresh_system_rest`]），
+    // 变了就重新整形。
+    if upstream.sim.as_ref().is_some_and(|s| {
+        upstream.client_data_wait.is_some() || s.rest_gen != crate::proxy::client_data::generation()
+    }) && upstream.sim.as_mut().is_some_and(|s| s.refresh_system_rest(cred.id))
+    {
+        (sent, sent_bits) = upstream.shape_outbound(body, cred, device_fp, body_json.as_ref());
+    }
+    // 主线程请求要发出去了：这个会话的 `<total_tokens>` 那一档定死（[`crate::proxy::lapis_anchor::settle`]）。
+    if let Some(s) = upstream.sim.as_ref().filter(|s| !s.lapis_peek) {
+        crate::proxy::lapis_anchor::settle(cred.id, &s.session_id);
+    }
     // 模拟路径（含 billing-only）的 `/v1/messages`：这个会话用过的工具名（2.1.311 起，号的 `tengu_snug_mitten` 开着时），
     // 按出站改名之后的名字记，见 [`crate::proxy::sandy_plover`]；`count_tokens` 官方不带。**放在启动握手之后**：新号首条
     // 请求建头时还没见过 eval，握手刚把开关拉回来（打开或关掉），以它为准；遥测的首次使用也跟着这份出站头报。
     if billable && let Some(s) = upstream.sim.as_ref() {
-        upstream.tools_used_truncation = crate::proxy::sandy_plover::apply_session_header(
-            &mut upstream.headers,
-            cred.id,
-            &s.session_id,
-            s.profile.version,
-            body_json.as_ref(),
-            tool_names.as_deref(),
-        );
+        (upstream.tools_used_truncation, upstream.tools_used_capped) =
+            crate::proxy::sandy_plover::apply_session_header(
+                &mut upstream.headers,
+                cred.id,
+                &s.session_id,
+                s.profile.version,
+                body_json.as_ref(),
+                tool_names.as_deref(),
+            );
     }
     // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
     // [`note_upstream_send`]。纯记录，不影响这条请求走向。

@@ -850,6 +850,11 @@ pub(super) fn error_trace(
         ("2.1.317", Some(s)) if s >= 500 => {
             Some((Some("Onn"), "5b32b751db51", "chunk-7fawza1z.js:5:1510"))
         }
+        // 2.1.318 摘要照旧，顶帧换了块；5xx 类压缩后是 `sln`（小写开头），过不了构造名校验，**又不带
+        // `error_constructor`** 了（`cap/auto-2.1.318-20261104-retry` 那条 529）。
+        ("2.1.318", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-sktwb66b.js:5:1510"))
+        }
         _ => None,
     }
 }

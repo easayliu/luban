@@ -2039,12 +2039,26 @@ impl HandshakeRunner {
 
     /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers（2.1.276 及以前，见
     /// [`handshake_code_triggers`]）/ downloads。抓包里这批与首条 messages 重叠，故 spawn 即可，不必挡着主请求。
-    pub async fn rest(&self, client: &wreq::Client, access_token: &str) {
+    ///
+    /// `fetch` 是这次 bootstrap 在 [`crate::proxy::client_data`] 里的进行中登记：bootstrap 那条回来（成功失败都算）就丢掉
+    /// 它，等着这个槽位的模拟请求随即放行（官方首条前最多等 1.5 秒这次拉取，2.1.318 `UWt`）。
+    pub async fn rest(
+        &self,
+        client: &wreq::Client,
+        access_token: &str,
+        fetch: Option<crate::proxy::client_data::FetchGuard>,
+    ) {
         let (penguin_mode, mcp_servers, mcp_registry, bootstrap, code_triggers, mcp_servers_2) = tokio::join!(
             keepalive_penguin_mode(client, access_token, &self.ctx),
             handshake_mcp_servers(client, access_token, &self.ctx),
             self.maybe_registry(client),
-            keepalive_bootstrap(client, access_token, &self.ctx, &self.model, &self.store),
+            async {
+                let r =
+                    keepalive_bootstrap(client, access_token, &self.ctx, &self.model, &self.store)
+                        .await;
+                drop(fetch);
+                r
+            },
             handshake_code_triggers(client, access_token, &self.ctx),
             handshake_mcp_servers(client, access_token, &self.ctx),
         );

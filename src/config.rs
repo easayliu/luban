@@ -34,6 +34,7 @@ mod v2_1_312;
 mod v2_1_314;
 mod v2_1_316;
 mod v2_1_317;
+mod v2_1_318;
 
 pub use betas::*;
 pub use client::*;
@@ -66,6 +67,7 @@ pub use v2_1_312::*;
 pub use v2_1_314::*;
 pub use v2_1_316::*;
 pub use v2_1_317::*;
+pub use v2_1_318::*;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +261,8 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 315))).version, "2.1.316", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 316))).version, "2.1.316", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 317))).version, "2.1.317", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.317", "模拟路径用 2.1.317 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 318))).version, "2.1.318", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.318", "模拟路径用 2.1.318 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
             let (old, mid) =
                 (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
@@ -316,10 +319,26 @@ mod tests {
                 (v311.beta, v311.effort, v311.request_class),
                 "{kind:?}"
             );
+            // 2.1.317 表同样逐行同 2.1.311；2.1.318 只有标题生成那行多 `claude-code-side-query`（紧跟
+            // `mid-conversation-system-clear-at`），别的行照旧。
+            let v317 = cc_profile_at(kind, Some((2, 1, 317)));
+            assert_eq!(
+                (v317.beta, v317.effort, v317.request_class),
+                (v312.beta, v312.effort, v312.request_class),
+                "{kind:?}"
+            );
             let latest = cc_profile(kind);
+            let want = if kind == SessionTitleHaiku {
+                v317.beta.replace(
+                    "mid-conversation-system-clear-at-2026-08-21,",
+                    "mid-conversation-system-clear-at-2026-08-21,claude-code-side-query-2026-09-29,",
+                )
+            } else {
+                v317.beta.to_string()
+            };
             assert_eq!(
                 (latest.beta, latest.effort, latest.request_class),
-                (v312.beta, v312.effort, v312.request_class),
+                (want.as_str(), v317.effort, v317.request_class),
                 "{kind:?}"
             );
             assert!(!latest.beta.contains(CC_BETA_CACHE_KEEPALIVE), "{kind:?}");
@@ -367,6 +386,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.316").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.315").is_none(), "2.1.315 没有单独的表");
         assert!(cc_profile_exact(MainOpus, "2.1.317").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.318").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

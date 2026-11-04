@@ -545,6 +545,7 @@ impl EventBuilder<'_> {
             v314,
             v316,
             v317,
+            v318,
             bash_metered,
             prompt_seq,
             ..
@@ -694,6 +695,9 @@ impl EventBuilder<'_> {
             }
             if v299 {
                 bash_meta_v299(&mut bash, command, &tu.result_head, &shape.model, false);
+            }
+            if v318 {
+                bash_meta_v318(&mut bash, &tu.result_head);
             }
             // 2.1.311 的命令类别、耗时与 CPU（[`bash_meta_v311`]）：耗时从这次调用的外部时长推，转到后台的没有。
             let usage = (v311 && !backgrounded).then(|| {
@@ -921,7 +925,11 @@ impl EventBuilder<'_> {
             // 2.1.316（`cap/auto-2.1.316-20261031-bashfail` 与全量包里三条，同值）摘要、行列、块名都换了；2.1.315 没抓，
             // 它的打包块名与 2.1.316 不同，摘要也就猜不出，先沿用 2.1.316 的。
             // 2.1.317（`cap/auto-2.1.317-20261103-bashfail`，同一次跑的 2.1.316 对照复现出 9396e613b9d8）摘要、行列、块名都换了。
-            if v317 {
+            // 2.1.318（`cap/auto-2.1.318-20261104-bashfail` 两条，同一次跑的 2.1.317 对照复现出 9a93a625ab80）摘要、行列、块名都换了。
+            if v318 {
+                err["error_stack_hash"] = json!("5f045de6ca68");
+                err["error_top_frame"] = json!("chunk-0x9x817t.js:3567:9365");
+            } else if v317 {
                 err["error_stack_hash"] = json!("9a93a625ab80");
                 err["error_top_frame"] = json!("chunk-vrwkjdrd.js:3571:9103");
             } else if v316 {

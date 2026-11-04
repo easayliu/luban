@@ -64,10 +64,24 @@ pub(crate) fn forget_client_data(cred_id: i64, model: &str) {
 /// 这个号拿 `model` 当主线程模型、客户端是 `version` 时，第四块带不带这一段：2.1.314 起，`client_data` 显式下发了就照它，
 /// 没下发按模型默认——规范名是 opus-5-5（`[1m]`、日期这类尾巴照认）的开、别的关（官方 `NP`）。读不出版本的按最新那版。
 pub(crate) fn applies(cred_id: i64, model: &str, version: &str) -> bool {
+    capability_on(cred_id, model, version) && !heron_covers(cred_id, model)
+}
+
+/// 能力本身开没开（只看版本、模型默认与 `client_data` 那一项），不管 [`heron_covers`]：遥测报来源事件看的是它。
+fn capability_on(cred_id: i64, model: &str, version: &str) -> bool {
     if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 314)) {
         return false;
     }
     served(cred_id, model).unwrap_or_else(|| canonical(model) == "claude-opus-5-5")
+}
+
+/// 官方 `Fmr`：`heron_brook` 下发的正文里已有这一句开头，原创游戏那段就不再单独出（`original_games` 一节的条件是
+/// 能力开着且 `!heron.includes(Fmr)`），免得同一段出现两回。
+const HERON_MARKER: &str = "Do build original games, games in a genre";
+
+/// 这个号这个模型下发的 `heron_brook` 正文（[`super::heron_brook::served`]）里已经含这一段。
+pub(crate) fn heron_covers(cred_id: i64, model: &str) -> bool {
+    super::heron_brook::served(cred_id, model).is_some_and(|(t, _)| t.contains(HERON_MARKER))
 }
 
 /// `client_data` 显式下发的那个值，没下发是 `None`。
@@ -106,10 +120,12 @@ pub(crate) fn client_data_event(
     Some((name, serde_json::json!({ "capability": CAPABILITY, "model": model })))
 }
 
+/// 只有这一段时的插法（测试参照；出站与 `heron_brook` 一节一起排，见 [`super::heron_brook::fit_system_rest`]）：
 /// 第四块（[`crate::proxy::render_system_rest`] 渲染出来的）插上 `version` 那一版的这一段（[`text_for`]）：模板末尾是
 /// `<total_tokens>` 那行时插在它前面、两段之间空一行；没有那行就接在末尾。`on` 为假原样返回。先于
 /// [`super::lapis_anchor::fit_system_rest`] 调，后者去掉那行时连同它前面的空行一起去掉，剩下的正好以这一段收尾
 /// （`cap/auto-2.1.314-20261030-full`、`cap/auto-2.1.317-20261103-full` 的 opus 会话）。
+#[cfg(test)]
 pub(crate) fn fit_system_rest(rest: String, on: bool, version: &str) -> String {
     if !on {
         return rest;
@@ -129,6 +145,23 @@ pub(crate) fn fit_system_rest(rest: String, on: bool, version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 官方 `original_games` 一节要求 `heron_brook` 下发的正文里没有这一段（`Fmr`）：2.1.318 抓包那天的 opus bootstrap
+    /// 既关了能力、又用 `heron_brook` 下发了同一段；能力开着时只要 heron 里有这一段，也不再单独出（不重复）。
+    #[test]
+    fn heron_brook_text_supersedes_the_capability_section() {
+        let id = -93_518;
+        assert!(applies(id, "claude-opus-5-5", "2.1.318"));
+        let boot = serde_json::json!({ "tengu_heron_brook": TEXT });
+        crate::proxy::heron_brook::note_client_data(id, "claude-opus-5-5", &boot);
+        assert!(heron_covers(id, "claude-opus-5-5"));
+        assert!(!applies(id, "claude-opus-5-5", "2.1.318"), "能力开着，heron 已含这段就不再单独出");
+        assert!(!applies(id, "claude-opus-5-5", "2.1.316"), "旧写法的开头同样认得");
+        let other = serde_json::json!({ "tengu_heron_brook": "Something else." });
+        crate::proxy::heron_brook::note_client_data(id, "claude-opus-5-5", &other);
+        assert!(!heron_covers(id, "claude-opus-5-5"));
+        assert!(applies(id, "claude-opus-5-5", "2.1.318"), "heron 里没有这段照出");
+    }
 
     #[test]
     fn on_by_default_for_opus_5_5_from_2_1_314_and_client_data_decides_when_given() {

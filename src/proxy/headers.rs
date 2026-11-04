@@ -122,6 +122,19 @@ pub(crate) fn merge_beta_for(
         {
             parts.insert(i + 1, config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
         }
+        // 2.1.318 起标题生成直连官方多带 `claude-code-side-query`（官方 `generate_session_title` 且走官方地址、OAuth），
+        // 经自定义 BASE_URL 的不带：照直连补回同一位置——紧跟 `mid-conversation-system-clear-at`，没有那项就放在
+        // `effort` 之前，都没有接在末尾（`cap/auto-2.1.318-20261104-full` 16 条标题请求）。
+        if ctx.title
+            && version.is_some_and(|v| v >= (2, 1, 318))
+            && !has(&parts, config::CC_BETA_SIDE_QUERY)
+        {
+            let at = pos(&parts, config::CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+                .map(|i| i + 1)
+                .or_else(|| pos(&parts, config::CC_BETA_EFFORT))
+                .unwrap_or(parts.len());
+            parts.insert(at, config::CC_BETA_SIDE_QUERY.to_string());
+        }
         // SDK 子代理订阅端比 API-key 端多的不只 `oauth`：2.1.251 起的子代理带
         // `cache-diagnosis`（`cap/2.1.285/00120`、`00127`，排在 `message-threads` 之前），API-key
         // 端不发。`advanced-tool-use` / `extended-cache-ttl` 子代理确实不发，照旧不补。
@@ -275,13 +288,21 @@ pub(crate) struct BetaCtx {
     pub(super) display_explicit: bool,
     /// SDK 子代理：只补 `oauth` 之外还要补 `cache-diagnosis`，见 [`merge_beta_for`]。
     pub(super) subagent: bool,
+    /// 会话标题生成（[`super::session_link::CcRequestKind::Title`] 且输出 schema 要 `title`）：2.1.318 起直连官方带
+    /// [`config::CC_BETA_SIDE_QUERY`]，经自定义 BASE_URL 来的不带，见 [`merge_beta_for`]。
+    pub(super) title: bool,
 }
 
 impl BetaCtx {
     /// 主线程、体里带 1h 断点、不压思考——订阅端主线程最常见的那一种，也是测试里按 API-key
     /// 端残缺串还原官方串时默认的前提。
-    pub(super) const MAIN: Self =
-        Self { only_oauth: false, ttl_1h: true, display_explicit: false, subagent: false };
+    pub(super) const MAIN: Self = Self {
+        only_oauth: false,
+        ttl_1h: true,
+        display_explicit: false,
+        subagent: false,
+        title: false,
+    };
 
     /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份，`beta` 是来访自己那串。
     /// 1h 断点先按字节粗筛（[`super::body::body_has_pair`]），命中再按解析好的体逐个断点核
@@ -313,6 +334,12 @@ impl BetaCtx {
                 && body.is_some_and(super::body::has_cache_ttl_1h),
             display_explicit: body.is_some_and(super::body::thinking_display_explicit),
             subagent: kind == super::session_link::CcRequestKind::Subagent,
+            // 只认会话标题那一种（输出 schema 要 `title`）：同属这一类的「给对话起 kebab-case 名」（schema 要 `name`，
+            // `cap/auto-2.1.318-20261104-full/00202`）官方不带 side-query。
+            title: kind == super::session_link::CcRequestKind::Title
+                && body.is_some_and(|v| {
+                    v.pointer("/output_config/format/schema/properties/title").is_some()
+                }),
         }
     }
 }

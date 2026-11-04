@@ -520,14 +520,47 @@ impl EventBuilder<'_> {
         if let Some(prev) = &previous_request_id {
             query.insert("previousRequestId".into(), json!(prev));
         }
+        // 2.1.318 `UWt`：组装请求前等了这个号这个模型的 `client_data`，等完那一刻报（超时进 `feature_sad`、等到且就绪进
+        // `feature_ok`，都带实际等了多久）。抓包机的槽位都有缓存，一条都没有，键序照官方 `c()` / `g()` 的写法。
+        if env.f.v318
+            && let Some(w) = env.call.chain_client_data_wait()
+        {
+            if w.timed_out {
+                let sad = json!({
+                    "waited_ms": w.waited_ms,
+                    "feature_name": "model_client_data_wait",
+                    "error_code": "timeout",
+                    "tengu_quizzical_giraffe": "unset"
+                });
+                self.push_dd(ms(t0, -1), "tengu_feature_sad", sad);
+            } else if w.ready {
+                let ok = feature_with(
+                    "model_client_data_wait",
+                    json!({ "waited_ms": w.waited_ms }),
+                    true,
+                );
+                self.push_dd(ms(t0, -1), "tengu_feature_ok", ok);
+            }
+        }
         self.push(t0, "tengu_api_query", Value::Object(query));
         // 头一回带上 `x-claude-code-sandy-plover`（或头装不下）却不发启动模板的这条：官方在拼这条请求的头时报，紧跟
         // `api_query`（`-p` 首条是 +4ms，那时中间还夹一条 `provider_route`）；发启动模板的那条落在模板里，见
         // [`super::template::tools_used_header_events`]。
         if !env.f.emits_startup() {
             let first_use = env.f.tools_used_header_first;
-            for (name, meta) in tools_used_header_events(first_use, env.f.tools_used_truncation) {
-                self.push_dd(ms(t0, 4), name, meta);
+            // 只是档位往上走（不是首次使用、也没丢名字）的那条紧跟 `api_query`、同一毫秒（`cap/auto-2.1.318-20261104-full`
+            // A0 .972）。
+            let lag = if first_use || env.f.tools_used_truncation.is_some() { 4 } else { 0 };
+            for (name, meta, to_dd) in tools_used_header_events(
+                first_use,
+                env.f.tools_used_truncation,
+                &env.f.tools_used_size_events,
+            ) {
+                if to_dd {
+                    self.push_dd(ms(t0, lag), name, meta);
+                } else {
+                    self.push(ms(t0, lag), name, meta);
+                }
             }
         }
         self.push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);

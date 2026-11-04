@@ -332,6 +332,91 @@ pub(crate) fn peek_session_mode(
     session_mode_at(cred_id, session_id, model, version, false)
 }
 
+/// 刚钉、还没随哪条请求发出去的会话（暂定钉）：会话头一回问到时按当时见过的下发定的，第一条请求发出之前还可以按
+/// 新下发重定（[`refresh_pin`]），发出时定死（[`settle`]）。冷缓存的号等到 bootstrap 之后才组装首条 system，官方此时才
+/// 读这一档；同一会话并发的几条在首条发出前一起跟着改，读到同一档。
+static PROVISIONAL: LazyLock<parking_lot::Mutex<std::collections::HashSet<(i64, String)>>> =
+    LazyLock::new(Default::default);
+
+/// 同 [`session_mode`]：会话头一回问到（或闲置过久重定）时这一档记成暂定（[`PROVISIONAL`]），暂定期间每次问都按现在的
+/// 下发重定。钉与记暂定在同一把锁下
+/// （先 [`PINS`] 后 [`PROVISIONAL`]，几处都按这个顺序拿），与 [`refresh_pin`] / [`settle`] 互斥。
+pub(crate) fn session_mode_provisional(
+    cred_id: i64,
+    session_id: &str,
+    model: &str,
+    version: &str,
+) -> SessionMode {
+    let key = (cred_id, session_id.to_string());
+    let now = Instant::now();
+    let mut pins = PINS.lock();
+    if let Some(entry) = pins.get_mut(&key)
+        && now.duration_since(entry.1) < PIN_IDLE
+    {
+        entry.1 = now;
+        // 还是暂定的（会话里还没有请求发出去）：这一刻按现在的下发重定——同一会话后到的请求在 bootstrap 回来之后才
+        // detect，读到的得是新那档，不能沿用先到那条按旧缓存定的（它记下的下发版本已是新的，不会再重拼）。
+        if PROVISIONAL.lock().contains(&key) {
+            entry.0 = current(cred_id, model, version);
+        }
+        return entry.0;
+    }
+    if pins.len() >= PIN_CAP {
+        prune(&mut pins, now);
+    }
+    let m = current(cred_id, model, version);
+    pins.insert(key.clone(), (m, now));
+    let mut set = PROVISIONAL.lock();
+    if set.len() >= PIN_CAP {
+        set.clear();
+    }
+    set.insert(key);
+    m
+}
+
+/// 等过这个号这个模型的 bootstrap 之后再问一次这个会话的那一档：还是暂定的（会话里还没有请求发出去）就按现在的下发
+/// 重定，否则原样返回钉住的那档——早先发过请求的会话不跟中途的下发（官方一个进程只算一次）。查暂定与写入在同一把锁下，
+/// 迟到的这一下改不动已经 [`settle`] 的会话。
+pub(crate) fn refresh_pin(
+    cred_id: i64,
+    session_id: &str,
+    model: &str,
+    version: &str,
+) -> SessionMode {
+    let key = (cred_id, session_id.to_string());
+    let now = Instant::now();
+    let mut pins = PINS.lock();
+    let provisional = PROVISIONAL.lock().contains(&key);
+    match pins.get_mut(&key) {
+        Some(entry) if !provisional && now.duration_since(entry.1) < PIN_IDLE => {
+            entry.1 = now;
+            entry.0
+        }
+        _ => {
+            let m = current(cred_id, model, version);
+            pins.insert(key, (m, now));
+            m
+        }
+    }
+}
+
+/// 这个会话的一条主线程请求要发出去了：那一档定死，之后不再按下发重定。
+pub(crate) fn settle(cred_id: i64, session_id: &str) {
+    let _pins = PINS.lock();
+    PROVISIONAL.lock().remove(&(cred_id, session_id.to_string()));
+}
+
+/// 钉住的表满了：先清一天没见的，仍超过一半就只留最近见过的一半。
+fn prune(map: &mut HashMap<(i64, String), Pinned>, now: Instant) {
+    map.retain(|_, (_, seen)| now.duration_since(*seen) < PIN_IDLE);
+    if map.len() >= PIN_CAP / 2 {
+        let mut seen: Vec<Instant> = map.values().map(|(_, s)| *s).collect();
+        seen.sort_unstable();
+        let cut = seen[seen.len() - PIN_CAP / 2];
+        map.retain(|_, (_, s)| *s >= cut);
+    }
+}
+
 fn session_mode_at(
     cred_id: i64,
     session_id: &str,
@@ -352,13 +437,7 @@ fn session_mode_at(
         };
     }
     if map.len() >= PIN_CAP {
-        map.retain(|_, (_, seen)| now.duration_since(*seen) < PIN_IDLE);
-        if map.len() >= PIN_CAP / 2 {
-            let mut seen: Vec<Instant> = map.values().map(|(_, s)| *s).collect();
-            seen.sort_unstable();
-            let cut = seen[seen.len() - PIN_CAP / 2];
-            map.retain(|_, (_, s)| *s >= cut);
-        }
+        prune(&mut map, now);
     }
     let entry = map.entry(key).or_insert_with(|| (current(cred_id, model, version), now));
     if now.duration_since(entry.1) >= PIN_IDLE {

@@ -177,6 +177,11 @@ pub const CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT: &str =
 
 /// `count_tokens` 的 beta（`cap/auto-2.1.285-20260930/00104` 起 35 条）：官方 ToolSearch 给延迟
 /// 工具与 MCP 说明数 token 时发，体只有 `model` / `messages` / `tools`。
+/// `claude-code-side-query-2026-09-29`：侧查询那几类请求带。2.1.318 起标题生成（`generate_session_title`）在官方地址、
+/// OAuth 登录时也带，紧跟 [`CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT`]（`cap/auto-2.1.318-20261104-full` 16 条标题请求）；
+/// 经自定义 `ANTHROPIC_BASE_URL` 的客户端不带，见 [`crate::proxy::merge_beta_for`]。
+pub const CC_BETA_SIDE_QUERY: &str = "claude-code-side-query-2026-09-29";
+
 pub const CC_BETA_TOKEN_COUNTING: &str = "token-counting-2024-11-01";
 
 /// `dangerous-tool-use-2026-09-03`：2.1.280 新增，四族主线程都发（`cap/2.1.280/00021` opus、

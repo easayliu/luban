@@ -108,6 +108,12 @@ pub struct ApiCall {
     /// `tengu_feature_sad{sent, dropped, api_tools_used_header, incomplete_list}`。锁存只在头一回给，那次失败、客户端
     /// 重发的几次都是 `None`，报的时候看整串（[`Self::chain_tools_used_truncation`]）。
     pub tools_used_truncation: Option<(usize, usize)>,
+    /// 这条出站 `x-claude-code-sandy-plover` 的大小（[`ToolsUsedSize::of`]），没带头是 `None`。2.1.318 起官方每次拼头都按它
+    /// 记一次档位，档位往上走才报 `tengu_tools_used_header_size`（[`super::template::tools_used_size_events`]）。
+    pub tools_used_size: Option<ToolsUsedSize>,
+    /// 发出前等了这个号这个模型的 `client_data`（[`crate::proxy::client_data::wait_for`]，官方 2.1.318 `UWt`）：等到且就绪
+    /// 报 `feature_ok{model_client_data_wait, waited_ms}`，超时报 `feature_sad{…, timeout}`。
+    pub client_data_wait: Option<crate::proxy::client_data::ClientDataWait>,
     /// 同一请求在这一条之前失败过的那几次（客户端自己重发的），按先后。转发路径交过来时总是空的，
     /// 遥测把扣住的失败接到最终那一次上时才填（见 `Telemetry::process` 的重试链）。
     pub prior_attempts: Vec<PriorAttempt>,
@@ -130,6 +136,26 @@ pub struct PriorAttempt {
     pub tools_used_header: bool,
     /// 那一次的头装不下的诊断，见 [`ApiCall::tools_used_truncation`]。
     pub tools_used_truncation: Option<(usize, usize)>,
+    /// 那一次的头大小，见 [`ApiCall::tools_used_size`]。
+    pub tools_used_size: Option<ToolsUsedSize>,
+    /// 那一次发出前等 `client_data` 的结果，见 [`ApiCall::client_data_wait`]。
+    pub client_data_wait: Option<crate::proxy::client_data::ClientDataWait>,
+}
+
+/// `x-claude-code-sandy-plover` 那串的大小（官方 2.1.318 `Dy`）：`count` 是写进去的元素数（装不下时连队首哨兵一起算，
+/// 即 `sent + 1`），`bytes` 是整串的 UTF-8 字节数，`capped` 是这一次有没有丢名字（官方 `dropped > 0`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolsUsedSize {
+    pub count: usize,
+    pub bytes: usize,
+    pub capped: bool,
+}
+
+impl ToolsUsedSize {
+    /// 从头值算（[`crate::proxy::sandy_plover::header_size`]，`capped` 由头值推）。
+    pub fn of(value: &str) -> Self {
+        crate::proxy::sandy_plover::header_size(value, None)
+    }
 }
 
 impl ApiCall {
@@ -147,6 +173,21 @@ impl ApiCall {
 
     /// 这个逻辑请求那条头装不下的诊断（[`Self::tools_used_truncation`]）：取最早给出的那次。会话锁存只在头一回丢名字
     /// 那次给（官方 `reportTruncationOnce`），那次 503、客户端重发成功时它在先前那几次里，只看最终这次就永远漏了。
+    /// 这个逻辑请求各次尝试出站头的大小（[`Self::tools_used_size`]），按先后：官方每次拼头都记一次档位。
+    pub fn chain_tools_used_sizes(&self) -> Vec<ToolsUsedSize> {
+        self.prior_attempts
+            .iter()
+            .filter_map(|a| a.tools_used_size)
+            .chain(self.tools_used_size)
+            .collect()
+    }
+
+    /// 这个逻辑请求发出前等 `client_data` 的结果（[`Self::client_data_wait`]）：只有头一次会等（等过槽位就有了，或那次
+    /// 拉取已结束），取最早给出的那次。
+    pub fn chain_client_data_wait(&self) -> Option<crate::proxy::client_data::ClientDataWait> {
+        self.prior_attempts.iter().find_map(|a| a.client_data_wait).or(self.client_data_wait)
+    }
+
     pub fn chain_tools_used_truncation(&self) -> Option<(usize, usize)> {
         self.prior_attempts
             .iter()
@@ -170,6 +211,8 @@ impl PriorAttempt {
             request_id: c.request_id.clone(),
             tools_used_header: c.tools_used_header,
             tools_used_truncation: c.tools_used_truncation,
+            tools_used_size: c.tools_used_size,
+            client_data_wait: c.client_data_wait,
         }
     }
 }
@@ -231,6 +274,10 @@ pub struct Capture {
     pub tools_used_header: bool,
     /// 见 [`ApiCall::tools_used_truncation`]。
     pub tools_used_truncation: Option<(usize, usize)>,
+    /// 见 [`ApiCall::tools_used_size`]。
+    pub tools_used_size: Option<ToolsUsedSize>,
+    /// 见 [`ApiCall::client_data_wait`]。
+    pub client_data_wait: Option<crate::proxy::client_data::ClientDataWait>,
 }
 
 impl Capture {
@@ -293,6 +340,8 @@ impl Capture {
             dispatch: self.dispatch,
             tools_used_header: self.tools_used_header,
             tools_used_truncation: self.tools_used_truncation,
+            tools_used_size: self.tools_used_size,
+            client_data_wait: self.client_data_wait,
             prior_attempts: Vec::new(),
         });
     }

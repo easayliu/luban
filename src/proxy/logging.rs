@@ -590,6 +590,8 @@ impl Drop for ReqLog {
                 dispatch: cap.dispatch,
                 tools_used_header: cap.tools_used_header,
                 tools_used_truncation: cap.tools_used_truncation,
+                tools_used_size: cap.tools_used_size,
+                client_data_wait: cap.client_data_wait,
                 prior_attempts: Vec::new(),
             });
         }
@@ -890,6 +892,12 @@ pub(super) fn telemetry_capture(
             .headers
             .contains_key(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER),
         tools_used_truncation: upstream.tools_used_truncation.map(|t| (t.sent, t.dropped)),
+        tools_used_size: upstream
+            .headers
+            .get(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| crate::proxy::sandy_plover::header_size(v, upstream.tools_used_capped)),
+        client_data_wait: upstream.client_data_wait,
     })
 }
 

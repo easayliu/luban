@@ -69,7 +69,7 @@ const MAX_NAME_BYTES: usize = 256;
 
 /// 有名字没写进去（超了上限，或名字是空串、超长）时排在最前面的哨兵名（官方 `jae`）；锁存里认不出的名字也记成它
 /// （[`readable`]）。
-const TRUNCATED_SENTINEL: &str = "unreadable-tools-used-before-summary";
+pub(crate) const TRUNCATED_SENTINEL: &str = "unreadable-tools-used-before-summary";
 
 /// 旧工具名 → 现名（官方 `cd` 查的那张表，2.1.312 逐字）：`tool_use` 与 `server_tool_use` 的名字先过它再记，于是来访
 /// 自己声明的 `Task`（官方旧名，白名单放行、不进改名表）记成 `Agent`。
@@ -219,8 +219,11 @@ fn records_for(cred_id: i64, version: &str) -> bool {
 }
 
 /// 这个号上、`version` 这一版的官方客户端发 `/v1/messages` 时带不带这个头：记着、且 `tengu_snug_mitten` 开着。
+/// 2.1.318 删了 `tengu_snug_mitten`（官方 `uS()` 只剩 `tengu_silly_shore`），记着就带。
 pub(crate) fn sent_for(cred_id: i64, version: &str) -> bool {
-    records_for(cred_id, version) && FLAGS.read().get(&cred_id).is_some_and(|&(snug, _)| snug)
+    let at_318 = super::parse_version(version).is_some_and(|v| v >= (2, 1, 318));
+    records_for(cred_id, version)
+        && (at_318 || FLAGS.read().get(&cred_id).is_some_and(|&(snug, _)| snug))
 }
 
 /// luban 自己发的那几条（预热、连通性测试、额度探测）：不在任何对话里，锁存是空的，带 `[]`。
@@ -230,7 +233,8 @@ pub(crate) fn fresh_header(cred_id: i64, version: &str) -> Option<HeaderValue> {
 
 /// 发出前那一刻定模拟路径这条 `/v1/messages` 的头：先摘掉（重新整形、换号重来时可能带着上一次的），开关开着再按锁存补上。
 /// 要放在新会话的启动握手之后——握手刚拉回的 eval 可能把这个号的开关打开或关掉，首条请求得跟着它。头装不下、这个锁存
-/// 头一回丢名字时返回那条诊断的两个数（遥测报 `tengu_feature_sad{api_tools_used_header, incomplete_list}`）。
+/// 头一回丢名字时返回那条诊断的两个数（遥测报 `tengu_feature_sad{api_tools_used_header, incomplete_list}`）；第二项是
+/// 带了头时这一次有没有丢名字（[`header_size`]），没带头是 `None`。
 pub(crate) fn apply_session_header(
     headers: &mut axum::http::HeaderMap,
     cred_id: i64,
@@ -238,12 +242,13 @@ pub(crate) fn apply_session_header(
     version: &str,
     body: Option<&serde_json::Value>,
     tool_names: Option<&ToolNameMap>,
-) -> Option<Truncation> {
+) -> (Option<Truncation>, Option<bool>) {
     headers.remove(SANDY_PLOVER_HEADER);
-    let Some((value, truncation)) = session_header(cred_id, session_id, version, body, tool_names)
+    let Some((value, truncation, capped)) =
+        session_header_full(cred_id, session_id, version, body, tool_names)
     else {
         tracing::debug!(cred_id, session = %session_id.chars().take(8).collect::<String>(), "tools-used header not sent");
-        return None;
+        return (None, None);
     };
     tracing::debug!(
         cred_id,
@@ -252,11 +257,12 @@ pub(crate) fn apply_session_header(
         "tools-used header sent"
     );
     headers.insert(SANDY_PLOVER_HEADER, value);
-    truncation
+    (truncation, Some(capped))
 }
 
 /// 模拟路径的一条 `/v1/messages`：来访对话里用过的工具并进这个会话的锁存（`tengu_silly_shore` 开着就记，不管发不发头），
 /// 头要发时返回头值与头一回丢名字时的诊断。
+#[cfg(test)]
 pub(crate) fn session_header(
     cred_id: i64,
     session_id: &str,
@@ -264,12 +270,39 @@ pub(crate) fn session_header(
     body: Option<&serde_json::Value>,
     tool_names: Option<&ToolNameMap>,
 ) -> Option<(HeaderValue, Option<Truncation>)> {
+    session_header_full(cred_id, session_id, version, body, tool_names).map(|(v, t, _)| (v, t))
+}
+
+/// [`session_header`]，另带这一次有没有丢名字（与「头一回丢名字」的诊断不同，之后每次装不下都是 true）。
+pub(crate) fn session_header_full(
+    cred_id: i64,
+    session_id: &str,
+    version: &str,
+    body: Option<&serde_json::Value>,
+    tool_names: Option<&ToolNameMap>,
+) -> Option<(HeaderValue, Option<Truncation>, bool)> {
     if !records_for(cred_id, version) {
         return None;
     }
     let used = body.map(|b| tools_used_in(b, tool_names)).unwrap_or_default();
-    let (value, truncation) = latch(cred_id, session_id, used, sent_for(cred_id, version))?;
-    Some((HeaderValue::from_str(&value).ok()?, truncation))
+    let (value, truncation, capped) = latch(cred_id, session_id, used, sent_for(cred_id, version))?;
+    Some((HeaderValue::from_str(&value).ok()?, truncation, capped))
+}
+
+/// 头值的大小（2.1.318 `tengu_tools_used_header_size`，官方 `Dy`）：`capped` 是这一次有没有丢名字。luban 自己拼的头
+/// 拼时就知道（[`session_header_full`]）；真实客户端自带的头只能从头值推：官方丢名字时队首换成哨兵，且那时要么写满
+/// 64 个、要么整串离 7168 字节不到一个名字（名字最长 256 字节），所以队首是哨兵且到了这个边上才算，单是有个认不出的
+/// 名字（同一个哨兵，[`readable`]）不算。**到了边上的那种头值本身有歧义**：认不出的名字恰好排在队首、总数又恰好到边，
+/// 与真截断拼出来逐字节相同，透传拿不到客户端的 `dropped`，按常见得多的截断算（官方那种情形报 false，这里会报 true）。
+pub(crate) fn header_size(value: &str, capped: Option<bool>) -> crate::telemetry::ToolsUsedSize {
+    let items: Vec<serde_json::Value> = serde_json::from_str(value).unwrap_or_default();
+    let capped = capped.unwrap_or_else(|| {
+        let first_sentinel = items.first().and_then(|v| v.get("name")).and_then(|n| n.as_str())
+            == Some(TRUNCATED_SENTINEL);
+        let item_max = MAX_NAME_BYTES + r#"{"name":""},"#.len();
+        first_sentinel && (items.len() >= MAX_NAMES || value.len() + item_max > MAX_BYTES)
+    });
+    crate::telemetry::ToolsUsedSize { count: items.len(), bytes: value.len(), capped }
 }
 
 /// 对话里调过的工具，按出现先后、去重：用户与助手消息都扫三类调用块（官方 `a5`）——`tool_use` 先换成出站那个名字
@@ -366,13 +399,13 @@ fn readable(name: String) -> String {
 }
 
 /// 把这条请求里用过的并进（号，会话）的锁存；`render` 时按并完的整份拼出头值，头一回丢名字时带上那条诊断（之后同一个
-/// 锁存不再报）。
+/// 锁存不再报）；末项是这一次有没有丢名字（官方 `dropped > 0`，2.1.318 `tengu_tools_used_header_size` 的 `hit_cap`）。
 fn latch(
     cred_id: i64,
     session_id: &str,
     used: Vec<String>,
     render_header: bool,
-) -> Option<(String, Option<Truncation>)> {
+) -> Option<(String, Option<Truncation>, bool)> {
     let now = Instant::now();
     let mut guard = LATCHES.lock();
     let latches = &mut *guard;
@@ -403,8 +436,9 @@ fn latch(
         return None;
     }
     let (value, truncation) = render(&entry.names);
+    let capped = truncation.is_some();
     let report = truncation.filter(|_| !std::mem::replace(&mut entry.truncation_reported, true));
-    Some((value, report))
+    Some((value, report, capped))
 }
 
 /// 照官方 `ny`：空名与超长名不写；非核心在前、核心在后；装不下（或有名字没写）时队首换哨兵重排，并给出写进去几个
@@ -499,6 +533,15 @@ mod tests {
         note_eval(id, &features(serde_json::json!({"features": {}})));
         assert!(!sent_for(id, "2.1.312"), "整份 eval 里没有 snug_mitten 按关");
         assert_eq!(fresh_header(id, "2.1.312"), None);
+        // 2.1.318 删了 snug_mitten：只看 silly_shore（读不到按开）。
+        assert!(sent_for(id, "2.1.318"), "2.1.318 起不看 snug_mitten");
+        assert!(!sent_for(id, "2.1.317"), "2.1.317 还看");
+        assert!(sent_for(-93_318, "2.1.318"), "没见过 eval 的号 silly_shore 按开");
+        note_eval(
+            id,
+            &features(serde_json::json!({"features": {"tengu_silly_shore": {"value": false}}})),
+        );
+        assert!(!sent_for(id, "2.1.318"), "silly_shore 下发关照样不带");
     }
 
     /// 取值与排法对上 `cap/auto-2.1.312-20261028-full`：`00090` 全是核心工具按首次使用；`00200` 非核心的
@@ -877,12 +920,47 @@ mod tests {
         let body = serde_json::json!({"messages":[{"role":"assistant","content":blocks}]});
         let mut headers = axum::http::HeaderMap::new();
         let first = apply_session_header(&mut headers, id, "s1", "2.1.312", Some(&body), None);
-        assert_eq!(first, Some(Truncation { sent: 63, dropped: 2 }));
+        assert_eq!(first, (Some(Truncation { sent: 63, dropped: 2 }), Some(true)));
         assert!(headers.get(SANDY_PLOVER_HEADER).is_some());
         let again = apply_session_header(&mut headers, id, "s1", "2.1.312", Some(&body), None);
-        assert_eq!(again, None, "同一个锁存只报一次");
+        assert_eq!(again, (None, Some(true)), "同一个锁存只报一次，这一次照样丢了名字");
         let other = apply_session_header(&mut headers, id, "s2", "2.1.312", Some(&body), None);
-        assert_eq!(other, Some(Truncation { sent: 63, dropped: 2 }), "别的会话另算");
+        assert_eq!(other, (Some(Truncation { sent: 63, dropped: 2 }), Some(true)), "别的会话另算");
+    }
+
+    /// 2.1.318 `tengu_tools_used_header_size` 的 `hit_cap` 是这一次有没有丢名字（官方 `dropped > 0`）：认不出的名字
+    /// 记成同一个哨兵、可能排到队首，但没丢名字，不算；luban 自己拼的按拼时的结果，真实客户端自带的头才从头值推。
+    #[test]
+    fn hit_cap_means_names_were_dropped() {
+        let id = -933_181;
+        note_eval(
+            id,
+            &features(serde_json::json!({"features": {"tengu_snug_mitten": {"value": true}}})),
+        );
+        let body = serde_json::json!({"messages":[{"role":"assistant","content":[
+            {"type":"mcp_tool_use","id":"m","name":"","server_name":"","input":{}}
+        ]}]});
+        let mut headers = axum::http::HeaderMap::new();
+        let out = apply_session_header(&mut headers, id, "s1", "2.1.318", Some(&body), None);
+        assert_eq!(out, (None, Some(false)), "只有一个认不出的名字，没丢");
+        let v = headers[SANDY_PLOVER_HEADER].to_str().unwrap().to_string();
+        assert_eq!(v, format!(r#"[{{"name":"{TRUNCATED_SENTINEL}"}}]"#));
+        let size = header_size(&v, None);
+        assert_eq!((size.count, size.bytes, size.capped), (1, v.len(), false), "从头值推也不算");
+        assert!(header_size(&v, Some(true)).capped, "拼时知道的为准");
+        // 真实客户端自带、写满 64 个且队首是哨兵：头值本身分不出来——「认不出的名字排在队首 + 63 个、一个没丢」与
+        // 「65 个、截掉 2 个」拼出来逐字节相同（官方前者 `hit_cap: false`、后者 `true`）。透传拿不到客户端那头的
+        // `dropped`，按常见得多的截断报 true；luban 自己拼的不走这条推断（上面 `Some(false)` 那条）。
+        let full = std::iter::once(format!(r#"{{"name":"{TRUNCATED_SENTINEL}"}}"#))
+            .chain((0..63).map(|i| format!(r#"{{"name":"t{i}"}}"#)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let ambiguous = format!("[{full}]");
+        assert!(header_size(&ambiguous, None).capped, "歧义时按截断");
+        assert!(!header_size(&ambiguous, Some(false)).capped, "拼时知道没丢的不受推断影响");
+        // 没到边上的一律不算，哪怕队首是哨兵。
+        let short = format!(r#"[{{"name":"{TRUNCATED_SENTINEL}"}},{{"name":"t0"}}]"#);
+        assert!(!header_size(&short, None).capped);
     }
 
     /// 启动时读回的那份与刚拉到的 eval 一样算数：重启前开着的号，重启后的额度探测照样带 `[]`；启动之后才到的 eval

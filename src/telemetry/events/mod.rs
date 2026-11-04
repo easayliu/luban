@@ -414,6 +414,11 @@ impl<'a> EventEnv<'a> {
             lapis: f.lapis.clone(),
             tools_used_header: f.tools_used_header_first && f.emits_startup(),
             tools_used_truncation: f.tools_used_truncation.filter(|_| f.emits_startup()),
+            tools_used_size: if f.emits_startup() {
+                f.tools_used_size_events.clone()
+            } else {
+                Vec::new()
+            },
             org_gate: f.org_gate.clone(),
             capability_events: f.capability_events.clone(),
             git: f.identity.vcs.is_some(),

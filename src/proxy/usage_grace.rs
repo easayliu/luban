@@ -71,6 +71,9 @@ pub fn note_eval_features(cred_id: i64, body: &[u8]) {
     super::curious_tower::note_eval(cred_id, features);
     // 拼进 system 的那段 `tengu_heron_brook`（bootstrap 的 `client_data` 优先，这里是兜底那份）。
     super::heron_brook::note_eval(cred_id, features);
+    super::client_data::note_eval(cred_id, features);
+    // eval 也管 `heron_brook` 与 `<total_tokens>` 那一档：变了让进行中的模拟请求发出前重拼第四块。
+    super::client_data::bump();
     // `<total_tokens>` 提醒的那一档（bootstrap 的 `client_data` 优先，这里是兜底那份）。
     super::lapis_anchor::note_eval(cred_id, features);
     // 组织配置那道闸的开关（`tengu_org_config_required`），启动遥测的影子判定与真判定照它报。

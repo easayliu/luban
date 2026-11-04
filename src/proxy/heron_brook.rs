@@ -19,11 +19,11 @@ const HERON_BROOK_FEATURE: &str = "tengu_heron_brook";
 /// `(号, 模型键)`。
 type ClientDataKey = (i64, String);
 
-/// `(号, 模型)` → bootstrap `client_data` 里那段文本的长度；下发了但为空、或没有这一项记 `None`。
-static CLIENT_DATA: LazyLock<parking_lot::RwLock<HashMap<ClientDataKey, Option<usize>>>> =
+/// `(号, 模型)` → bootstrap `client_data` 里那段文本（`trim` 过）；下发了但为空、或没有这一项记 `None`。
+static CLIENT_DATA: LazyLock<parking_lot::RwLock<HashMap<ClientDataKey, Option<String>>>> =
     LazyLock::new(Default::default);
-/// 号 → eval 里那段文本的长度（同上）。
-static EVAL: LazyLock<parking_lot::RwLock<HashMap<i64, Option<usize>>>> =
+/// 号 → eval 里那段文本（同上）。
+static EVAL: LazyLock<parking_lot::RwLock<HashMap<i64, Option<String>>>> =
     LazyLock::new(Default::default);
 
 /// 模型键：小写、去掉 `[1m]`（bootstrap 的 `model` 参数是规范名，遥测这边是展示名）。
@@ -32,16 +32,16 @@ fn model_key(model: &str) -> String {
     m.strip_suffix("[1m]").unwrap_or(&m).to_string()
 }
 
-/// 非空文本的长度（`trim` 之后按 UTF-16 码元数）。
-fn text_len(v: Option<&serde_json::Value>) -> Option<usize> {
+/// 非空文本（`trim` 之后，官方 `vmr` 同样先 `trim` 再判空）。
+fn text_of(v: Option<&serde_json::Value>) -> Option<String> {
     let t = v.and_then(|v| v.as_str())?.trim();
-    (!t.is_empty()).then(|| t.encode_utf16().count())
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// 记下一份 bootstrap 回包里的 `client_data`（[`super::client_data`] 拆好交过来，回包里没有这一项时是空对象）。
 pub(crate) fn note_client_data(cred_id: i64, model: &str, data: &serde_json::Value) {
-    let len = text_len(data.get(HERON_BROOK_FEATURE));
-    CLIENT_DATA.write().insert((cred_id, model_key(model)), len);
+    let text = text_of(data.get(HERON_BROOK_FEATURE));
+    CLIENT_DATA.write().insert((cred_id, model_key(model)), text);
 }
 
 /// 忘掉这个号这个模型的那份（[`super::client_data`] 按号限条数，挤出去的一并清掉）。
@@ -51,16 +51,68 @@ pub(crate) fn forget_client_data(cred_id: i64, model: &str) {
 
 /// 从一份 eval 的 `features` 里记下这个号的文本：一份 eval 是整份特性缓存，没有这一项即按没下发记。
 pub(crate) fn note_eval(cred_id: i64, features: &serde_json::Map<String, serde_json::Value>) {
-    let len = text_len(features.get(HERON_BROOK_FEATURE).and_then(|f| f.get("value")));
-    EVAL.write().insert(cred_id, len);
+    let text = text_of(features.get(HERON_BROOK_FEATURE).and_then(|f| f.get("value")));
+    EVAL.write().insert(cred_id, text);
 }
 
-/// 这个号用 `model` 当主模型时，那条事件该报的 `(len, fromClientData)`；两处都没下发是 `None`。
-pub(crate) fn applied(cred_id: i64, model: &str) -> Option<(usize, bool)> {
-    let client = CLIENT_DATA.read().get(&(cred_id, model_key(model))).copied().flatten();
+/// 这个号用 `model` 当主模型时下发的那段正文与来处（`fromClientData`）：先看 bootstrap 的 `client_data`，再看 eval；
+/// 两处都没下发是 `None`。
+pub(crate) fn served(cred_id: i64, model: &str) -> Option<(String, bool)> {
+    let client = CLIENT_DATA.read().get(&(cred_id, model_key(model))).cloned().flatten();
     client
-        .map(|n| (n, true))
-        .or_else(|| EVAL.read().get(&cred_id).copied().flatten().map(|n| (n, false)))
+        .map(|t| (t, true))
+        .or_else(|| EVAL.read().get(&cred_id).cloned().flatten().map(|t| (t, false)))
+}
+
+/// 这个号用 `model` 当主模型时，那条事件该报的 `(len, fromClientData)`（长度按 UTF-16 码元）；两处都没下发是 `None`。
+pub(crate) fn applied(cred_id: i64, model: &str) -> Option<(usize, bool)> {
+    served(cred_id, model).map(|(t, from)| (t.encode_utf16().count(), from))
+}
+
+/// haiku-5-5 那段内置的「提前收手」说明（官方 `Amr`）：`heron_brook` 这一节没有下发时，带
+/// `haiku_5_5_early_stopping_guidance` 能力的模型用它（[`crate::config::CC_SYSTEM_REST_HAIKU_5_5`] 里就是这一段）；
+/// 下发了就换成下发的正文。取它在模板里的那一段：从「The reasoning effort setting changes」起到下一个空行。
+const EARLY_STOPPING_HEAD: &str =
+    "The reasoning effort setting changes how much you think before you act.";
+
+/// 第四块末尾那两节（官方 2.1.293 起 system 段序 `…、original_games、heron_brook、…`，都在 `<total_tokens>` 之前）：`games`
+/// 是原创游戏那段（[`super::original_games`] 判开了才给），`served` 是下发的 `heron_brook` 正文。`heron_brook` 这一节在
+/// 模板里有内置的「提前收手」那段（haiku-5-5，官方 `Amr`）时就占着它的位置：下发了就整段换掉，没下发保留原样；原创游戏
+/// 那段总排在这一节前面。模板里没有那段的，两节依次插在 `<total_tokens>` 前、两段之间空一行，没有那行就接在末尾。
+/// `served` 在 2.1.293 之前不算（没有这一节）。两样都没有原样返回。在 [`super::lapis_anchor::fit_system_rest`] 之前调。
+pub(crate) fn fit_system_rest(
+    rest: String,
+    games: Option<&str>,
+    served: Option<&str>,
+    version: &str,
+) -> String {
+    let served =
+        served.filter(|_| !crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 293)));
+    if games.is_none() && served.is_none() {
+        return rest;
+    }
+    let mut out = rest;
+    if let Some(at) = out.find(EARLY_STOPPING_HEAD) {
+        // 那段自己带空行，是模板里 `<total_tokens>` 前的最后一段：截到那行之前，没有那行就截到末尾。
+        let end = out[at..].find("\n\n<total_tokens>").map_or(out.len(), |n| at + n);
+        let builtin = out[at..end].to_string();
+        let heron = served.unwrap_or(&builtin);
+        let section = match games {
+            Some(g) => format!("{g}\n\n{heron}"),
+            None => heron.to_string(),
+        };
+        out.replace_range(at..end, &section);
+        return out;
+    }
+    let section = [games, served].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+    match out.rfind("<total_tokens>").filter(|at| out[..*at].ends_with("\n\n")) {
+        Some(at) => out.insert_str(at, &format!("{section}\n\n")),
+        None => {
+            out.push_str("\n\n");
+            out.push_str(&section);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -86,5 +138,54 @@ mod tests {
         note_client_data(id, "claude-haiku-5-5", &serde_json::json!({ "heather_vale": true }));
         note_eval(id, &serde_json::Map::new());
         assert_eq!(applied(id, "claude-haiku-5-5"), None);
+    }
+
+    /// 2.1.318 抓包那天 opus 的原创游戏说明改由 `heron_brook` 下发：插在原创游戏那段的位置（`<total_tokens>` 前、
+    /// 没有那行接末尾）；haiku-5-5 模板里内置的「提前收手」那段（自带空行）整段换掉；原创游戏那段总在这一节前面，
+    /// 替换时不能吞掉它；2.1.293 之前没有这一节。
+    #[test]
+    fn served_text_takes_the_heron_brook_slot() {
+        let text = crate::proxy::original_games::TEXT;
+        let rest = "…an exhaustive survey\n\n<total_tokens>15000000 tokens left</total_tokens>";
+        assert_eq!(
+            fit_system_rest(rest.into(), None, Some(text), "2.1.318"),
+            format!(
+                "…an exhaustive survey\n\n{text}\n\n<total_tokens>15000000 tokens left</total_tokens>"
+            )
+        );
+        assert_eq!(
+            fit_system_rest("…an exhaustive survey".into(), None, Some(text), "2.1.318"),
+            format!("…an exhaustive survey\n\n{text}")
+        );
+        assert_eq!(fit_system_rest(rest.into(), None, None, "2.1.318"), rest);
+        assert_eq!(
+            fit_system_rest(rest.into(), None, Some(text), "2.1.291"),
+            rest,
+            "2.1.293 之前没有这一节"
+        );
+        // 两节都有：原创游戏在前、下发的跟在后面；只有原创游戏的与原先的插法一致。
+        assert_eq!(
+            fit_system_rest(rest.into(), Some(text), Some("served"), "2.1.318"),
+            format!(
+                "…an exhaustive survey\n\n{text}\n\nserved\n\n<total_tokens>15000000 tokens left</total_tokens>"
+            )
+        );
+        assert_eq!(
+            fit_system_rest(rest.into(), Some(text), None, "2.1.318"),
+            crate::proxy::original_games::fit_system_rest(rest.into(), true, "2.1.318")
+        );
+
+        let haiku = crate::config::CC_SYSTEM_REST_HAIKU_5_5;
+        let at = haiku.find(EARLY_STOPPING_HEAD).expect("haiku-5-5 模板带内置那段");
+        let tail = &haiku[haiku.find("\n\n<total_tokens>").unwrap()..];
+        let builtin = &haiku[at..haiku.len() - tail.len()];
+        let out = fit_system_rest(haiku.into(), None, Some("served"), "2.1.318");
+        assert_eq!(out, format!("{}served{tail}", &haiku[..at]), "内置那段整段换掉");
+        // haiku-5-5 开了原创游戏、又下发了不含它的正文：两段都在，原创游戏在前。
+        let out = fit_system_rest(haiku.into(), Some(text), Some("served"), "2.1.318");
+        assert_eq!(out, format!("{}{text}\n\nserved{tail}", &haiku[..at]));
+        // 只开原创游戏：排在内置那段前面，内置那段原样。
+        let out = fit_system_rest(haiku.into(), Some(text), None, "2.1.318");
+        assert_eq!(out, format!("{}{text}\n\n{builtin}{tail}", &haiku[..at]));
     }
 }

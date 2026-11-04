@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.317."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.318."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.317."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.318."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1629,19 +1629,21 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.317-20261103-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.318-20261104-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、`x-claude-code-sandy-plover`、顶层键序、
 /// `thinking`、`context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方
-/// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00655`、`00359`、`00583`、`00442`
-/// 都是各自首轮；2.1.316 那次是 `00666`、`00362`、`00596`、`00445`，2.1.314 是 `00706`（中断后重开那轮）、`00381`、`00625`、
-/// `00470`）；fable 只有 auto 模式的（`00882`，2.1.316 是 `00903`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
+/// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00674`、`00367`、`00599`、`00452`
+/// 都是各自首轮；2.1.317 那次是 `00655`、`00359`、`00583`、`00442`，2.1.316 那次是 `00666`、`00362`、`00596`、`00445`，2.1.314 是 `00706`（中断后重开那轮）、`00381`、`00625`、
+/// `00470`）；fable 只有 auto 模式的（`00910`，2.1.317 是 `00882`，2.1.316 是 `00903`），它的 beta 去掉 auto 模式才有的 `afk-mode` 与
 /// `dangerous-tool-use`、Bash 不比（auto 那版少一句）。抓包那个号开着缓存保活，官方 beta 里的
 /// `cache-keepalive` 模拟路径暂不带（喂了开着的 eval 也不带，见 `SIM_CACHE_KEEPALIVE`；2.1.310 起这个号服务端已把
 /// 那个开关关了，官方串里本就没有）；基座末尾那段 Artifact `edits` 说明随注入的工具一起出现（2.1.303 起
 /// 从第四块挪到基座）。抓包时服务端在 opus / sonnet 的 bootstrap 里下发了 `tengu_lapis_anchor:"off"`
 /// （[`crate::proxy::lapis_anchor`]），这里同样喂给测试号：这两族第四块与首轮都没有 `<total_tokens>`，其余三族照有
 /// （2.1.314 的内置目录里这两族本身也没有这项能力了，不喂一样不发）。opus 的第四块 2.1.314 起多一段原创游戏的说明
-/// （[`crate::proxy::original_games`]），落在末尾；2.1.317 换了写法（多 77 字节）。
+/// （[`crate::proxy::original_games`]），落在末尾；2.1.317 换了写法（多 77 字节）。2.1.318 抓包那天服务端给 opus 的 bootstrap
+/// 改下发 `original_games_guidance: false` 加 `tengu_heron_brook`（正文与 2.1.317 那段逐字相同），出站字节不变，
+/// 这里照样喂给测试号（[`crate::proxy::heron_brook`]）。
 /// 抓包那天服务端开着 `tengu_snug_mitten`，五条官方主线程都带 `x-claude-code-sandy-plover: []`（各自首轮，还没用过工具），
 /// 测试号同样喂开，见 [`crate::proxy::sandy_plover`]。
 ///
@@ -1649,10 +1651,10 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_317_captures() {
-    let dir = format!("{}/cap/auto-2.1.317-20261103-full", env!("CARGO_MANIFEST_DIR"));
+fn simulated_main_threads_match_the_2_1_318_captures() {
+    let dir = format!("{}/cap/auto-2.1.318-20261104-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.317-20261103-full not present");
+        eprintln!("skipped: cap/auto-2.1.318-20261104-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
@@ -1674,16 +1676,22 @@ fn simulated_main_threads_match_the_2_1_317_captures() {
                 "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"},
             "tengu_snug_mitten": {"value": true, "source": "force"}}});
         crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
-        // 抓包那天 bootstrap 的 `client_data`：opus / sonnet 下发 `tengu_lapis_anchor:"off"`，haiku 与 fable 没有这一项。
-        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
-            let boot =
-                br#"{"client_data":{"cedar_basin":"2027-08-31","tengu_lapis_anchor":"off"}}"#;
-            crate::proxy::client_data::note_bootstrap(cred.id, model, boot);
-        }
+        // 抓包那天 bootstrap 的 `client_data`：opus / sonnet 下发 `tengu_lapis_anchor:"off"`，haiku 与 fable 没有这一项；
+        // opus 另有 `original_games_guidance: false` 与 `tengu_heron_brook`（那段原创游戏的正文改由它下发）。
+        let heron = serde_json::json!({"client_data": {"cedar_basin": "2027-08-31",
+            "tengu_lapis_anchor": "off", "original_games_guidance": false,
+            "tengu_heron_brook": crate::proxy::original_games::TEXT}});
+        crate::proxy::client_data::note_bootstrap(
+            cred.id,
+            "claude-opus-5-5",
+            heron.to_string().as_bytes(),
+        );
+        let boot = br#"{"client_data":{"cedar_basin":"2027-08-31","tengu_lapis_anchor":"off"}}"#;
+        crate::proxy::client_data::note_bootstrap(cred.id, "claude-sonnet-5-5", boot);
         cred
     };
     for (i, (n, auto_mode)) in
-        [("00655", false), ("00359", false), ("00442", false), ("00583", false), ("00882", true)]
+        [("00674", false), ("00367", false), ("00452", false), ("00599", false), ("00910", true)]
             .into_iter()
             .enumerate()
     {
@@ -1786,7 +1794,7 @@ fn simulated_main_threads_match_the_2_1_317_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.317."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.318."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1795,7 +1803,7 @@ fn simulated_main_threads_match_the_2_1_317_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/5b1067d9-5d18-4d5d-a257-5dda6af8ca6f/scratchpad/cal8",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/adfa147e-8aa1-47d5-8298-ce3017f786fd/scratchpad/cal9",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -1813,12 +1821,16 @@ fn simulated_main_threads_match_the_2_1_317_captures() {
             "{model}"
         );
         let template = super::cc_system_rest(model).unwrap();
+        // opus 的原创游戏说明这次由 `heron_brook` 下发（能力本身被关掉），别的模型两样都没有。
         let games = crate::proxy::original_games::applies(cred.id, model, sim.profile.version);
-        assert_eq!(games, model == "claude-opus-5-5", "{model}");
+        assert!(!games, "{model}: 下发的 heron_brook 已含这一段，能力那段不再单独出");
+        let heron = crate::proxy::heron_brook::served(cred.id, model).map(|(t, _)| t);
+        assert_eq!(heron.is_some(), model == "claude-opus-5-5", "{model}");
         let rest = crate::proxy::lapis_anchor::fit_system_rest(
-            crate::proxy::original_games::fit_system_rest(
+            crate::proxy::heron_brook::fit_system_rest(
                 crate::proxy::render_system_rest(template, &cap_env),
-                games,
+                games.then(|| crate::proxy::original_games::text_for(sim.profile.version)),
+                heron.as_deref(),
                 sim.profile.version,
             ),
             sim.lapis,
@@ -1827,7 +1839,8 @@ fn simulated_main_threads_match_the_2_1_317_captures() {
         // 出站那块就是这样拼的（客户端的环境另算，只比原创游戏那段在不在、在末尾）。
         let out_rest = sys[3]["text"].as_str().unwrap();
         let games_text = crate::proxy::original_games::text_for(sim.profile.version);
-        assert_eq!(out_rest.contains(games_text), games, "{model}");
+        assert_eq!(out_rest.contains(games_text), model == "claude-opus-5-5", "{model}");
+        assert!(out_rest.matches(games_text).count() <= 1, "{model}: 不重复");
         // `<total_tokens>` 跟这个号这个模型的下发走：有没有与官方那条一致（opus / sonnet 没有，其余有）。
         let has_tt =
             |x: &serde_json::Value| serde_json::to_string(x).unwrap().contains("<total_tokens>");
@@ -2089,11 +2102,11 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.317 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315 没抓）
+/// **2.1.309 ~ 2.1.318 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315 没抓）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
-/// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，照样认作官方。
+/// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。
 #[test]
-fn every_auto_2_1_309_to_317_official_request_passes_through() {
+fn every_auto_2_1_309_to_318_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2102,6 +2115,7 @@ fn every_auto_2_1_309_to_317_official_request_passes_through() {
         ("auto-2.1.314-20261030-full", (2, 1, 314)),
         ("auto-2.1.316-20261031-full", (2, 1, 316)),
         ("auto-2.1.317-20261103-full", (2, 1, 317)),
+        ("auto-2.1.318-20261104-full", (2, 1, 318)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");
@@ -3335,4 +3349,135 @@ fn lapis_budget_and_user_turn_shape_the_reminders() {
     let quiet = run(93_142, &new_prompt, true).matches("<total_tokens>").count();
     let usual = run(93_143, &new_prompt, false).matches("<total_tokens>").count();
     assert_eq!(usual, quiet + 1, "新输入之后不再跟那一条");
+}
+
+/// 启动握手刚拉回的 `client_data` 改了原创游戏那段与 `heron_brook` 的正文：`detect` 时拼好的第四块在发出前重拼
+/// （[`super::Simulation::refresh_system_rest`]），首条请求就跟着新下发走；没变不动。
+#[test]
+fn system_rest_follows_client_data_fetched_by_the_handshake() {
+    let cred = crate::credentials::Credential { id: 933_185, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    );
+    let mut sim = detect_as(&body, all_on(), &cred).unwrap();
+    let games = crate::proxy::original_games::TEXT;
+    let before = sim.rest.clone().unwrap();
+    assert_eq!(before.matches(games).count(), 1, "opus 默认带原创游戏那段");
+    assert!(!sim.refresh_system_rest(cred.id), "下发没变不动");
+    // 握手拉回：关掉能力、改由 heron_brook 下发另一段正文。
+    let boot = serde_json::json!({"client_data": {"original_games_guidance": false,
+        "tengu_heron_brook": "Served guidance."}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-opus-5-5",
+        boot.to_string().as_bytes(),
+    );
+    assert_ne!(
+        sim.rest_gen,
+        crate::proxy::client_data::generation(),
+        "下发变了：发出前要重拼（不等也是）"
+    );
+    assert!(sim.refresh_system_rest(cred.id));
+    assert_eq!(sim.rest_gen, crate::proxy::client_data::generation());
+    let after = sim.rest.clone().unwrap();
+    assert!(!after.contains(games) && after.contains("Served guidance."), "{after}");
+    assert!(!sim.refresh_system_rest(cred.id), "重拼过的再调不动");
+}
+
+/// 冷缓存的 haiku-5-5 会话：`detect` 时还没见过这个号这个模型的下发，按默认钉了带 `<total_tokens>` 的那档；等到 bootstrap
+/// 下发 `tengu_lapis_anchor:"off"` 后重拼，这条刚钉的会话跟着改（官方此时才组装首条 system）。早先就钉住的会话不跟。
+#[test]
+fn freshly_pinned_lapis_follows_the_awaited_bootstrap() {
+    let cred = crate::credentials::Credential { id: 933_186, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":8,
+            "tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}]}"#,
+    );
+    // 没带工具的那种归辅助请求，只看不钉，重拼时照样按现在的下发再看一眼。
+    let peek = Bytes::from(
+        r#"{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"yo"}],"max_tokens":8}"#,
+    );
+    let mut aux =
+        detect_as(&peek, all_on(), &crate::credentials::Credential { id: 933_187, ..test_cred() })
+            .unwrap();
+    assert!(aux.lapis_peek);
+    let mut sim = detect_as(&body, all_on(), &cred).unwrap();
+    assert!(!sim.lapis_peek, "主线程钉住（暂定）");
+    assert!(sim.rest.as_deref().unwrap().contains("<total_tokens>"));
+    // 同一会话并发的第二条：首条重钉之前就 detect 了，拿的还是旧档。
+    let mut again = detect_as(&body, all_on(), &cred).unwrap();
+    assert!(again.lapis.reminders());
+    let boot = serde_json::json!({"client_data": {"tengu_lapis_anchor": "off"}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-haiku-5-5",
+        boot.to_string().as_bytes(),
+    );
+    assert!(sim.refresh_system_rest(cred.id));
+    assert!(!sim.lapis.reminders());
+    assert!(!sim.rest.as_deref().unwrap().contains("<total_tokens>"), "首条跟着下发关掉");
+    let boot187 = serde_json::json!({"client_data": {"tengu_lapis_anchor": "off"}});
+    crate::proxy::client_data::note_bootstrap(
+        933_187,
+        "claude-haiku-5-5",
+        boot187.to_string().as_bytes(),
+    );
+    aux.refresh_system_rest(933_187);
+    assert!(!aux.lapis.reminders(), "只看的那条也跟着现在的下发");
+    // 第二条重拼时读到重定后的那档（与首条一致）。
+    assert!(again.refresh_system_rest(cred.id));
+    assert!(!again.lapis.reminders() && !again.rest.as_deref().unwrap().contains("<total_tokens>"));
+    // 定死与迟到的重定互斥：先 settle 再 refresh_pin 也改不动。
+    let late = crate::credentials::Credential { id: 933_188, ..test_cred() };
+    let mut l = detect_as(&body, all_on(), &late).unwrap();
+    assert!(l.lapis.reminders());
+    crate::proxy::lapis_anchor::settle(late.id, &l.session_id);
+    let off = serde_json::json!({"client_data": {"tengu_lapis_anchor": "off"}});
+    crate::proxy::client_data::note_bootstrap(
+        late.id,
+        "claude-haiku-5-5",
+        off.to_string().as_bytes(),
+    );
+    l.refresh_system_rest(late.id);
+    assert!(l.lapis.reminders(), "已定死的会话不被迟到的重定改档");
+    // 首条发出、定死之后，再来的下发不改这个会话。
+    crate::proxy::lapis_anchor::settle(cred.id, &sim.session_id);
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-haiku-5-5",
+        br#"{"client_data":{}}"#,
+    );
+    assert!(!sim.refresh_system_rest(cred.id));
+    assert!(!sim.lapis.reminders(), "发过请求的会话不跟中途的下发");
+}
+
+/// 同一会话：A 按旧缓存（开着提醒）detect 后，bootstrap 下发 `off`；B 这时才 detect、会话仍是暂定的——B 这一刻就读到
+/// 新那档（不能沿用 A 定的旧档：B 记下的下发版本已是新的，不会再重拼），B 定死之后 A 重拼读到的也是这一档。
+#[test]
+fn a_later_detect_in_a_provisional_session_reads_the_new_lapis() {
+    let cred = crate::credentials::Credential { id: 933_189, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":8,
+            "tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}]}"#,
+    );
+    let mut a = detect_as(&body, all_on(), &cred).unwrap();
+    assert!(a.lapis.reminders());
+    let off = serde_json::json!({"client_data": {"tengu_lapis_anchor": "off"}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-haiku-5-5",
+        off.to_string().as_bytes(),
+    );
+    let b = detect_as(&body, all_on(), &cred).unwrap();
+    assert_eq!(b.session_id, a.session_id);
+    assert!(!b.lapis.reminders(), "暂定期间 detect 读现在的下发");
+    assert_eq!(
+        b.rest_gen,
+        crate::proxy::client_data::generation(),
+        "B 不会再重拼，所以得一开始就对"
+    );
+    crate::proxy::lapis_anchor::settle(cred.id, &b.session_id);
+    assert_ne!(a.rest_gen, crate::proxy::client_data::generation());
+    a.refresh_system_rest(cred.id);
+    assert!(!a.lapis.reminders(), "A 重拼读到 B 定死的那档");
 }

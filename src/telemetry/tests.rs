@@ -238,6 +238,8 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             dispatch: Some("v2d".into()),
             tools_used_header: false,
             tools_used_truncation: None,
+            tools_used_size: None,
+            client_data_wait: None,
             prior_attempts: Vec::new(),
         }
 }
@@ -3656,6 +3658,8 @@ fn a_capture_can_report_a_failure_without_a_response() {
         bare: false,
         tools_used_header: false,
         tools_used_truncation: None,
+        tools_used_size: None,
+        client_data_wait: None,
     };
     // 连接层就失败：没有状态码、没有上游 request-id。
     cap(t.clone()).record_failure(
@@ -3728,6 +3732,8 @@ fn a_401_early_return_still_reports_an_auth_error() {
         bare: false,
         tools_used_header: false,
         tools_used_truncation: None,
+        tools_used_size: None,
+        client_data_wait: None,
     }
     .record_failure(
         7,
@@ -4844,6 +4850,15 @@ fn dump_telemetry_replay() {
     // 抓包那个号 2.1.305 起开着会话活动心跳（`tengu_dapper_dawn` 是 force 的 true）。
     let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
     crate::proxy::dapper_dawn::note_eval(7, eval.as_object().unwrap());
+    // 抓包那天各模型 bootstrap 的 `client_data`（`{模型: client_data}`，`LUBAN_REPLAY_CLIENT_DATA` 指向的 JSON），按号 7 记下。
+    if let Ok(p) = std::env::var("LUBAN_REPLAY_CLIENT_DATA") {
+        let per_model: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        for (model, data) in &per_model {
+            let boot = json!({ "client_data": data }).to_string();
+            crate::proxy::client_data::note_bootstrap(7, model, boot.as_bytes());
+        }
+    }
     // 回放真实 CC 经网关的抓包（`*-api`）时置 1，按透传路径报（[`ApiCall::client_tools`]）。
     let client_tools = std::env::var("LUBAN_REPLAY_CLIENT_TOOLS").is_ok_and(|v| v == "1");
     let t = Telemetry::default();
@@ -4854,6 +4869,11 @@ fn dump_telemetry_replay() {
         // 模拟 billing-only：体里的 `cc_prompt_id` 被挪到这里（会话链那份），见 [`ApiCall::link_prompt_id`]。
         a.link_prompt_id = s(c, "link_prompt_id");
         a.betas = s(c, "betas");
+        // 出站带的 `x-claude-code-sandy-plover`（抓包里的原值）。
+        if let Some(v) = c["sandy"].as_str() {
+            a.tools_used_header = true;
+            a.tools_used_size = Some(ToolsUsedSize::of(v));
+        }
         a.ua_out = s(c, "ua").unwrap_or_default();
         a.session_header = s(c, "session_header");
         a.organization_id = s(c, "organization_id");
@@ -6509,6 +6529,39 @@ fn bash_meta_v299_adds_the_new_judgements() {
     assert!(!zsh_equals_line("(eval):1: two words not found"));
     assert!(!zsh_equals_line("zsh: command not found: foo"));
     assert!(!zsh_equals_line("(eval): foo not found"));
+}
+
+/// 2.1.318 Bash 执行 / 失败事件在 `zsh_equals_error` 后多 `zsh_equals_as_command_error`（官方 `Dkt` 的 `b$s`：
+/// `/^(?:\(eval\)|[A-Za-z_][\w-]*)(?::\d+)?: command not found: =\S+$/m`），抓包里条条都带。
+#[test]
+fn bash_meta_v318_adds_zsh_equals_as_command_error() {
+    use super::tools::{
+        bash_executed_meta, bash_meta_v293, bash_meta_v299, bash_meta_v318, bash_profile,
+        zsh_equals_as_command_line as hit,
+    };
+    let cmd = "ls";
+    let mut m =
+        bash_executed_meta(&bash_profile(cmd), 10, Some("toolu_1"), false, false, "default");
+    bash_meta_v293(&mut m, "");
+    bash_meta_v299(&mut m, cmd, "", "claude-opus-5-5", false);
+    bash_meta_v318(&mut m, "out\nzsh:1: command not found: =python3\n");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let after = |k: &str| keys[keys.iter().position(|x| *x == k).unwrap() + 1];
+    assert_eq!(after("zsh_equals_error"), "zsh_equals_as_command_error");
+    assert_eq!(after("zsh_equals_as_command_error"), "bash_pipestatus_use");
+    assert_eq!(m["zsh_equals_as_command_error"], true);
+    let mut quiet = m.clone();
+    bash_meta_v318(&mut quiet, "a.txt");
+    assert_eq!(quiet["zsh_equals_as_command_error"], false, "没有那种行照样报 false");
+
+    assert!(hit("(eval):3: command not found: =foo"));
+    assert!(hit("zsh: command not found: =python"));
+    assert!(hit("my-fn: command not found: =x"));
+    assert!(!hit("zsh: command not found: python"), "得是 `=` 开头的那种");
+    assert!(!hit("zsh: command not found: ="), "`=` 后至少一个字符");
+    assert!(!hit("zsh: command not found: =a b"), "到行尾不能有空白");
+    assert!(!hit("1zsh: command not found: =a"), "名字不能以数字开头");
+    assert!(!hit("(eval):x: command not found: =a"));
 }
 
 /// `bash_pipestatus_use` 与 `bash_word_split_use` 照官方 2.1.299 的判定，取值逐条核对可执行文件里那两个
@@ -8188,6 +8241,32 @@ fn version_2_1_314_telemetry_shape() {
     assert_eq!(k[at + 1..at + 3], ["leaveOutPasses", "preservedUuidCount"], "{succeeded}");
     let (attempt, succeeded) = compact("claude-cli/2.1.312 (external, cli)");
     assert!(attempt.get("leaveOutPasses").is_none() && succeeded.get("leaveOutPasses").is_none());
+    // 2.1.318 起成功那条不再报 `summaryPromptArm`（`cap/auto-2.1.318-20261104-full` A18），更早照报。
+    let (_, succeeded) = compact("claude-cli/2.1.318 (external, cli)");
+    assert!(succeeded.get("summaryPromptArm").is_none(), "{succeeded}");
+    let k = keys(&succeeded);
+    let at = k.iter().position(|x| x == "forkAssistantMessageCount").unwrap();
+    assert_eq!(k[at + 1], "trigger", "{succeeded}");
+    let (_, succeeded) = compact("claude-cli/2.1.317 (external, cli)");
+    assert_eq!(succeeded["summaryPromptArm"], "no_scratchpad");
+}
+
+/// 2.1.318（`cap/auto-2.1.318-20261104-retry`）：5xx 的栈哈希照旧、顶帧换块，类名 `sln` 过不了构造名校验，**不带**
+/// `error_constructor`。
+#[test]
+fn version_2_1_318_drops_the_5xx_constructor() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.318 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert!(m.get("error_constructor").is_none(), "2.1.318 {n}: {m}");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-sktwb66b.js:5:1510")),
+            "2.1.318 {n}"
+        );
+    }
+    assert!(seen > 0);
 }
 
 /// 2.1.317（`cap/auto-2.1.317-20261103-*`）：5xx 的栈换块且带上构造名 `Onn`；Bash 执行事件在 `output_end_shown` 后多
@@ -9334,6 +9413,7 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        ("claude-cli/2.1.318 (external, cli)", "5f045de6ca68", "chunk-0x9x817t.js:3567:9365"),
         ("claude-cli/2.1.317 (external, cli)", "9a93a625ab80", "chunk-vrwkjdrd.js:3571:9103"),
         ("claude-cli/2.1.316 (external, cli)", "9396e613b9d8", "chunk-qd604jgh.js:3538:8129"),
         ("claude-cli/2.1.314 (external, cli)", "d67c18908567", "chunk-sq7yspzm.js:3529:7027"),
@@ -11514,4 +11594,117 @@ fn persisted_previews_are_recognised_without_a_size() {
     let shape = super::shape::parse_shape(body.to_string().as_bytes()).unwrap();
     let tu = &shape.tool_uses[0];
     assert!(tu.result_persisted && tu.persisted_from.is_none(), "{tu:?}");
+}
+
+/// 2.1.318 `tengu_tools_used_header_size`：头大小按元素数（上限 64）、字节数（上限 7168）分 10 / 25 / 50 / 75 / 90 档，
+/// 进程头一回、任一档往上走、头一回丢名字才报（官方 `raiseHeaderSizeSteps`）。`cap/auto-2.1.318-20261104-full` A0：
+/// 启动探测带 `[]` 报 `{0, 2, false}`，用到第 7 个工具（129 字节）时元素数到了 10% 档再报一条。
+#[test]
+fn tools_used_header_size_reports_only_when_a_step_rises() {
+    use super::template::tools_used_size_events;
+    let empty = ToolsUsedSize::of("[]");
+    assert_eq!(empty, ToolsUsedSize { count: 0, bytes: 2, capped: false });
+    let seven = ToolsUsedSize { count: 7, bytes: 129, capped: false };
+    let six = ToolsUsedSize { count: 6, bytes: 110, capped: false };
+    let mut steps = None;
+    let out = tools_used_size_events(&mut steps, &[empty, empty, six]);
+    assert_eq!(
+        out,
+        vec![json!({"count": 0, "size_bytes": 2, "hit_cap": false})],
+        "首回报，没升档不报"
+    );
+    let out = tools_used_size_events(&mut steps, &[seven, seven]);
+    assert_eq!(
+        out,
+        vec![json!({"count": 7, "size_bytes": 129, "hit_cap": false})],
+        "到 10% 档报一次"
+    );
+    let out = tools_used_size_events(&mut steps, &[empty]);
+    assert!(out.is_empty(), "档位只升不降（/clear 后变短也不报）");
+    let capped = ToolsUsedSize { count: 7, bytes: 140, capped: true };
+    assert_eq!(tools_used_size_events(&mut steps, &[capped]).len(), 1, "头一回丢名字报");
+    assert!(tools_used_size_events(&mut steps, &[capped]).is_empty());
+    let big = ToolsUsedSize { count: 33, bytes: 900, capped: true };
+    assert_eq!(tools_used_size_events(&mut steps, &[big]).len(), 1, "元素数到 50% 档");
+
+    // 队首是哨兵不等于丢了名字（认不出的名字也记成它）：没到 64 个、也没挨着 7168 字节的不算。
+    let v = r#"[{"name":"unreadable-tools-used-before-summary"},{"name":"Bash"},{"name":"café"}]"#;
+    assert_eq!(ToolsUsedSize::of(v), ToolsUsedSize { count: 3, bytes: v.len(), capped: false });
+}
+
+/// 2.1.318 起 PID 锁、常驻那支 `tengu_version_lock_failed` 末尾多 `per_pid_lock_written: true`（`cap/auto-2.1.318-20261104-full`
+/// 23 条），更早的版本与非 PID 锁那几支不加。
+#[test]
+fn version_lock_failed_gains_per_pid_lock_written_from_2_1_318() {
+    use super::template::version_lock_v318;
+    let base = json!({"is_pid_based": true, "is_lifetime_lock": true});
+    let mut m = base.clone();
+    version_lock_v318(&mut m, "2.1.318");
+    assert_eq!(
+        serde_json::to_string(&m).unwrap(),
+        r#"{"is_pid_based":true,"is_lifetime_lock":true,"per_pid_lock_written":true}"#
+    );
+    let mut m = base.clone();
+    version_lock_v318(&mut m, "2.1.317");
+    assert_eq!(m, base);
+    let mut m = json!({"is_pid_based": false, "is_lifetime_lock": true});
+    version_lock_v318(&mut m, "2.1.318");
+    assert!(m.get("per_pid_lock_written").is_none());
+}
+
+/// 2.1.318 `UWt`：发出前等了 `client_data` 的那条，在 `api_query` 前报——超时 `feature_sad{waited_ms, model_client_data_wait,
+/// timeout}`，等到且就绪 `feature_ok{waited_ms, model_client_data_wait}`；没等到就绪（拉取失败）不报；2.1.317 不报。
+#[test]
+fn client_data_wait_is_reported_before_the_query() {
+    use crate::proxy::client_data::ClientDataWait;
+    let run = |ua: &str, w: ClientDataWait| {
+        let t = Telemetry::default();
+        let mut c = call(cc_body(true), "req_1", "end_turn");
+        c.ua_out = ua.into();
+        c.client_data_wait = Some(w);
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .map(|(_, e)| {
+                let mut m = meta_of(e);
+                if let Some(o) = m.as_object_mut() {
+                    for k in ["renderer_mode", "subscription_type", "cc_prompt_id"] {
+                        o.shift_remove(k);
+                    }
+                }
+                (ev_name(e).to_string(), m)
+            })
+            .collect::<Vec<_>>()
+    };
+    let ua = "claude-cli/2.1.318 (external, cli)";
+    let hit = |ev: &[(String, Value)], name: &str| {
+        ev.iter()
+            .position(|(n, m)| n == name && m["feature_name"] == "model_client_data_wait")
+            .map(|i| (i, ev[i].1.clone()))
+    };
+    let query =
+        |ev: &[(String, Value)]| ev.iter().position(|(n, _)| n == "tengu_api_query").unwrap();
+
+    let ev = run(ua, ClientDataWait { waited_ms: 1500, timed_out: true, ready: false });
+    let (at, sad) = hit(&ev, "tengu_feature_sad").expect("超时报 sad");
+    assert!(at < query(&ev));
+    assert_eq!(
+        serde_json::to_string(&sad).unwrap(),
+        r#"{"waited_ms":1500,"feature_name":"model_client_data_wait","error_code":"timeout","tengu_quizzical_giraffe":"unset"}"#
+    );
+    let ev = run(ua, ClientDataWait { waited_ms: 377, timed_out: false, ready: true });
+    let (_, ok) = hit(&ev, "tengu_feature_ok").expect("等到报 ok");
+    assert_eq!(
+        serde_json::to_string(&ok).unwrap(),
+        r#"{"waited_ms":377,"feature_name":"model_client_data_wait"}"#
+    );
+    let ev = run(ua, ClientDataWait { waited_ms: 50, timed_out: false, ready: false });
+    assert!(hit(&ev, "tengu_feature_ok").is_none() && hit(&ev, "tengu_feature_sad").is_none());
+    let ev = run(
+        "claude-cli/2.1.317 (external, cli)",
+        ClientDataWait { waited_ms: 1500, timed_out: true, ready: false },
+    );
+    assert!(hit(&ev, "tengu_feature_sad").is_none(), "2.1.317 没有这一项");
 }

@@ -772,9 +772,10 @@ impl EventBuilder<'_> {
                         // `holds_fork` / `cold_after_ms` 只在按 full 触发过一次（官方 `Ae ??= bi(...)` 在 full 分支里）时才有：
                         // 发过 full 摘要的，或最后一条摘要之后某次触发按 full（那一刻配置不是 short、或 writer 已失败）。
                         // 逐次看最后那几次触发当时的模式：那一刻配置是 short、writer 还没失败过才按 short，否则按 full。
+                        // 2.1.318 删了这两项（连同 `tengu_wobbly_petal` 那套扣住策略），不再报。
                         let fired_full = done.summaries > done.summaries_short
                             || fires.iter().any(|&t| !short_at(t));
-                        if fired_full {
+                        if fired_full && !env.f.v318 {
                             let (holds, cold) = crate::proxy::agent_summary_config::hold_policy(
                                 call.cred_id,
                                 session_family,
