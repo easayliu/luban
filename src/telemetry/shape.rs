@@ -123,7 +123,7 @@ pub(super) fn persisted_original_size(content: &Value) -> Option<usize> {
 }
 
 /// 从出站请求体里读出来的形态。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct RequestShape {
     pub(super) model: String,
     pub(super) messages_len: usize,
@@ -1293,8 +1293,15 @@ impl ToolsOff {
     }
 }
 
+/// 测试里直接从字节取形态；正式路径走 [`super::CallBody`]，解析一次、各样一起取。
+#[cfg(test)]
 pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     let v: Value = serde_json::from_slice(body).ok()?;
+    shape_of(&v, body)
+}
+
+/// [`parse_shape`] 的主体：`v` 是 `body` 解析出来的那份（几处特征按原始字节找，两样都要）。
+pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     let mut shape = RequestShape {
         model: v.get("model")?.as_str()?.to_string(),
         temperature: v.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0),
@@ -1314,7 +1321,7 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         has_cache_control: body.windows(15).any(|w| w == b"\"cache_control\""),
         ..Default::default()
     };
-    (shape.device_id, shape.session_id, shape.account_uuid) = parse_user_id(&v);
+    (shape.device_id, shape.session_id, shape.account_uuid) = parse_user_id(v);
     shape.thread_type =
         v.get("thread").and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(str::to_string);
     // 这条请求自己声明的上一条 message.id（官方主线程每条都带，首轮是 `null`）。
@@ -1669,7 +1676,7 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
         shape.permission_declared = true;
     }
     // 缓存断点的 ttl：任一处断点写了 1h 就算 1h（工具入参里的同名字段不算）。
-    shape.cache_ttl_1h = crate::proxy::has_cache_ttl_1h(&v);
+    shape.cache_ttl_1h = crate::proxy::has_cache_ttl_1h(v);
     // 是不是 git 仓库、开场时工作区干不干净（`gitStatus` 那段的 `Status:`）。
     let find = |mark: &[u8]| body.windows(mark.len()).position(|w| w == mark);
     if let Some(at) = find(b"Is a git repository: ") {

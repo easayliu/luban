@@ -24,8 +24,8 @@ pub struct ApiCall {
     pub cred_id: i64,
     pub account_uuid: Option<String>,
     pub org_type: Option<String>,
-    /// 实际发往上游的请求体。
-    pub body: Bytes,
+    /// 实际发往上游的请求体（遥测只要其中几样，见 [`CallBody`]）。
+    pub body: CallBody,
     /// 实际发出的 `anthropic-beta`。
     pub betas: Option<String>,
     /// 实际发出的 `X-Claude-Code-Session-Id`（body 里没有时的兜底）。
@@ -252,7 +252,7 @@ pub struct Capture {
     pub sink: Telemetry,
     pub account_uuid: Option<String>,
     pub org_type: Option<String>,
-    pub body: Bytes,
+    pub body: CallBody,
     pub betas: Option<String>,
     pub session_header: Option<String>,
     /// 实际发出的 `x-client-request-id`。

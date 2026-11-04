@@ -36,6 +36,7 @@ use crate::config;
 mod bash_ast;
 mod bash_kinds;
 mod bash_repeat;
+mod body;
 mod call;
 mod compact;
 mod events;
@@ -52,6 +53,7 @@ mod tests;
 mod tools;
 mod upload;
 
+pub use body::CallBody;
 pub use call::*;
 use events::*;
 use files::Files;
@@ -175,7 +177,7 @@ impl Telemetry {
                 continue;
             };
             // 解析在锁外，见 [`Self::process_parsed`]。
-            let shape = parse_shape(&call.body);
+            let shape = call.body.facts().shape();
             let mut st = self.0.state.lock();
             Self::process_parsed(&mut st, call, shape, true, None);
         }

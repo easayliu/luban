@@ -12,7 +12,7 @@ impl Telemetry {
         allow_defer: bool,
         prev_end_override: Option<SystemTime>,
     ) {
-        let shape = parse_shape(&call.body);
+        let shape = call.body.facts().shape();
         Self::process_parsed(st, call, shape, allow_defer, prev_end_override);
     }
 
@@ -248,7 +248,7 @@ impl Telemetry {
                 let this_end = c.started_at + Duration::from_millis(c.total_ms);
                 sess.last_call_end = Some(prev_end.map_or(this_end, |e| e.max(this_end)));
                 sess.recent_ends.push_back(this_end);
-                if let Some(m) = body_model(&c.body) {
+                if let Some(m) = c.body.facts().model.clone() {
                     sess.waiting_titles.push((c.logical_start(), sleepy_key(&m)));
                 }
                 sess.deferred.push((c, prev_end, at));
@@ -635,8 +635,10 @@ impl Telemetry {
             .filter(|(name, _)| {
                 // 体里那段在不在，得与下发一致：能力打开（`from`）时在；关掉（`off`）时只有 `heron_brook` 下发的正文里本就
                 // 含这一段才在（2.1.318 抓包那天 opus 就是这样，[`crate::proxy::original_games::heron_covers`]）。
-                let text = crate::proxy::original_games::text_for(&version).as_bytes();
-                let has = call.body.windows(text.len()).any(|w| w == text);
+                let has = call
+                    .body
+                    .facts()
+                    .has_original_games_text(crate::proxy::original_games::text_for(&version));
                 let expect = *name == "tengu_model_capability_from_client_data"
                     || crate::proxy::original_games::heron_covers(call.cred_id, &display_model);
                 !own_system || has == expect
@@ -1074,15 +1076,6 @@ pub(super) fn sleepy_key(model: &str) -> String {
     m.strip_suffix("[1m]").unwrap_or(&m).to_string()
 }
 
-/// 只取请求体的 `model`（扣住的标题建会话前没解析过形态）。
-fn body_model(body: &[u8]) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct M {
-        model: String,
-    }
-    serde_json::from_slice::<M>(body).ok().map(|m| m.model)
-}
-
 /// 这条请求的角色与收尾方式，[`Session::advance_turn`] / [`Session::record_call`] 共用。
 #[derive(Clone, Copy)]
 struct CallFlags {
@@ -1425,7 +1418,8 @@ impl Session {
         if self.delegated_pending.is_empty() && self.nested_pending == 0 {
             return false;
         }
-        let texts = first_user_texts(&call.body);
+        let facts = call.body.facts();
+        let texts = &facts.first_user_texts;
         if let Some(i) = self
             .delegated_pending
             .iter()
@@ -1938,22 +1932,5 @@ impl Session {
             handback,
             agent_done,
         }
-    }
-}
-
-/// 请求体里首条用户消息的各个文本块（字符串内容算一块）。
-fn first_user_texts(body: &[u8]) -> Vec<String> {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else { return Vec::new() };
-    let Some(m) = v["messages"].as_array().and_then(|ms| ms.iter().find(|m| m["role"] == "user"))
-    else {
-        return Vec::new();
-    };
-    match &m["content"] {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
     }
 }

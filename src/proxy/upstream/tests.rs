@@ -813,7 +813,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
             sink: sink.clone(),
             account_uuid: cred.account_uuid.clone(),
             org_type: None,
-            body: first.clone(),
+            body: first.clone().into(),
             betas: None,
             session_header: None,
             client_request_id: None,
@@ -1236,6 +1236,60 @@ async fn truncated_upstream_stream_yields_502(pool: sqlx::PgPool) {
 
     assert_eq!(status, crate::proxy::StatusCode::BAD_GATEWAY);
     assert!(!String::from_utf8_lossy(&body).contains("半句"), "截断的内容不该回给客户端");
+}
+
+/// 回包注定留不成拒答原文时（出了内容块、超了回放上限、解不开的编码），等着按提示词学拒答的来访体
+/// 当场放掉，别陪着整条流活到收尾；输出前的拒答（只有 `fallback` 标记也算输出前）一直留着，照常能学。
+#[sqlx::test]
+async fn the_inbound_body_is_released_once_a_refusal_can_no_longer_be_learned(pool: sqlx::PgPool) {
+    let raw = Bytes::from(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#.to_vec());
+    let mut rl = req_log(pool.clone()).await;
+    let arm = |rl: &mut crate::proxy::ReqLog, stream: bool, opaque: bool| {
+        rl.sniffer = UsageSniffer::new(stream, opaque);
+        rl.prompt_key = Some(("m".into(), crate::proxy::LazyPromptDigest::FromBody(raw.clone())));
+        assert!(!raw.is_unique());
+    };
+    let step = |rl: &mut crate::proxy::ReqLog, chunk: &str| {
+        rl.sniffer.feed(chunk.as_bytes());
+        rl.release_moot_prompt_key();
+        rl.prompt_key.is_some()
+    };
+    const START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_r\",\"content\":[],\"usage\":{\"input_tokens\":9}}}\n\n";
+
+    // 1) 正常回复：message_start 还留着，第一个内容块（思考块也算）一到就放。
+    arm(&mut rl, true, false);
+    assert!(step(&mut rl, START));
+    assert!(!step(
+        &mut rl,
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n"
+    ));
+    assert!(raw.is_unique(), "来访体只剩测试手里这一份");
+
+    // 2) 输出前拒答：只有 fallback 标记、随后 refusal 收尾——一路留着，收尾时才按提示词学得成。
+    arm(&mut rl, true, false);
+    assert!(step(&mut rl, START));
+    assert!(step(
+        &mut rl,
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\",\"from\":{\"model\":\"a\"},\"to\":{\"model\":\"b\"}}}\n\n"
+    ));
+    assert!(step(
+        &mut rl,
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+    ));
+    assert!(rl.sniffer.refusal_reply().is_some());
+
+    // 3) 还没出块、但回包超了回放上限：同样学不成，放掉。
+    arm(&mut rl, true, false);
+    assert!(step(&mut rl, START));
+    let pad = format!(": {}\n", "x".repeat(crate::proxy::REFUSAL_REPLY_BYTES));
+    assert!(!step(&mut rl, &pad));
+    assert!(raw.is_unique());
+
+    // 4) 解不开的编码：一个字节都不攒，第一次检查就放。
+    arm(&mut rl, true, true);
+    rl.release_moot_prompt_key();
+    assert!(rl.prompt_key.is_none());
+    assert!(raw.is_unique());
 }
 
 /// 起一个吐 `sse` 的本地上游，取回响应交给 [`crate::proxy::aggregate_sse`]，

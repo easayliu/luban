@@ -167,6 +167,8 @@ async fn relay_ok(
         )
         .map(|mut c| {
             c.cache_keepalive_ok = keepalive_prev_ok;
+            // 遥测要的几样现在就交给阻塞线程池解析、随即放掉出站体，别让它陪着流活到收尾。
+            c.body.digest_in_background();
             c
         })
     };

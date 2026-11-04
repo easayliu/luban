@@ -171,7 +171,7 @@ impl<'a> EventEnv<'a> {
             .as_deref()
             .map(|r| r.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b))))
             .unwrap_or(0);
-        let body_chars = std::str::from_utf8(&call.body).map(js_len).unwrap_or(call.body.len());
+        let body_chars = call.body.facts().chars;
         // 请求体不到 4 KiB 不压缩，报 `below_min_size`；够大的才报「走代理不压缩」的 `proxy`
         // （`cap/auto-2.1.285-20260930` 128 条：22 条 573–3821 字是前者，106 条 4107 起是后者）。
         let gzip_skip = if body_chars < 4096 { "below_min_size" } else { "proxy" };

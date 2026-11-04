@@ -313,6 +313,8 @@ pub(crate) fn stream_upstream(
 ) -> Response {
     let builder = resp_builder(&up);
     let (sse, _) = resp_shape(&up);
+    // 解不开的编码（`opaque`）一开始就攒不成拒答原文，不必等首块。
+    rl.release_moot_prompt_key();
     // 末尾接一个哨兵：上游读到头时记下 `upstream_done`。客户端先断开的话 axum 丢掉响应体，
     // 哨兵永远走不到——收尾时据此分出「客户端取消」与「上游半截 EOF」，见 [`ReqLog::upstream_done`]。
     let stream = up.bytes_stream().map(Some).chain(futures_util::stream::iter([None])).filter_map(
@@ -325,7 +327,10 @@ pub(crate) fn stream_upstream(
                 rl.ttft_ms = Some(rl.started.elapsed().as_millis());
             }
             match &chunk {
-                Ok(bytes) => rl.sniffer.feed(bytes),
+                Ok(bytes) => {
+                    rl.sniffer.feed(bytes);
+                    rl.release_moot_prompt_key();
+                }
                 // 上游把流掐了。错误照旧原样交给 axum（客户端拿到的行为不变），但要留个痕
                 // 给收尾时的日志——否则这条请求在服务端侧只剩一行 `forwarded status=200`。
                 Err(e) => {
@@ -376,6 +381,7 @@ pub(crate) async fn aggregate_sse(
             rl.ttft_ms = Some(rl.started.elapsed().as_millis());
         }
         rl.sniffer.feed(&bytes);
+        rl.release_moot_prompt_key();
         agg.feed(&bytes);
     }
     match agg.finish() {

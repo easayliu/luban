@@ -196,7 +196,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             cred_id: 7,
             account_uuid: Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df".into()),
             org_type: Some("claude_team".into()),
-            body: Bytes::from(body),
+            body: Bytes::from(body).into(),
             betas: Some(
                 "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,effort-2025-11-24"
                     .into(),
@@ -1829,11 +1829,11 @@ fn clear_keeps_the_old_session_until_session_start() {
     at(&mut probe, 0, 300, 400);
     t.ingest(probe);
     let mut first = main_call(SESSION, "req_1", "msg_1", SystemTime::now());
-    first.body = Bytes::from(with_prompt(first.body.to_vec(), PROMPT_1));
+    first.body = Bytes::from(with_prompt(first.body.to_vec(), PROMPT_1)).into();
     at(&mut first, 5, 1_000, 3_000);
     t.ingest(first);
     let mut second = main_call(s2, "req_2", "msg_2", SystemTime::now());
-    second.body = Bytes::from(with_prompt(second.body.to_vec(), PROMPT_2));
+    second.body = Bytes::from(with_prompt(second.body.to_vec(), PROMPT_2)).into();
     at(&mut second, 60, 1_000, 3_000);
     t.ingest(second);
     let st = t.0.state.lock();
@@ -3644,7 +3644,7 @@ fn a_capture_can_report_a_failure_without_a_response() {
         sink,
         account_uuid: Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df".into()),
         org_type: Some("claude_team".into()),
-        body: Bytes::from(cc_body(true)),
+        body: Bytes::from(cc_body(true)).into(),
         betas: Some("claude-code-20250219,oauth-2025-04-20".into()),
         session_header: None,
         client_request_id: Some("3c1f0a4e-5c4f-4a8b-9d2e-7f0a1b2c3d4e".into()),
@@ -3718,7 +3718,7 @@ fn a_401_early_return_still_reports_an_auth_error() {
         sink: t.clone(),
         account_uuid: Some("9922ef8e-7945-4f5a-ab4f-cf5f521531df".into()),
         org_type: Some("claude_team".into()),
-        body: Bytes::from(cc_body(true)),
+        body: Bytes::from(cc_body(true)).into(),
         betas: None,
         session_header: None,
         client_request_id: None,
@@ -4831,6 +4831,151 @@ fn tool_and_subagent_replay_matches_the_2_1_285_capture() {
         assert_eq!(m["attachment_token_estimates"].as_array().unwrap().last().unwrap(), "23");
         assert!(m["query_source"].is_string(), "{m}");
     }
+}
+
+/// 改成 [`CallBody`] 之前遥测各处直接读原始字节的那几样，原样留在这里当对照。
+mod old_body_reads {
+    use super::*;
+
+    pub(super) fn body_model(body: &[u8]) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct M {
+            model: String,
+        }
+        serde_json::from_slice::<M>(body).ok().map(|m| m.model)
+    }
+
+    pub(super) fn first_user_texts(body: &[u8]) -> Vec<String> {
+        let Ok(v) = serde_json::from_slice::<Value>(body) else { return Vec::new() };
+        let Some(m) =
+            v["messages"].as_array().and_then(|ms| ms.iter().find(|m| m["role"] == "user"))
+        else {
+            return Vec::new();
+        };
+        match &m["content"] {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(super) fn has_text(body: &[u8], text: &str) -> bool {
+        let text = text.as_bytes();
+        body.windows(text.len()).any(|w| w == text)
+    }
+
+    pub(super) fn chars(body: &[u8]) -> usize {
+        std::str::from_utf8(body).map(js_len).unwrap_or(body.len())
+    }
+
+    /// 一份体上，新旧两种读法逐项相同。
+    pub(super) fn assert_same(body: &[u8], what: &str) {
+        let facts = CallBody::new(Bytes::copy_from_slice(body)).facts();
+        assert_eq!(
+            format!("{:?}", facts.shape()),
+            format!("{:?}", parse_shape(body)),
+            "shape: {what}"
+        );
+        assert_eq!(facts.model, body_model(body), "model: {what}");
+        assert_eq!(facts.first_user_texts, first_user_texts(body), "first_user_texts: {what}");
+        assert_eq!(facts.chars, chars(body), "chars: {what}");
+        for version in ["2.1.316", "2.1.317", "2.1.318", ""] {
+            let text = crate::proxy::original_games::text_for(version);
+            assert_eq!(
+                facts.has_original_games_text(text),
+                has_text(body, text),
+                "original_games {version}: {what}"
+            );
+        }
+    }
+}
+
+/// 遥测改拿 [`CallBody`]（解析一次、各样一起取、取完放掉原始字节）：与此前各处直接读字节的结果逐项相同，
+/// 后台解析之后原始字节确实放掉了。
+#[tokio::test]
+async fn call_body_facts_match_the_raw_body_reads_and_drop_the_bytes() {
+    let mut games = cc_body(true);
+    let at = games.len() / 2;
+    games.splice(at..at, crate::proxy::original_games::TEXT.bytes());
+    // 工具续轮、入参是个大数组（展开成 `Value` 比原文大一个数量级）：留着的只能是文本。
+    let zeros = vec![0u8; 100_000];
+    let tool_turn = json!({
+        "model": "claude-opus-5",
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Write",
+                 "input": {"file_path": "/tmp/a", "content": "x", "extra": zeros, "f": 0.1, "big": u64::MAX}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+            ]},
+        ],
+    })
+    .to_string()
+    .into_bytes();
+    let facts = CallBody::new(Bytes::from(tool_turn.clone())).facts();
+    let stored = facts.stored_tool_inputs().expect("留着的形态里不该有展开的入参");
+    assert!(stored > 200_000 && stored < tool_turn.len(), "{stored}");
+    assert_eq!(
+        facts.shape().unwrap().tool_uses[0].input["extra"].as_array().unwrap().len(),
+        100_000
+    );
+    for (body, what) in [
+        (tool_turn, "工具续轮、入参很大"),
+        (cc_body(true), "主线程新输入"),
+        (cc_body(false), "续轮"),
+        (tool_search_body(), "ToolSearch"),
+        (games, "带原创游戏正文（2.1.317 写法）"),
+        (br#"{"model":1,"messages":[]}"#.to_vec(), "model 不是字符串"),
+        (br#"{"messages":[{"role":"user","content":"hi"}]}"#.to_vec(), "没有 model"),
+        (b"{".to_vec(), "不是 JSON"),
+        (vec![0xff, 0xfe, b'{'], "不是 UTF-8"),
+    ] {
+        old_body_reads::assert_same(&body, what);
+    }
+
+    let body = CallBody::new(Bytes::from(cc_body(true)));
+    assert!(!body.digested());
+    body.digest_in_background();
+    for _ in 0..200 {
+        if body.digested() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(body.digested(), "后台解析完就只留结果");
+    assert_eq!(body.facts().model.as_deref(), Some("claude-opus-5"));
+}
+
+/// **对照工具，默认不跑**：`cap/` 下全部抓包里的 `/v1/messages` 请求体，[`CallBody`] 与此前直接读字节的
+/// 各样逐项相同。`cargo test call_body_facts_match_every_captured_body -- --ignored --nocapture`。
+#[test]
+#[ignore]
+fn call_body_facts_match_every_captured_body() {
+    let root = format!("{}/cap", env!("CARGO_MANIFEST_DIR"));
+    let mut n = 0;
+    for dir in std::fs::read_dir(&root).unwrap().flatten() {
+        let Ok(files) = std::fs::read_dir(dir.path()) else { continue };
+        for f in files.flatten() {
+            let path = f.path();
+            if !path.to_string_lossy().ends_with(".req.raw") {
+                continue;
+            }
+            let raw = std::fs::read(&path).unwrap();
+            if !raw.starts_with(b"POST /v1/messages") {
+                continue;
+            }
+            let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+            old_body_reads::assert_same(&raw[sep + 4..], &path.to_string_lossy());
+            n += 1;
+        }
+    }
+    eprintln!("{n} bodies compared");
+    assert!(n > 0);
 }
 
 /// **对照工具，默认不跑**：把 `LUBAN_REPLAY_CALLS`（抓包提出来的一串调用，见 scratchpad 里
@@ -11227,7 +11372,7 @@ fn a_lone_title_survives_a_non_ascii_device_default_model() {
     };
     let body = String::from_utf8(seed.body.to_vec()).unwrap();
     assert!(body.contains("\"claude-fable-5-1\""));
-    seed.body = Bytes::from(body.replace("\"claude-fable-5-1\"", "\"claude-模型\""));
+    seed.body = Bytes::from(body.replace("\"claude-fable-5-1\"", "\"claude-模型\"")).into();
     seed.resp_model = Some("claude-模型".into());
     t.ingest(failed(seed, Some(400), "invalid_request_error", "model: 模型"));
     let title = gaps_call(&("00115", "end_turn", &[]), 7, base + Duration::from_secs(60)).unwrap();

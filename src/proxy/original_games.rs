@@ -28,6 +28,10 @@ pub(crate) const TEXT: &str = "Do build original games, games in a genre or with
 /// 2.1.314 ~ 2.1.316 的写法（2.1.314 `Jsn`，逐字取自可执行文件，与抓包一致）。
 pub(crate) const TEXT_2_1_314: &str = "Do build original games, games in a genre, and games from the user's own designs and assets. Don't build a recreation of a specific existing game, even if it is renamed or called original.";
 
+/// [`text_for`] 可能给出的全部写法：遥测在解析请求体时把每一种在不在都记下（[`crate::telemetry::CallBody`]），
+/// 之后按会话版本查，不必为这一处留着整份体。加了新写法要补进这里。
+pub(crate) const TEXTS: [&str; 2] = [TEXT_2_1_314, TEXT];
+
 /// `version` 这一版的正文：2.1.317 起是 [`TEXT`]，更早是 [`TEXT_2_1_314`]。读不出版本的按最新那版。
 pub(crate) fn text_for(version: &str) -> &'static str {
     if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 317)) {

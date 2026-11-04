@@ -631,7 +631,9 @@ impl ReqLog {
             self.upstream_request_id = Some(rid);
         }
         if let Some(cap) = &mut self.telemetry {
-            cap.body = sent.clone();
+            // 换成重试那一发的体；首发那份的后台解析即便还在跑，也只写进被换掉的旧状态。
+            cap.body = crate::telemetry::CallBody::new(sent.clone());
+            cap.body.digest_in_background();
         }
         // 只换形态摘要那一项：身份三项（session/device）重试前后逐字相同——两发都过同一个
         // `upstream.shape()`，只有 messages 内容不同。
@@ -640,6 +642,18 @@ impl ReqLog {
         // 了，见 [`shape_summary_of`]）；重试是 400 兜底，一条请求最多走一次，不值得为它把
         // 一份解析态的体从改写那里一路拿到这里。
         self.forensics.shape = shape_summary(sent).shape;
+    }
+
+    /// 按提示词学拒答（[`Self::prompt_key`]）离不开上游那次的原样回包；回包已经注定留不成
+    /// （[`UsageSniffer::refusal_reply_ruled_out`]）时，这条就不可能再按提示词学了，把它连同
+    /// 里面那份来访原始字节一起放掉——否则几 MB 的来访体要陪着整条流活到收尾。
+    ///
+    /// 收尾时的判定不受影响：回包留不成时 `learn` 恒为 `none`、`reply` 标签只看嗅探器，都不读
+    /// `prompt_key`。回程每喂一块嗅探器就调一次。
+    pub(super) fn release_moot_prompt_key(&mut self) {
+        if self.prompt_key.is_some() && self.sniffer.refusal_reply_ruled_out() {
+            self.prompt_key = None;
+        }
     }
 
     /// 上游回了 200 却没回答（判据见 [`Drop`] 里的调用处）：响应体开头记进流水的
@@ -871,7 +885,7 @@ pub(super) fn telemetry_capture(
         sink: state.telemetry.clone(),
         account_uuid: cred.account_uuid.clone(),
         org_type: cred.org_type.clone(),
-        body: sent.clone(),
+        body: crate::telemetry::CallBody::new(sent.clone()),
         betas: header_opt(&upstream.headers, "anthropic-beta"),
         session_header: header_opt(&upstream.headers, "x-claude-code-session-id"),
         client_request_id: header_opt(&upstream.headers, "x-client-request-id"),
@@ -2030,11 +2044,18 @@ impl UsageSniffer {
     /// 内容块（流到一半才被掐的——分类器看的是采样出来的正文，不是对提示词的确定性判决，
     /// 把半截答案当固定回复回放也不对）；体不是 UTF-8；一个字节都没收到。
     pub(super) fn refusal_reply(&self) -> Option<store::LearnedReply> {
-        if self.reply_overflow || self.saw_output_block || self.reply.is_empty() {
+        if self.refusal_reply_ruled_out() || self.reply.is_empty() {
             return None;
         }
         let body = String::from_utf8(self.reply.clone()).ok()?;
         Some(store::LearnedReply { sse: self.is_stream, body })
+    }
+
+    /// 这条回复**再也**攒不成可回放的拒答原文了（[`Self::refusal_reply`] 往后恒为 `None`）：已经出了
+    /// 内容块、原文超了上限，或响应体是解不开的编码（`opaque` 时 `feed` 一个字节都不攒）。三样一旦成立
+    /// 就不会再变回去，[`ReqLog::release_moot_prompt_key`] 据此提前放掉等着算提示词哈希的来访体。
+    pub(super) fn refusal_reply_ruled_out(&self) -> bool {
+        self.opaque || self.reply_overflow || self.saw_output_block
     }
 
     /// 上游以 `stop_reason: "refusal"` 收尾——分类器或模型自己拒了这条提示词（`stop_details`
