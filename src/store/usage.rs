@@ -334,7 +334,7 @@ macro_rules! opt_texts {
 
 /// 流水里有文本字段带 NUL 时，回一份去掉 NUL 的拷贝（见 [`super::nul_free`]）；都不带回
 /// `None`，不拷贝。限流窗口（`windows`）取自响应头，HTTP 头里本来就不会有 NUL，不查。
-fn without_nul(rec: &UsageRecord) -> Option<UsageRecord> {
+pub(super) fn without_nul(rec: &UsageRecord) -> Option<UsageRecord> {
     let has = |s: &str| s.contains('\0');
     let dirty = opt_texts!(rec).into_iter().flatten().any(|s| has(s))
         || has(&rec.cred_label)
@@ -438,7 +438,7 @@ pub(super) fn usage_log_page_sql(where_sql: &str, n: usize) -> String {
 }
 
 /// 写一条流水的那条 SQL，见 [`CredentialStore::insert_usage_log_at`]。
-const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
+pub(super) const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
         (ts, cred_id, cred_label, device_id, model, path, status, has_usage,
          input_tokens, output_tokens, cache_creation_tokens, cache_5m_tokens,
          cache_1h_tokens, cache_read_tokens, ttft_ms, total_ms,
@@ -456,7 +456,7 @@ const INSERT_USAGE_LOG_SQL: &str = "INSERT INTO usage_logs
 
 /// 流水事务的提交方式，见 [`CredentialStore::insert_usage_log_at`]：`$1` 为 `'off'` 即本事务
 /// 不等 WAL 落盘，为 NULL 即照库的当前设置（原样写回，等于不改）。
-const SET_SYNC_COMMIT_SQL: &str = "SELECT set_config('synchronous_commit', COALESCE($1, current_setting('synchronous_commit')), true)";
+pub(super) const SET_SYNC_COMMIT_SQL: &str = "SELECT set_config('synchronous_commit', COALESCE($1, current_setting('synchronous_commit')), true)";
 
 /// 落账（`credential_stats` 与 `device_costs`）的那条 SQL：不带额度快照的。设备账本在 CTE 里，
 /// `$4`（device_id）为 NULL 时不记。
@@ -529,6 +529,7 @@ impl CredentialStore {
     }
 
     /// 写入一条用量日志。
+    #[cfg(test)]
     pub async fn insert_usage_log(&self, rec: &UsageRecord) -> Result<()> {
         self.insert_usage_log_at(rec, None).await
     }
@@ -820,7 +821,7 @@ impl CredentialStore {
 }
 
 /// 进程内记着已经落进 `tool_sets` 的 sha 最多几条，见 [`CredentialStore::insert_usage_log_at`]。
-const KNOWN_TOOL_SETS_MAX: usize = 10_000;
+pub(super) const KNOWN_TOOL_SETS_MAX: usize = 10_000;
 
 /// 把 shape 摘要（`proxy::logging` 的 `shape_summary`）里的工具名清单 `tools.names` 拆出来：
 /// 回（去掉清单后的 shape, Some((tools.sha, 清单的 JSON))）。没有清单的原样返回、第二项为

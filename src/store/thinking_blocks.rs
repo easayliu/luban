@@ -97,7 +97,9 @@ impl CredentialStore {
     }
 
     /// 这批指纹的签发者与覆盖情况（[`ThinkingIssuers`]）。没登记过的指纹——功能上线前的历史、
-    /// 超过保留期、或签名根本不是经 luban 发出的——算进 `total` 不算进 `known`。
+    /// 超过保留期、或签名根本不是经 luban 发出的——算进 `total` 不算进 `known`。库里没有、但还在
+    /// 批量写入队列里的（[`CredentialStore::pending_thinking_issuer`]）按待写的签发者算；两边都有时
+    /// 以库里的为准（落库是先到先得）。
     pub async fn thinking_block_issuers(&self, fps: &[String]) -> Result<ThinkingIssuers> {
         let mut uniq: Vec<&str> = fps.iter().map(String::as_str).collect();
         uniq.sort_unstable();
@@ -110,6 +112,16 @@ impl CredentialStore {
                 .bind(&uniq)
                 .fetch_all(&self.pool)
                 .await?;
+        let mut rows = rows;
+        let in_db: std::collections::HashSet<String> =
+            rows.iter().map(|(fp, _)| fp.clone()).collect();
+        for fp in &uniq {
+            if !in_db.contains(*fp)
+                && let Some(cred) = self.pending_thinking_issuer(fp)
+            {
+                rows.push((fp.to_string(), cred));
+            }
+        }
         let mut issuers: Vec<Option<i64>> = rows.iter().map(|(_, id)| *id).collect();
         issuers.sort_unstable();
         issuers.dedup();
@@ -130,6 +142,15 @@ impl CredentialStore {
         for fp in fps {
             map.insert(fp.clone(), now);
         }
+    }
+
+    /// 从这批里拿掉已有号签发、只是还在批量写入队列里的指纹（[`Self::pending_thinking_issuer`]）：
+    /// 它们不是外来的，记成外来会因先到先得一直错下去。
+    pub fn without_pending_signed(&self, fps: &[String]) -> Vec<String> {
+        fps.iter()
+            .filter(|fp| !matches!(self.pending_thinking_issuer(fp), Some(Some(_))))
+            .cloned()
+            .collect()
     }
 
     /// 这批指纹里有没有近期（[`RECOVERED_HISTORY_TTL`] 内）救活过的。

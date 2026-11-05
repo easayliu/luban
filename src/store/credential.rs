@@ -464,7 +464,8 @@ impl CredentialStore {
         let mut tx = self.begin_write().await?;
         // 先锁账号行，再动挂在它上面的小表：在途的流水写入是「账号行 FOR KEY SHARE → 账本 upsert」
         // 这个顺序（见 `insert_usage_log_at`），这里反过来先删账本行就会和它互相等、被判死锁。
-        sqlx::query("SELECT id FROM credentials WHERE id = ANY($1) FOR UPDATE")
+        // 按 id 顺序锁，与批量写流水（`usage_batch`，一次锁一批号）同序，不会互相等成死锁。
+        sqlx::query("SELECT id FROM credentials WHERE id = ANY($1) ORDER BY id FOR UPDATE")
             .bind(ids)
             .execute(&mut *tx)
             .await?;

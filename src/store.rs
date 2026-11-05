@@ -53,6 +53,7 @@ mod tests;
 mod thinking_blocks;
 mod tools_used_flags;
 mod usage;
+mod usage_batch;
 mod users;
 
 pub use bans::*;
@@ -154,6 +155,17 @@ pub struct CredentialStore {
     /// 近期降级重试救活过的历史思考块**指纹**（进程内、同步可见），见
     /// [`CredentialStore::mark_history_recovered`]。
     recovered_history: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
+    /// 流水批量写入任务的发送端（头一笔时起），见 [`usage_batch`]。
+    usage_batch: Mutex<Option<usage_batch::Batcher>>,
+    /// [`Self::drain_writes`] 敲它，批量写入任务不再等满攒批时间、手里有的当场写。
+    batch_flush: tokio::sync::Notify,
+    /// 批量写入的丢弃计数，见 [`usage_batch`]。
+    batch_stats: usage_batch::BatchStats,
+    /// 已入队、还没落库的 thinking 签发登记（指纹 → (签发号, 入队时刻)），见
+    /// [`Self::queue_thinking_blocks`]：落库前查签发者（[`Self::thinking_block_issuers`]）与记外来
+    /// 登记时都先看它，别把本号刚签发、还在队列里的指纹判成没登记或记成外来。落库后删，30 秒没落库的
+    /// 不再算。
+    pending_thinking: parking_lot::Mutex<HashMap<String, (Option<i64>, std::time::Instant)>>,
 }
 
 /// 后台写入（流水、学到的规则）同时占用的连接数上限。
@@ -239,6 +251,10 @@ impl CredentialStore {
             known_tool_sets: Mutex::default(),
             next_resume_check: Default::default(),
             recovered_history: Default::default(),
+            usage_batch: Mutex::new(None),
+            batch_flush: tokio::sync::Notify::new(),
+            batch_stats: Default::default(),
+            pending_thinking: Default::default(),
         })
     }
 
@@ -337,6 +353,8 @@ impl CredentialStore {
             if n == 0 {
                 return;
             }
+            // 攒着的那批别等攒批时间，当场写。
+            self.batch_flush.notify_one();
             if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(pending = n, "gave up waiting for background store writes");
                 return;

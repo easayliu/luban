@@ -418,11 +418,7 @@ impl Drop for ReqLog {
         // 成功的回复——半截流里的签名客户端也不会回传。
         if ok && !self.sniffer.thinking_blocks.is_empty() {
             let fps = std::mem::take(&mut self.sniffer.thinking_blocks);
-            let s = self.store.clone();
-            let cred_id = self.cred_id;
-            self.store.spawn_write("thinking blocks", async move {
-                s.remember_thinking_blocks(Some(cred_id), &fps).await
-            });
+            self.store.queue_thinking_blocks(Some(self.cred_id), fps);
         }
         // 失败的那些走 `tengu_api_error`。三类里只报**能确定是上游拒了**的两类：
         //
@@ -1148,13 +1144,12 @@ pub(crate) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
     }
 }
 
-/// 把一条用量日志交给后台任务落库，见 [`store::CredentialStore::spawn_write`]。
+/// 把一条用量日志交给后台批量落库，见 [`store::CredentialStore::queue_usage_log`]。
 pub(crate) fn spawn_usage_log(
     store: std::sync::Arc<store::CredentialStore>,
     rec: store::UsageRecord,
 ) {
-    let s = store.clone();
-    store.spawn_write("usage log", async move { s.insert_usage_log(&rec).await });
+    store.queue_usage_log(rec);
 }
 
 /// 输出前就拒答也照常收费的类别（官方「How refusals are billed」，2026-09 起）：误判率低的这几类，

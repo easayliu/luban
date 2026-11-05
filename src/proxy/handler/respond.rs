@@ -772,8 +772,12 @@ async fn thinking_history_check(
 /// 已登记的指纹不改（首次签发者优先）。
 fn remember_foreign_history(state: &AppState, history: Option<&ThinkingHistoryCheck>) {
     let Some(h) = history.filter(|h| !h.foreign.is_empty()) else { return };
-    state.store.mark_history_recovered(&h.foreign);
-    let fps = h.foreign.clone();
+    // 本号刚签发、还在批量写入队列里的不是外来的（见 [`CredentialStore::without_pending_signed`]）。
+    let fps = state.store.without_pending_signed(&h.foreign);
+    if fps.is_empty() {
+        return;
+    }
+    state.store.mark_history_recovered(&fps);
     let s = state.store.clone();
     state.store.spawn_write("foreign thinking blocks", async move {
         s.remember_thinking_blocks(None, &fps).await
