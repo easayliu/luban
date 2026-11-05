@@ -109,7 +109,31 @@ export type CredentialFilterKey =
  * 「这个号是什么档位」。合进同一个单选列表的话，「Pro 里有哪些需要处理」这种最常问的问题就
  * 提不出来——选了 Pro 就丢掉了状态条件。故单开一列，两个菜单同时生效（取交集）。
  */
-export type CredentialTierFilterKey = 'all' | PlanKey
+/**
+ * 套餐筛选值：`all`、某个档位，或 `team:<套餐名>`——团队 / 企业号再按库里的套餐全称细分
+ * （`Team Standard`、`Team Premium`、`Enterprise`…）。全称取自数据本身，上游出了新的席位档
+ * 不用改代码就能列出来。
+ */
+export type CredentialTierFilterKey = 'all' | PlanKey | `team:${string}`
+
+const TEAM_TIER_PREFIX = 'team:'
+
+/** 团队 / 企业号的细分名：库里的套餐全称（已带组织前缀，如 `Team Standard`）。 */
+function teamSubtier(credential: Pick<Credential, 'tier'>): string {
+  return (credential.tier ?? '').trim()
+}
+
+function matchTier(credential: Pick<Credential, 'tier'>, tier: CredentialTierFilterKey): boolean {
+  if (tier === 'all') return true
+  const plan = planKey(credential.tier)
+  if (tier.startsWith(TEAM_TIER_PREFIX)) return plan === 'team' && teamSubtier(credential) === tier.slice(TEAM_TIER_PREFIX.length)
+  return plan === tier
+}
+
+export function parseTierFilter(raw: string): CredentialTierFilterKey | null {
+  if (raw.startsWith(TEAM_TIER_PREFIX) && raw.length > TEAM_TIER_PREFIX.length) return raw as CredentialTierFilterKey
+  return (CREDENTIAL_TIER_FILTER_KEYS as readonly string[]).includes(raw) ? raw as CredentialTierFilterKey : null
+}
 
 export type CredentialViewMode = 'card' | 'list'
 
@@ -125,6 +149,14 @@ type LocalizedLabel = readonly [chinese: string, english: string]
  * 与 Linear / GitHub 的下拉一致，十来项的列表靠分隔线就能读出层次，标题只会把菜单撑高。
  */
 type FilterGroup = 'overview' | 'schedule' | 'status' | 'usage' | 'device'
+
+/** 状态下拉里各组的小标题；「全部」那组不加。 */
+const FILTER_GROUP_LABELS: Partial<Record<FilterGroup, LocalizedLabel>> = {
+  schedule: ['调度', 'Scheduling'],
+  status: ['账号状态', 'Account status'],
+  usage: ['用量', 'Usage'],
+  device: ['设备', 'Devices'],
+}
 
 const FILTERS: {
   key: CredentialFilterKey
@@ -210,7 +242,7 @@ const FILTERS: {
  * 档位选项按**从高到低**排，与 [`tierRank`] 的口径一致——下拉里读到的顺序就是套餐的贵贱顺序，
  * 不必再去对照徽标颜色。档位名是上游的商品名，中英文一样，故不做翻译。
  */
-const TIER_FILTERS: { key: CredentialTierFilterKey; label: LocalizedLabel }[] = [
+const TIER_FILTERS: { key: 'all' | PlanKey; label: LocalizedLabel }[] = [
   { key: 'all', label: ['全部套餐', 'All plans'] },
   { key: 'max20x', label: ['Max 20x', 'Max 20x'] },
   { key: 'max5x', label: ['Max 5x', 'Max 5x'] },
@@ -251,9 +283,10 @@ const SORT_GROUPS: readonly (readonly SortKey[])[] = [
 /** 能不能改由后端按权限给（`editable`）：代理的列表里下属的号只读。 */
 const owns = (credential: Credential) => credential.editable
 
-function FacetOption({ label, count, nested = false }: { label: string; count: string; nested?: boolean }) {
+/** 计数为 0 的项调暗而不隐藏：状态是一组固定选项，位置不跳；「已封禁 0」本身也是信息。 */
+function FacetOption({ label, count, nested = false, empty = false }: { label: string; count: string; nested?: boolean; empty?: boolean }) {
   return (
-    <span className={cn('flex min-w-0 flex-1 items-center justify-between gap-4', nested && 'ps-3')}>
+    <span className={cn('flex min-w-0 flex-1 items-center justify-between gap-4', nested && 'ps-3', empty && 'text-muted-foreground/70')}>
       <span className="min-w-0 truncate">{label}</span>
       <span className="tnum text-xs text-muted-foreground">{count}</span>
     </span>
@@ -668,8 +701,9 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   )
   const activeFilterLabel = filterItems.find((item) => item.key === filter)?.label
     ?? t(...FILTERS[0].label)
-  const activeTierLabel = tierItems.find((item) => item.key === tier)?.label
-    ?? t(...TIER_FILTERS[0].label)
+  const activeTierLabel = tier.startsWith(TEAM_TIER_PREFIX)
+    ? tier.slice(TEAM_TIER_PREFIX.length)
+    : tierItems.find((item) => item.key === tier)?.label ?? t(...TIER_FILTERS[0].label)
   const activeSortLabel = sortItems.find((item) => item.key === sort)?.label
     ?? t(...SORT_LABELS.priority)
   // 成员筛选：管理员按代理（连同下属）或具体某人缩小，代理按本人或某个下属。它是「看谁的号」，
@@ -715,7 +749,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       evaluatedPool
         .filter((evaluation) => (
           match(evaluation)
-          && (tier === 'all' || planKey(evaluation.credential.tier) === tier)
+          && matchTier(evaluation.credential, tier)
           && (proxyValue === 'all' || proxyBucket(evaluation.credential) === proxyValue)
           && matchQuery(evaluation, debouncedQuery, language)
         ))
@@ -726,6 +760,40 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       language,
     )
   }, [evaluatedPool, sort, dir, filter, tier, proxyValue, debouncedQuery, now, language])
+
+  // 下拉与筛选弹层里的计数：每一维按「其余各维已生效的条件 + 搜索词」来数（常见的分面计数）。
+  // 数字回答的是「切过去能看到几个」：本维自己的选择不影响本维的数（选一次数字不会跟着跳），
+  // 但别的维度已筛「套餐 Pro」时，状态菜单里的「可调度」就是 Pro 里能调度的个数，点下去与数字一致。
+  // 成员是「看谁的号」的范围，早在 evaluatedPool 就收窄了，不参与交叉。概览各格仍用 metrics 的全池口径。
+  const facetCounts = useMemo(() => {
+    const statusMatch = FILTERS.find((item) => item.key === filter)?.match ?? (() => true)
+    const base = (skip: 'status' | 'tier' | 'proxy') => evaluatedPool.filter((evaluation) => (
+      (skip === 'status' || statusMatch(evaluation))
+      && (skip === 'tier' || matchTier(evaluation.credential, tier))
+      && (skip === 'proxy' || proxyValue === 'all' || proxyBucket(evaluation.credential) === proxyValue)
+      && matchQuery(evaluation, debouncedQuery, language)
+    ))
+    const forStatus = base('status')
+    const status = Object.fromEntries(
+      FILTERS.map((item) => [item.key, forStatus.filter(item.match).length]),
+    ) as Record<CredentialFilterKey, number>
+    const forTier = base('tier')
+    const tierAll: Record<'all' | PlanKey, number> = { all: 0, max20x: 0, max5x: 0, max: 0, team: 0, pro: 0, free: 0, unknown: 0 }
+    const team = new Map<string, number>()
+    for (const { credential } of forTier) {
+      tierAll.all += 1
+      const plan = planKey(credential.tier)
+      tierAll[plan] += 1
+      if (plan === 'team') team.set(teamSubtier(credential), (team.get(teamSubtier(credential)) ?? 0) + 1)
+    }
+    const forProxy = base('proxy')
+    const proxy = new Map<string, number>()
+    for (const { credential } of forProxy) {
+      const bucket = proxyBucket(credential)
+      proxy.set(bucket, (proxy.get(bucket) ?? 0) + 1)
+    }
+    return { status, tier: tierAll, team, proxy, proxyAll: forProxy.length }
+  }, [evaluatedPool, filter, tier, proxyValue, debouncedQuery, language])
 
   // 「今日费用」那格的小字：名下各号累计费用之和（账号列表里本来就有，不必另查）。代理的列表里
   // 混着下属的号，只加本人的，与「今日费用」同口径。
@@ -748,18 +816,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       hasDevice: 0,
       deviceFull: 0,
     }
-    // 与状态筛选那份一样，按**整池**统计而不是按当前可见的那一屏：下拉里的数字要回答
-    // 「切过去能看到几个」，跟着当前筛选走的话每选一次数字就变一次，等于没有参考价值。
-    const tierCounts: Record<CredentialTierFilterKey, number> = {
-      all: 0,
-      max20x: 0,
-      max5x: 0,
-      max: 0,
-      team: 0,
-      pro: 0,
-      free: 0,
-      unknown: 0,
-    }
     let rateLimitedPauseCount = 0
     // 「需处理」那一格的小字按**主状态**分项：每个号只落一档（与卡片上显示的那个状态同一个），
     // 各项加起来恰好等于大数。原先小字拼的是几个互相重叠的筛选计数——「冷却」连只是某个模型
@@ -777,8 +833,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     for (const evaluation of evaluatedPool) {
       const credential = evaluation.credential
       filterCounts.all += 1
-      tierCounts.all += 1
-      tierCounts[planKey(credential.tier)] += 1
       if (evaluation.schedulable) filterCounts.schedulable += 1
       if (evaluation.needsAttention) {
         filterCounts.attention += 1
@@ -835,7 +889,6 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
 
     return {
       filterCounts,
-      tierCounts,
       attentionKinds,
       modelOnlyCoolingCount,
       rateLimitedPauseCount,
@@ -1042,9 +1095,16 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     }
     const tierGroups: FacetFilterOption[][] = []
     tierItems.forEach((item, index) => {
-      const entry = { value: item.key, label: item.label, count: metrics.tierCounts[item.key] }
+      const entry = { value: item.key, label: item.label, count: facetCounts.tier[item.key] }
       if (index === 0 || TIER_GROUP_STARTS.has(item.key)) tierGroups.push([entry])
       else tierGroups[tierGroups.length - 1].push(entry)
+      // 团队 / 企业下面按套餐全称缩进列出各细分（Standard / Premium / Enterprise…），按名称排。
+      if (item.key === 'team') {
+        const subs = [...facetCounts.team]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([name, count]) => ({ value: `${TEAM_TIER_PREFIX}${name}`, label: name, count, nested: true }))
+        tierGroups[tierGroups.length - 1].push(...subs)
+      }
     })
     sections.push({
       key: 'tier',
@@ -1061,23 +1121,30 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         value: proxyValue,
         allValue: 'all',
         onChange: changeProxy,
-        searchable: true,
         searchPlaceholder: t('搜索 #id 或名称', 'Search #id or name'),
         groups: [
-          [{ value: 'all', label: t('全部代理', 'All proxies'), count: evaluatedPool.length }],
-          ...proxyGroups,
+          [{ value: 'all', label: t('全部代理', 'All proxies'), count: facetCounts.proxyAll }],
+          // 名单（有哪些代理）按成员范围内的全池定，计数按交叉口径：选中的那条不会因为别的
+          // 条件把它数成 0 就从名单里消失、悄悄退回「全部」。
+          ...proxyGroups.map((items) => items.map((item) => ({ ...item, count: facetCounts.proxy.get(item.value) ?? 0 }))),
         ],
       })
     }
     return sections
     // change* 每轮都是新函数但行为只依赖 actions，不必进依赖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ownerGroups, ownerValue, pool.length, tierItems, metrics.tierCounts, tier, proxyGroups, proxyValue, evaluatedPool.length, t])
-  // 工具条下面的生效条件：弹层里那三维各一枚，状态已经写在自己的按钮上，不重复。
+  }, [ownerGroups, ownerValue, pool.length, tierItems, facetCounts, tier, proxyGroups, proxyValue, t])
+  // 工具条下的生效条件：只列「筛选」弹层里那几维。状态已写在自己的按钮上、概览对应那格也高亮，
+  // 再列一枚是三处重复，只筛状态时还会把页头凭空撑高一行；搜索词同理，搜索框里看得见。
   const filterChips: ActiveFilterChip[] = [
     ...(ownerValue !== 'all' ? [{ key: 'owner', dimension: t('成员', 'Member'), value: activeOwnerLabel, onRemove: () => changeOwner('all') }] : []),
     ...(tier !== 'all' ? [{ key: 'tier', dimension: t('套餐', 'Plan'), value: activeTierLabel, onRemove: () => changeTier('all') }] : []),
     ...(proxyValue !== 'all' ? [{ key: 'proxy', dimension: t('代理', 'Proxy'), value: activeProxyLabel, onRemove: () => changeProxy('all') }] : []),
+  ]
+  // 筛空时空状态里列出的「其余条件」：弹层那几维 + 搜索词（状态单独写在标题里）。
+  const emptyConditions = [
+    ...filterChips.map((chip) => `${chip.dimension} ${chip.value}`),
+    ...(debouncedQuery.trim() ? [t(`搜索「${debouncedQuery.trim()}」`, `search “${debouncedQuery.trim()}”`)] : []),
   ]
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
@@ -1235,8 +1302,18 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                 ariaLabel={t(`状态：${activeFilterLabel}`, `Status: ${activeFilterLabel}`)}
                 groups={filterGroups.map((items) => items.map((item) => ({
                   value: item.key,
-                  label: <FacetOption label={item.label} count={formatNumber(metrics.filterCounts[item.key])} />,
+                  label: (
+                    <FacetOption
+                      label={item.label}
+                      count={formatNumber(facetCounts.status[item.key])}
+                      empty={item.key !== 'all' && facetCounts.status[item.key] === 0}
+                    />
+                  ),
                 })))}
+                groupLabels={filterGroups.map((items) => {
+                  const label = FILTER_GROUP_LABELS[items[0].group]
+                  return label ? t(...label) : undefined
+                })}
                 icon={ListFilterIcon}
                 label={(
                   <span className="min-w-0 truncate">
@@ -1265,9 +1342,14 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
             </ToolbarGroup>
           </Toolbar>
         )}
+        {/* 生效条件紧跟工具条下面一行，与页头同在一块里，xl 起横跨标题与工具条两列、靠左排。 */}
         {!isLoading && count > 0 && (
           <ActiveFilterChips
-            className="xl:col-start-2 xl:justify-end"
+            className="xl:col-span-2"
+            summary={t(
+              `${formatNumber(total)} / ${formatNumber(count)} 个账号`,
+              `${formatNumber(total)} of ${formatNumber(count)} accounts`,
+            )}
             chips={filterChips}
             onClearAll={() => {
               changeOwner('all')
@@ -1479,31 +1561,48 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
           ) : count === 0 ? (
             <Card><EmptyState onAdd={actions.onAdd} /></Card>
           ) : total === 0 ? (
+            // 筛空时说清是哪个条件筛空的：状态筛空最常见（点了个 0 的状态），标题直接点名该状态，
+            // 描述列出其余生效条件，按钮先给「只撤状态」这条最小退路，再给「全部清除」。
             <Card>
               <Empty>
                 <EmptyHeader>
                   <EmptyMedia variant="icon"><SearchIcon /></EmptyMedia>
-                  <EmptyTitle>{t('没有符合条件的账号', 'No matching accounts')}</EmptyTitle>
+                  <EmptyTitle>
+                    {filter !== 'all'
+                      ? t(`没有「${activeFilterLabel}」的账号`, `No accounts in “${activeFilterLabel}”`)
+                      : t('没有符合条件的账号', 'No matching accounts')}
+                  </EmptyTitle>
                   <EmptyDescription>
-                    {t(
-                      '尝试清除当前筛选条件或搜索关键字。',
-                      'Try clearing the current filters or search terms.',
-                    )}
+                    {emptyConditions.length > 0
+                      ? t(
+                        `当前条件：${emptyConditions.join('、')}。`,
+                        `Current conditions: ${emptyConditions.join(', ')}.`,
+                      )
+                      : filter !== 'all'
+                        ? t('账号池里目前没有处于这个状态的账号。', 'No account in the pool is in this state right now.')
+                        : t('尝试清除当前筛选条件或搜索关键字。', 'Try clearing the current filters or search terms.')}
                   </EmptyDescription>
                 </EmptyHeader>
-                <EmptyContent>
-                  <Button
-                    variant="outline"
-                    onClick={() => {
-                      actions.onQueryChange('')
-                      changeFilter('all')
-                      changeTier('all')
-                      changeOwner('all')
-                      changeProxy('all')
-                    }}
-                  >
-                    {t('清除筛选与搜索', 'Clear filters and search')}
-                  </Button>
+                <EmptyContent className="flex-row flex-wrap justify-center gap-2">
+                  {filter !== 'all' && (
+                    <Button variant={emptyConditions.length > 0 ? 'default' : 'outline'} onClick={() => changeFilter('all')}>
+                      {t('查看全部状态', 'Show all statuses')}
+                    </Button>
+                  )}
+                  {(filter === 'all' || emptyConditions.length > 0) && (
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        actions.onQueryChange('')
+                        changeFilter('all')
+                        changeTier('all')
+                        changeOwner('all')
+                        changeProxy('all')
+                      }}
+                    >
+                      {t('清除筛选与搜索', 'Clear filters and search')}
+                    </Button>
+                  )}
                 </EmptyContent>
               </Empty>
             </Card>

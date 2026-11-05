@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ElementType, type ReactNode, type RefObject } from 'react'
-import { CheckIcon, SearchIcon, SlidersHorizontalIcon, XIcon } from 'lucide-react'
+import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, SearchIcon, SlidersHorizontalIcon, XIcon } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { Button, buttonVariants } from '@/components/ui/button'
@@ -8,6 +8,7 @@ import { Kbd } from '@/components/ui/kbd'
 import {
   Menu,
   MenuGroup,
+  MenuGroupLabel,
   MenuPopup,
   MenuRadioGroup,
   MenuRadioItem,
@@ -129,6 +130,7 @@ export function ToolbarMenuSelect<T extends string>({
   ariaLabel,
   value,
   groups,
+  groupLabels,
   onChange,
   active = false,
   className,
@@ -139,6 +141,8 @@ export function ToolbarMenuSelect<T extends string>({
   ariaLabel: string
   value: T
   groups: MenuSelectItem<T>[][]
+  /** 与 `groups` 按下标对应的组标题，缺的组不加。 */
+  groupLabels?: (string | undefined)[]
   onChange: (value: T) => void
   active?: boolean
   className?: string
@@ -163,6 +167,7 @@ export function ToolbarMenuSelect<T extends string>({
           {groups.map((items, index) => (
             <MenuGroup key={items[0]?.value ?? index}>
               {index > 0 && <MenuSeparator />}
+              {groupLabels?.[index] && <MenuGroupLabel className="pb-0.5">{groupLabels[index]}</MenuGroupLabel>}
               {items.map((item) => (
                 // 内容列收成 minmax(0,1fr)、包裹层 min-w-0：选项名过长（代理名称）时截断自身，
                 // 不把右侧计数挤出弹层。
@@ -193,7 +198,7 @@ export interface FacetFilterOption {
   value: string
   label: string
   count: number
-  /** 挂在上一项下面的子项（成员筛选里队下的人），缩进一档。 */
+  /** 挂在上一项下面的子项（成员筛选里队下的人、团队套餐的细分），缩进一档。 */
   nested?: boolean
 }
 
@@ -206,30 +211,56 @@ export interface FacetFilterSection {
   allValue: string
   groups: FacetFilterOption[][]
   onChange: (value: string) => void
-  /** 选项多时（代理）在这一节顶上放个搜索框，只过滤 `allValue` 以外的项。 */
-  searchable?: boolean
   searchPlaceholder?: string
 }
 
-/** 选项多于这个数才出这一节的搜索框，少的时候一眼就看完了。 */
-const FACET_SEARCH_THRESHOLD = 6
+/** 选项多于这个数才出搜索框，少的时候一眼就看完了。 */
+const FACET_SEARCH_THRESHOLD = 8
 
-function FacetSection({ section }: { section: FacetFilterSection }) {
+/**
+ * 某一维的选项页：顶上「‹ 维度名」返回，选项多时有搜索框；数量为 0 的不列（当前选中的除外），
+ * 空组连分隔线一起去掉。代理一多就是几十上百条，靠搜索与弹层自身的滚动收住。
+ */
+function FacetOptions({
+  section,
+  onBack,
+  onPicked,
+}: {
+  section: FacetFilterSection
+  onBack?: () => void
+  onPicked: () => void
+}) {
   const { t } = useI18n()
   const [query, setQuery] = useState('')
-  const total = section.groups.reduce((sum, group) => sum + group.length, 0)
-  const showSearch = section.searchable && total > FACET_SEARCH_THRESHOLD
+  const visible = useMemo(() => section.groups
+    .map((group) => group.filter((item) => (
+      item.count > 0 || item.value === section.value || item.value === section.allValue
+    )))
+    .filter((group) => group.length > 0), [section.groups, section.value, section.allValue])
+  const total = visible.reduce((sum, group) => sum + group.length, 0)
+  const showSearch = total > FACET_SEARCH_THRESHOLD
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase()
-    if (!q) return section.groups
-    return section.groups
-      .map((group) => group.filter((item) => item.value === section.allValue || item.label.toLowerCase().includes(q)))
+    if (!q) return visible
+    return visible
+      .map((group) => group.filter((item) => item.label.toLowerCase().includes(q)))
       .filter((group) => group.length > 0)
-  }, [section.groups, section.allValue, query])
+  }, [visible, query])
   const titleId = `facet-${section.key}`
   return (
-    <div className="space-y-1" role="radiogroup" aria-labelledby={titleId}>
-      <p id={titleId} className="px-2 text-xs font-medium text-muted-foreground">{section.title}</p>
+    <div className="space-y-1">
+      {onBack ? (
+        <button
+          type="button"
+          onClick={onBack}
+          className="flex h-7 w-full cursor-default items-center gap-1 rounded-sm px-1 text-xs font-medium text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:bg-accent"
+        >
+          <ChevronLeftIcon className="size-3.5" />
+          <span id={titleId}>{section.title}</span>
+        </button>
+      ) : (
+        <p id={titleId} className="px-2 py-1 text-xs font-medium text-muted-foreground">{section.title}</p>
+      )}
       {showSearch && (
         <div className="px-1 pb-1">
           <ToolbarSearch
@@ -242,41 +273,49 @@ function FacetSection({ section }: { section: FacetFilterSection }) {
           />
         </div>
       )}
-      {groups.map((items, index) => (
-        <div key={items[0]?.value ?? index} className={cn(index > 0 && 'mt-1 border-t pt-1')}>
-          {items.map((item) => {
-            const checked = item.value === section.value
-            return (
-              <button
-                key={item.value}
-                type="button"
-                role="radio"
-                aria-checked={checked}
-                onClick={() => section.onChange(item.value)}
-                className={cn(
-                  'grid min-h-8 w-full cursor-default grid-cols-[.75rem_minmax(0,1fr)_auto] items-center gap-2 rounded-sm ps-2 pe-2 text-left text-sm outline-none hover:bg-accent focus-visible:bg-accent sm:min-h-7',
-                  checked && 'font-medium',
-                )}
-              >
-                {checked ? <CheckIcon className="size-3.5" /> : <span />}
-                <span className={cn('min-w-0 truncate', item.nested && 'ps-3')}>{item.label}</span>
-                <span className="tnum text-xs text-muted-foreground">{item.count.toLocaleString()}</span>
-              </button>
-            )
-          })}
-        </div>
-      ))}
-      {groups.length === 0 && (
-        <p className="px-2 py-1.5 text-sm text-muted-foreground">{t('无匹配结果', 'No matches')}</p>
-      )}
+      <div role="radiogroup" aria-labelledby={titleId} className="max-h-80 overflow-y-auto">
+        {groups.map((items, index) => (
+          <div key={items[0]?.value ?? index} className={cn(index > 0 && 'mt-1 border-t pt-1')}>
+            {items.map((item) => {
+              const checked = item.value === section.value
+              return (
+                <button
+                  key={item.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={checked}
+                  onClick={() => {
+                    section.onChange(item.value)
+                    onPicked()
+                  }}
+                  className={cn(
+                    'grid min-h-8 w-full cursor-default grid-cols-[.75rem_minmax(0,1fr)_auto] items-center gap-2 rounded-sm px-2 text-left text-sm outline-none hover:bg-accent focus-visible:bg-accent sm:min-h-7',
+                    checked && 'font-medium',
+                  )}
+                >
+                  {checked ? <CheckIcon className="size-3.5" /> : <span />}
+                  <span className={cn('min-w-0 truncate', item.nested && 'ps-3 text-muted-foreground', item.nested && checked && 'text-foreground')}>
+                    {item.label}
+                  </span>
+                  <span className="tnum text-xs text-muted-foreground">{item.count.toLocaleString()}</span>
+                </button>
+              )
+            })}
+          </div>
+        ))}
+        {groups.length === 0 && (
+          <p className="px-2 py-1.5 text-sm text-muted-foreground">{t('无匹配结果', 'No matches')}</p>
+        )}
+      </div>
     </div>
   )
 }
 
 /**
- * 「筛选」按钮 + 分节弹层：把用得不那么勤的几个维度（成员、套餐、代理）收进一处，工具条上只占
- * 一个按钮，按钮上标出已生效几项。选一项不关弹层——常常是连着设两三个维度。每节单选，第一项是
- * 「全部」。生效的条件另由 [ActiveFilterChips] 摊在工具条下面，一眼看得出筛了什么。
+ * 「筛选」按钮 + 两级弹层（Linear / Stripe 的排法）：第一级只列各维度及其当前值，点进去才是
+ * 那一维的选项，选完回到第一级、弹层不关——常常是连着设两三个维度。维度再多、某一维选项再多
+ * （代理上百条），第一级也只有几行。只有一个维度时直接进它的选项页。生效的条件另由
+ * [ActiveFilterChips] 摊在工具条下面。
  */
 export function ToolbarFacetFilter({
   sections,
@@ -286,10 +325,17 @@ export function ToolbarFacetFilter({
   className?: string
 }) {
   const { t } = useI18n()
+  const [openKey, setOpenKey] = useState<string | null>(null)
   const active = sections.filter((section) => section.value !== section.allValue).length
   const label = t('筛选', 'Filter')
+  const single = sections.length === 1 ? sections[0] : null
+  const current = single ?? sections.find((section) => section.key === openKey) ?? null
+  const valueLabel = (section: FacetFilterSection) =>
+    section.groups.flat().find((item) => item.value === section.value)?.label
+    ?? section.groups.flat().find((item) => item.value === section.allValue)?.label
+    ?? ''
   return (
-    <Popover>
+    <Popover onOpenChange={(open) => { if (!open) setOpenKey(null) }}>
       <PopoverTrigger
         aria-label={active > 0 ? t(`${label}，已生效 ${active} 项`, `${label}, ${active} active`) : label}
         className={cn(
@@ -305,9 +351,36 @@ export function ToolbarFacetFilter({
           {active > 0 && <span className="tnum shrink-0 text-xs">· {active}</span>}
         </span>
       </PopoverTrigger>
-      <PopoverPopup align="end" className="w-72 [--viewport-inline-padding:--spacing(1.5)] *:data-[slot=popover-viewport]:py-2">
-        <div className="space-y-2 [&>*+*]:border-t [&>*+*]:pt-2">
-          {sections.map((section) => <FacetSection key={section.key} section={section} />)}
+      <PopoverPopup align="end" className="w-72 [--viewport-inline-padding:--spacing(1.5)] *:data-[slot=popover-viewport]:py-1.5">
+        {/* 各页都挂着、只切显隐：点击里把被点的按钮卸掉的话，弹层收到的点击目标已不在自己
+            里面，会当成点在外面直接关掉。 */}
+        {sections.map((section) => (
+          <div key={section.key} hidden={current?.key !== section.key}>
+            <FacetOptions
+              section={section}
+              onBack={single ? undefined : () => setOpenKey(null)}
+              onPicked={() => { if (!single) setOpenKey(null) }}
+            />
+          </div>
+        ))}
+        <div className="space-y-0.5" hidden={current != null}>
+          {sections.map((section) => {
+            const on = section.value !== section.allValue
+            return (
+              <button
+                key={section.key}
+                type="button"
+                onClick={() => setOpenKey(section.key)}
+                className="grid min-h-9 w-full cursor-default grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 rounded-sm px-2 text-left text-sm outline-none hover:bg-accent focus-visible:bg-accent sm:min-h-8"
+              >
+                <span>{section.title}</span>
+                <span className={cn('min-w-0 truncate text-right text-xs', on ? 'font-medium text-marine-foreground' : 'text-muted-foreground')}>
+                  {valueLabel(section)}
+                </span>
+                <ChevronRightIcon className="size-3.5 text-muted-foreground" />
+              </button>
+            )
+          })}
         </div>
       </PopoverPopup>
     </Popover>
@@ -325,16 +398,19 @@ export interface ActiveFilterChip {
 }
 
 /**
- * 生效条件的标签行：「维度：值 ✕」逐个列出，末尾一个「清除全部」。没有生效条件时不渲染，
- * 不占高度。
+ * 生效条件的标签行（GitHub / Linear 列表页的常见排法）：「维度 值 ✕」靠左逐个列出，「清除全部」
+ * 紧跟其后，结果数靠右、弱化。没有生效条件时不渲染，不占高度。
  */
 export function ActiveFilterChips({
   chips,
   onClearAll,
+  summary,
   className,
 }: {
   chips: ActiveFilterChip[]
   onClearAll: () => void
+  /** 行尾靠右的结果数，如「1 / 9 个账号」。 */
+  summary?: ReactNode
   className?: string
 }) {
   const { t } = useI18n()
@@ -362,6 +438,7 @@ export function ActiveFilterChips({
       <Button size="xs" variant="ghost" className="text-muted-foreground" onClick={onClearAll}>
         {t('清除全部', 'Clear all')}
       </Button>
+      {summary && <span className="ms-auto text-xs text-muted-foreground tnum">{summary}</span>}
     </div>
   )
 }

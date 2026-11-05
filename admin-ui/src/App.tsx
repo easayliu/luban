@@ -14,7 +14,7 @@ import {
 } from '@/components/credential-shared'
 import {
   CREDENTIAL_FILTER_KEYS,
-  CREDENTIAL_TIER_FILTER_KEYS,
+  parseTierFilter,
   CREDENTIAL_PAGE_SIZES,
   CREDENTIAL_VIEW_MODES,
   CredentialWorkspace,
@@ -223,7 +223,7 @@ function App() {
   const [tier, setTier] = usePersisted<CredentialTierFilterKey>(
     'tier',
     'all',
-    oneOf(CREDENTIAL_TIER_FILTER_KEYS),
+    parseTierFilter,
     String,
     seed.get('tier'),
   )
