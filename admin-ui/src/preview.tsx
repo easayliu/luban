@@ -798,6 +798,7 @@ function PreviewCredentialWorkspace() {
     (previewParams.get('tier') as CredentialTierFilterKey | null) ?? 'all',
   )
   const [owner, setOwner] = React.useState(previewParams.get('owner') ?? 'all')
+  const [proxy, setProxy] = React.useState(previewParams.get('proxy') ?? 'all')
   const [sort, setSort] = React.useState<SortKey>('priority')
   const [dir, setDir] = React.useState<SortDir>('asc')
   const [view, setView] = React.useState<CredentialViewMode>(
@@ -821,6 +822,7 @@ function PreviewCredentialWorkspace() {
         filter,
         tier,
         owner,
+        proxy,
         sort,
         dir,
         view,
@@ -833,6 +835,7 @@ function PreviewCredentialWorkspace() {
         onFilterChange: setFilter,
         onTierChange: setTier,
         onOwnerChange: setOwner,
+        onProxyChange: setProxy,
         onSortChange: (key, nextDir) => {
           setSort(key)
           setDir(nextDir)

@@ -1,8 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowUpDownIcon,
   DatabaseZapIcon,
-  LayersIcon,
   LayoutGridIcon,
   ListFilterIcon,
   ListIcon,
@@ -16,20 +14,20 @@ import {
   SmartphoneIcon,
   TimerIcon,
   TriangleAlertIcon,
-  UsersIcon,
-  XIcon,
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import type { Credential } from '@/api/credentials'
 import { getMetrics } from '@/api/metrics'
 import { getBilling } from '@/api/billing'
 import { listUsers } from '@/api/users'
+import { listProxies } from '@/api/proxies'
 import { BatchActionsBar } from '@/components/batch-actions-bar'
 import { CacheHitSparkline, cacheSplitText } from '@/components/cache-hit-chart'
 import { CacheHitTrendDialog, useCacheSeries } from '@/components/cache-hit-trend-dialog'
 import { CredentialCard } from '@/components/credential-card'
 import { CredentialLoadingState } from '@/components/credential-loading'
 import { ownerFacets, type CredentialOwnerFilter } from '@/components/credential-owner-filter'
+import { proxyBucket, proxyFacets, type CredentialProxyFilter } from '@/components/credential-proxy-filter'
 import {
   SORTS,
   CREDENTIAL_CARD_GRID_CLASS,
@@ -58,7 +56,7 @@ import { getRejections, type CacheSeriesPoint, type TtftSeriesPoint } from '@/ap
 import { PaginationBar } from '@/components/pagination-bar'
 import { ErrorState } from '@/components/state-placeholders'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
   Empty,
@@ -68,14 +66,25 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from '@/components/ui/empty'
-import { ToolbarMenuSelect, ToolbarSearch } from '@/components/toolbar-controls'
-import { MenuRadioGroup, MenuRadioItem } from '@/components/ui/menu'
+import {
+  ActiveFilterChips,
+  ToolbarFacetFilter,
+  ToolbarMenuSelect,
+  ToolbarSearch,
+  type ActiveFilterChip,
+  type FacetFilterOption,
+  type FacetFilterSection,
+} from '@/components/toolbar-controls'
+import { Popover, PopoverPopup, PopoverTrigger } from '@/components/ui/popover'
+import {
+  Select, SelectGroup, SelectItem, SelectPopup, SelectSeparator, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCaption } from '@/components/ui/table'
 import { Toggle } from '@/components/ui/toggle'
 import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components/ui/toggle-group'
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
-import { Hint, Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
 import { ReadOnlyScope, useCanManageUsers, useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
@@ -317,6 +326,7 @@ interface CredentialWorkspaceState {
   filter: CredentialFilterKey
   tier: CredentialTierFilterKey
   owner: CredentialOwnerFilter
+  proxy: CredentialProxyFilter
   sort: SortKey
   dir: SortDir
   view: CredentialViewMode
@@ -330,6 +340,7 @@ interface CredentialWorkspaceActions {
   onFilterChange: (value: CredentialFilterKey) => void
   onTierChange: (value: CredentialTierFilterKey) => void
   onOwnerChange: (value: CredentialOwnerFilter) => void
+  onProxyChange: (value: CredentialProxyFilter) => void
   onSortChange: (key: SortKey, dir: SortDir) => void
   onViewChange: (value: CredentialViewMode) => void
   onSelectedChange: (value: Set<number>) => void
@@ -350,17 +361,126 @@ export interface CredentialWorkspaceProps {
 function WorkspaceToolbarSkeleton() {
   return (
     <div
-      className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end"
+      className="grid w-full grid-cols-3 items-stretch gap-2 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end"
       aria-hidden="true"
     >
-      <Skeleton className="h-9 max-sm:col-start-1 max-sm:row-start-1 sm:h-8 sm:min-w-56 sm:flex-1 xl:max-w-64" />
-      <div className="grid min-w-0 grid-cols-3 gap-1 max-sm:col-span-2 max-sm:row-start-2 sm:flex">
-        <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-24" />
+      <Skeleton className="h-9 max-sm:col-span-3 sm:h-8 sm:min-w-56 sm:flex-1 xl:max-w-64" />
+      <div className="grid min-w-0 grid-cols-3 gap-1 max-sm:col-span-3 sm:flex">
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
+        <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-20" />
         <Skeleton className="h-9 min-w-0 sm:h-8 sm:w-28" />
       </div>
-      <Skeleton className="h-9 w-[4.5rem] justify-self-end max-sm:col-start-2 max-sm:row-start-1 sm:ml-auto sm:h-8 sm:w-16 xl:ml-0" />
     </div>
+  )
+}
+
+/**
+ * 「显示」按钮：视图（卡片 / 列表）、排序字段与方向收在一处。它们决定「怎么摆」，与状态、筛选
+ * 这些「看哪些号」分开；视图与排序大多设一次就不动（都记在 localStorage），常驻工具条占地方。
+ * 按钮上仍写着当前排序（「添加时间 ↓」），收起来也看得出是怎么排的。列表视图点表头排序照旧。
+ */
+function DisplayOptions({
+  view,
+  onViewChange,
+  sort,
+  dir,
+  sortGroups,
+  sortLabel,
+  onSortKeyChange,
+  onSortDirChange,
+}: {
+  view: CredentialViewMode
+  onViewChange: (value: CredentialViewMode) => void
+  sort: SortKey
+  dir: SortDir
+  sortGroups: { key: SortKey; label: string }[][]
+  sortLabel: string
+  onSortKeyChange: (key: SortKey) => void
+  onSortDirChange: (dir: SortDir) => void
+}) {
+  const { t } = useI18n()
+  const arrow = dir === 'asc' ? '↑' : '↓'
+  const viewLabel = view === 'card' ? t('卡片视图', 'Card view') : t('列表视图', 'List view')
+  const sortItems = sortGroups.flat().map((item) => ({ value: item.key, label: item.label }))
+  const row = 'grid grid-cols-[3.5rem_minmax(0,1fr)] items-center gap-2'
+  const rowLabel = 'text-xs font-medium text-muted-foreground'
+  return (
+    <Popover>
+      <PopoverTrigger
+        aria-label={t(
+          `显示：${viewLabel}，按${sortLabel}${dir === 'asc' ? '升序' : '降序'}`,
+          `Display: ${viewLabel}, sorted by ${sortLabel} ${dir === 'asc' ? 'ascending' : 'descending'}`,
+        )}
+        className={cn(
+          buttonVariants({ variant: 'outline' }),
+          'w-full min-w-0 justify-between max-sm:[&_svg]:hidden sm:w-auto',
+        )}
+      >
+        {view === 'card' ? <LayoutGridIcon /> : <ListIcon />}
+        <span className="min-w-0 truncate max-[22rem]:hidden">{sortLabel} {arrow}</span>
+        <span className="hidden shrink-0 max-[22rem]:inline">{t('排序', 'Sort')} {arrow}</span>
+      </PopoverTrigger>
+      <PopoverPopup align="end" className="w-72">
+        <div className="space-y-3">
+          <div className={row}>
+            <span className={rowLabel}>{t('视图', 'View')}</span>
+            <ToggleGroup
+              value={[view]}
+              onValueChange={(values) => {
+                const next = values[values.length - 1]
+                if (next === 'card' || next === 'list') onViewChange(next)
+              }}
+              variant="outline"
+              size="sm"
+              className="w-full"
+              aria-label={t('账号视图', 'Account view')}
+            >
+              <ToggleGroupItem value="card" className="flex-1">
+                <LayoutGridIcon />
+                {t('卡片', 'Cards')}
+              </ToggleGroupItem>
+              <ToggleGroupSeparator />
+              <ToggleGroupItem value="list" className="flex-1">
+                <ListIcon />
+                {t('列表', 'List')}
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+          <div className={row}>
+            <span className={rowLabel}>{t('排序', 'Sort')}</span>
+            <Select items={sortItems} value={sort} onValueChange={(next) => next && onSortKeyChange(next as SortKey)}>
+              <SelectTrigger size="sm" aria-label={t('排序字段', 'Sort field')}><SelectValue /></SelectTrigger>
+              <SelectPopup alignItemWithTrigger={false}>
+                {sortGroups.map((items, index) => (
+                  <SelectGroup key={items[0]?.key ?? index}>
+                    {index > 0 && <SelectSeparator />}
+                    {items.map((item) => <SelectItem key={item.key} value={item.key}>{item.label}</SelectItem>)}
+                  </SelectGroup>
+                ))}
+              </SelectPopup>
+            </Select>
+          </div>
+          <div className={row}>
+            <span className={rowLabel}>{t('方向', 'Order')}</span>
+            <ToggleGroup
+              value={[dir]}
+              onValueChange={(values) => {
+                const next = values[values.length - 1]
+                if (next === 'asc' || next === 'desc') onSortDirChange(next)
+              }}
+              variant="outline"
+              size="sm"
+              className="w-full"
+              aria-label={t('排序方向', 'Sort order')}
+            >
+              <ToggleGroupItem value="asc" className="flex-1">{t('升序', 'Ascending')} ↑</ToggleGroupItem>
+              <ToggleGroupSeparator />
+              <ToggleGroupItem value="desc" className="flex-1">{t('降序', 'Descending')} ↓</ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+        </div>
+      </PopoverPopup>
+    </Popover>
   )
 }
 
@@ -385,6 +505,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     filter,
     tier,
     owner,
+    proxy,
     sort,
     dir,
     view,
@@ -576,6 +697,17 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       .map((credential) => evaluateCredential(credential, now, language)),
     [pool, activeOwner, now, language],
   )
+  // 代理筛选：按号绑的出站代理缩小（直连 / 自定义 / 代理池某一条），筛出来全选后用批量操作里的
+  // 「出站代理」整批换掉。它是号的一项属性，与套餐同级：下拉计数跟着成员筛选走，不影响概览各格。
+  const proxiesQuery = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
+  const proxyGroups = useMemo(
+    () => proxyFacets(evaluatedPool.map((evaluation) => evaluation.credential), proxiesQuery.data, t),
+    [evaluatedPool, proxiesQuery.data, t],
+  )
+  // 选中的那条代理已没有号在用（刚整批换走）时按「全部」算，同成员筛选。
+  const activeProxy = proxyGroups.flat().find((item) => item.value === proxy)
+  const proxyValue = activeProxy?.value ?? 'all'
+  const activeProxyLabel = activeProxy?.label ?? t('全部代理', 'All proxies')
 
   const sorted = useMemo(() => {
     const match = FILTERS.find((item) => item.key === filter)?.match ?? (() => true)
@@ -584,6 +716,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         .filter((evaluation) => (
           match(evaluation)
           && (tier === 'all' || planKey(evaluation.credential.tier) === tier)
+          && (proxyValue === 'all' || proxyBucket(evaluation.credential) === proxyValue)
           && matchQuery(evaluation, debouncedQuery, language)
         ))
         .map((evaluation) => evaluation.credential),
@@ -592,7 +725,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
       now,
       language,
     )
-  }, [evaluatedPool, sort, dir, filter, tier, debouncedQuery, now, language])
+  }, [evaluatedPool, sort, dir, filter, tier, proxyValue, debouncedQuery, now, language])
 
   // 「今日费用」那格的小字：名下各号累计费用之和（账号列表里本来就有，不必另查）。代理的列表里
   // 混着下属的号，只加本人的，与「今日费用」同口径。
@@ -724,7 +857,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   const attentionCount = metrics.filterCounts.attention
   const quotaRiskCount = metrics.filterCounts.nearLimit
   const fullDeviceCount = metrics.filterCounts.deviceFull
-  const filtering = filter !== 'all' || tier !== 'all' || ownerValue !== 'all' || debouncedQuery.trim() !== ''
+  const filtering = filter !== 'all' || tier !== 'all' || ownerValue !== 'all' || proxyValue !== 'all' || debouncedQuery.trim() !== ''
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const current = Math.min(page, pageCount)
   const pageItems = sorted.slice((current - 1) * pageSize, current * pageSize)
@@ -843,6 +976,11 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     actions.onPageChange(1)
     clearSelection()
   }
+  const changeProxy = (value: CredentialProxyFilter) => {
+    actions.onProxyChange(value)
+    actions.onPageChange(1)
+    clearSelection()
+  }
   // 下拉里字段与方向分开选：换字段时用该字段的默认方向，重选当前字段不翻转方向
   //（翻转是列表表头点击的交互，放进单选菜单里会让「点了已勾选的项」反而改掉排序）。
   const changeSortKey = (key: SortKey) => {
@@ -883,28 +1021,75 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
     if ([...selected].every((id) => visible.has(id))) return
     onSelectedChangeRef.current(new Set([...selected].filter((id) => visible.has(id))))
   }, [credentials, editable, selected])
-  // 套餐下拉按 TIER_GROUP_STARTS 切成几组，组间画分隔线。
-  const tierGroups = useMemo(() => {
-    const groups: { value: CredentialTierFilterKey; label: ReactNode }[][] = []
+  // 「筛选」弹层的三节。成员与代理只有可分的时候才出（成员名单只有一个人时不出）；套餐按
+  // TIER_GROUP_STARTS 切组，组间画分隔线。各节第一项是「全部」。
+  const facetSections = useMemo(() => {
+    const sections: FacetFilterSection[] = []
+    if (ownerGroups.length > 0) {
+      sections.push({
+        key: 'owner',
+        title: t('成员', 'Member'),
+        value: ownerValue,
+        allValue: 'all',
+        onChange: changeOwner,
+        groups: [
+          [{ value: 'all', label: t('全部成员', 'All members'), count: pool.length }],
+          ...ownerGroups.map((items) => items.map((item) => ({
+            value: item.value, label: item.label, count: item.count, nested: item.nested,
+          }))),
+        ],
+      })
+    }
+    const tierGroups: FacetFilterOption[][] = []
     tierItems.forEach((item, index) => {
-      const entry = { value: item.key, label: <FacetOption label={item.label} count={formatNumber(metrics.tierCounts[item.key])} /> }
-      if (index === 0 || TIER_GROUP_STARTS.has(item.key)) groups.push([entry])
-      else groups[groups.length - 1].push(entry)
+      const entry = { value: item.key, label: item.label, count: metrics.tierCounts[item.key] }
+      if (index === 0 || TIER_GROUP_STARTS.has(item.key)) tierGroups.push([entry])
+      else tierGroups[tierGroups.length - 1].push(entry)
     })
-    return groups
-  }, [tierItems, metrics.tierCounts, formatNumber])
+    sections.push({
+      key: 'tier',
+      title: t('套餐', 'Plan'),
+      value: tier,
+      allValue: 'all',
+      onChange: (value) => changeTier(value as CredentialTierFilterKey),
+      groups: tierGroups,
+    })
+    if (proxyGroups.length > 0) {
+      sections.push({
+        key: 'proxy',
+        title: t('代理', 'Proxy'),
+        value: proxyValue,
+        allValue: 'all',
+        onChange: changeProxy,
+        searchable: true,
+        searchPlaceholder: t('搜索 #id 或名称', 'Search #id or name'),
+        groups: [
+          [{ value: 'all', label: t('全部代理', 'All proxies'), count: evaluatedPool.length }],
+          ...proxyGroups,
+        ],
+      })
+    }
+    return sections
+    // change* 每轮都是新函数但行为只依赖 actions，不必进依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownerGroups, ownerValue, pool.length, tierItems, metrics.tierCounts, tier, proxyGroups, proxyValue, evaluatedPool.length, t])
+  // 工具条下面的生效条件：弹层里那三维各一枚，状态已经写在自己的按钮上，不重复。
+  const filterChips: ActiveFilterChip[] = [
+    ...(ownerValue !== 'all' ? [{ key: 'owner', dimension: t('成员', 'Member'), value: activeOwnerLabel, onRemove: () => changeOwner('all') }] : []),
+    ...(tier !== 'all' ? [{ key: 'tier', dimension: t('套餐', 'Plan'), value: activeTierLabel, onRemove: () => changeTier('all') }] : []),
+    ...(proxyValue !== 'all' ? [{ key: 'proxy', dimension: t('代理', 'Proxy'), value: activeProxyLabel, onRemove: () => changeProxy('all') }] : []),
+  ]
   const selectMetric = (key: CredentialFilterKey) => changeFilter(filter === key ? 'all' : key)
 
   return (
     <div className="space-y-3 sm:space-y-4" data-slot="credential-workspace">
       {/* 页面头 + 工具条 + 指标条同在一张卡片里，**标题与工具条在宽屏上合成一行**
           （用户指定回到 v0.3.142 的这个版式）：
-              xl 起  [账号池 13 个账号 7/65 台设备 ● 30 秒刷新][搜索 筛选 排序 | 视图切换]
+              xl 起  [账号池 13 个账号 7/65 台设备 ● 30 秒刷新][搜索 状态 筛选 | 显示]
               xl 以下 两行，标题行内「刷新」靠 justify-between 推到右端
+          生效的筛选条件在工具条下面另起一行（ActiveFilterChips），xl 起落在右列、靠右对齐。
           机制就是外层那个 `xl:grid-cols-[auto_minmax(0,1fr)]`：左列按内容宽、右列吃掉剩下的，
-          工具条自己 `xl:justify-end` 靠右。三处 `xl:` 是一套，改一个就得看另两个——
-          `Toolbar` 的 `xl:justify-end`（外层右推）必须配 `ToolbarSeparator` 的 `xl:ml-0`
-          （内层不再重复右推），搜索框也要 `xl:max-w-64` 封顶，否则它会把筛选器挤到屏幕外。
+          工具条自己 `xl:justify-end` 靠右；搜索框要 `xl:max-w-64` 封顶，否则它会把筛选器挤到屏幕外。
           「添加账号」不在这里——它是顶栏上那枚橙色 `+`（见 App.tsx 的 AppHeader actions）。 */}
       <section
         className="overflow-hidden rounded-2xl border bg-card shadow-xs/5"
@@ -1030,147 +1215,66 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
         {isLoading ? (
           <WorkspaceToolbarSkeleton />
         ) : count > 0 && (
-          <Toolbar className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
+          <Toolbar className="grid w-full grid-cols-3 items-stretch gap-2 border-0 bg-transparent p-0 sm:flex sm:flex-row sm:flex-wrap sm:items-center xl:justify-end">
             {/* sm–lg（工具条独占一行）时搜索框吃掉剩余宽度，整行没有死区；xl 起与标题同行，
                 必须用 `xl:max-w-64` 封顶——不封顶它会一路撑开，把筛选与视图切换挤出可视区。 */}
             <ToolbarSearch
               ariaLabel={t('搜索账号', 'Search accounts')}
-              className="max-sm:col-start-1 max-sm:row-start-1 sm:min-w-56 sm:flex-1 xl:max-w-64"
+              className="max-sm:col-span-3 sm:min-w-56 sm:flex-1 xl:max-w-64"
               placeholder={t('搜索名称、#id、套餐或状态', 'Search name, #id, plan or status')}
               value={query}
               onChange={changeQuery}
             />
 
-            {/* 搜索与两个筛选是同一组「缩小范围」的控件，中间不加分隔线；排序与视图切换属于
-                「怎么展示」，在分隔线之后。与 GitHub / Linear 列表页的工具条排布一致。 */}
-            <ToolbarGroup
-              className={cn(
-                'grid min-w-0 max-sm:col-span-2 max-sm:row-start-2 sm:flex sm:flex-wrap',
-                ownerGroups.length > 0 ? 'grid-cols-2 min-[24rem]:grid-cols-4' : 'grid-cols-3',
-              )}
-            >
-              {ownerGroups.length > 0 && (
-                <ToolbarMenuSelect
-                  active={ownerValue !== 'all'}
-                  ariaLabel={t(`成员：${activeOwnerLabel}`, `Member: ${activeOwnerLabel}`)}
-                  groups={[
-                    [{ value: 'all', label: <FacetOption label={t('全部成员', 'All members')} count={formatNumber(pool.length)} /> }],
-                    ...ownerGroups.map((items) => items.map((item) => ({
-                      value: item.value,
-                      label: <FacetOption label={item.label} count={formatNumber(item.count)} nested={item.nested} />,
-                    }))),
-                  ]}
-                  icon={UsersIcon}
-                  label={activeOwnerLabel}
-                  value={ownerValue}
-                  onChange={changeOwner}
-                />
-              )}
-
+            {/* 状态是最常用的一维，概览各格点下去切的也是它，单独一个按钮；成员、套餐、代理这些
+                「按属性缩小范围」的收进「筛选」弹层，工具条上只占一格，再加维度也不变长。手机上
+                固定三格（状态 / 筛选 / 排序），不随维度多少变列。排序在分隔线之后，属于「怎么展示」。 */}
+            <ToolbarGroup className="grid min-w-0 grid-cols-3 max-sm:col-span-3 sm:flex sm:flex-wrap">
               <ToolbarMenuSelect
                 active={filter !== 'all'}
-                ariaLabel={t(`筛选：${activeFilterLabel}`, `Filter: ${activeFilterLabel}`)}
+                ariaLabel={t(`状态：${activeFilterLabel}`, `Status: ${activeFilterLabel}`)}
                 groups={filterGroups.map((items) => items.map((item) => ({
                   value: item.key,
                   label: <FacetOption label={item.label} count={formatNumber(metrics.filterCounts[item.key])} />,
                 })))}
                 icon={ListFilterIcon}
-                label={activeFilterLabel}
+                label={(
+                  <span className="min-w-0 truncate">
+                    <span className="max-sm:hidden">{t('状态：', 'Status: ')}</span>
+                    {activeFilterLabel}
+                  </span>
+                )}
                 value={filter}
                 onChange={changeFilter}
               />
 
-              <ToolbarMenuSelect
-                active={tier !== 'all'}
-                ariaLabel={t(`套餐：${activeTierLabel}`, `Plan: ${activeTierLabel}`)}
-                groups={tierGroups}
-                icon={LayersIcon}
-                label={activeTierLabel}
-                value={tier}
-                onChange={changeTier}
-              />
-
-              {(filter !== 'all' || tier !== 'all' || ownerValue !== 'all') && (
-                <Button
-                  variant="ghost"
-                  className="text-muted-foreground max-sm:hidden"
-                  onClick={() => {
-                    changeFilter('all')
-                    changeTier('all')
-                    changeOwner('all')
-                  }}
-                >
-                  {t('重置', 'Reset')}
-                  <XIcon />
-                </Button>
-              )}
+              <ToolbarFacetFilter sections={facetSections} />
 
               <ToolbarSeparator orientation="vertical" className="mx-1 hidden sm:block" />
 
-              <ToolbarMenuSelect
-                ariaLabel={t(
-                  `排序：${activeSortLabel}，${dir === 'asc' ? '升序' : '降序'}`,
-                  `Sort by ${activeSortLabel}, ${dir === 'asc' ? 'ascending' : 'descending'}`,
-                )}
-                groups={sortGroups.map((items) => items.map((item) => ({ value: item.key, label: item.label })))}
-                icon={ArrowUpDownIcon}
-                label={(
-                  <>
-                    <span className="min-w-0 truncate max-[22rem]:hidden">
-                      {activeSortLabel} {dir === 'asc' ? '↑' : '↓'}
-                    </span>
-                    <span className="hidden shrink-0 max-[22rem]:inline">
-                      {t('排序', 'Sort')} {dir === 'asc' ? '↑' : '↓'}
-                    </span>
-                  </>
-                )}
-                value={sort}
-                onChange={changeSortKey}
-              >
-                <MenuRadioGroup
-                  value={dir}
-                  onValueChange={(next) => {
-                    if (next === 'asc' || next === 'desc') changeSortDir(next)
-                  }}
-                >
-                  <MenuRadioItem value="asc">
-                    {t('升序', 'Ascending')}
-                  </MenuRadioItem>
-                  <MenuRadioItem value="desc">
-                    {t('降序', 'Descending')}
-                  </MenuRadioItem>
-                </MenuRadioGroup>
-              </ToolbarMenuSelect>
-            </ToolbarGroup>
-
-            {/* `sm:ml-auto` 把视图切换推到整行最右端，与下面指标卡、列表的右边界落在同一条竖线上。
-                `xl:ml-0` 是给合并成一行的那档用的：那时整条工具条已由 `xl:justify-end` 右推，
-                内层再推一次就会把搜索与筛选之间撑开一大片空白。两者永远成对出现。 */}
-            <ToolbarSeparator orientation="vertical" className="hidden" />
-            <ToolbarGroup className="self-center justify-end max-sm:col-start-2 max-sm:row-start-1">
-              <ToggleGroup
-                value={[view]}
-                onValueChange={(values) => {
-                  const next = values[values.length - 1]
-                  if (next === 'card' || next === 'list') actions.onViewChange(next)
-                }}
-                variant="outline"
-                aria-label={t('账号视图', 'Account view')}
-              >
-                <Hint label={t('卡片视图', 'Card view')}>
-                  <ToggleGroupItem value="card" aria-label={t('卡片视图', 'Card view')}>
-                    <LayoutGridIcon />
-                  </ToggleGroupItem>
-                </Hint>
-                <ToggleGroupSeparator />
-                <Hint label={t('列表视图', 'List view')}>
-                  <ToggleGroupItem value="list" aria-label={t('列表视图', 'List view')}>
-                    <ListIcon />
-                  </ToggleGroupItem>
-                </Hint>
-              </ToggleGroup>
+              <DisplayOptions
+                view={view}
+                onViewChange={actions.onViewChange}
+                sort={sort}
+                dir={dir}
+                sortGroups={sortGroups}
+                sortLabel={activeSortLabel}
+                onSortKeyChange={changeSortKey}
+                onSortDirChange={changeSortDir}
+              />
             </ToolbarGroup>
           </Toolbar>
+        )}
+        {!isLoading && count > 0 && (
+          <ActiveFilterChips
+            className="xl:col-start-2 xl:justify-end"
+            chips={filterChips}
+            onClearAll={() => {
+              changeOwner('all')
+              changeTier('all')
+              changeProxy('all')
+            }}
+          />
         )}
         </div>
       {isLoading ? (
@@ -1395,6 +1499,7 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
                       changeFilter('all')
                       changeTier('all')
                       changeOwner('all')
+                      changeProxy('all')
                     }}
                   >
                     {t('清除筛选与搜索', 'Clear filters and search')}

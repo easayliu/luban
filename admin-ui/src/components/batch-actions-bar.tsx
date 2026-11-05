@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDownIcon, FolderIcon, GlobeIcon, PauseIcon, PlayIcon, SlidersHorizontalIcon, Trash2Icon, XIcon } from 'lucide-react'
 import {
@@ -7,6 +7,7 @@ import {
   type Credential,
 } from '@/api/credentials'
 import { listProxies } from '@/api/proxies'
+import { ProxyPickerCombobox } from '@/components/credential-proxy-dialog'
 import { useDevicesBySession } from '@/components/credential-shared'
 import { SetGroupsDialog } from '@/components/group-picker'
 import { useI18n } from '@/lib/i18n'
@@ -165,12 +166,6 @@ export function BatchActionsBar({
     enabled: advancedOpen,
   })
   const savedProxies = proxiesQuery.data ?? []
-
-  useEffect(() => {
-    if (savedProxies.length > 0 && !selectedProxyUrl) {
-      setSelectedProxyUrl(savedProxies[0].url)
-    }
-  }, [savedProxies, selectedProxyUrl])
 
   // 只对列表里还在的账号下手：勾选集合可能残留刚离开筛选结果或已删除的 id。
   const ids = all.filter((item) => selected.has(item.id)).map((item) => item.id)
@@ -615,18 +610,16 @@ export function BatchActionsBar({
               </SelectPopup>
             </Select>
             {proxyMode === 'pool' && savedProxies.length > 0 && (
-              <Select
-                items={savedProxies.map((p) => ({ value: p.url, label: p.label }))}
-                value={selectedProxyUrl}
-                onValueChange={(value) => value && setSelectedProxyUrl(value)}
-              >
-                <SelectTrigger aria-label={t('选择代理', 'Select proxy')} size="sm" className="w-56"><SelectValue /></SelectTrigger>
-                <SelectPopup alignItemWithTrigger={false}>
-                  {savedProxies.map((p) => (
-                    <SelectItem key={p.id} value={p.url}>{p.label}</SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
+              // 与单个账号的出站代理弹窗同一个选择器：可按 #id、名称、地址或使用账号搜，代理一多
+              // 名称又是「1」「2」时，只列名称的下拉根本找不到要换的那条。不预选第一条，免得没看清就应用。
+              <div className="flex w-72 max-w-full">
+                <ProxyPickerCombobox
+                  ariaLabel={t('选择代理', 'Select proxy')}
+                  proxies={savedProxies}
+                  value={selectedProxyUrl}
+                  onPick={setSelectedProxyUrl}
+                />
+              </div>
             )}
             {proxyMode === 'custom' && (
               <Input
