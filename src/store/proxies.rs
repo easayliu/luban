@@ -32,6 +32,15 @@ use super::Scope;
 /// 读一条代理池记录的列清单，与 [`row_to_proxy`] 一一对应。
 const PROXY_COLS: &str = "id, label, url, created_at";
 
+/// 「不在池里才插」：先用 `NOT EXISTS` 挡掉已存在的地址，这时 `SELECT` 产出 0 行、不会去
+/// 序列取号；直接 `VALUES ... ON CONFLICT DO NOTHING` 则是先取号再撞索引，撞了号也不退，
+/// 每次设代理/登录/导入撞上已有地址都让 id 白跳一格。`ON CONFLICT` 只留作两个请求同时加
+/// 同一新地址时的并发兜底。参数显式标类型：`$1` 只出现在选择列里，PG 推不出类型。
+const INSERT_IF_ABSENT: &str = "INSERT INTO proxies (label, url, owner_id) \
+     SELECT $1::text, $2::text, $3::bigint \
+     WHERE NOT EXISTS (SELECT 1 FROM proxies WHERE owner_id = $3 AND url = $2) \
+     ON CONFLICT DO NOTHING";
+
 fn row_to_proxy(row: &PgRow) -> Result<SavedProxy> {
     Ok(SavedProxy {
         id: row.try_get(0)?,
@@ -66,14 +75,12 @@ impl CredentialStore {
     /// 确保代理在 `owner` 的池中存在：不在则自动添加（label 取 host:port），已在则忽略。
     pub async fn ensure_proxy_in_pool(&self, owner: i64, url: &str) {
         let label = url_to_label(url);
-        if let Err(e) = sqlx::query(
-            "INSERT INTO proxies (label, url, owner_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        )
-        .bind(label)
-        .bind(url)
-        .bind(owner)
-        .execute(&self.pool)
-        .await
+        if let Err(e) = sqlx::query(INSERT_IF_ABSENT)
+            .bind(label)
+            .bind(url)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
         {
             tracing::debug!(error = %e, url, "ensure_proxy_in_pool: insert ignored");
         }
@@ -104,10 +111,7 @@ impl CredentialStore {
         owner: i64,
         items: &[(String, String)],
     ) -> Result<Vec<Option<SavedProxy>>> {
-        let sql = format!(
-            "INSERT INTO proxies (label, url, owner_id) VALUES ($1, $2, $3) \
-             ON CONFLICT DO NOTHING RETURNING {PROXY_COLS}"
-        );
+        let sql = format!("{INSERT_IF_ABSENT} RETURNING {PROXY_COLS}");
         let mut tx = self.pool.begin().await?;
         let mut out = Vec::with_capacity(items.len());
         for (label, url) in items {
@@ -247,5 +251,36 @@ mod tests {
         assert!(out[0].is_none());
         assert_eq!(out[1].as_ref().unwrap().label, "b");
         assert_eq!(store.list_proxies(Scope::All).await.unwrap().len(), 2);
+    }
+
+    /// 已在池里的地址再入池/再导入不取序列号：下一条新地址的 id 紧接上一条，不跳号。
+    /// 同一批里重复的地址只写第一条。
+    #[sqlx::test]
+    async fn existing_urls_do_not_burn_ids(pool: PgPool) {
+        let store = CredentialStore::for_test(pool).await;
+        let url = "socks5h://10.0.0.1:1080";
+        store.ensure_proxy_in_pool(1, url).await;
+        let first = store.list_proxies(Scope::All).await.unwrap()[0].id;
+        for _ in 0..5 {
+            store.ensure_proxy_in_pool(1, url).await;
+        }
+        let out = store
+            .add_proxies(
+                1,
+                &[
+                    ("a".into(), url.into()),
+                    ("b".into(), "socks5h://10.0.0.2:1080".into()),
+                    ("c".into(), "socks5h://10.0.0.2:1080".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(out[0].is_none() && out[2].is_none());
+        assert_eq!(out[1].as_ref().unwrap().id, first + 1);
+        store.ensure_proxy_in_pool(1, "socks5h://10.0.0.3:1080").await;
+        let ids: Vec<i64> =
+            store.list_proxies(Scope::All).await.unwrap().into_iter().map(|p| p.id).collect();
+        assert!(ids.contains(&(first + 2)), "{ids:?}");
+        assert_eq!(ids.len(), 3);
     }
 }
