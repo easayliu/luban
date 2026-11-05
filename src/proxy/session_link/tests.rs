@@ -851,7 +851,7 @@ fn link_fields_follow_official_captures() {
     use super::CcRequestKind;
     let mut seen = 0;
     let mut bad = Vec::new();
-    for sub in ["2.1.285", "auto-2.1.285-20260930"] {
+    for sub in ["2.1.285", "auto-2.1.285-20260930", "auto-2.1.318-20261104-full"] {
         let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         let mut files: Vec<_> = entries
@@ -1300,4 +1300,79 @@ fn billing_only_capture_replay() {
         );
         assert_eq!(with, without, "{}", c["file"]);
     }
+}
+
+/// 「猜下一句」分叉自己一小段链（`cap/auto-2.1.318-20261104-full` `00694`–`00696`）：头一条读主线程那一环，
+/// 回复调了工具、带着拒绝结果接着发的那条接分叉上一条，且不写 `cc_prompt_id`；两条都不推进主线程。
+#[test]
+fn suggestion_fork_keeps_its_own_chain() {
+    use super::{CcRequestKind, CcSessionKey, CcSessionLink, ChainLane};
+    const SID: &str = "6a1e4b0c-2f3d-4e5a-8b7c-9d0e1f2a3b4c";
+    let body = |messages: &str| {
+        Bytes::from(format!(
+            concat!(
+                r#"{{"model":"claude-opus-5","max_tokens":64000,"messages":{},"#,
+                r#""system":[{{"type":"text","text":"x-anthropic-billing-header: "#,
+                r#"cc_version=2.1.318.222; cc_entrypoint=cli;"}},"#,
+                r#"{{"type":"text","text":"{}"}},{}],"#,
+                r#""tools":[{{"name":"Bash"}}],"#,
+                r#""metadata":{{"user_id":"{{\"device_id\":\"{}\",\"session_id\":\"{}\"}}"}}}}"#
+            ),
+            messages,
+            config::CC_SYSTEM_IDENTITY,
+            base_block(),
+            "832cb7e697190bc475b926c7994ef183a0f8a58e29818f182e11f924e1ea2870",
+            SID
+        ))
+    };
+    let mut headers = crate::proxy::HeaderMap::new();
+    headers.insert("x-claude-code-session-id", HeaderValue::from_static(SID));
+    headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("claude-code-20250219,effort-2025-11-24"),
+    );
+    headers.insert(header::USER_AGENT, HeaderValue::from_static(config::CC_USER_AGENT));
+    let cred = test_cred();
+    let key = CcSessionKey { cred_id: cred.id, session_id: SID };
+    let link_of = |b: &Bytes| {
+        let v = parsed(b).unwrap();
+        let kind = CcRequestKind::of(&v, &["claude-code-20250219".into()]);
+        let (_, l) =
+            crate::proxy::client_session_link(Some(&v), &headers, None, all_on(), true, &cred)
+                .unwrap();
+        (kind, l)
+    };
+
+    let (kind, main) = link_of(&body(r#"[{"role":"user","content":"hi"}]"#));
+    assert_eq!(kind, CcRequestKind::Main);
+    CcSessionLink::record(key, main.lane.as_ref().unwrap(), Some("req_main"), Some("msg_main"));
+
+    let fork = r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},
+        {"role":"user","content":"[SUGGESTION MODE: Suggest what the user might naturally type next]"}"#;
+    let (kind, s0) = link_of(&body(&format!("{fork}]")));
+    assert_eq!(kind, CcRequestKind::Suggestion);
+    assert_eq!(s0.lane, Some(ChainLane::Suggestion));
+    assert_eq!(s0.prev_req.as_deref(), Some("req_main"), "头一条读主线程那一环");
+    assert_eq!(s0.prev_message_id.as_deref(), Some("msg_main"));
+    CcSessionLink::record(key, &ChainLane::Suggestion, Some("req_s0"), Some("msg_s0"));
+
+    let step1 = format!(
+        r#"{fork},{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"ToolSearch","input":{{}}}}]}},
+        {{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"No tools needed for suggestion"}}]}}]"#
+    );
+    let (kind, s1) = link_of(&body(&step1));
+    assert_eq!(kind, CcRequestKind::Suggestion, "末条是被拒工具结果，提示词在前面");
+    assert_eq!(s1.prev_req.as_deref(), Some("req_s0"), "接分叉自己的上一条");
+    assert_eq!(s1.prev_message_id.as_deref(), Some("msg_s0"));
+    assert!(s1.prompt_id.is_none(), "猜下一句不写 cc_prompt_id");
+    CcSessionLink::record(key, &ChainLane::Suggestion, Some("req_s1"), Some("msg_s1"));
+
+    let (_, next) = link_of(&body(
+        r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"again"}]"#,
+    ));
+    assert_eq!(next.prev_req.as_deref(), Some("req_main"), "分叉不推进主线程");
+
+    // 下一次分叉头一条重新读主线程，不接上一次分叉。
+    let (_, again) = link_of(&body(&format!("{fork}]")));
+    assert_eq!(again.prev_req.as_deref(), Some("req_main"));
 }

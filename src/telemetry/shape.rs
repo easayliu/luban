@@ -1185,7 +1185,7 @@ pub(super) const USER_REJECTED_TOOL_USE: &str =
 /// 「猜下一句」分叉里接着发的那条（[`RequestShape::suggestion_step`]）：从末尾往回跳过「助手调工具 → 用户回
 /// 结果」那几对，落到的那条用户消息就是猜下一句的提示词，返回跳过了几对。头一条（末条就是提示词）与其余形态
 /// 返回 `None`。分叉不进会话记录（官方 `skipTranscript`），主线程里不会有这句提示词。
-pub(super) fn suggestion_step_of(messages: &[Value]) -> Option<u32> {
+pub fn suggestion_step_of(messages: &[Value]) -> Option<u32> {
     fn role(m: &Value) -> Option<&str> {
         m.get("role").and_then(|r| r.as_str())
     }

@@ -278,10 +278,15 @@ fn retains_input(v: &serde_json::Value, input: &TurnInput, base: Option<usize>) 
 /// - 每个子代理（`x-claude-code-agent-id`）自己一条链：首条 `cc_prev_req` 不写、
 ///   `previous_message_id` 为 null，之后接它自己的上一条（`00077` → `00080` → `00082`），
 ///   也不推进主线程（`00075` → 子代理 `00077` → `00078` 仍指 `00075`）。
+/// - 「猜下一句」分叉自己一小段链：头一条读主线程那一环；回复调了工具、带着拒绝结果接着发的那几条
+///   （[`crate::telemetry::suggestion_step_of`]）接分叉自己的上一条（`cap/auto-2.1.318-20261104-full`：
+///   主线程 `00694` → 建议 `00695` 指 `00694` → `00696` 指 `00695`，`previous_message_id` 同样），
+///   也不推进主线程。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChainLane {
     Main,
     Agent(String),
+    Suggestion,
 }
 
 impl CcSessionLink {
@@ -312,6 +317,8 @@ pub(crate) struct CcSessionEntry {
     threads: Vec<ThreadState>,
     /// 子代理各自那条链（[`ChainLane::Agent`]），按最近使用排在后面。
     agents: Vec<AgentChain>,
+    /// 最近一次「猜下一句」分叉的上一环（`request-id`, `message.id`），见 [`ChainLane::Suggestion`]。
+    suggestion: (Option<String>, Option<String>),
     /// 当前这一轮的主线程新输入失败了：它的指纹（[`turn_fp`]）。下一条新输入指纹相同即是重发，
     /// 不换轮；换了轮、或这一轮成功一条就清掉。只存当前这一轮的（[`TurnMark`]）。
     failed_turn: Option<u64>,
@@ -378,6 +385,7 @@ impl CcSessionEntry {
                 let a = self.agent_mut(id);
                 (&mut a.prev_req, &mut a.prev_message_id)
             }
+            ChainLane::Suggestion => (&mut self.suggestion.0, &mut self.suggestion.1),
         };
         if let Some(r) = req_id {
             *prev_req = Some(r.to_string());
@@ -1370,6 +1378,7 @@ impl CcSessionLink {
             local_turn: false,
             threads: Vec::new(),
             agents: Vec::new(),
+            suggestion: (None, None),
             failed_turn: None,
             turn_done: false,
             issued_seq: 0,
@@ -1609,6 +1618,24 @@ impl CcSessionLink {
         self
     }
 
+    /// 改接到「猜下一句」分叉那段链上，见 [`ChainLane::Suggestion`]：头一条（`step` 为 0）照读主线程那一环，
+    /// 之后几条换成分叉上一条成功回复；回程都记回分叉那段，不推进主线程。分叉上一条没记下（失败、取消）时
+    /// 不写这两项——官方链上跳过报错的请求，分叉头一条之前没有别的环。
+    fn on_suggestion_chain(mut self, key: CcSessionKey<'_>, step: u32) -> Self {
+        self.lane = Some(ChainLane::Suggestion);
+        if step == 0 {
+            if let Some(entry) = CC_SESSIONS.lock().get_mut(&key.owned()) {
+                entry.suggestion = (None, None);
+            }
+            return self;
+        }
+        let map = CC_SESSIONS.lock();
+        let (req, msg) = map.get(&key.owned()).map(|e| e.suggestion.clone()).unwrap_or_default();
+        self.prev_req = req;
+        self.prev_message_id = msg;
+        self
+    }
+
     /// 回程记下这一条的上游 `request-id` 与回复的 `message.id`，供同一条链（`lane`）的下一条
     /// 引用。**只给完整成功的回复调用**：官方链上跳过报错的请求，下一条仍指此前成功的那条
     /// （`cap/auto-2.1.306-20261021-retry` 的 R4：连续 5 次注入 529 都带 `request-id`，下一轮
@@ -1735,7 +1762,8 @@ impl CcSessionLink {
 pub(crate) enum CcRequestKind {
     Main,
     Subagent,
-    /// 「猜下一句」：带工具，末条用户消息以 `[SUGGESTION MODE:` 开头。
+    /// 「猜下一句」：带工具，末条用户消息以 `[SUGGESTION MODE:` 开头；或是分叉里回复调了工具、带着拒绝结果
+    /// 接着发的那几条（[`crate::telemetry::suggestion_step_of`]）。
     Suggestion,
     /// 子代理那条无工具的辅助调用（billing header 带 `cc_is_subagent=true`）。
     Helper,
@@ -1812,7 +1840,13 @@ impl CcRequestKind {
         if super::simulation::is_official_web_search_request(v) {
             return Self::Auxiliary;
         }
-        if last_user_text_starts_with(v, "[SUGGESTION MODE:") {
+        // 分叉里回复调了工具、带着拒绝结果接着发的那条，末条是工具结果，提示词在更前面
+        // （`cap/auto-2.1.318-20261104-full/00696`）；只看末条会落成主线程，多写 `cc_prompt_id`、还推进主线程链。
+        if last_user_text_starts_with(v, "[SUGGESTION MODE:")
+            || v.get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|m| crate::telemetry::suggestion_step_of(m).is_some())
+        {
             return Self::Suggestion;
         }
         if last_user_text_starts_with(v, "CRITICAL: Respond with TEXT ONLY")
@@ -2038,7 +2072,7 @@ pub(crate) fn client_session_link(
         turn_origin_of(v, headers),
         main.then_some(v),
     );
-    // 只有主线程与子代理的回复推进链条，各推各的（[`ChainLane`]）；其余几类只读主线程那一环。
+    // 只有主线程、子代理与「猜下一句」分叉的回复推进链条，各推各的（[`ChainLane`]）；其余几类只读主线程那一环。
     // 子代理认不出支线号（2.1.277 之前不发 `x-claude-code-agent-id`）就不接任何链。
     link.lane = None;
     match kind {
@@ -2055,6 +2089,14 @@ pub(crate) fn client_session_link(
                 link.prev_message_id = None;
             }
         },
+        CcRequestKind::Suggestion => {
+            let step = v
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|m| crate::telemetry::suggestion_step_of(m))
+                .unwrap_or(0);
+            link = link.on_suggestion_chain(key, step);
+        }
         _ => {}
     }
     if !main
