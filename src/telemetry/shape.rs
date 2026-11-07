@@ -12,6 +12,8 @@ pub(super) struct ToolUse {
     pub(super) input: Value,
     /// auto 模式的服务端判决，见 [`ToolCall::verdict`]。
     pub(super) verdict: Option<String>,
+    /// 回复流里这次调用的入参流了多久，见 [`ToolCall::input_stream_ms`]。
+    pub(super) input_stream_ms: Option<u64>,
     /// `tool_result.is_error`：工具执行失败（Bash 非零退出、被用户拒绝……）。
     pub(super) is_error: bool,
     /// `tool_result` 正文的开头（至多 400 字符），认「被用户拒绝」「命令失败」用。
@@ -169,6 +171,23 @@ pub(super) struct RequestShape {
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
     pub(super) tools_hash: String,
+    /// 工具表**内容**的摘要（各非延迟工具去掉 `cache_control` 后的紧凑 JSON，按先后；延迟占位与长度表同样不算）：
+    /// tether 判工具变没变用它（官方 `v4` 比的是逐项条目，不是长度表），描述或 schema 改了而长度没变的也认得出。线程续轮的
+    /// 增量体不带工具，同长度表一样从线程底本补（[`super::session::ThreadBase::fill`]）。
+    pub(super) tools_content_hash: String,
+    /// 体里写了 `tools` 键（哪怕是空数组）：线程续轮显式发 `tools: []` 是把工具清空，不是省略了让底本补。
+    pub(super) tools_declared: bool,
+    /// 体里每条消息内容的摘要（角色加内容，块上的 `cache_control` 不算），按先后。线程续轮的增量体里只有新增那几条，
+    /// tether 拿它与上一条比对历史有没有被改写（[`super::kind::tether_decide`]）。
+    pub(super) message_hashes: Vec<u64>,
+    /// 体里带了发送时补的那条提醒（[`SEND_TIME_NUDGE`]）：tether live outcome 报 `keptReminderClearAt: true`
+    /// （`cap/auto-2.1.319-20261106-full` fable 那几轮，带它的 `00917`、`00923` 是 true，别的 false），会话里这个模型头一回带时
+    /// 报 `feature_ok{batching_reminder}` 与 `tengu_toasty_thimble_applied`。
+    pub(super) send_time_nudge: bool,
+    /// 这一轮新加的那段「延迟工具不再可用（MCP 服务器断开）」提醒里列了几个工具（末条 assistant 之后那几条里找）：
+    /// 2.1.319 的 `tengu_deferred_tools_pool_change` 按它报 `removedCount` 与 `departed_disconnected`
+    /// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00162` 带了两项，批次 `00165` 报 2、2）。历史里先前那几轮的不再数。
+    pub(super) mcp_disconnected: usize,
     /// `{"Agent":3078,…}` 那串 JSON。
     pub(super) tool_lens: String,
     pub(super) deferred_tools: usize,
@@ -294,6 +313,15 @@ pub(super) struct RequestShape {
     /// 省掉不发的那部分，`tengu_tether_live_outcome.omittedBytes`（`cap/2.1.277/00031`：
     /// 13184 + 72661 = 85845，与事件逐字节相等）。
     pub(super) omitted_bytes: usize,
+    /// [`Self::omitted_bytes`] 里 system（billing 之后那几块）与 tools 各占多少：线程续轮只省掉没带的那部分——带着 `tools` 的续轮
+    /// 只省 system（`cap/auto-2.1.319-20261106-full` 的 `00100`、`00107`、`00203`：`omittedTools: false`、`omittedBytes: 8848`）。
+    pub(super) omitted_system_bytes: usize,
+    pub(super) omitted_tools_bytes: usize,
+    /// 这条在客户端眼里的 system（billing 之后那几块）与 tools 的完整大小：完整体就是体里的；线程续轮由底本补（system 恒沿用，
+    /// tools 没带才沿用）。底本记的是它，不是这一轮省了多少——带着 tools 的那轮省 0，下一轮没带时省的仍是整份工具
+    /// （`cap/auto-2.1.319-20261106-full` 的 `00102`、`00111`、`00205`）。
+    pub(super) system_bytes: usize,
+    pub(super) tools_bytes: usize,
     /// system 最后一块（会话级的动态段）的 sha256 前缀，`tengu_api_success.snapshotHash`
     /// 的来源，见 [`snapshot_hash_of`]。
     pub(super) dynamic_hash: String,
@@ -643,12 +671,175 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         image_b64: hit.map_or(0, |r| r.image_b64),
                         media_blocks: hit.map_or(0, |r| r.media_blocks),
                         verdict: None,
+                        input_stream_ms: None,
                         input,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 2.1.319 发送时补在消息末尾的那条 system 提醒（官方 `bm`，`tengu_toasty_thimble` / `tengu_gentle_parasol` 控制，fable 那几条
+/// 带）：不进对话历史，每次发送时重新附上。
+pub(super) const SEND_TIME_NUDGE: &str = "First privately list what you need next; then request every item that doesn't depend on another's result in this one response.";
+
+/// 「延迟工具不再可用」那段提醒的开头（2.1.319）。
+const MCP_DISCONNECTED_HEAD: &str =
+    "The following deferred tools are no longer available (their MCP server disconnected).";
+
+/// 一条消息里那段提醒列了几个工具：开头那行之后、空行之前，每行一个工具名。
+fn disconnected_tools_listed(m: &Value) -> usize {
+    let count = |t: &str| {
+        t.find(MCP_DISCONNECTED_HEAD)
+            .map_or(0, |i| t[i..].lines().skip(1).take_while(|l| !l.trim().is_empty()).count())
+    };
+    match m.get("content") {
+        Some(Value::String(s)) => count(s),
+        Some(Value::Array(b)) => {
+            b.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).map(count).sum()
+        }
+        _ => 0,
+    }
+}
+
+/// 这条消息是发送时临时补的提醒（[`SEND_TIME_NUDGE`]）：`system` 角色、正文就是那一句（字符串或单个文本块）。
+fn is_send_time_nudge(m: &Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("system") {
+        return false;
+    }
+    let text = match m.get("content") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Array(b)) if b.len() == 1 => b[0].get("text").and_then(|t| t.as_str()),
+        _ => None,
+    };
+    text.is_some_and(|t| t.trim() == SEND_TIME_NUDGE)
+}
+
+/// 一条消息内容的摘要：角色加内容，块上的 `cache_control` 不算（客户端每轮挪断点，不算改写）。直接在借用的值上逐层喂
+/// 哈希，不拷贝也不序列化——带几十 MB 附件的消息照样只读一遍。
+fn message_hash(m: &Value) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match m {
+        Value::Object(o) => {
+            let mut entries: Vec<(&String, &Value)> = o.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            h.write_usize(entries.len());
+            for (k, v) in entries {
+                h.write(k.as_bytes());
+                h.write_u8(0xff);
+                if k == "content"
+                    && let Value::Array(blocks) = v
+                {
+                    h.write_u8(b'[');
+                    h.write_usize(blocks.len());
+                    for b in blocks {
+                        hash_value(b, &mut h, true);
+                    }
+                    h.write_u8(b']');
+                } else {
+                    hash_value(v, &mut h, false);
+                }
+            }
+        }
+        other => hash_value(other, &mut h, false),
+    }
+    h.finish()
+}
+
+/// [`message_hash`] 的逐层喂法：类型标记加内容；`skip_cache_control` 只管这一层对象的键（内容块本身）。
+///
+/// 键的先后：消息与内容块的字段按字典序喂（官方是按字段读的，换了先后不算改写）；工具调用块的 `input` 那棵子树照
+/// `JSON.stringify` 的序（[`js_key_order`]：整数键按数值升序在前、其余保持原先后），官方对它就是序列化后比的，入参里
+/// 键换了先后算改写。
+fn hash_value(v: &Value, h: &mut impl std::hash::Hasher, skip_cache_control: bool) {
+    hash_value_in(v, h, skip_cache_control, false);
+}
+
+fn hash_value_in(v: &Value, h: &mut impl std::hash::Hasher, skip_cache_control: bool, js: bool) {
+    match v {
+        Value::Null => h.write_u8(0),
+        Value::Bool(b) => h.write_u8(if *b { 2 } else { 1 }),
+        Value::Number(n) => {
+            h.write_u8(3);
+            h.write(js_number_text(n).as_bytes());
+        }
+        Value::String(s) => {
+            h.write_u8(4);
+            h.write_usize(s.len());
+            h.write(s.as_bytes());
+        }
+        Value::Array(a) => {
+            h.write_u8(5);
+            h.write_usize(a.len());
+            for x in a {
+                hash_value_in(x, h, false, js);
+            }
+        }
+        Value::Object(o) => {
+            // 对象要有边界（键数加结束标记），否则 `{"a":{"x":null},"y":null}` 与 `{"a":{"x":null,"y":null}}` 喂进去一样。
+            h.write_u8(6);
+            let mut entries: Vec<(&String, &Value)> =
+                o.iter().filter(|(k, _)| !(skip_cache_control && *k == "cache_control")).collect();
+            if js {
+                js_key_order(&mut entries);
+            } else {
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            }
+            // 工具调用块的入参照序列化的序比。
+            let tool_block = skip_cache_control
+                && matches!(
+                    o.get("type").and_then(|t| t.as_str()),
+                    Some("tool_use" | "server_tool_use" | "mcp_tool_use")
+                );
+            h.write_usize(entries.len());
+            for (k, x) in entries {
+                h.write_usize(k.len());
+                h.write(k.as_bytes());
+                hash_value_in(x, h, false, js || (tool_block && k == "input"));
+            }
+            h.write_u8(7);
+        }
+    }
+}
+
+/// 数字照 JavaScript 的 `Number#toString` 写（`JSON.stringify` 就这么写）：`1`、`1.0`、`1e0` 是同一个数；`-0` 写 `0`；
+/// 绝对值不小于 1e21 或小于 1e-6 的用指数写法（`1e+21`、`1e-7`），其余是最短的十进制。超出 f64 的整数（serde 按 u64/i64
+/// 原样存的）同样先转成 f64，JavaScript 读进来也是这个值。
+///
+/// **已知限制**：serde_json 默认的快速浮点解析可能差一个最低位（`0.9999999999999999` 读成 `1.0`），这样只差最低位的两个数
+/// 摘要相同、漏报一次 `history_reshaped`。打开 `float_roundtrip` 能精确解析，但它是全局开关，超长小数字面量在入口解析时
+/// 要多一份与字面量同长的临时内存，每条请求（含透传）都担这份开销；为一个遥测字段的极端情形不值得，故不开。
+fn js_number_text(n: &serde_json::Number) -> String {
+    let Some(x) = n.as_f64().filter(|x| x.is_finite()) else { return n.to_string() };
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let a = x.abs();
+    if (1e-6..1e21).contains(&a) {
+        return format!("{x}");
+    }
+    // Rust 的 `{:e}` 是最短尾数加指数（`1.5e21`、`1e-7`），JavaScript 正指数要带 `+`。
+    let e = format!("{x:e}");
+    match e.split_once('e') {
+        Some((m, exp)) if !exp.starts_with('-') => format!("{m}e+{exp}"),
+        _ => e,
+    }
+}
+
+/// `JSON.stringify` 写对象键的先后：数组下标那种整数键（`0`、`1`、`42`，不带前导零、小于 2³²−1）按数值升序排前头，
+/// 其余保持原先后。
+fn js_key_order(entries: &mut [(&String, &Value)]) {
+    let index = |k: &str| {
+        (k == "0"
+            || (!k.starts_with('0') && !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())))
+        .then(|| k.parse::<u64>().ok())
+        .flatten()
+        .filter(|n| *n < u64::from(u32::MAX))
+    };
+    // 稳定排序：整数键按值、其余排在后头且彼此不动。
+    entries.sort_by_key(|(k, _)| index(k).map_or((1, 0), |n| (0, n)));
 }
 
 pub(super) fn sha256_hex(data: &[u8]) -> String {
@@ -854,6 +1045,10 @@ pub(super) fn error_trace(
         // `error_constructor`** 了（`cap/auto-2.1.318-20261104-retry` 那条 529）。
         ("2.1.318", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-sktwb66b.js:5:1510"))
+        }
+        // 2.1.319 摘要照旧、顶帧换了块，照旧不带构造名（`cap/auto-2.1.319-20261106-retry` 那条 529）。
+        ("2.1.319", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-jmrd53pe.js:5:1510"))
         }
         _ => None,
     }
@@ -1376,7 +1571,10 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         if let Value::Array(blocks) = sys
             && blocks.len() > 1
         {
-            shape.omitted_bytes += serde_json::to_string(&blocks[1..]).map_or(0, |j| js_len(&j));
+            let n = serde_json::to_string(&blocks[1..]).map_or(0, |j| js_len(&j));
+            shape.omitted_bytes += n;
+            shape.omitted_system_bytes += n;
+            shape.system_bytes += n;
         }
         if texts.iter().any(|t| t.contains("auto mode is active")) {
             shape.permission_mode = "auto";
@@ -1394,9 +1592,13 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     // `toolSchemasHash` 是**长度表那串 JSON** 的 sha256 前 12 位，而不是工具数组的：无工具时
     // 官方报 `44136fa355b3`，正是 sha256("{}") 的前缀（`cap/2.1.260-2` 标题生成那条）。
     let mut lens = Map::new();
+    shape.tools_declared = v.get("tools").is_some();
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         shape.tools_count = tools.len();
-        shape.omitted_bytes += serde_json::to_string(tools).map_or(0, |j| js_len(&j));
+        let n = serde_json::to_string(tools).map_or(0, |j| js_len(&j));
+        shape.omitted_bytes += n;
+        shape.omitted_tools_bytes += n;
+        shape.tools_bytes += n;
         for t in tools {
             // 延迟加载的占位工具计入 `toolsCount` / `deferredToolsCount`，但不进长度表：官方
             // 16 个工具的表只有 15 项，`toolsCharLength` 也不含它（差的 204 正是占位那条）。
@@ -1424,14 +1626,42 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     }
     shape.tool_lens = Value::Object(lens).to_string();
     shape.tools_hash = sha256_hex(shape.tool_lens.as_bytes())[..12].to_string();
+    shape.tools_content_hash = {
+        let mut h = Sha256::new();
+        let tools =
+            v.get("tools").and_then(|t| t.as_array()).map(Vec::as_slice).unwrap_or_default();
+        for t in
+            tools.iter().filter(|t| t.get("defer_loading").and_then(|d| d.as_bool()) != Some(true))
+        {
+            let mut t = t.clone();
+            if let Some(o) = t.as_object_mut() {
+                o.shift_remove("cache_control");
+            }
+            h.update(t.to_string().as_bytes());
+            h.update(b"\n");
+        }
+        crate::credentials::hex_lower(&h.finalize())[..16].to_string()
+    };
 
     // messages：条数、文本量、图片/文档、末条是否新输入、system 角色条数、续轮的工具调用。
     if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
-        shape.messages_len = msgs.len();
-        shape.after_last_assistant = msgs
+        // 发送时临时补在末尾的那条提醒（[`is_send_time_nudge`]）不是对话历史：官方逻辑消息数、增量数与历史比对都不算它
+        // （`cap/auto-2.1.319-20261106-full/00917`：体里 3 条，`messagesLength` 与 tether 都按 2 条增量算）。
+        let nudges = msgs.iter().filter(|m| is_send_time_nudge(m)).count();
+        shape.messages_len = msgs.len() - nudges;
+        shape.send_time_nudge = nudges > 0;
+        shape.mcp_disconnected = msgs
             .iter()
             .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .map_or(0, |i| msgs.len() - 1 - i);
+            .map_or(&msgs[..], |i| &msgs[i + 1..])
+            .iter()
+            .map(disconnected_tools_listed)
+            .sum();
+        let last_assistant =
+            msgs.iter().rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+        // 体里没有 assistant 的（首轮完整体）记 0，线程续轮的增量另由底本补（[`super::session::ThreadBase::fill`]）。
+        shape.after_last_assistant = last_assistant
+            .map_or(0, |i| msgs[i + 1..].iter().filter(|m| !is_send_time_nudge(m)).count());
         let has_breakpoint = |m: &Value| {
             m.get("content")
                 .and_then(|c| c.as_array())
@@ -1571,6 +1801,8 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
                 Some(ResultSeen { id, readable: readable_of(b.get("content")) })
             })
             .collect();
+        shape.message_hashes =
+            msgs.iter().filter(|m| !is_send_time_nudge(m)).map(message_hash).collect();
         if !shape.new_prompt {
             shape.tool_uses = tool_uses_of(msgs);
             if shape.tool_uses.is_empty() {
@@ -1748,5 +1980,57 @@ mod total_tokens_tests {
         let started = std::time::Instant::now();
         assert_eq!(seen(&evil), (true, Some(1)));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod message_hash_tests {
+    use super::*;
+
+    /// 内容块上的 `cache_control` 不算改写；内容、角色、块里更深处的同名键都算。
+    #[test]
+    fn ignores_only_block_level_cache_control() {
+        let a = json!({"role":"user","content":[{"type":"text","text":"hi"}]});
+        let b = json!({"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]});
+        assert_eq!(message_hash(&a), message_hash(&b));
+        let c = json!({"role":"user","content":[{"type":"text","text":"hi!"}]});
+        assert_ne!(message_hash(&a), message_hash(&c));
+        let d = json!({"role":"assistant","content":[{"type":"text","text":"hi"}]});
+        assert_ne!(message_hash(&a), message_hash(&d));
+        let e = json!({"role":"user","content":[{"type":"tool_use","input":{"cache_control":1}}]});
+        let f = json!({"role":"user","content":[{"type":"tool_use","input":{}}]});
+        assert_ne!(message_hash(&e), message_hash(&f), "工具入参里的同名键是内容");
+        let n1 = json!({"role":"user","content":[{"type":"tool_use","input":{"a":{"x":null},"y":null}}]});
+        let n2 = json!({"role":"user","content":[{"type":"tool_use","input":{"a":{"x":null,"y":null}}}]});
+        assert_ne!(message_hash(&n1), message_hash(&n2), "对象边界");
+        let r1 = json!({"role":"user","content":[{"type":"text","text":"hi"}]});
+        let r2: Value =
+            serde_json::from_str(r#"{"content":[{"text":"hi","type":"text"}],"role":"user"}"#)
+                .unwrap();
+        assert_eq!(message_hash(&r1), message_hash(&r2), "键的先后不算");
+        let i1: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"x","input":{"b":1,"a":2}}]}"#).unwrap();
+        let i2: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"input":{"a":2,"b":1},"name":"x","id":"t","type":"tool_use"}]}"#).unwrap();
+        assert_ne!(message_hash(&i1), message_hash(&i2), "工具入参照序列化的序：键换了先后算改写");
+        let i3: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"x","input":{"2":0,"1":0}}]}"#).unwrap();
+        let i4: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"x","input":{"1":0,"2":0}}]}"#).unwrap();
+        assert_eq!(message_hash(&i3), message_hash(&i4), "整数键 JSON.stringify 本就按数值排");
+        let f1: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"x","input":{"n":1}}]}"#).unwrap();
+        let f2: Value = serde_json::from_str(r#"{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"x","input":{"n":1.0}}]}"#).unwrap();
+        assert_eq!(message_hash(&f1), message_hash(&f2), "1 与 1.0 在 JavaScript 里是同一个数");
+        let num = |s: &str| js_number_text(&serde_json::from_str::<serde_json::Number>(s).unwrap());
+        assert_eq!(
+            [
+                num("1.0"),
+                num("-0.0"),
+                num("0.1"),
+                num("1e21"),
+                num("1.5e-7"),
+                num("123456789012"),
+                num("2.50")
+            ],
+            ["1", "0", "0.1", "1e+21", "1.5e-7", "123456789012", "2.5"].map(str::to_string)
+        );
+        let g = json!({"role":"user","content":"hi"});
+        assert_ne!(message_hash(&a), message_hash(&g), "字符串与块数组不同");
     }
 }

@@ -361,6 +361,8 @@ pub(super) fn model_held_stateless(model: &str, listed: Option<&str>, v291: bool
 /// `create` + `unclaimedHistoryChange` 报，原因名是推测的。
 pub(super) fn tether_decide(
     prev: Option<&TetherThread>,
+    cleared: Option<usize>,
+    post_compaction: bool,
     shape: &RequestShape,
     model: &str,
     betas: &str,
@@ -375,38 +377,108 @@ pub(super) fn tether_decide(
         changed_latched: false,
         changed_thinking: false,
         changed_effort: false,
+        tools_kept: false,
+        claimed_clear: false,
+        claimed_rewind: false,
+        claimed_compact: false,
+        unclaimed: false,
+        first_changed: -1,
         turns: 1,
         prev_messages,
         delta: 0,
         echo: false,
     };
-    let Some(p) = prev else { return fresh("create", "first_request", 0) };
+    // `/clear` 之后的头一条：线程指针没了，上一份状态（消息数）还在、工具哈希那份清了（`cap/auto-2.1.291-20261006-full/00356`
+    // 起就是 `create/no_continue_pointer`，2.1.319 的 `00092` 还看得到 `prevMessageCount` 与 `claimedClear`）。
+    let Some(p) = prev else {
+        return match cleared {
+            Some(messages) => Tether {
+                claimed_clear: true,
+                echo: is_main,
+                ..fresh("create", "no_continue_pointer", messages)
+            },
+            None => fresh("create", "first_request", 0),
+        };
+    };
     let changed_model = p.model != model;
-    let changed_tools = p.tools_hash != shape.tools_hash;
+    let changed_tools = p.tools_content != shape.tools_content_hash;
+    let tools_kept = !changed_tools;
+    let fresh = |decision, reason, prev_messages| Tether {
+        tools_kept,
+        ..fresh(decision, reason, prev_messages)
+    };
     let changed_betas = p.betas != betas;
     let changed_thinking = p.thinking_type != shape.thinking_type;
     let changed_effort = p.effort != shape.effort;
-    if changed_model || changed_tools || changed_betas || changed_thinking || changed_effort {
+    // 压缩之后的头一条：官方报配置变了（锁存的头随压缩重置，`changedLatchedHeaders`）并认领压缩
+    // （`cap/auto-2.1.319-20261106-full/00214`：72 条 → 6 条，`create/config_changed`、`claimedCompact`）。
+    if changed_model
+        || changed_tools
+        || changed_betas
+        || changed_thinking
+        || changed_effort
+        || post_compaction
+    {
         return Tether {
             changed_model,
             changed_tools,
             changed_betas,
-            changed_latched: model.contains("haiku") && !p.model.contains("haiku"),
+            changed_latched: post_compaction
+                || model.contains("haiku") && !p.model.contains("haiku"),
             changed_thinking,
             changed_effort,
+            claimed_compact: post_compaction,
             echo: is_main,
             ..fresh("create", "config_changed", p.messages)
         };
     }
-    if shape.messages_len >= p.messages {
+    // 上一条被中断后另起、且这条没有续轮指针（`diagnostics.previous_message_id` 是 `null`）：客户端认领的是回退，不比内容
+    // （`cap/auto-2.1.319-20261106-full/00688`：中断的 `00686` 之后首条用户消息改写了，报 `create/no_continue_pointer`、
+    // `claimedRewind`、`firstChangedIndex: -1`）。带着指针的照样比内容（`cap/auto-2.1.291-20261006-full/00342` 上一条也中断了，
+    // 指针还在，官方报 `history_reshaped`、`firstChangedIndex: 3`）。
+    let create = shape.thread_type.as_deref() == Some("create");
+    if p.aborted && create && shape.diag_prev_message_id.is_none() {
+        return Tether {
+            claimed_rewind: true,
+            echo: is_main,
+            ..fresh("create", "no_continue_pointer", p.messages)
+        };
+    }
+    // 线程续轮是客户端自己判的接着用；完整体就看历史是不是只多不少（`thread: create` 的还要上一条那些逐条没变，服务端持有的
+    // 那条谁都认）。
+    let cur = &shape.message_hashes;
+    let same_at =
+        |i: usize| p.hashes.get(i).copied().flatten().is_none_or(|h| cur.get(i) == Some(&h));
+    // 只有体里明确写了 `thread: create`（客户端自己判了另起）才逐条比内容；没写线程的（模拟路径、老版本）照旧只看条数。
+    // `thread: create` 的要真多出几条才算接着用；一样长或变短、共同那段又没变的是回退（下面）。
+    let extends = if create {
+        shape.messages_len > p.messages && (0..p.hashes.len()).all(same_at)
+    } else {
+        shape.messages_len >= p.messages
+    };
+    if shape.thread_type.as_deref() == Some("continue") || extends {
         return Tether {
             turns: p.turns + 1,
-            delta: shape.messages_len - p.messages,
+            delta: shape.messages_len.saturating_sub(p.messages),
             echo: true,
             ..fresh("continue", "append", p.messages)
         };
     }
-    Tether { echo: is_main, ..fresh("create", "history_changed", p.messages) }
+    // 历史被改写：头一处不一样的下标；没有不一样的是回退（`history_rewound`），否则 `history_reshaped`
+    // （`cap/auto-2.1.291-20261006-full/00342`：5 条对 5 条，下标 3 起不同，`firstChangedIndex: 3`、未认领）。
+    // 共同那段没变、只是一样长或变短：`history_rewound`，`firstChangedIndex: -1`（官方 319 带续轮指针时如此）。
+    let first = (0..p.hashes.len().min(cur.len())).find(|&i| !same_at(i));
+    let (reason, first_changed) = match first {
+        Some(i) => ("history_reshaped", i as i64),
+        None => ("history_rewound", -1),
+    };
+    // 「未认领的历史改动」只给主线程报，子代理的改写照样报原因与下标（官方只对主线程置这个标记）。
+    Tether {
+        echo: is_main,
+        unclaimed: is_main,
+        first_changed,
+        ..fresh("create", reason, p.messages)
+    }
 }
 
 /// 按请求头与体的形态判出这条请求在会话里的角色。

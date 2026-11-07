@@ -144,17 +144,23 @@ pub struct PriorAttempt {
 
 /// `x-claude-code-sandy-plover` 那串的大小（官方 2.1.318 `Dy`）：`count` 是写进去的元素数（装不下时连队首哨兵一起算，
 /// 即 `sent + 1`），`bytes` 是整串的 UTF-8 字节数，`capped` 是这一次有没有丢名字（官方 `dropped > 0`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 另带头值里有没有 2.1.319 的两样东西（官方拼完头按整串 `includes` 判）：连接器字段（`"directory_entry":` 或 `"url":`，
+/// 报 `feature_ok{api_tools_used_connector_fields}`，按会话一次）与 MCP 标记（`"mcp":true`，报
+/// `feature_ok{api_tools_used_mcp_mark}`，按进程一次）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ToolsUsedSize {
     pub count: usize,
     pub bytes: usize,
     pub capped: bool,
+    pub connector_fields: bool,
+    pub mcp_mark: bool,
 }
 
 impl ToolsUsedSize {
     /// 从头值算（[`crate::proxy::sandy_plover::header_size`]，`capped` 由头值推）。
     pub fn of(value: &str) -> Self {
-        crate::proxy::sandy_plover::header_size(value, None)
+        crate::proxy::sandy_plover::header_size(value, None, None)
     }
 }
 
@@ -227,6 +233,9 @@ pub struct ToolCall {
     /// 响应 `safeguard_results` 里给它的判决：`not_flagged` / `flagged` / `skipped`；没有判决
     /// （default 模式、只读工具）为 `None`。
     pub verdict: Option<String>,
+    /// 流式回复里这一块从 `content_block_start` 到 `content_block_stop` 的毫秒数（至少 1），2.1.319 起
+    /// `tengu_tool_use_success` 的 `tool_input_stream_ms`；非流式或没收完为 `None`。
+    pub input_stream_ms: Option<u64>,
 }
 
 /// 一条失败请求客户端那头看到的东西。

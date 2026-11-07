@@ -379,6 +379,9 @@ impl EventBuilder<'_> {
             if env.f.v314 {
                 auto_mode_decision_v314(&mut decision);
             }
+            if env.f.v319 {
+                auto_mode_decision_v319(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`
@@ -546,6 +549,7 @@ impl EventBuilder<'_> {
             v316,
             v317,
             v318,
+            v319,
             bash_metered,
             prompt_seq,
             ..
@@ -845,6 +849,13 @@ impl EventBuilder<'_> {
         if v299 && let Some(timing) = tool_timing(tu, duration, bash_timing, req_hash, i) {
             insert_after(&mut rest, "durationMs", timing);
         }
+        // 2.1.319：分段计时之后（官方 `...ca.fields(...)` 后的 `...zr`）报回复流里这次调用的入参流了多久
+        // （`cap/auto-2.1.319-20261106-full` 每条 tool_use_success 都有，紧跟 `externalWallMs` / `preExternalMs`）。非流式、
+        // 没收完的不报。
+        if v319 && let Some(ms) = tu.input_stream_ms {
+            let after = after_timing(&rest);
+            insert_after(&mut rest, after, vec![("tool_input_stream_ms", json!(ms))]);
+        }
         // 没有 effort 的模型（haiku 子代理，`cap/2.1.285` 九条）不报这一项。
         if v285
             && effort.is_none()
@@ -893,6 +904,12 @@ impl EventBuilder<'_> {
                     vec![("externalWallMs", json!(t.external)), ("preExternalMs", json!(t.pre))],
                 );
             }
+            // 2.1.319：失败那条同样在计时之后报入参流了多久（`cap/auto-2.1.319-20261106-bashfail/2.1.319/00064`、
+            // `cap/auto-2.1.319-20261106-full/00696`，紧跟 `preExternalMs`）。
+            if v319 && let Some(stream) = tu.input_stream_ms {
+                let after = after_timing(&err);
+                insert_after(&mut err, after, vec![("tool_input_stream_ms", json!(stream))]);
+            }
             if is_sub {
                 err["subagent_type"] =
                     json!(call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
@@ -926,7 +943,12 @@ impl EventBuilder<'_> {
             // 它的打包块名与 2.1.316 不同，摘要也就猜不出，先沿用 2.1.316 的。
             // 2.1.317（`cap/auto-2.1.317-20261103-bashfail`，同一次跑的 2.1.316 对照复现出 9396e613b9d8）摘要、行列、块名都换了。
             // 2.1.318（`cap/auto-2.1.318-20261104-bashfail` 两条，同一次跑的 2.1.317 对照复现出 9a93a625ab80）摘要、行列、块名都换了。
-            if v318 {
+            // 2.1.319（`cap/auto-2.1.319-20261106-bashfail` 与全量包里那条，同值；同一次跑的 2.1.318 对照复现出 5f045de6ca68）
+            // 摘要、行列、块名都换了。
+            if v319 {
+                err["error_stack_hash"] = json!("934df67089d3");
+                err["error_top_frame"] = json!("chunk-24jdhyyr.js:3603:9437");
+            } else if v318 {
                 err["error_stack_hash"] = json!("5f045de6ca68");
                 err["error_top_frame"] = json!("chunk-0x9x817t.js:3567:9365");
             } else if v317 {
@@ -998,6 +1020,15 @@ impl EventBuilder<'_> {
                 "preToolHookDurationMs": 0,
                 "permissionDurationMs": permission_ms.max(5)
             });
+            // 执行抛错那条同样先写分段计时（官方 catch 里 `durationMs`、`...ca.fields(...)`，取法同成功那条，
+            // [`tool_timing`]），2.1.319 再跟入参流了多久（`...zr`）。
+            if v299 && let Some(timing) = tool_timing(tu, duration, bash_timing, req_hash, i) {
+                insert_after(&mut err, "durationMs", timing);
+            }
+            if v319 && let Some(stream) = tu.input_stream_ms {
+                let after = after_timing(&err);
+                insert_after(&mut err, after, vec![("tool_input_stream_ms", json!(stream))]);
+            }
             if is_sub {
                 err["subagent_type"] =
                     json!(call.agent.agent_type.as_deref().unwrap_or("general-purpose"));
@@ -1025,6 +1056,15 @@ impl EventBuilder<'_> {
             }
         }
     }
+}
+
+/// `tool_input_stream_ms` 插在哪个键后面：官方在整组分段计时（`durationMs` 后的 `externalWallMs`、`modelCallMs`、
+/// `preExternalMs`，[`tool_timing`]）之后写它，取这组里最后出现的那个。
+fn after_timing(v: &Value) -> &'static str {
+    ["preExternalMs", "modelCallMs", "externalWallMs"]
+        .into_iter()
+        .find(|k| v.get(*k).is_some())
+        .unwrap_or("durationMs")
 }
 
 /// 模型调了没声明的工具时客户端回的结果开头。
@@ -1191,6 +1231,17 @@ fn tool_is_prompted(tu: &ToolUse, permission_mode: &str, read_only: bool) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 输入流耗时排在整组分段计时之后：有 `modelCallMs` 没 `preExternalMs` 的（短 WebFetch 那种）排在 `modelCallMs` 后。
+    #[test]
+    fn input_stream_goes_after_the_whole_timing_group() {
+        let v = json!({"durationMs": 1, "externalWallMs": 2, "modelCallMs": 3, "rssDeltaBytes": 4});
+        assert_eq!(after_timing(&v), "modelCallMs");
+        let v = json!({"durationMs": 1, "externalWallMs": 2, "modelCallMs": 3, "preExternalMs": 4});
+        assert_eq!(after_timing(&v), "preExternalMs");
+        assert_eq!(after_timing(&json!({"durationMs": 1, "externalWallMs": 2})), "externalWallMs");
+        assert_eq!(after_timing(&json!({"durationMs": 1})), "durationMs");
+    }
 
     fn tu(name: &str, input: Value) -> ToolUse {
         ToolUse { name: name.into(), input, ..Default::default() }

@@ -1184,7 +1184,8 @@ mod tests {
             ("credential_stats", "SELECT to_jsonb(t) FROM credential_stats t ORDER BY cred_id"),
             ("device_costs", "SELECT to_jsonb(t) FROM device_costs t ORDER BY device_id, cred_id"),
             ("usage_rollup", "SELECT to_jsonb(t) FROM usage_rollup t ORDER BY dim, bucket, key"),
-            ("tool_sets", "SELECT to_jsonb(t) FROM tool_sets t ORDER BY sha"),
+            // `created_at` 是写入时的库时间（`unixepoch()`），逐条与批量两遍跨了秒就差 1，同 `thinking_blocks` 的 `ts` 不比。
+            ("tool_sets", "SELECT to_jsonb(t) - 'created_at' FROM tool_sets t ORDER BY sha"),
             ("thinking_blocks", "SELECT to_jsonb(t) - 'ts' FROM thinking_blocks t ORDER BY fp"),
         ] {
             let rows: Vec<(Value,)> = sqlx::query_as(sql).fetch_all(pool).await.unwrap();

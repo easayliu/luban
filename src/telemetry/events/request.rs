@@ -262,6 +262,23 @@ impl EventBuilder<'_> {
                 );
             }
         }
+        // 发送时补的那条提醒头一回（这个会话、这个模型）附上：紧跟提醒折叠的回放，同一毫秒两条（`cap/auto-2.1.319-20261106-full`
+        // 批次 `00920`：`feature_ok{batching_reminder}`、`tengu_toasty_thimble_applied{model, source, text, len}`）。
+        if self.env.f.batching_reminder_first {
+            let tb = ms(t0, -3);
+            self.push_dd(tb, "tengu_feature_ok", feature("batching_reminder"));
+            let text = crate::telemetry::shape::SEND_TIME_NUDGE;
+            self.push(
+                tb,
+                "tengu_toasty_thimble_applied",
+                json!({
+                    "model": &shape.model,
+                    "source": "model",
+                    "text": &sha256_hex(text.as_bytes())[..12],
+                    "len": text.chars().count()
+                }),
+            );
+        }
         // 每条带工具的请求发出前核一次声明的工具集（主线程、猜下一句、离开摘要、子代理都有，
         // 标题那类无工具的没有）。`deferredLate` 两份抓包 55 条恒为 3、其余计数恒为 0；
         // 没有 `ToolSearch` 的形态抓包里没见过，按字段名报 0 与 `toolSearchAbsent: true`。
@@ -454,15 +471,15 @@ impl EventBuilder<'_> {
                 "turnsInThread": t.turns,
                 "messageCount": shape.messages_len,
                 "prevMessageCount": t.prev_messages,
-                "firstChangedIndex": -1,
+                "firstChangedIndex": t.first_changed,
                 "deltaMessageCount": t.delta,
-                "claimedCompact": false,
+                "claimedCompact": t.claimed_compact,
                 "claimedSnip": false,
                 "claimedToolResultClear": false,
-                "claimedRewind": false,
-                "claimedClear": false,
+                "claimedRewind": t.claimed_rewind,
+                "claimedClear": t.claimed_clear,
                 "claimedAbortStrip": false,
-                "unclaimedHistoryChange": t.reason == "history_changed"
+                "unclaimedHistoryChange": t.unclaimed
             });
             let mut decision = decision;
             if v285 {
@@ -470,6 +487,16 @@ impl EventBuilder<'_> {
                     &mut decision,
                     "classifierHeldStateless",
                     vec![("creditRetryStateless", json!(false))],
+                );
+            }
+            // 2.1.319：`changedExtraBody` 后多 `toolsHashKept`——这个来源上一份状态在、工具逐项没变（官方 `v4` 复用旧哈希，
+            // `tether_decide` 单独记）。`cap/auto-2.1.319-20261106-full`：`first_request` 那条 false，续轮、`config_changed` 都是
+            // true；`/clear` 之后那条（`cap/auto-2.1.319-20261106-confirm/2.1.319/00092`）上一份状态已清，false。
+            if env.f.v319 {
+                insert_after(
+                    &mut decision,
+                    "changedExtraBody",
+                    vec![("toolsHashKept", json!(t.tools_kept))],
                 );
             }
             self.push_dd_snake(t0, "tengu_tether_decision", decision);
@@ -562,6 +589,14 @@ impl EventBuilder<'_> {
                     self.push(ms(t0, lag), name, meta);
                 }
             }
+        }
+        // 2.1.319：拼头时头一回带上连接器字段、`"mcp":true`，各报一条，紧跟 `api_query` 1ms、先连接器后 MCP
+        // （`cap/auto-2.1.319-20261106-confirm/2.1.319/00072` .341 → .342 两条，Datadog 同样有）。
+        if env.f.tools_used_connector_fields_first {
+            self.push_dd(ms(t0, 1), "tengu_feature_ok", feature("api_tools_used_connector_fields"));
+        }
+        if env.f.tools_used_mcp_mark_first {
+            self.push_dd(ms(t0, 1), "tengu_feature_ok", feature("api_tools_used_mcp_mark"));
         }
         self.push(ms(t0, 1), "tengu_api_cache_breakpoints", breakpoints);
         // 2.1.291：会话首条主线程请求发出后约 40 ~ 120ms 头一回写会话记录（交互式与 `-p` 都有，

@@ -72,6 +72,12 @@ pub(super) struct Session {
     /// 这个进程已经报过 `feature_ok{api_tools_used_header}`：官方头一回在请求上补 `x-claude-code-sandy-plover` 时报，
     /// 按进程一次（`ri().once`，`/clear` 与 resume 都不清），所以 `/clear` 接着算、新进程从头算。
     pub(super) tools_used_header_reported: bool,
+    /// 这个进程已经报过 `feature_ok{api_tools_used_mcp_mark}`（2.1.319 头里头一回带 `"mcp":true`）：同上按进程一次
+    /// （`ri().once`），`/clear` 接着算。
+    pub(super) tools_used_mcp_mark_reported: bool,
+    /// 这个会话已经报过 `feature_ok{api_tools_used_connector_fields}`（2.1.319 头里头一回带连接器的 `url` /
+    /// `directory_entry`）：官方记在按会话的连接器状态上（`fieldsSentReported`），`/clear` 换了会话就从头算。
+    pub(super) tools_used_connector_fields_reported: bool,
     /// 这个进程 `x-claude-code-sandy-plover` 到过的最高档位（官方 2.1.318 `raiseHeaderSizeSteps` 记的 `#s`：
     /// 元素数档、字节数档、丢没丢过名字），往上走才报 `tengu_tools_used_header_size`。按进程记，`/clear` 接着算
     /// （官方 `clear()` 只清名字与「丢名字报过」，不清档位）。
@@ -188,6 +194,12 @@ pub(super) struct Session {
     pub(super) capability_logged: std::collections::HashSet<String>,
     /// 主线程的 tether 线程状态，见 [`TetherThread`]；子代理的各记在 [`AgentState`] 里。
     pub(super) tether_main: Option<TetherThread>,
+    /// `/clear` 换掉的那个会话主线程最后一条的消息数：这个会话的头一条主线程请求报 `create/no_continue_pointer`，
+    /// `prevMessageCount` 就是它、`claimedClear: true`（官方按来源记的上一份状态跨 `/clear` 还在，工具哈希那份清了；
+    /// `cap/auto-2.1.319-20261106-confirm/2.1.319/00092`）。用掉一次就清。
+    pub(super) cleared_tether_messages: Option<usize>,
+    /// 这个会话里已经报过 `tengu_toasty_thimble_applied` 的模型（官方按对话、按模型锁存，`/clear` 换了对话从头算）。
+    pub(super) batching_reminder_models: Vec<String>,
     /// 每条线程上一条完整请求的形态，键是 `main` 或 `agent:<支线号>`，见 [`ThreadBase`]。
     pub(super) thread_bases: HashMap<String, ThreadBase>,
     /// 会话里的子代理，按支线号（`x-claude-code-agent-id`）分开记。
@@ -343,6 +355,7 @@ pub(super) struct ThreadBase {
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
     pub(super) tools_hash: String,
+    pub(super) tools_content_hash: String,
     pub(super) tool_lens: String,
     pub(super) deferred_tools: usize,
     pub(super) mcp_tools: usize,
@@ -353,7 +366,9 @@ pub(super) struct ThreadBase {
     pub(super) static_len: usize,
     pub(super) dynamic_len: usize,
     pub(super) dynamic_hash: String,
-    pub(super) omitted_bytes: usize,
+    /// 客户端眼里 system / tools 的完整大小（[`super::shape::RequestShape::system_bytes`]）。
+    pub(super) system_bytes: usize,
+    pub(super) tools_bytes: usize,
     pub(super) permission_mode: &'static str,
     pub(super) messages: usize,
     pub(super) assistant_messages: usize,
@@ -383,6 +398,7 @@ impl ThreadBase {
             tools_count: s.tools_count,
             tools_chars: s.tools_chars,
             tools_hash: s.tools_hash.clone(),
+            tools_content_hash: s.tools_content_hash.clone(),
             tool_lens: s.tool_lens.clone(),
             deferred_tools: s.deferred_tools,
             mcp_tools: s.mcp_tools,
@@ -393,7 +409,8 @@ impl ThreadBase {
             static_len: s.static_len,
             dynamic_len: s.dynamic_len,
             dynamic_hash: s.dynamic_hash.clone(),
-            omitted_bytes: s.omitted_bytes,
+            system_bytes: s.system_bytes,
+            tools_bytes: s.tools_bytes,
             permission_mode: s.permission_mode,
             messages: s.messages_len,
             assistant_messages: s.assistant_messages,
@@ -411,11 +428,12 @@ impl ThreadBase {
     /// 把一条增量请求的形态补成客户端视角的全量。auto 模式的提示在增量里没出现就沿用上一条的。
     pub(super) fn fill(&self, s: &mut RequestShape, auto_in_delta: bool) {
         // 工具集中途变了的续轮自己带着完整 `tools`（ToolSearch 刚载入工具、MCP 工具上线，
-        // `cap/auto-2.1.285-20260930/00054`），以它为准；没带才沿用底本那份。
-        if s.tools_count == 0 {
+        // `cap/auto-2.1.285-20260930/00054`），以它为准；没带 `tools` 键才沿用底本那份——显式 `tools: []` 是清空了。
+        if !s.tools_declared {
             s.tools_count = self.tools_count;
             s.tools_chars = self.tools_chars;
             s.tools_hash = self.tools_hash.clone();
+            s.tools_content_hash = self.tools_content_hash.clone();
             s.tool_lens = self.tool_lens.clone();
             s.deferred_tools = self.deferred_tools;
             s.mcp_tools = self.mcp_tools;
@@ -427,7 +445,16 @@ impl ThreadBase {
         s.static_len = self.static_len;
         s.dynamic_len = self.dynamic_len;
         s.dynamic_hash = self.dynamic_hash.clone();
-        s.omitted_bytes = self.omitted_bytes;
+        // 续轮省掉的是底本里有、这条没带的：system 恒省（增量只剩 billing），tools 只在这条没写 `tools` 键时省。
+        s.system_bytes = self.system_bytes;
+        s.omitted_system_bytes = self.system_bytes;
+        if s.tools_declared {
+            s.omitted_tools_bytes = 0;
+        } else {
+            s.tools_bytes = self.tools_bytes;
+            s.omitted_tools_bytes = self.tools_bytes;
+        }
+        s.omitted_bytes = s.omitted_system_bytes + s.omitted_tools_bytes;
         if !auto_in_delta {
             s.permission_mode = self.permission_mode;
         }
@@ -477,6 +504,7 @@ impl ThreadBase {
                         media_blocks: r.media_blocks,
                         input: Value::Null,
                         verdict: None,
+                        input_stream_ms: None,
                         // 线程续轮的增量体里没有那条助手消息，工具名取自回复流；Read 的原文照样从结果还原。
                         read_content: (name == "Read"
                             && !r.is_error
@@ -510,10 +538,16 @@ pub(super) struct TetherThread {
     pub(super) model: String,
     pub(super) betas: String,
     pub(super) effort: Option<String>,
-    pub(super) tools_hash: String,
+    /// 工具表内容的摘要（[`super::shape::RequestShape::tools_content_hash`]）。
+    pub(super) tools_content: String,
     pub(super) thinking_type: String,
     pub(super) messages: usize,
     pub(super) turns: u32,
+    /// 客户端视角整段对话每条消息的摘要（[`super::shape::RequestShape::message_hashes`]），按下标；线程续轮里服务端持有、
+    /// 体里没有的那条回复记 `None`（比对时谁都认）。
+    pub(super) hashes: Vec<Option<u64>>,
+    /// 这条被中断了（Esc）：下一条另起时客户端认领的是回退（`claimedRewind`）。
+    pub(super) aborted: bool,
 }
 
 /// 一条请求的 tether 判定结果，事件链里 `tether_decision` / `echo_audit` / `live_outcome`
@@ -527,6 +561,20 @@ pub(super) struct Tether {
     pub(super) changed_latched: bool,
     pub(super) changed_thinking: bool,
     pub(super) changed_effort: bool,
+    /// 这个来源上一份状态在、且工具逐项没变（2.1.319 `toolsHashKept`，官方 `v4` 复用旧哈希）：线程里没有上一条的
+    /// （首条、`/clear` 换了会话）为假，与线程怎么续、配置别的项变没变无关。
+    pub(super) tools_kept: bool,
+    /// `create/no_continue_pointer` 的认领：`/clear` 之后（`claimedClear`）、同会话里带着 `thread: create` 重发的同样多或
+    /// 更少的历史（`claimedRewind`，`cap/auto-2.1.319-20261106-full/00696`）。
+    pub(super) claimed_clear: bool,
+    pub(super) claimed_rewind: bool,
+    /// 压缩之后的头一条（`claimedCompact`，官方同时报 `config_changed` 与 `changedLatchedHeaders`，
+    /// `cap/auto-2.1.319-20261106-full/00214`）。
+    pub(super) claimed_compact: bool,
+    /// 历史被改写、没有认领：`history_reshaped` / `history_rewound`，`unclaimedHistoryChange: true`。
+    pub(super) unclaimed: bool,
+    /// 头一处不一样的消息下标（`firstChangedIndex`），没有是 -1。
+    pub(super) first_changed: i64,
     pub(super) turns: u32,
     pub(super) prev_messages: usize,
     pub(super) delta: usize,
@@ -725,6 +773,10 @@ pub(super) struct TurnFacts {
     /// 2.1.318：失败 Bash 与 5xx 的错误栈换块，5xx 类压缩后成了 `sln`、过不了构造名校验，**不再带 `error_constructor`**；
     /// `tengu_reactive_compact_succeeded` 去掉 `summaryPromptArm`（`cap/auto-2.1.318-20261104-*`）。
     pub(super) v318: bool,
+    /// 2.1.319：失败 Bash 与 5xx 的错误栈换块（5xx 照旧不带构造名），`tengu_tool_use_success` 在计时那几项后多
+    /// `tool_input_stream_ms`（[`super::shape::ToolUse::input_stream_ms`]），`tengu_tether_decision` 在 `changedExtraBody`
+    /// 后多 `toolsHashKept`（`cap/auto-2.1.319-20261106-*`）。
+    pub(super) v319: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
@@ -732,6 +784,13 @@ pub(super) struct TurnFacts {
     /// `feature_ok{api_tools_used_header}`——发启动模板的那条落在模板里 `provider_route` 之后，别的落在这条 `api_query`
     /// 之后（握手的 eval 没赶上首条、续轮才头一回带上时就是这样）。
     pub(super) tools_used_header_first: bool,
+    /// 2.1.319：这条出站的 sandy-plover 头里头一回（按会话）带了连接器字段，紧跟 `api_query` 报
+    /// `feature_ok{api_tools_used_connector_fields}`（[`Session::tools_used_connector_fields_reported`]）。
+    pub(super) tools_used_connector_fields_first: bool,
+    /// 2.1.319：头一回（按进程）带了 `"mcp":true`，紧跟上一条报 `feature_ok{api_tools_used_mcp_mark}`。
+    pub(super) tools_used_mcp_mark_first: bool,
+    /// 这条带了发送时提醒、且这个会话里这个模型头一回带（[`Session::batching_reminder_models`]）。
+    pub(super) batching_reminder_first: bool,
     /// 2.1.318 起这条拼头时档位往上走了的那几次（[`super::template::tools_used_size_events`]）各一条 `tengu_tools_used_header_size`
     /// 的内容，按先后；与首次使用那条同处报（在 `feature_sad` 之后、`feature_ok` 之前），不进 Datadog。
     pub(super) tools_used_size_events: Vec<serde_json::Value>,
@@ -1010,6 +1069,9 @@ impl Session {
             background_done: cleared_prev.map_or(0, |p| p.background_done),
             ide_detect_done: cleared_prev.is_some_and(|p| p.ide_detect_done),
             tools_used_header_reported: cleared_prev.is_some_and(|p| p.tools_used_header_reported),
+            tools_used_mcp_mark_reported: cleared_prev
+                .is_some_and(|p| p.tools_used_mcp_mark_reported),
+            tools_used_connector_fields_reported: false,
             tools_used_steps: cleared_prev.and_then(|p| p.tools_used_steps),
             attachment_counts: Vec::new(),
             last_main_reply_model: None,
@@ -1038,6 +1100,8 @@ impl Session {
             heron_done: false,
             capability_logged: Default::default(),
             tether_main: None,
+            cleared_tether_messages: cleared_prev.and_then(|p| p.tether_main_messages),
+            batching_reminder_models: Vec::new(),
             thread_bases: HashMap::new(),
             agents: HashMap::new(),
             delegated_pending: Vec::new(),
@@ -1090,6 +1154,10 @@ pub(super) struct ClearedPrev {
     pub(super) ide_detect_done: bool,
     /// 进程里那条 `api_tools_used_header` 已经报过，见 [`Session::tools_used_header_reported`]。
     pub(super) tools_used_header_reported: bool,
+    /// 进程里那条 `api_tools_used_mcp_mark` 已经报过，见 [`Session::tools_used_mcp_mark_reported`]。
+    pub(super) tools_used_mcp_mark_reported: bool,
+    /// 旧会话主线程最后一条的消息数，见 [`Session::cleared_tether_messages`]。
+    pub(super) tether_main_messages: Option<usize>,
     /// 进程里头大小到过的档位，见 [`Session::tools_used_steps`]。
     pub(super) tools_used_steps: Option<(u32, u32, bool)>,
     /// 进程里已经发过的 `tengu_lucky_cerf` 一系曝光（按 feature）：GrowthBook 的曝光按进程记，
@@ -1200,6 +1268,8 @@ impl State {
                 background_done: p.background_done,
                 ide_detect_done: p.ide_detect_done,
                 tools_used_header_reported: p.tools_used_header_reported,
+                tools_used_mcp_mark_reported: p.tools_used_mcp_mark_reported,
+                tether_main_messages: p.tether_main.as_ref().map(|t| t.messages),
                 tools_used_steps: p.tools_used_steps,
                 lucky_cerf_exposed: p.lucky_cerf_exposed.clone(),
                 hb: p.hb.clone(),

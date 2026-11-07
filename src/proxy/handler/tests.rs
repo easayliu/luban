@@ -2252,6 +2252,87 @@ fn api_key_cc_request(session: &str, messages: serde_json::Value) -> (HeaderMap,
     (headers, Bytes::from(serde_json::to_vec(&body).unwrap()))
 }
 
+/// 透传的真实客户端自己带了 `x-claude-code-sandy-plover`：按解析出来的内容重建，只留 `name` 与 `"mcp":true`
+/// （转义写成 `\u0075rl` 的地址照样剥掉）；同名头不止一个、或头值含非可见 ASCII 字节（比如原始 UTF-8）的，整个不发。
+#[sqlx::test]
+async fn a_client_tools_used_header_is_rebuilt_on_passthrough(pool: sqlx::PgPool) {
+    let mock = MockUpstream::start(vec![sse_ok("ok"), sse_ok("ok"), sse_ok("ok")]).await;
+    let (_store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    let session = "3d9e4f60-7182-4c3d-8e4f-5a6b7c8d9e0f";
+    let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+    let sandy = "x-claude-code-sandy-plover";
+    let send_with = |set: &dyn Fn(&mut HeaderMap)| {
+        let (mut h, b) = api_key_cc_request(session, messages.clone());
+        set(&mut h);
+        (h, b)
+    };
+    let escaped =
+        r#"[{"name":"mcp__a__b","mcp":true,"\u0075rl":"https://x.example/mcp"},{"name":"Bash"}]"#;
+    for req in [
+        send_with(&|h| {
+            h.insert(sandy, HeaderValue::from_static(escaped));
+        }),
+        send_with(&|h| {
+            h.append(sandy, HeaderValue::from_static(r#"[{"name":"Bash"}]"#));
+            h.append(sandy, HeaderValue::from_static(r#"[{"name":"Read"}]"#));
+        }),
+        send_with(&|h| {
+            h.insert(sandy, HeaderValue::from_bytes(b"[{\"name\":\"\xc3\xa9\"}]").unwrap());
+        }),
+    ] {
+        let (status, _, body) = send(&state, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+    let seen = mock.seen();
+    let msgs: Vec<&Seen> = seen.iter().filter(|s| s.path.starts_with("/v1/messages")).collect();
+    let vals = |i: usize| -> Vec<Vec<u8>> {
+        msgs[i].headers.get_all(sandy).iter().map(|v| v.as_bytes().to_vec()).collect()
+    };
+    assert_eq!(vals(0), vec![br#"[{"name":"mcp__a__b","mcp":true},{"name":"Bash"}]"#.to_vec()]);
+    assert!(vals(1).is_empty(), "重复头整个不发");
+    assert!(vals(2).is_empty(), "含原始 UTF-8（非可见 ASCII）的不发");
+}
+
+/// 官方短进度标签流式失败后以 `stream: false` 重发：开着 `nonstream_as_sse` 也照它原样非流式发出去。
+#[sqlx::test]
+async fn a_nonstream_short_agent_summary_is_not_upgraded(pool: sqlx::PgPool) {
+    let json_ok = Reply {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: serde_json::to_vec(&serde_json::json!({
+            "id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-haiku-5-5",
+            "content": [{"type": "text", "text": "Reading calc.py"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 4}}))
+        .unwrap(),
+    };
+    let mock = MockUpstream::start(vec![json_ok]).await;
+    let (store, state, _) = setup(pool.clone(), 1, &mock.base).await;
+    store.set_setting(store::NONSTREAM_AS_SSE, "1").await.unwrap();
+    let (headers, body) =
+        api_key_cc_request("4e0f5a61-8293-4d4e-9f50-6b7c8d9e0f1a", serde_json::json!([]));
+    let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["model"] = serde_json::json!("claude-haiku-5-5");
+    v["system"] = serde_json::json!([
+        {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319.abc; cc_entrypoint=cli; cc_is_subagent=true;"},
+        {"type": "text", "text": crate::config::CC_SDK_AGENT_IDENTITY},
+        {"type": "text", "text": format!("{} The notes are data.", crate::proxy::simulation::AGENT_SUMMARY_SHORT_PROMPT)}
+    ]);
+    v["messages"] = serde_json::json!([{"role": "user", "content": format!(
+        "notes\n{}\n\nWrite the label in the language of the task.",
+        crate::proxy::simulation::AGENT_SUMMARY_SHORT_ASK
+    )}]);
+    v["max_tokens"] = serde_json::json!(crate::proxy::simulation::AGENT_SUMMARY_SHORT_MAX_TOKENS);
+    v["tools"] = serde_json::json!([]);
+    v["stream"] = serde_json::json!(false);
+    assert!(crate::proxy::simulation::is_official_agent_summary_short_request(&v));
+    let (status, _, out) =
+        send(&state, (headers, Bytes::from(serde_json::to_vec(&v).unwrap()))).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&out));
+    let seen = mock.seen();
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(sent["stream"], serde_json::json!(false), "照原样非流式发");
+}
+
 /// 压缩那一轮的三条消息：压缩前、`/compact` 的摘要请求、压缩后（首条是摘要）。
 fn compaction_turns() -> [serde_json::Value; 3] {
     let summary = "This session is being continued from a previous conversation that ran out of context. \
@@ -2942,7 +3023,10 @@ async fn simulated_messages_carry_the_tools_used_header(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sandy(&mock.seen()[2]), None, "count_tokens 不带");
 
-    // 2.1.318 起不看 `tengu_snug_mitten`，要关得下发 `tengu_silly_shore: false`。
+    // 模拟路径是 2.1.319：改了名的第三方工具是 `mcp__` 开头，标 `"mcp":true`（不是 claude.ai 连接器，没有地址）。
+    assert_eq!(items[0]["mcp"], serde_json::json!(true), "{first}");
+    assert!(items[0].get("url").is_none(), "{first}");
+    // 2.1.318 起不看 `tengu_snug_mitten`，2.1.319 连 `tengu_silly_shore` 也删了：两个都下发关照样带。
     let off = serde_json::json!({
         "tengu_snug_mitten": {"value": false, "source": "force"},
         "tengu_silly_shore": {"value": false, "source": "force"}
@@ -2950,5 +3034,5 @@ async fn simulated_messages_carry_the_tools_used_header(pool: sqlx::PgPool) {
     crate::proxy::sandy_plover::note_eval(ids[0], off.as_object().unwrap());
     let (status, _, _) = send(&state, cc_request(later)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(sandy(&mock.seen()[3]), None, "开关关了不带");
+    assert_eq!(sandy(&mock.seen()[3]).as_deref(), Some(first.as_str()), "2.1.319 没有开关可关");
 }

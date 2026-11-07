@@ -1235,6 +1235,20 @@ pub(super) fn auto_mode_decision_v314(v: &mut Value) {
     }
 }
 
+/// 2.1.319 的 `tengu_auto_mode_decision`（`cap/auto-2.1.319-20261106-full` 30 条）：每条在 `mcpRemoteSessionAllowOverride`
+/// 后多 `mcpWorkspaceShellHeld: false`（MCP 工作区 shell 判定扣住，luban 模拟的会话没有）；acceptEdits 快路径那种（带
+/// `serverClassifierNoVerdict` 的，5 条）在它后面多 `serverOutcome: "server_call_skipped"`——快路径不问服务端。
+pub(super) fn auto_mode_decision_v319(v: &mut Value) {
+    insert_after(v, "mcpRemoteSessionAllowOverride", vec![("mcpWorkspaceShellHeld", json!(false))]);
+    if v.get("serverClassifierNoVerdict").is_some() {
+        insert_after(
+            v,
+            "serverClassifierNoVerdict",
+            vec![("serverOutcome", json!("server_call_skipped"))],
+        );
+    }
+}
+
 /// 2.1.312 的权限两条（`tengu_tool_use_can_use_tool_allowed` / `rejected`）在 `messageID` 后多 `toolUseID`，
 /// 即这次调用的 tool_use id（`cap/auto-2.1.312-20261028-full` 的 60 条 allowed 与 B1 那条 rejected）。
 pub(super) fn can_use_tool_v312(v: &mut Value, tool_use_id: &str) {

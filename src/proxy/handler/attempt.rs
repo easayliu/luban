@@ -62,10 +62,14 @@ impl Prepared {
         // 一看就不是 CC」，对它们恰好相反——改成流式才是官方不产生的形态。
         // `merge_beta_for` 要的那几项请求事实：来访体不变，转发循环外算一次，换号重试沿用。
         let beta_ctx = BetaCtx::of(cc_kind, body, body_json.as_ref(), &inbound_beta_list(headers));
+        // 官方侧查询（短进度标签等）流式失败会以 `stream: false` 重发（[`crate::proxy::simulation::is_official_side_query_request`]），
+        // 那条照它原样发。
         let upgrade_stream = billable
             && flags.nonstream_as_sse
             && !cc_kind.keeps_nonstream()
-            && body_json.as_ref().is_some_and(|v| !stream_requested(v));
+            && body_json.as_ref().is_some_and(|v| {
+                !stream_requested(v) && !crate::proxy::simulation::is_official_side_query_request(v)
+            });
         // 工具名混淆映射：从**客户端原始体**扫一次就够（后续改写不动工具名），请求侧与回程
         // 两侧共用同一份。见 [`ToolNameMap`]。**billing-only 的范围看 `sim_billing_mimic_all`**：开（默认）
         // 与完整模拟同一套白名单混淆；关则只改 `mcp_`（单下划线）开头的名字——这类名字单独就会被上游判成
@@ -474,6 +478,31 @@ pub(super) async fn prepare<'a>(
                 body_json.as_ref(),
                 tool_names.as_deref(),
             );
+    }
+    // 透传的真实客户端自己带了这个头：按解析出来的内容重建（只留 `name` 与 `"mcp":true`，[`crate::proxy::sandy_plover::strip_client_header`]），
+    // 截断与否照原值推好交给遥测。同名头不止一个、或头值含非可见 ASCII 字节（比如原始 UTF-8，`to_str` 读不出）的，整个不发。
+    if upstream.sim.is_none()
+        && upstream.headers.contains_key(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER)
+    {
+        let values: Vec<_> = upstream
+            .headers
+            .get_all(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER)
+            .iter()
+            .map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+        upstream.headers.remove(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER);
+        if let [Some(value)] = values.as_slice() {
+            let version = upstream
+                .headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|u| u.to_str().ok())
+                .and_then(crate::proxy::cc_cli_version);
+            let (rebuilt, capped) = crate::proxy::sandy_plover::strip_client_header(value, version);
+            if let Some(v) = rebuilt {
+                upstream.headers.insert(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER, v);
+                upstream.tools_used_capped = Some(capped);
+            }
+        }
     }
     // 占住这条路线的在飞格并把这次发送记进窗口——**在 `send` 之前**，见
     // [`note_upstream_send`]。纯记录，不影响这条请求走向。

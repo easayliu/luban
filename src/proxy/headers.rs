@@ -122,11 +122,11 @@ pub(crate) fn merge_beta_for(
         {
             parts.insert(i + 1, config::CC_BETA_PROMPT_CACHING_SCOPE.to_string());
         }
-        // 2.1.318 起标题生成直连官方多带 `claude-code-side-query`（官方 `generate_session_title` 且走官方地址、OAuth），
-        // 经自定义 BASE_URL 的不带：照直连补回同一位置——紧跟 `mid-conversation-system-clear-at`，没有那项就放在
-        // `effort` 之前，都没有接在末尾（`cap/auto-2.1.318-20261104-full` 16 条标题请求）。
-        if ctx.title
-            && version.is_some_and(|v| v >= (2, 1, 318))
+        // 侧查询直连官方多带 `claude-code-side-query`（走官方地址、OAuth），经自定义 BASE_URL 的不带：照直连补回同一
+        // 位置——紧跟 `mid-conversation-system-clear-at`，没有那项就放在 `effort` 之前，都没有接在末尾。2.1.318 起只有标题
+        // 生成（`cap/auto-2.1.318-20261104-full` 16 条标题请求），2.1.319 起扩到 kebab-case 命名与 WebFetch 页面处理
+        // （`cap/auto-2.1.319-20261106-full/00204`、`00110`），见 [`BetaCtx::side_query_from`]。
+        if ctx.side_query_from.is_some_and(|from| version.is_some_and(|v| v >= from))
             && !has(&parts, config::CC_BETA_SIDE_QUERY)
         {
             let at = pos(&parts, config::CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
@@ -277,6 +277,37 @@ pub(crate) fn ensure_cache_ttl_beta(beta: &str) -> String {
 
 /// [`merge_beta_for`] 要的那几项**请求事实**：它自己只看得到 beta 串，这几样得从请求体与请求
 /// 分类里来。
+/// 真正的 `/model` 预热（`cap/auto-2.1.319-20261106-model/00061` 等）：非流式、system 是 billing 与身份句两块、只有一条用户
+/// 消息、正文就是「Hi」。同样 `max_tokens: 1`、
+/// 没有工具的流式主线程请求也会被分到 `Prewarm` 那类，它不走侧查询入口，不补 side-query。
+fn is_model_prewarm(v: &serde_json::Value) -> bool {
+    let Some([m]) = v.get("messages").and_then(|m| m.as_array()).map(Vec::as_slice) else {
+        return false;
+    };
+    let text = match m.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Array(b)) if b.len() == 1 => {
+            b[0].get("text").and_then(|t| t.as_str())
+        }
+        _ => None,
+    };
+    // 流式失败回退成非流式的普通请求也可能是一条、无工具、`max_tokens: 1`：正文得是预热那句「Hi」，system 也得是预热
+    // 那两块（billing header、身份句；关了归因的客户端只发身份句一块），主线程那种带基座与第四块的不算。
+    let system_ok = v.get("system").and_then(|s| s.as_array()).is_some_and(|b| {
+        let texts: Vec<&str> =
+            b.iter().map(|x| x.get("text").and_then(|t| t.as_str()).unwrap_or_default()).collect();
+        match texts.as_slice() {
+            [billing, identity] => {
+                super::simulation::is_official_billing_block(billing)
+                    && *identity == config::CC_SYSTEM_IDENTITY
+            }
+            [identity] => *identity == config::CC_SYSTEM_IDENTITY,
+            _ => false,
+        }
+    });
+    v.get("stream").and_then(|s| s.as_bool()) != Some(true) && text == Some("Hi") && system_ok
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BetaCtx {
     /// 只补 `oauth`、别的一项不动（[`super::session_link::CcRequestKind::beta_only_oauth`]）。
@@ -288,9 +319,12 @@ pub(crate) struct BetaCtx {
     pub(super) display_explicit: bool,
     /// SDK 子代理：只补 `oauth` 之外还要补 `cache-diagnosis`，见 [`merge_beta_for`]。
     pub(super) subagent: bool,
-    /// 会话标题生成（[`super::session_link::CcRequestKind::Title`] 且输出 schema 要 `title`）：2.1.318 起直连官方带
-    /// [`config::CC_BETA_SIDE_QUERY`]，经自定义 BASE_URL 来的不带，见 [`merge_beta_for`]。
-    pub(super) title: bool,
+    /// 这条是官方侧查询、直连时从哪个版本起带 [`config::CC_BETA_SIDE_QUERY`]（经自定义 BASE_URL 来的不带，见
+    /// [`merge_beta_for`]）；`None` 即不是。会话标题（[`super::session_link::CcRequestKind::Title`] 且输出 schema 要
+    /// `title`）2.1.318 起；同一类的 kebab-case 命名（schema 要 `name`）与认出来的 WebFetch 页面处理
+    /// （[`super::simulation::is_official_helper_request`]）2.1.319 起——官方 `mNr` / `r0e` 没显式给时按 `g4()` 补
+    /// （firstParty、OAuth、官方地址）。WebSearch 子调用不走这两个入口，不带。
+    pub(super) side_query_from: Option<(u64, u64, u64)>,
 }
 
 impl BetaCtx {
@@ -301,7 +335,7 @@ impl BetaCtx {
         ttl_1h: true,
         display_explicit: false,
         subagent: false,
-        title: false,
+        side_query_from: None,
     };
 
     /// 按请求分类与来访体取：`raw` 是来访体原文，`body` 是解析好的那份，`beta` 是来访自己那串。
@@ -323,23 +357,48 @@ impl BetaCtx {
         body: Option<&serde_json::Value>,
         beta: &[String],
     ) -> Self {
-        let official_aux = kind == super::session_link::CcRequestKind::Auxiliary
-            && body.is_some_and(|v| {
-                super::simulation::is_official_helper_request(v, beta)
-                    || super::simulation::is_official_web_search_request(v)
-            });
+        // 子代理里的 WebFetch 页面处理（billing 带 `cc_is_subagent`）分类是 `Helper`，走的是同一个侧查询入口，同样认。
+        // 官方子代理的短进度标签、工具完成摘要、MCP 日期解析、反馈标题也走同一个侧查询入口，按它们自己的形态认，不看分到了哪一类。
+        let helper = matches!(
+            kind,
+            super::session_link::CcRequestKind::Auxiliary
+                | super::session_link::CcRequestKind::Helper
+        ) && body
+            .is_some_and(|v| super::simulation::is_official_helper_request(v, beta))
+            || body.is_some_and(super::simulation::is_official_side_query_request);
+        let official_aux = helper
+            || kind == super::session_link::CcRequestKind::Auxiliary
+                && body.is_some_and(super::simulation::is_official_web_search_request);
+        let schema_has = |key: &str| {
+            body.is_some_and(|v| {
+                v.pointer("/output_config/format/schema/properties")
+                    .and_then(|p| p.get(key))
+                    .is_some()
+            })
+        };
+        let side_query_from =
+            if kind == super::session_link::CcRequestKind::Title && schema_has("title") {
+                Some((2, 1, 318))
+            } else if kind == super::session_link::CcRequestKind::Title && schema_has("name")
+                || helper
+                || kind == super::session_link::CcRequestKind::Prewarm
+                    && body.is_some_and(is_model_prewarm)
+            {
+                // `/model` 预热也走那两个侧查询入口（`cap/auto-2.1.319-20261106-model/00061` 等，末尾带）。
+                Some((2, 1, 319))
+            } else {
+                None
+            };
         Self {
             only_oauth: kind.beta_only_oauth() || official_aux,
             ttl_1h: super::body::body_has_pair(raw, b"\"ttl\"", b"\"1h\"")
                 && body.is_some_and(super::body::has_cache_ttl_1h),
             display_explicit: body.is_some_and(super::body::thinking_display_explicit),
             subagent: kind == super::session_link::CcRequestKind::Subagent,
-            // 只认会话标题那一种（输出 schema 要 `title`）：同属这一类的「给对话起 kebab-case 名」（schema 要 `name`，
-            // `cap/auto-2.1.318-20261104-full/00202`）官方不带 side-query。
-            title: kind == super::session_link::CcRequestKind::Title
-                && body.is_some_and(|v| {
-                    v.pointer("/output_config/format/schema/properties/title").is_some()
-                }),
+            // 2.1.318 只有会话标题（schema 要 `title`）带；同属这一类的 kebab-case 命名（schema 要 `name`，
+            // `cap/auto-2.1.318-20261104-full/00202` 不带、`cap/auto-2.1.319-20261106-full/00204` 带）与 WebFetch 页面处理
+            // （2.1.318 `00101` 不带、2.1.319 `00110` 带）2.1.319 起带。
+            side_query_from,
         }
     }
 }

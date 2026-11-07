@@ -337,13 +337,13 @@ impl<'a> EventEnv<'a> {
             "toolRemovalHistory": false,
             "toolChangeHistory": false,
             "requestScopedStateless": false,
-            "keptReminderClearAt": false,
+            "keptReminderClearAt": shape.send_time_nudge,
             "keptReminderScope": "all",
             "deltaMessageCount": shape.after_last_assistant,
             "messageCount": shape.messages_len,
             "turnsInThread": t.turns,
             "omittedSystem": omitted,
-            "omittedTools": omitted,
+            "omittedTools": omitted && !shape.tools_declared,
             "omittedBytes": if omitted { shape.omitted_bytes } else { 0 },
             "inheritBreakerTripped": false,
             "dropArmed": false,
@@ -404,6 +404,7 @@ impl<'a> EventEnv<'a> {
             resumed: f.resumed,
             prompt_index: f.prompt_seq,
             deferred: self.shape.deferred_tools > 0,
+            mcp_disconnected: self.shape.mcp_disconnected,
             tool_search: tool_search_decision(self.shape, &f.display_model, f.kind.is_agent()),
             sdk: self.shape.sdk,
             tool_family: super::template::ToolFamily::of(&self.shape.model),
@@ -540,6 +541,7 @@ impl<'a> EventBuilder<'a> {
     /// 发一条事件。服务端下发的抽样配置在这里统一过一遍（[`sample_event`]），抽掉的不发。
     pub(super) fn push(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
+        scrub_mcp_tool(name, &mut extra);
         if !sample_event(name, &env.f.version, &mut extra) {
             return;
         }
@@ -548,16 +550,18 @@ impl<'a> EventBuilder<'a> {
     }
 
     /// 同一条事件同时进事件链与 Datadog，两边是同一份 meta。
-    pub(super) fn push_dd(&mut self, dt: DateTime<Utc>, name: &str, extra: Value) {
+    pub(super) fn push_dd(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
+        scrub_mcp_tool(name, &mut extra);
         self.push(dt, name, extra.clone());
         let ctx = self.ctx_at(dt);
         self.dd.push(env.f.identity.dd_entry(name, &ctx, &env.f.dd_model, extra));
     }
 
     /// 同上，Datadog 那份是 [`snake_flat`] 扁平化过的字段。
-    pub(super) fn push_dd_snake(&mut self, dt: DateTime<Utc>, name: &str, extra: Value) {
+    pub(super) fn push_dd_snake(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
+        scrub_mcp_tool(name, &mut extra);
         let flat = snake_flat(&extra);
         self.push(dt, name, extra);
         let ctx = self.ctx_at(dt);
@@ -714,4 +718,20 @@ pub(super) fn feature_with(name: &str, props: Value, v293: bool) -> Value {
         out.insert("feature_name".into(), json!(name));
     }
     Value::Object(out)
+}
+
+/// 工具类事件（`tengu_tool_use_*`、`tengu_auto_mode_decision`）里的 MCP 工具：官方报 `toolName: "mcp_tool"`、`isMcp: true`
+/// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00072` 的判决、放行、进度、成功各条），原名只留在内部匹配用。官方另带的服务
+/// 类型、地址摘要、服务名、工具名、服务 id 那几项 luban 不知道（转发的 MCP 工具都是来访客户端自己的），不报。
+fn scrub_mcp_tool(name: &str, extra: &mut Value) {
+    if !(name.starts_with("tengu_tool_use_") || name == "tengu_auto_mode_decision") {
+        return;
+    }
+    let Some(o) = extra.as_object_mut() else { return };
+    if o.get("toolName").and_then(|n| n.as_str()).is_some_and(|n| n.starts_with("mcp__")) {
+        o.insert("toolName".into(), Value::from("mcp_tool"));
+        if let Some(m) = o.get_mut("isMcp") {
+            *m = Value::Bool(true);
+        }
+    }
 }

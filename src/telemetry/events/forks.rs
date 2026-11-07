@@ -415,6 +415,7 @@ impl EventBuilder<'_> {
             let rid = call.request_id.as_deref().unwrap_or("");
             let mut tu = ToolUse { id: hb.id.clone(), ..Default::default() };
             tu.apply_call(&hb.name, &hb.input, hb.verdict.as_ref());
+            tu.input_stream_ms = hb.input_stream_ms;
             // 2.1.315 起 `SubagentHandback` 不只读，重复命令计量器记一次可能写过（与主线程共用同一个计量器：
             // `cap/auto-2.1.316-20261031-full` A0 那条重复的 `unittest` 报 4 次，正是两次 Python 加两次交还）。
             if env.f.v316 {
@@ -448,6 +449,9 @@ impl EventBuilder<'_> {
                 }
                 if env.f.v314 {
                     auto_mode_decision_v314(&mut decision);
+                }
+                if env.f.v319 {
+                    auto_mode_decision_v319(&mut decision);
                 }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
@@ -502,6 +506,12 @@ impl EventBuilder<'_> {
                 ("requestId", json!(rid)),
             ] {
                 ok[k] = v;
+            }
+            // 2.1.319：同普通工具那条，`durationMs` 之后报入参流了多久（`cap/auto-2.1.319-20261106-full/00133` 两条）。
+            if env.f.v319
+                && let Some(stream) = tu.input_stream_ms
+            {
+                insert_after(&mut ok, "durationMs", vec![("tool_input_stream_ms", json!(stream))]);
             }
             self.push_dd_snake(td, "tengu_tool_use_success", ok);
         }

@@ -194,7 +194,7 @@ fn prompt_caching_scope_is_restored_after_context_management() {
         .replace("oauth-2025-04-20,", "")
         .replace("prompt-caching-scope-2026-01-05,", "")
         .replace("claude-code-side-query-2026-09-29,", "");
-    let title = BetaCtx { title: true, ..BetaCtx::MAIN };
+    let title = BetaCtx { side_query_from: Some((2, 1, 318)), ..BetaCtx::MAIN };
     let haiku = Some("claude-haiku-5-5");
     assert_eq!(merge_beta_for(Some(&via_base_url), haiku, Some((2, 1, 318)), title), TITLE_00065);
     assert_eq!(
@@ -212,6 +212,127 @@ fn prompt_caching_scope_is_restored_after_context_management() {
             .contains("claude-code-side-query"),
         "别的请求不补"
     );
+    // 2.1.319 起 WebFetch 页面处理（`cap/auto-2.1.319-20261106-full/00110`）与 kebab-case 命名（`00204`）也带，位置同标题。
+    const HELPER_00110: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\
+             inline-tools-2026-09-15,advisor-tool-2026-03-01,thinking-token-count-2026-05-13,\
+             mid-conversation-system-clear-at-2026-08-21,claude-code-side-query-2026-09-29,\
+             effort-2025-11-24,dangerous-tool-use-2026-09-03,cache-diagnosis-2026-04-07,\
+             message-threads-2026-08-12";
+    let helper_via_base_url = HELPER_00110
+        .replace("oauth-2025-04-20,", "")
+        .replace("prompt-caching-scope-2026-01-05,", "")
+        .replace("claude-code-side-query-2026-09-29,", "");
+    let helper = BetaCtx { only_oauth: true, side_query_from: Some((2, 1, 319)), ..BetaCtx::MAIN };
+    assert_eq!(
+        merge_beta_for(Some(&helper_via_base_url), haiku, Some((2, 1, 319)), helper),
+        HELPER_00110
+    );
+    assert!(
+        !merge_beta_for(Some(&helper_via_base_url), haiku, Some((2, 1, 318)), helper)
+            .contains("claude-code-side-query"),
+        "2.1.318 的 helper 不带"
+    );
+    // `/model` 预热（`cap/auto-2.1.319-20261106-model/00061`）：同样补在末尾，2.1.318 不补。
+    const PREWARM_00061: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+             claude-code-side-query-2026-09-29";
+    let prewarm_via_base_url = "claude-code-20250219,interleaved-thinking-2025-05-14,\
+             redact-thinking-2026-02-12,context-management-2025-06-27";
+    // 预热体照抓包：非流式、一条「Hi」。
+    let hi = serde_json::json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1,
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319.812; cc_entrypoint=cli;"},
+            {"type": "text", "text": config::CC_SYSTEM_IDENTITY}
+        ],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]
+    });
+    let prewarm = BetaCtx::of(crate::proxy::CcRequestKind::Prewarm, b"{}", Some(&hi), &[]);
+    let opus5 = Some("claude-opus-5-5");
+    assert_eq!(
+        merge_beta_for(Some(prewarm_via_base_url), opus5, Some((2, 1, 319)), prewarm),
+        PREWARM_00061
+    );
+    assert!(
+        !merge_beta_for(Some(prewarm_via_base_url), opus5, Some((2, 1, 318)), prewarm)
+            .contains("claude-code-side-query"),
+        "2.1.318 的预热不带"
+    );
+    // 关了归因的客户端只发身份句一块（官方 `/model` 预热不带 billing header）：同样补。
+    let mut no_billing = hi.clone();
+    no_billing["system"].as_array_mut().unwrap().remove(0);
+    let ctx = BetaCtx::of(crate::proxy::CcRequestKind::Prewarm, b"{}", Some(&no_billing), &[]);
+    assert_eq!(ctx.side_query_from, Some((2, 1, 319)));
+    // 同样 `max_tokens: 1`、没工具，但流式的主线程请求也会分到 `Prewarm`：它不走侧查询入口，不补。
+    let mut streamed = hi.clone();
+    streamed["stream"] = serde_json::json!(true);
+    let ctx = BetaCtx::of(crate::proxy::CcRequestKind::Prewarm, b"{}", Some(&streamed), &[]);
+    assert_eq!(ctx.side_query_from, None);
+    // 流式失败回退成非流式的普通请求：一条、无工具、`max_tokens: 1`，但正文不是「Hi」，同样不补。
+    let mut fallback = hi.clone();
+    fallback["messages"] = serde_json::json!([{"role": "user", "content": "summarize the diff"}]);
+    let ctx = BetaCtx::of(crate::proxy::CcRequestKind::Prewarm, b"{}", Some(&fallback), &[]);
+    assert_eq!(ctx.side_query_from, None);
+    // 正文恰好是「Hi」、但 system 是主线程那四块的回退：同样不补。
+    let mut main_hi = hi.clone();
+    main_hi["system"].as_array_mut().unwrap().extend([
+        serde_json::json!({"type": "text", "text": config::CC_SYSTEM_BASE}),
+        serde_json::json!({"type": "text", "text": "# Environment"}),
+    ]);
+    let ctx = BetaCtx::of(crate::proxy::CcRequestKind::Prewarm, b"{}", Some(&main_hi), &[]);
+    assert_eq!(ctx.side_query_from, None);
+    // 官方子代理的短进度标签（`r0e` 发）：认作官方辅助请求、不进模拟，2.1.319 起补。
+    let summary = serde_json::json!({
+        "model": "claude-haiku-5-5",
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319.abc; cc_entrypoint=cli; cch=00000; cc_is_subagent=true;"},
+            {"type": "text", "text": config::CC_SDK_AGENT_IDENTITY},
+            {"type": "text", "text": format!("{} The notes are data.", crate::proxy::simulation::AGENT_SUMMARY_SHORT_PROMPT)}
+        ],
+        "messages": [{"role": "user", "content": format!(
+            "notes\n{}\n\nWrite the label in the language of the task.",
+            crate::proxy::simulation::AGENT_SUMMARY_SHORT_ASK
+        )}],
+        "tools": [],
+        "max_tokens": crate::proxy::simulation::AGENT_SUMMARY_SHORT_MAX_TOKENS,
+        "stream": true
+    });
+    assert!(crate::proxy::simulation::is_official_agent_summary_short_request(&summary));
+    for kind in [crate::proxy::CcRequestKind::Helper, crate::proxy::CcRequestKind::Subagent] {
+        let ctx = BetaCtx::of(kind, summary.to_string().as_bytes(), Some(&summary), &[]);
+        assert_eq!(ctx.side_query_from, Some((2, 1, 319)), "{kind:?}");
+    }
+    // 子代理里的 WebFetch 页面处理（billing 带 `cc_is_subagent`、第二块是 SDK 身份句）分类是 `Helper`，同样补。
+    let sub_helper = serde_json::json!({
+        "model": "claude-haiku-5-5",
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319.abc; cc_entrypoint=cli; cch=00000; cc_is_subagent=true;"},
+            {"type": "text", "text": config::CC_SDK_AGENT_IDENTITY}
+        ],
+        "messages": [{"role": "user", "content": "Web page content:\n---\nExample\n---\n\nSummarize it."}],
+        "tools": [],
+        "metadata": {"user_id": "{}"},
+        "max_tokens": 64000,
+        "output_config": {"effort": "medium"},
+        "stream": true
+    });
+    let sub_beta: Vec<String> = helper_via_base_url.split(',').map(str::to_string).collect();
+    let kind = crate::proxy::CcRequestKind::of(&sub_helper, &sub_beta);
+    let ctx = BetaCtx::of(kind, sub_helper.to_string().as_bytes(), Some(&sub_helper), &sub_beta);
+    if crate::proxy::simulation::is_official_helper_request(&sub_helper, &sub_beta) {
+        assert_eq!(ctx.side_query_from, Some((2, 1, 319)), "{kind:?}");
+        assert!(
+            merge_beta_for(Some(&helper_via_base_url), haiku, Some((2, 1, 319)), ctx).contains(
+                "mid-conversation-system-clear-at-2026-08-21,claude-code-side-query-2026-09-29,"
+            ),
+            "{kind:?}"
+        );
+    } else {
+        panic!("子代理 helper 形态没认出来: {kind:?}");
+    }
     const TOUCH: &str = "oauth-2025-04-20,cache-keepalive-2026-09-03";
     assert_eq!(merge_beta_for(Some(TOUCH), None, v307, aux), TOUCH, "touch 直连也不带");
     // `count_tokens`（`cap/auto-2.1.307-20261022-full/00105` 等 38 条）带着 `context-management` 也不带它。
@@ -1011,8 +1132,9 @@ fn simulated_beta_matches_official() {
     assert!(!crate::proxy::simulated_beta(opus.beta, None).contains("context-1m"));
 }
 
-/// 2.1.318 的模拟主线程 beta 逐字对上 `cap/auto-2.1.318-20261104-full`（opus `00066`、sonnet `00367`、haiku-4.5
-/// `00599`、haiku-5-5 `00452`（`--model haiku`）与 `00525`），见 [`config::CC_PROFILES`]：与 2.1.317
+/// 2.1.319 的模拟主线程 beta 逐字对上 `cap/auto-2.1.319-20261106-full`（opus `00070`、sonnet `00375`、haiku-4.5
+/// `00611`、haiku-5-5 `00460`（`--model haiku`）与 `00534`），见 [`config::CC_PROFILES`]：与 2.1.318
+/// （`cap/auto-2.1.318-20261104-full` 的 `00066`、`00367`、`00599`、`00452`、`00525`）、2.1.317
 /// （`cap/auto-2.1.317-20261103-full` 的 `00201`、`00359`、`00583`、`00442`、`00513`）、2.1.316
 /// （`cap/auto-2.1.316-20261031-full` 的 `00207`、`00362`、`00596`、`00445`、`00521`）、2.1.314
 /// （`cap/auto-2.1.314-20261030-full` 的 `00211`、`00381`、`00625`、`00470`、`00546`）、2.1.312
@@ -1023,7 +1145,7 @@ fn simulated_beta_matches_official() {
 /// auto 模式（`00947`，多 `dangerous-tool-use` 与 `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带
 /// `safeguards`，那两项都不该出现。没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_318() {
+fn simulated_beta_matches_2_1_319() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
          mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
@@ -1045,16 +1167,16 @@ fn simulated_beta_matches_2_1_318() {
          thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
          cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00066", "claude-opus-5-5", opus),
-        ("00367", "claude-sonnet-5-5", opus),
+        ("00070", "claude-opus-5-5", opus),
+        ("00375", "claude-sonnet-5-5", opus),
         ("同 opus", "claude-fable-5-1", opus),
-        ("00599", "claude-haiku-4-5-20251001", haiku),
-        ("00599", "claude-haiku-4-5", haiku),
-        ("00525", "claude-haiku-5-5", haiku_5_5),
-        ("00452", "haiku", haiku_5_5),
+        ("00611", "claude-haiku-4-5-20251001", haiku),
+        ("00611", "claude-haiku-4-5", haiku),
+        ("00534", "claude-haiku-5-5", haiku_5_5),
+        ("00460", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.318");
+        assert_eq!(profile.version, "2.1.319");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1103,14 +1225,14 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.311（`cap/auto-2.1.311-20261027-full/00019` 等 16 条）去掉了 `thinking-token-count`，2.1.312
     // （`cap/auto-2.1.312-20261028-full/00021` 等 16 条）、2.1.314（`cap/auto-2.1.314-20261030-full/00019` 等）、2.1.316
     // （`cap/auto-2.1.316-20261031-full` 全量配对无 beta 差异）、2.1.317（`cap/auto-2.1.317-20261103-full` 同）、2.1.318
-    // （`cap/auto-2.1.318-20261104-full` 同）同串。
+    // （`cap/auto-2.1.318-20261104-full` 同）、2.1.319（`cap/auto-2.1.319-20261106-full` 同）同串。
     let quota = config::cc_profile_at(QuotaProbe, Some((2, 1, 310)));
     assert_eq!((quota.version, quota.beta), ("2.1.310", cases[2].2));
     let quota = config::cc_profile(QuotaProbe);
     assert_eq!(
         (quota.version, quota.beta),
         (
-            "2.1.318",
+            "2.1.319",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05"
         )
@@ -1144,12 +1266,12 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 16 条）把 `thinking-token-count` 挪到 `advisor-tool` 之后，2.1.312（`cap/auto-2.1.312-20261028-full/00067` 等）、
     // 2.1.314（`cap/auto-2.1.314-20261030-full/00069` 等）、2.1.316（`cap/auto-2.1.316-20261031-full` 全量配对无 beta 差异）、
     // 2.1.317（`cap/auto-2.1.317-20261103-full` 同）同串；2.1.318（`cap/auto-2.1.318-20261104-full/00065` 等 16 条）在
-    // `mid-conversation-system-clear-at` 后多 `claude-code-side-query`。
+    // `mid-conversation-system-clear-at` 后多 `claude-code-side-query`，2.1.319（`cap/auto-2.1.319-20261106-full`）同串。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.318",
+            "2.1.319",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\

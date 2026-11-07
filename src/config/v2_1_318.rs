@@ -1,9 +1,9 @@
-//! 2.1.318 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.318 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.318 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.318 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.318 的 profile 表：2.1.318 来访的 beta 参照（[`cc_profile_at`]）。2.1.319 的表（[`CC_PROFILES`]）除 helper 那行外
+/// 各行除版本号外与这张相同。
 ///
 /// **除标题生成那行外，各行除版本号外与 2.1.317（[`CC_PROFILES_2_1_317`]）完全相同**。标题生成（`generate_session_title`）
 /// 2.1.318 起在官方地址、OAuth 登录时多带 `claude-code-side-query-2026-09-29`，紧跟 `mid-conversation-system-clear-at`
@@ -12,7 +12,7 @@ use super::*;
 /// 新增的 `tool-provenance-2026-10-26` 只在官方地址、OAuth 登录、服务端 `tengu_snappy_noodle` 开着时带（只给 `mcp__`
 /// 工具挂 `ownership_metadata`），`cap/auto-2.1.318-20261104-full` 的 eval 下发它为 `false`，全量里一条都没有。
 /// 依据 `cap/auto-2.1.318-20261104-full`（场景同 2.1.317-full，测试项目换了干净的 `scratchpad/cal9`）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_318: &[CcProfile] = &[
     at_318(CC_PROFILES_2_1_317[0]),
     at_318(CC_PROFILES_2_1_317[1]),
     at_318(CC_PROFILES_2_1_317[2]),

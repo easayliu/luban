@@ -322,29 +322,31 @@ fn prewarm_probe_matches_the_capture() {
     use crate::proxy::body::{CcClient, apply_cch};
     use crate::proxy::session_link::CcRequestKind;
 
-    // `cap/auto-2.1.318-20261104-model/00064` 原文（与 2.1.317 的 `00064` 只差版本、cch 与会话）。cch 算法在这个形态上同样成立：四条体只差模型名，cch 却都是同一个值，
-    // 一并钉住（`00068` / `00073` / `00080` 等同为 `2f9da`）。
+    // `cap/auto-2.1.319-20261106-model/00061` 原文（与 2.1.318 的 `00064` 只差版本、cch 与会话）。cch 算法在这个形态上同样成立：四条体只差模型名，cch 却都是同一个值，
+    // 一并钉住（`00065` / `00070` / `00077` 等同为 `19025`）。
     const CAPTURED: &str = concat!(
         r#"{"model":"claude-opus-5-5","max_tokens":1,"system":[{"type":"text","text":"#,
-        r#""x-anthropic-billing-header: cc_version=2.1.318.da9; cc_entrypoint=cli; cch=2f9da;"},"#,
+        r#""x-anthropic-billing-header: cc_version=2.1.319.812; cc_entrypoint=cli; cch=19025;"},"#,
         r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
         r#""messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}],"#,
         r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\","#,
-        r#"\"account_uuid\":\"7766686b-9614-4e43-a874-0e1c11b9f180\",\"session_id\":\"54705200-93b8-4044-b6bb-2c05b1ccf62c\"}"}}"#,
+        r#"\"account_uuid\":\"7766686b-9614-4e43-a874-0e1c11b9f180\",\"session_id\":\"2b66c424-f919-44f3-b9a7-c4df985d33c2\"}"}}"#,
     );
     for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5"] {
         let captured = CAPTURED.replace("claude-opus-5-5", model);
         assert_eq!(
             apply_cch(&mut captured.clone().into_bytes()).as_deref(),
-            Some("2f9da"),
+            Some("19025"),
             "{model}"
         );
     }
 
     let cred = test_cred();
+    // 2.1.319 起末尾多 `claude-code-side-query`（`cap/auto-2.1.319-20261106-model/00061` 等五条，haiku 那条同样少
+    // `claude-code`）。
     let official = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
                     redact-thinking-2026-02-12,context-management-2025-06-27,\
-                    prompt-caching-scope-2026-01-05";
+                    prompt-caching-scope-2026-01-05,claude-code-side-query-2026-09-29";
     for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-5-5"] {
         let sim = crate::proxy::probe_simulation(&cred, model);
         let sid = sim.session_id.clone();
@@ -399,7 +401,7 @@ fn prewarm_probe_matches_the_capture() {
         // 抓包那条换上本凭证的身份与这份体自己的 cch，其余逐字节相同。
         let want = CAPTURED
             .replace("claude-opus-5-5", model)
-            .replace("cch=2f9da", &format!("cch={cch}"))
+            .replace("cch=19025", &format!("cch={cch}"))
             .replace(
                 &CAPTURED[CAPTURED.find(r#""metadata""#).unwrap()..],
                 &format!(r#""metadata":{{"user_id":{}}}}}"#, serde_json::json!(user_id)),

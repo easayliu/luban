@@ -611,6 +611,7 @@ pub(super) fn simulation_reason(
     if !(prewarm
         || is_official_helper_request(v, &inbound_beta_list(headers))
         || is_official_title_request(v, &inbound_beta_list(headers))
+        || is_official_side_query_request(v)
         || has_cc_base_prompt(v))
     {
         return Some(SimulationReason::NoBasePrompt);
@@ -1404,6 +1405,172 @@ const TITLE_PROMPT_MIN_LEN: usize = 300;
 /// 它与 Helper 是两种请求：Helper 是子代理（SDK 身份句、两块），标题生成是主线程身份（CC
 /// 身份句、带长提示词）。两条都在第三条判据的豁免里，见 [`probe_signature`](crate::proxy::probe_signature) 里标题生成为什么
 /// 必须豁免。
+/// 官方子代理**短进度标签**（2.1.303 起 short 模式的 `agent_summary`，官方 `ap` 经 `r0e` 发）的完整样子：system 恰好三块
+/// ——billing header、身份句（主线程那句或 SDK 那句）、以 [`AGENT_SUMMARY_SHORT_PROMPT`] 开头的那段提示词——没有工具、
+/// `max_tokens` 是官方写死的 [`AGENT_SUMMARY_SHORT_MAX_TOKENS`]、只有一条用户消息且里面是官方拼的那两段固定文字
+/// （[`AGENT_SUMMARY_SHORT_ASK`] 与「Write the label in …」）。流式与否都认：官方流式失败会回退成非流式重发。现有抓包没有
+/// 这一支，按官方代码认；一次性会话探针那头另外要求来源是可信客户端（[`crate::proxy::probe_signature`]）。
+pub(crate) fn is_official_agent_summary_short_request(v: &serde_json::Value) -> bool {
+    // 先看 system、工具、`max_tokens` 这几样小字段，最后才在借来的正文里找那两段固定文字（不拷贝正文）。billing header 可有
+    // 可无（关了归因的客户端不发它）。
+    let cheap = side_query_prompt_blocks(v)
+        .is_some_and(|p| p.len() == 1 && p[0].starts_with(AGENT_SUMMARY_SHORT_PROMPT))
+        && field_is_empty(v.get("tools"))
+        && request_max_tokens(Some(v)) == Some(AGENT_SUMMARY_SHORT_MAX_TOKENS);
+    if !cheap {
+        return false;
+    }
+    let Some([message]) = v.get("messages").and_then(|m| m.as_array()).map(Vec::as_slice) else {
+        return false;
+    };
+    if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let has = |needle: &str| match message.get("content") {
+        Some(serde_json::Value::String(s)) => s.contains(needle),
+        Some(serde_json::Value::Array(b)) => b
+            .iter()
+            .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.contains(needle)),
+        _ => false,
+    };
+    has(AGENT_SUMMARY_SHORT_ASK) && has("Write the label in ")
+}
+
+/// 2.1.319 走侧查询入口（`mNr` / `r0e`，没显式给就按 `g4()` 带 `claude-code-side-query`）的那几条无工具官方请求，luban 认得的
+/// 全集：会话标题与 kebab 命名、WebFetch 页面处理另有识别；这里是短进度标签（[`is_official_agent_summary_short_request`]）与
+/// 下面三条——工具完成摘要（`tool_use_summary_generation`）、MCP 自然语言日期解析（`mcp_datetime_parse`）、反馈标题
+/// （`feedback`）。三条的样子按官方代码认（现有抓包都没有）：system 首块 billing header（关了归因的客户端没有）、接着身份句、
+/// 之后是官方那组提示词用空行拼成的一块、与官方全文逐字相同——只抄开头一句、抽几段、打乱或夹带别的话都不算——没有工具，只有一条用户消息且里面有官方拼的那段固定文字（反馈标题的
+/// 用户消息是用户自己写的，只认 system）。先看小字段，最后才在借来的正文里找。
+pub(crate) fn is_official_side_query_request(v: &serde_json::Value) -> bool {
+    if is_official_agent_summary_short_request(v) {
+        return true;
+    }
+    let Some(prompt) = side_query_prompt_blocks(v) else { return false };
+    if !field_is_empty(v.get("tools")) {
+        return false;
+    }
+    // 官方把身份句之后那组提示词用空行拼成**一块**（2.1.319 `Lys`：`h.join("\n\n")`）：只认恰好一块、且与官方全文逐字
+    // 相同——抄一句开头、抽几段、打乱顺序、段间或末尾夹带别的话都不算。就地逐段比，不拷贝正文。
+    let [text] = prompt.as_slice() else { return false };
+    let Some(sq) = SIDE_QUERY_PROMPTS.iter().find(|sq| is_joined(text, sq.lines, "\n\n")) else {
+        return false;
+    };
+    let Some([message]) = v.get("messages").and_then(|m| m.as_array()).map(Vec::as_slice) else {
+        return false;
+    };
+    if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let Some(marker) = sq.ask else { return true };
+    match message.get("content") {
+        Some(serde_json::Value::String(s)) => s.contains(marker),
+        Some(serde_json::Value::Array(b)) => b
+            .iter()
+            .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+            .any(|t| t.contains(marker)),
+        _ => false,
+    }
+}
+
+/// `text` 是否恰好是 `parts` 用 `sep` 拼起来的那串（逐段借用比对，不拼接）。
+fn is_joined(text: &str, parts: &[&str], sep: &str) -> bool {
+    let mut rest = text;
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let Some(r) = rest.strip_prefix(sep) else { return false };
+            rest = r;
+        }
+        let Some(r) = rest.strip_prefix(part) else { return false };
+        rest = r;
+    }
+    rest.is_empty()
+}
+
+/// 侧查询的 system 里身份句之后那几块正文：首块 billing header 可有可无（关了归因的客户端不发它），接着必须是身份句（主线程
+/// 那句或 SDK 那句），之后至少一块。
+fn side_query_prompt_blocks(v: &serde_json::Value) -> Option<Vec<&str>> {
+    let blocks = v.get("system")?.as_array()?;
+    let texts: Vec<&str> =
+        blocks.iter().map(|b| b.get("text").and_then(|t| t.as_str()).unwrap_or_default()).collect();
+    // billing 块得整块就是一条官方 header（[`is_official_billing_block`]）：夹带了别的文字的不当 billing，落到下面身份句那关
+    // 自然不认。
+    let rest = match texts.as_slice() {
+        [billing, rest @ ..] if is_official_billing_block(billing) => rest,
+        all => all,
+    };
+    match rest {
+        [identity, prompt @ ..]
+            if !prompt.is_empty()
+                && (*identity == config::CC_SYSTEM_IDENTITY
+                    || *identity == config::CC_SDK_AGENT_IDENTITY) =>
+        {
+            Some(prompt.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// [`is_official_side_query_request`] 那三条：官方那组提示词（逐条照 2.1.319 原文，按官方顺序空行拼成一块；工具完成摘要官方本就是一整串）与用户消息里必须有的那段官方
+/// 文字（反馈标题的用户消息是用户自己写的，没有）。
+struct SideQueryPrompt {
+    lines: &'static [&'static str],
+    ask: Option<&'static str>,
+}
+
+const SIDE_QUERY_PROMPTS: &[SideQueryPrompt] = &[
+    // 工具完成摘要（2.1.319 `tm`）。
+    SideQueryPrompt {
+        lines: &[
+            "Write a short summary label describing what these tool calls accomplished. It appears as a single-line row in a mobile app and truncates around 30 characters, so think git-commit-subject, not sentence.\n\nKeep the verb in past tense and the most distinctive noun. Drop articles, connectors, and long location context first.\n\nExamples:\n- Searched in auth/\n- Fixed NPE in UserService\n- Created signup endpoint\n- Read config.json\n- Ran failing tests",
+        ],
+        ask: Some("Tools completed:"),
+    },
+    // MCP 自然语言日期解析（2.1.319 `_mt`）。
+    SideQueryPrompt {
+        lines: &[
+            "You are a date/time parser that converts natural language into ISO 8601 format.",
+            "You MUST respond with ONLY the ISO 8601 formatted string, with no explanation or additional text.",
+            "If the input is ambiguous, prefer future dates over past dates.",
+            "For times without dates, use today's date.",
+            "For dates without times, do not include a time component.",
+            "If the input is incomplete or you cannot confidently parse it into a valid date, respond with exactly \"INVALID\" (nothing else).",
+            "Examples of INVALID input: partial dates like \"2025-01-\", lone numbers like \"13\", gibberish.",
+            "Examples of valid natural language: \"tomorrow\", \"next Monday\", \"jan 1st 2025\", \"in 2 hours\", \"yesterday\".",
+        ],
+        ask: Some("Parse the user's input into ISO 8601 format. Return ONLY the formatted string"),
+    },
+    // 反馈的 GitHub issue 标题（2.1.319 `xt`）。
+    SideQueryPrompt {
+        lines: &[
+            "Generate a concise, technical issue title (max 80 chars) for a public GitHub issue based on this bug report for Claude Code.",
+            "Claude Code is an agentic coding CLI based on the Anthropic API.",
+            "The title should:",
+            "- Include the type of issue [Bug] or [Feature Request] as the first thing in the title",
+            "- Be concise, specific and descriptive of the actual problem",
+            "- Use technical terminology appropriate for a software issue",
+            "- For error messages, extract the key error (e.g., \"Missing Tool Result Block\" rather than the full message)",
+            "- Be direct and clear for developers to understand the problem",
+            "- If you cannot determine a clear issue, use \"Bug Report: [brief description]\"",
+            "- Any LLM API errors are from the Anthropic API, not from any other model provider",
+            "Your response will be directly used as the title of the Github issue, and as such should not contain any other commentary or explaination",
+            "Examples of good titles include: \"[Bug] Auto-Compact triggers to soon\", \"[Bug] Anthropic API Error: Missing Tool Result Block\", \"[Bug] Error: Invalid Model Name for Opus\"",
+        ],
+        ask: None,
+    },
+];
+
+/// 短进度标签那段提示词的开头（2.1.319 `Zu`）。
+pub(crate) const AGENT_SUMMARY_SHORT_PROMPT: &str = "You write a 3-5 word progress label for a background agent, from short notes about what it is doing.";
+
+/// 短进度标签的 `max_tokens`（2.1.319 `maxOutputTokensOverride: np`，`np = 2108`）。
+pub(crate) const AGENT_SUMMARY_SHORT_MAX_TOKENS: i64 = 2108;
+
+/// 短进度标签用户消息里官方拼的那句要求（2.1.319 `aa(s, true)`）。
+pub(crate) const AGENT_SUMMARY_SHORT_ASK: &str =
+    "Describe the agent's most recent action in 3-5 words using present tense (-ing).";
+
 pub(super) fn is_official_title_request(v: &serde_json::Value, beta: &[String]) -> bool {
     let Some(blocks) = v.get("system").and_then(|s| s.as_array()) else { return false };
     if blocks.len() != 3 {
@@ -1804,6 +1971,61 @@ fn strip_cc_preamble(mut blocks: Vec<serde_json::Value>) -> Vec<serde_json::Valu
 }
 
 const BILLING_KEY: &str = "x-anthropic-billing-header:";
+
+/// 官方 billing header 可能带的字段，按官方拼接顺序（2.1.319 拼 header 的那段：`cc_version`、`cc_entrypoint` 打头，其余按需
+/// 追加，每个至多一次；`cap/` 下 4086 种不同 header 无一例外）。
+const BILLING_FIELDS: &[&str] = &[
+    "cc_version",
+    "cc_entrypoint",
+    "cch",
+    "cc_workload",
+    "cc_is_subagent",
+    "cc_prev_req",
+    "cc_prompt_id",
+    "cc_turn_origin",
+    "cc_prompt_index",
+    "cc_turn_index",
+    "cc_gateway",
+    "cc_project",
+    "cc_project_src",
+    "cc_prev_msg",
+    "cc_prev_prompt_index",
+    "cc_prev_turn_index",
+];
+
+/// 整块文字恰好是一条官方 billing header：`x-anthropic-billing-header:` 后面只有一串 ` 名=值;`，头两项是 `cc_version`、
+/// `cc_entrypoint`，其余名字按 [`BILLING_FIELDS`] 的顺序往后走、每个至多一次，值非空且只由字母数字与 `._-:` 组成（版本、
+/// `cli`、`req_…`、`msg_…`、序号这些）。不容任何附加文字——换行、句子、不认识或重复的字段、乱序都不算，免得借 billing 块
+/// 夹带东西拿豁免。
+pub(crate) fn is_official_billing_block(text: &str) -> bool {
+    let Some(mut rest) = text.strip_prefix(BILLING_KEY) else { return false };
+    let mut i = 0;
+    // 下一个字段只能从 BILLING_FIELDS 的这个下标往后找。
+    let mut next = 0;
+    while !rest.is_empty() {
+        let Some(r) = rest.strip_prefix(' ') else { return false };
+        let Some((field, r)) = r.split_once(';') else { return false };
+        let Some((k, v)) = field.split_once('=') else { return false };
+        let Some(at) = BILLING_FIELDS[next..].iter().position(|f| *f == k).map(|p| p + next) else {
+            return false;
+        };
+        // 头两项必须恰好是 cc_version、cc_entrypoint。
+        if i < 2 && at != i {
+            return false;
+        }
+        next = at + 1;
+        if v.is_empty()
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+        {
+            return false;
+        }
+        rest = r;
+        i += 1;
+    }
+    i >= 2
+}
 
 /// 这一行是不是一条抄来的 billing header：行首（只容许 BOM，不容许缩进）就是
 /// `x-anthropic-billing-header:`，且带 `cc_version` 字段（按 `;` 拆字段、按第一个 `=` 拆名与值，

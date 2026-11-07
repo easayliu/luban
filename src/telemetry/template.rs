@@ -473,6 +473,8 @@ pub(super) struct Subst<'a> {
     /// ——官方 API-key 端（全量声明、无 ToolSearch）正是这个形态（`cap/2.1.258-api/00002`、
     /// `00022`），而订阅端延迟形态两者都有（`cap/2.1.258/00020`、`00032`）。
     pub(super) deferred: bool,
+    /// 这一轮新加的 MCP 断开提醒里列的工具数（[`super::shape::RequestShape::mcp_disconnected`]）。
+    pub(super) mcp_disconnected: usize,
     /// `tengu_tool_search_mode_decision` 的 meta，见 [`tool_search_decision`]。模板里那两条
     /// 的 meta 只是占位，一律以这份覆盖。
     pub(super) tool_search: Value,
@@ -966,6 +968,7 @@ where
             let mut meta = substitute(&e.meta, subst);
             if e.name == "tengu_deferred_tools_pool_change" {
                 deferred_pool_v317(&mut meta, subst.version);
+                deferred_pool_disconnected(&mut meta, subst.version, subst.mcp_disconnected);
             }
             if e.name == "tengu_version_lock_failed" {
                 version_lock_v318(&mut meta, subst.version);
@@ -1068,6 +1071,16 @@ where
                     "haiku_match",
                     vec![("context_window_match", json!(true)), ("max_output_match", json!(true))],
                 );
+            }
+            // 服务端 11-06 前后把下发目录里选择器的顺序改成与内置的一样（opus、fable、sonnet、haiku）：主循环那份与内置
+            // 那份一致了，`picker_match` 变 true、`picker_new` 跟着换序，`picker_base_old` / `picker_main_new` 与两个计数整组
+            // 不再报（官方 `...!r.match&&{…}`）。代码两版没变，同一天 2.1.318 照样如此（`cap/auto-2.1.319-20261106-full` 24 条、
+            // `cap/auto-2.1.319-20261106-confirm/2.1.318` 两条；`cap/auto-2.1.318-20261104-full` 还是旧序），模板是旧序时拍的，
+            // 各版一并改，见 [`catalog_picker_served_order`]。
+            if e.name == "tengu_model_catalog_compare" {
+                catalog_picker_served_order(&mut meta);
+                catalog_picker_with_current_model(&mut meta);
+                catalog_served_state(&mut meta, subst.tool_family == ToolFamily::HaikuLong);
             }
             // 2.1.310 起组织配置闸的影子判定在 `settings_cache_age_ms` 后多五项（`cap/auto-2.1.310-20261024-full`
             // 全部 25 条都带）：两份签名副本恒 `trusted`；现拉的签名在那一侧还没答复（`unavailable_pending`）时报
@@ -1331,8 +1344,94 @@ pub(super) fn deferred_pool_v317(meta: &mut Value, version: &str) {
     }
 }
 
+/// 2.1.319：这一轮 MCP 服务器断开、延迟工具池里走掉了 `n` 个，`removedCount` 记上，并在它后面报按原因分的
+/// `departed_disconnected`（`cap/auto-2.1.319-20261106-confirm/2.1.319` 批次 `00165`：2、2）。
+pub(super) fn deferred_pool_disconnected(meta: &mut Value, version: &str, n: usize) {
+    if n == 0 || !version_at_least(version, "2.1.319") {
+        return;
+    }
+    meta["removedCount"] = json!(n);
+    super::kind::insert_after(meta, "removedCount", vec![("departed_disconnected", json!(n))]);
+}
+
 /// 2.1.318 起 PID 锁那支的 `tengu_version_lock_failed` 末尾多 `per_pid_lock_written`：这个进程自己的那份 PID 锁文件写没写成
 /// （`cap/auto-2.1.318-20261104-full` 23 条都是 `{is_pid_based: true, is_lifetime_lock: true, per_pid_lock_written: true}`）。
+/// 模型目录那条的几项状态：
+/// - `served_has_runtime`：服务端下发的目录里有没有运行时那段。luban 不拉目录，按现行下发记 true（`cap/auto-2.1.305-20261021-full`、
+///   `2.1.316`、`2.1.319` 三份全量 23 条都是）；
+/// - `selection_source`：这个会话的模型从哪来——设置里选了模型是 `user_setting`，否则 `global_default`。luban 模拟的客户端
+///   设置里恒有模型：别的事件报的 `model_setting` 就是它（[`model_setting`] 由请求模型名推出，恒非空），这里与之一致恒报
+///   `user_setting`。来访请求看不出用户是显式选的还是默认的，报 `global_default` 反倒与那些事件自相矛盾；
+/// - `served_has_default_effort`：下发目录里这个模型有没有默认 effort，haiku-4.5 没有（`00616` 是 false），其余有。
+///
+/// 2.1.305 交互式模板是在没选模型、下发还没有运行时那段的会话里拍的，三项都与之不符。
+///
+/// 不分版本：这三项看的是服务端**现在**下发的目录（`GET /api/organizations/<org>/model_selector/cc`），判定代码 2.1.300 与
+/// 2.1.319 一样（`kIr` / `Uwo`：目录里有一行带 `runtime`）。2.1.291~2.1.300 的全量抓包（截至 10-15）是 false、2.1.301（10-16）
+/// 起是 true，是服务端那两天开始下发 runtime；11-07 用 2.1.300 挪开本机缓存现拉（`cap/auto-2.1.300-20261107-catalog/00183`，
+/// `cache_age_s: 0`）同样报 true / `user_setting` / true，拉到的目录与 2.1.319 那份逐字相同。旧模板里的 false 是拍时的服务端状态，
+/// 2.1.299 那份的 `global_default` 是抓包那次设置里没选模型，都不该照搬。
+pub(super) fn catalog_served_state(meta: &mut Value, haiku_long: bool) {
+    let Some(o) = meta.as_object_mut() else { return };
+    for (k, v) in [
+        ("served_has_runtime", json!(true)),
+        ("selection_source", json!("user_setting")),
+        ("served_has_default_effort", json!(!haiku_long)),
+    ] {
+        if let Some(slot) = o.get_mut(k) {
+            *slot = v;
+        }
+    }
+}
+
+/// 当前主循环模型不在内置选择器（`picker_old`）里时，官方把它接在末尾、计数加一（haiku-4.5 主模型的会话：
+/// `cap/auto-2.1.319-20261106-full/00616`、`cap/auto-2.1.318-20261104-full/00604`、`cap/auto-2.1.316-20261031-full/00601`
+/// 都是 `…,claude-haiku-5-5,claude-haiku-4-5`、5 项；opus / sonnet / haiku-5-5 / fable 本就在里头，照旧 4 项）。
+pub(super) fn catalog_picker_with_current_model(meta: &mut Value) {
+    let Some(o) = meta.as_object_mut() else { return };
+    let Some(model) = o.get("main_loop_model").and_then(|m| m.as_str()).map(str::to_string) else {
+        return;
+    };
+    let Some(old) = o.get("picker_old").and_then(|v| v.as_str()).map(str::to_string) else {
+        return;
+    };
+    if model.is_empty() || old.split(',').any(|m| m == model) {
+        return;
+    }
+    o.insert("picker_old".into(), json!(format!("{old},{model}")));
+    if let Some(n) = o.get("picker_old_count").and_then(|n| n.as_u64()) {
+        o.insert("picker_old_count".into(), json!(n + 1));
+    }
+}
+
+/// `tengu_model_catalog_compare` 换成服务端现行的选择器顺序（与内置那份一致）：`picker_new` 里内置那份（`picker_old`）有的
+/// 按它的先后排在前头、其余照旧，`picker_match` 置 true，`picker_base_old` / `picker_main_new` 及两个计数去掉。已经是新样子
+/// （没有 `picker_base_old`）的不动。
+pub(super) fn catalog_picker_served_order(meta: &mut Value) {
+    let Some(o) = meta.as_object_mut() else { return };
+    if o.shift_remove("picker_base_old").is_none() {
+        return;
+    }
+    for k in ["picker_main_new", "picker_base_old_count", "picker_main_new_count"] {
+        o.shift_remove(k);
+    }
+    if let Some(m) = o.get_mut("picker_match") {
+        *m = json!(true);
+    }
+    let old: Vec<String> = o
+        .get("picker_old")
+        .and_then(|v| v.as_str())
+        .map(|s| s.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    if let Some(new) = o.get("picker_new").and_then(|v| v.as_str()) {
+        let new: Vec<&str> = new.split(',').collect();
+        let head = old.iter().filter(|m| new.contains(&m.as_str())).map(String::as_str);
+        let tail = new.iter().copied().filter(|m| !old.iter().any(|o| o == m));
+        let joined = head.chain(tail).collect::<Vec<_>>().join(",");
+        o.insert("picker_new".into(), json!(joined));
+    }
+}
+
 /// 模板里只有 PID 锁、常驻那一支，非 PID 锁那几支官方也不报这项。
 pub(super) fn version_lock_v318(meta: &mut Value, version: &str) {
     let pid_lifetime = meta.get("is_pid_based") == Some(&json!(true))
@@ -1342,5 +1441,66 @@ pub(super) fn version_lock_v318(meta: &mut Value, version: &str) {
         && let Some(o) = meta.as_object_mut()
     {
         o.entry("per_pid_lock_written").or_insert(json!(true));
+    }
+}
+
+#[cfg(test)]
+mod catalog_picker_tests {
+    use super::*;
+
+    /// `cap/auto-2.1.319-20261106-full` opus 那条：选择器换成服务端现行顺序，`picker_base_old` 那组不报。
+    #[test]
+    fn follows_the_served_picker_order() {
+        let mut meta = json!({
+            "picker_match": false,
+            "picker_set_match": true,
+            "picker_old": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5",
+            "picker_new": "claude-opus-5-5,claude-sonnet-5-5,claude-fable-5-1,claude-haiku-5-5,claude-haiku-4-5-20251001,claude-sonnet-5",
+            "picker_old_count": 4,
+            "picker_new_count": 6,
+            "picker_base_old": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5",
+            "picker_main_new": "claude-opus-5-5,claude-sonnet-5-5,claude-fable-5-1,claude-haiku-5-5",
+            "picker_base_old_count": 4,
+            "picker_main_new_count": 4
+        });
+        catalog_picker_served_order(&mut meta);
+        assert_eq!(
+            meta,
+            json!({
+                "picker_match": true,
+                "picker_set_match": true,
+                "picker_old": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5",
+                "picker_new": "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5,claude-haiku-4-5-20251001,claude-sonnet-5",
+                "picker_old_count": 4,
+                "picker_new_count": 6
+            })
+        );
+        let again = meta.clone();
+        catalog_picker_served_order(&mut meta);
+        assert_eq!(meta, again, "已是新样子的不动");
+        // 当前模型不在内置选择器里（haiku-4.5）：接在末尾、计数加一；在里头的不动。
+        meta["main_loop_model"] = json!("claude-haiku-4-5");
+        catalog_picker_with_current_model(&mut meta);
+        assert_eq!(
+            (&meta["picker_old"], &meta["picker_old_count"]),
+            (
+                &json!(
+                    "claude-opus-5-5,claude-fable-5-1,claude-sonnet-5-5,claude-haiku-5-5,claude-haiku-4-5"
+                ),
+                &json!(5)
+            )
+        );
+        meta["main_loop_model"] = json!("claude-opus-5-5");
+        let before = meta.clone();
+        catalog_picker_with_current_model(&mut meta);
+        assert_eq!(meta, before);
+        let mut state = json!({"served_has_runtime": false, "selection_source": "global_default", "served_has_default_effort": false});
+        catalog_served_state(&mut state, false);
+        assert_eq!(
+            state,
+            json!({"served_has_runtime": true, "selection_source": "user_setting", "served_has_default_effort": true})
+        );
+        catalog_served_state(&mut state, true);
+        assert_eq!(state["served_has_default_effort"], json!(false), "haiku-4.5 没有默认 effort");
     }
 }

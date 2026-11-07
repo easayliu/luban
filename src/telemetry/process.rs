@@ -489,6 +489,9 @@ impl Telemetry {
         let v317 = version_at_least(&version, "2.1.317");
         // 2.1.318：错误栈换块、5xx 不再带构造名，`/compact` 那条去掉 `summaryPromptArm`，见 [`TurnFacts::v318`]。
         let v318 = version_at_least(&version, "2.1.318");
+        // 2.1.319：错误栈换块，`tool_use_success` 多 `tool_input_stream_ms`、`tether_decision` 多 `toolsHashKept`，见
+        // [`TurnFacts::v319`]。
+        let v319 = version_at_least(&version, "2.1.319");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -529,6 +532,20 @@ impl Telemetry {
             Vec::new()
         };
         let tools_used_truncation = call.chain_tools_used_truncation();
+        // 2.1.319：拼出的头里带了连接器字段 / MCP 标记，头一回各报一次（连接器字段按会话、MCP 标记按进程）。
+        let sizes = call.chain_tools_used_sizes();
+        let connector_fields = v319 && sizes.iter().any(|s| s.connector_fields);
+        let mcp_mark = v319 && sizes.iter().any(|s| s.mcp_mark);
+        let tools_used_connector_fields_first =
+            connector_fields && !sess.tools_used_connector_fields_reported;
+        sess.tools_used_connector_fields_reported |= connector_fields;
+        let tools_used_mcp_mark_first = mcp_mark && !sess.tools_used_mcp_mark_reported;
+        let batching_reminder_first =
+            shape.send_time_nudge && !sess.batching_reminder_models.contains(&shape.model);
+        if batching_reminder_first {
+            sess.batching_reminder_models.push(shape.model.clone());
+        }
+        sess.tools_used_mcp_mark_reported |= mcp_mark;
         if first_prompt_tpl {
             sess.first_prompt_tpl_done = true;
         }
@@ -687,8 +704,9 @@ impl Telemetry {
         } else {
             !call.bare
         };
-        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent) && threads)
-            .then(|| sess.tether_for(&call, &shape, &display_model, is_main, &agent_key));
+        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent) && threads).then(|| {
+            sess.tether_for(&call, &shape, &display_model, is_main, &agent_key, post_compaction)
+        });
         // 这条线程的全量形态记下来，给下一条增量请求补（见 [`ThreadBase`]）。
         // 只记全量视角：不是增量（`create` 或没开线程），或增量已经按底本补全了。没补上的增量（底本
         // 丢了）不能拿来当底本。此前用「工具数 > 0」近似「是全量」，无工具的主线程对话（模拟路径不补
@@ -867,8 +885,12 @@ impl Telemetry {
             v316,
             v317,
             v318,
+            v319,
             bash_metered,
             tools_used_header_first,
+            tools_used_connector_fields_first,
+            tools_used_mcp_mark_first,
+            batching_reminder_first,
             tools_used_size_events,
             tools_used_truncation,
             safety_events,
@@ -1143,6 +1165,7 @@ impl Session {
             for tu in shape.tool_uses.iter_mut() {
                 if let Some(c) = calls.iter().find(|c| c.id == tu.id) {
                     tu.apply_call(&c.name, &c.input, c.verdict.as_ref());
+                    tu.input_stream_ms = c.input_stream_ms;
                 }
             }
         }
@@ -1651,22 +1674,63 @@ impl Session {
         display_model: &str,
         is_main: bool,
         agent_key: &str,
+        post_compaction: bool,
     ) -> Tether {
+        // tether 比 beta 时不算逐请求变的那两项（auto 模式的 `afk-mode`、`dangerous-tool-use`）：压缩前那条带、压缩后那条
+        // 不带，官方照样报 `changedBetas: false`（`cap/auto-2.1.319-20261106-full/00209` → `00214`）。官方比之前还排过序，
+        // 同一组换了先后不算变；只用于比较，出站头照原样。
+        let betas = call
+            .betas
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .filter(|b| !b.starts_with("afk-mode-") && !b.starts_with("dangerous-tool-use-"))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        let cleared = if is_main && self.tether_main.is_none() {
+            self.cleared_tether_messages.take()
+        } else {
+            None
+        };
         let slot = if is_main {
             &mut self.tether_main
         } else {
             &mut self.agents.get_mut(agent_key).expect("agent state exists").tether
         };
-        let betas = call.betas.clone().unwrap_or_default();
-        let t = tether_decide(slot.as_ref(), shape, display_model, &betas, is_main);
+        let t = tether_decide(
+            slot.as_ref(),
+            cleared,
+            post_compaction,
+            shape,
+            display_model,
+            &betas,
+            is_main,
+        );
+        // 客户端视角的整段：完整体就是体里那些；线程续轮是上一条的、加服务端持有的那条回复（不知道内容）、加增量，
+        // 再对齐到补全后的条数。
+        let hashes: Vec<Option<u64>> = if shape.thread_type.as_deref() == Some("continue") {
+            let mut h = slot.as_ref().map(|p| p.hashes.clone()).unwrap_or_default();
+            h.push(None);
+            h.extend(shape.message_hashes.iter().copied().map(Some));
+            h.resize(shape.messages_len, None);
+            h
+        } else {
+            shape.message_hashes.iter().copied().map(Some).collect()
+        };
         *slot = Some(TetherThread {
             model: display_model.to_string(),
             betas,
             effort: shape.effort.clone(),
-            tools_hash: shape.tools_hash.clone(),
+            tools_content: shape.tools_content_hash.clone(),
             thinking_type: shape.thinking_type.clone(),
             messages: shape.messages_len,
             turns: t.turns,
+            hashes,
+            aborted: call.aborted,
         });
         t
     }

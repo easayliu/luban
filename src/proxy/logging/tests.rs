@@ -917,3 +917,49 @@ fn tool_loop_rounds_belong_to_one_attempt() {
     ));
     assert!(want > est("claude-opus-5", None, 1000, 100) + est("claude-opus-5", None, 1200, 200));
 }
+
+/// 2.1.319 `tool_input_stream_ms`：流式下 `tool_use` 块从 `content_block_start` 到 `content_block_stop` 的毫秒数，至少 1；
+/// 没等到 `content_block_stop` 的、非流式的都没有（遥测那头就不报）。
+#[test]
+fn times_tool_use_blocks_from_start_to_stop() {
+    let start = |i: u8, id: &str| {
+        format!(
+            "data: {{\"type\":\"content_block_start\",\"index\":{i},\"content_block\":{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"Bash\",\"input\":{{}}}}}}\n\n"
+        )
+    };
+    let mut s = crate::proxy::UsageSniffer::new(true, false);
+    s.feed(start(0, "t1").as_bytes());
+    s.feed(start(1, "t2").as_bytes());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    s.feed(b"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+    let calls = s.tool_calls();
+    assert!(calls[0].input_stream_ms.is_some_and(|ms| ms >= 5), "{:?}", calls[0].input_stream_ms);
+    assert_eq!(calls[1].input_stream_ms, None, "没等到 content_block_stop");
+
+    let mut s = crate::proxy::UsageSniffer::new(false, false);
+    s.feed(
+        br#"{"id":"msg_1","type":"message","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"stop_reason":"tool_use"}"#,
+    );
+    s.finish();
+    assert_eq!(s.tool_calls().first().and_then(|c| c.input_stream_ms), None, "非流式没有");
+}
+
+/// 取证摘要里的 `x-claude-code-sandy-plover` 只记重建后的（名字与 `mcp` 标记），来访那个账号的连接器地址与目录 id 不落库；
+/// 读不出来的只记字节数。
+#[test]
+fn forensics_keep_only_the_rebuilt_tools_used_header() {
+    use axum::http::{HeaderMap, HeaderValue};
+    let mut h = HeaderMap::new();
+    h.insert(
+        "x-claude-code-sandy-plover",
+        HeaderValue::from_static(
+            r#"[{"name":"mcp__a__b","mcp":true,"url":"https://secret.example/u/abc","directory_entry":"dir_123"}]"#,
+        ),
+    );
+    let s = crate::proxy::logging::inbound_headers_summary(&h).unwrap();
+    assert!(!s.contains("secret.example") && !s.contains("dir_123"), "{s}");
+    assert!(s.contains("mcp__a__b"), "{s}");
+    h.insert("x-claude-code-sandy-plover", HeaderValue::from_bytes(b"\xc3\xa9url").unwrap());
+    let s = crate::proxy::logging::inbound_headers_summary(&h).unwrap();
+    assert!(s.contains("<5 bytes>") && !s.contains("url"), "{s}");
+}

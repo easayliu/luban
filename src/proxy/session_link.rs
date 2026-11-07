@@ -1893,6 +1893,9 @@ impl CcRequestKind {
             Self::Classifier => {
                 system_contains(v, "You are a security monitor for autonomous AI coding agents")
             }
+            // 官方那几条侧查询（短进度标签、工具完成摘要、日期解析、反馈标题）显式关了缓存（`enablePromptCaching: false`），同样不补
+            // 断点；分到哪一类都认。
+            _ if super::simulation::is_official_side_query_request(v) => true,
             Self::Auxiliary | Self::Helper => {
                 super::simulation::is_official_web_search_request(v)
                     || (super::simulation::field_is_empty(v.get("tools"))

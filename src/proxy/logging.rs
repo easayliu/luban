@@ -906,7 +906,14 @@ pub(super) fn telemetry_capture(
             .headers
             .get(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER)
             .and_then(|v| v.to_str().ok())
-            .map(|v| crate::proxy::sandy_plover::header_size(v, upstream.tools_used_capped)),
+            .map(|v| {
+                let version = upstream
+                    .headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|u| u.to_str().ok())
+                    .and_then(crate::proxy::cc_cli_version);
+                crate::proxy::sandy_plover::header_size(v, upstream.tools_used_capped, version)
+            }),
         client_data_wait: upstream.client_data_wait,
     })
 }
@@ -961,6 +968,17 @@ pub(in crate::proxy) fn inbound_headers_summary(headers: &HeaderMap) -> Option<S
         .iter()
         .filter(|(k, _)| !SKIP.contains(&k.as_str()))
         .map(|(k, v)| {
+            // 用过的工具那个头可能带着来访那个账号的连接器地址与目录 id：只记重建后的（名字与 `mcp` 标记，
+            // [`crate::proxy::sandy_plover::strip_client_header`]），读不出来的只记字节数。
+            if k.as_str() == crate::proxy::sandy_plover::SANDY_PLOVER_HEADER {
+                let rebuilt = v
+                    .to_str()
+                    .ok()
+                    .and_then(|s| crate::proxy::sandy_plover::strip_client_header(s, None).0)
+                    .and_then(|h| h.to_str().ok().map(str::to_string));
+                let v = rebuilt.unwrap_or_else(|| format!("<{} bytes>", v.len()));
+                return (k.as_str().to_string(), v.chars().take(600).collect::<String>());
+            }
             let v = String::from_utf8_lossy(v.as_bytes());
             (k.as_str().to_string(), v.chars().take(600).collect::<String>())
         })
@@ -1458,6 +1476,11 @@ struct ToolUseBlock {
     /// 见过 `input_json_delta`：此后 `json` 是增量拼的，别再被 `content_block_start`
     /// 里那个空 `{}` 盖回去。
     from_delta: bool,
+    /// 流式下这一块 `content_block_start` 到的时刻（非流式为 `None`）。
+    started: Option<std::time::Instant>,
+    /// 流式下这一块从 `content_block_start` 到 `content_block_stop` 的毫秒数（官方 2.1.319 `tool_input_stream_ms`：
+    /// `Math.max(1, Math.round(...))`），没等到 `content_block_stop` 的为 `None`。
+    stream_ms: Option<u64>,
 }
 
 impl UsageSniffer {
@@ -1541,10 +1564,19 @@ impl UsageSniffer {
                         self.flush_pending_signatures();
                     }
                     "content_block_stop" => {
-                        if let Some(index) = v.get("index").and_then(|i| i.as_i64())
+                        let index = v.get("index").and_then(|i| i.as_i64());
+                        if let Some(index) = index
                             && let Some(sig) = self.pending_signatures.remove(&index)
                         {
                             self.note_thinking_block(Some(&serde_json::Value::String(sig)));
+                        }
+                        if let Some(index) = index
+                            && let Some(b) = self.tool_uses.iter_mut().find(|b| b.index == index)
+                            && let Some(at) = b.started
+                            && b.stream_ms.is_none()
+                        {
+                            let ms = (at.elapsed().as_secs_f64() * 1000.0).round() as u64;
+                            b.stream_ms = Some(ms.max(1));
                         }
                     }
                     _ => {}
@@ -1859,6 +1891,8 @@ impl UsageSniffer {
                     client_side: ty == "tool_use",
                     json: cb.get("input").map(|i| i.to_string()).unwrap_or_else(|| "{}".into()),
                     from_delta: false,
+                    started: self.is_stream.then(std::time::Instant::now),
+                    stream_ms: None,
                 });
             }
             _ => {}
@@ -1881,6 +1915,7 @@ impl UsageSniffer {
                     .iter()
                     .find(|(id, _)| *id == b.id)
                     .map(|(_, v)| v.clone()),
+                input_stream_ms: b.stream_ms,
             })
             .collect()
     }

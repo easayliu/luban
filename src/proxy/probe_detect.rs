@@ -214,6 +214,7 @@ pub(crate) async fn probe_signature(
     if max_tokens != Some(1)
         && !is_official_helper_request(v, beta)
         && !is_official_title_request(v, beta)
+        && !(from_cc_client && super::simulation::is_official_side_query_request(v))
         && !is_official_classifier_request(v, beta)
         && !is_official_thread_continuation(v, beta)
         && device_id.is_some()

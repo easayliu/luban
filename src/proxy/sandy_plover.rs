@@ -13,6 +13,10 @@
 //! 排后头（各自保持先后）；每个写成 `{"name":"…"}`（`\u007f` 起的字符逐个 UTF-16 码元写 `\uXXXX`），逗号连起来套
 //! 方括号；最多 64 个、整串不超过 7168 字节，装不下的丢掉、队首换成哨兵 [`TRUNCATED_SENTINEL`]。会话刚开头是 `[]`。
 //!
+//! 2.1.318 删了 `tengu_snug_mitten`，2.1.319 又删了 `tengu_silly_shore`：只要走官方地址就记、就发（[`records_for`]）。2.1.319
+//! 起 `mcp__` 开头的工具那项多 `"mcp":true`（[`Style`]）；claude.ai 连接器的字段 luban 不带（见 [`Style`]）。项目根有
+//! `connector-downloads` 目录时官方还会补一个 `ReadMcpResourceTool`，模拟路径没有这个目录，不补。
+//!
 //! 记的是哪些名字（官方工具执行入口的 `yKs`、助手消息到达时的 `_Ks`、按转录重建的 `a5`）：`tool_use` 记名字（先过旧名
 //! 别名表 [`TOOL_ALIASES`]），`server_tool_use` 同样，`mcp_tool_use` 记 `server_name:name`（任一为空记哨兵）；每个名字再过
 //! 一道字符集校验（[`readable`]，不合格的记成哨兵）。权限判定之前就记，被拒的工具也算用过。客户端还把调用块里看不到的
@@ -21,7 +25,8 @@
 //! luban 这边：模拟路径（含 billing-only）与 luban 自己发的预热、连通性测试、额度探测补这个头；锁存按（号，出站会话
 //! id）记，每条模拟请求把来访对话里的这三类调用与那几份清单（名字一律按出站改名之后的，[`ToolNameMap`]）并进去，空闲
 //! [`LATCH_IDLE`] 就忘掉，口径同会话链。头在发出前那一刻定（[`apply_session_header`]）：新会话首条的启动握手刚把这个号的
-//! eval 拉回来，开关以它为准。真实 CC 经 `ANTHROPIC_BASE_URL` 透传的请求客户端自己不带，这里也不补。
+//! eval 拉回来，开关以它为准。真实 CC 经 `ANTHROPIC_BASE_URL` 透传的请求客户端自己不带，这里也不补；万一来访自己带了，
+//! 透传时剥掉里面的连接器字段（[`strip_client_header`]）。
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -166,7 +171,16 @@ pub(crate) fn note_eval(cred_id: i64, features: &serde_json::Map<String, serde_j
         "tools-used header flags from eval"
     );
     FLAGS.write().insert(cred_id, (snug, silly));
+    let jolly = served(JOLLY_WREN_FEATURE).unwrap_or(true);
+    JOLLY_WREN.write().insert(cred_id, jolly);
 }
+
+/// 2.1.319 每一项写不写 `"mcp":true`：读不到按开（官方 `k("tengu_jolly_wren", true)`）。
+const JOLLY_WREN_FEATURE: &str = "tengu_jolly_wren";
+
+/// 号 → `tengu_jolly_wren`，随 eval 记在内存（没见过的号按开）。
+static JOLLY_WREN: LazyLock<parking_lot::RwLock<HashMap<i64, bool>>> =
+    LazyLock::new(Default::default);
 
 /// 这个号内存里的两个开关与上次落库的不同（或还没落过）就写进 `tools_used_flags` 表。eval 回包记完（[`note_eval`]）
 /// 之后调；内存里没有这个号（回包解析不出 `features`）什么都不做。写失败只告警，下一份 eval 再试。
@@ -212,10 +226,13 @@ fn restore_rows(rows: Vec<(i64, bool, bool)>) -> usize {
 }
 
 /// 这个号上、`version` 这一版的官方客户端记不记用过的工具：只看 `tengu_silly_shore`（读不到按开），与发不发头无关——
-/// 官方 `yKs` / `_Ks` / `UU` 都只判它，`tengu_snug_mitten` 关着的那段照样记，开关打开时历史还在。
+/// 官方 `yKs` / `_Ks` / `UU` 都只判它，`tengu_snug_mitten` 关着的那段照样记，开关打开时历史还在。2.1.319 连这个开关也删了
+/// （发头只剩官方地址那道闸，`CLe`），一律记。
 fn records_for(cred_id: i64, version: &str) -> bool {
-    let at_311 = super::parse_version(version).is_some_and(|v| v >= (2, 1, 311));
-    at_311 && FLAGS.read().get(&cred_id).is_none_or(|&(_, silly)| silly)
+    let v = super::parse_version(version);
+    let at_311 = v.is_some_and(|v| v >= (2, 1, 311));
+    let at_319 = v.is_some_and(|v| v >= (2, 1, 319));
+    at_311 && (at_319 || FLAGS.read().get(&cred_id).is_none_or(|&(_, silly)| silly))
 }
 
 /// 这个号上、`version` 这一版的官方客户端发 `/v1/messages` 时带不带这个头：记着、且 `tengu_snug_mitten` 开着。
@@ -250,10 +267,11 @@ pub(crate) fn apply_session_header(
         tracing::debug!(cred_id, session = %session_id.chars().take(8).collect::<String>(), "tools-used header not sent");
         return (None, None);
     };
+    // 只记大小：2.1.319 起头里可能有连接器地址，不往日志里写整串。
     tracing::debug!(
         cred_id,
         session = %session_id.chars().take(8).collect::<String>(),
-        value = %String::from_utf8_lossy(value.as_bytes()),
+        bytes = value.len(),
         "tools-used header sent"
     );
     headers.insert(SANDY_PLOVER_HEADER, value);
@@ -285,7 +303,8 @@ pub(crate) fn session_header_full(
         return None;
     }
     let used = body.map(|b| tools_used_in(b, tool_names)).unwrap_or_default();
-    let (value, truncation, capped) = latch(cred_id, session_id, used, sent_for(cred_id, version))?;
+    let style = sent_for(cred_id, version).then(|| Style::of(cred_id, version));
+    let (value, truncation, capped) = latch(cred_id, session_id, used, style)?;
     Some((HeaderValue::from_str(&value).ok()?, truncation, capped))
 }
 
@@ -294,15 +313,78 @@ pub(crate) fn session_header_full(
 /// 64 个、要么整串离 7168 字节不到一个名字（名字最长 256 字节），所以队首是哨兵且到了这个边上才算，单是有个认不出的
 /// 名字（同一个哨兵，[`readable`]）不算。**到了边上的那种头值本身有歧义**：认不出的名字恰好排在队首、总数又恰好到边，
 /// 与真截断拼出来逐字节相同，透传拿不到客户端的 `dropped`，按常见得多的截断算（官方那种情形报 false，这里会报 true）。
-pub(crate) fn header_size(value: &str, capped: Option<bool>) -> crate::telemetry::ToolsUsedSize {
+/// 2.1.319 起的头一项还可能带 `"mcp":true`，「离边上不到一项」的上界按这一版最长的那种项算（[`ITEM_MAX_2_1_319`]）。
+pub(crate) fn header_size(
+    value: &str,
+    capped: Option<bool>,
+    version: Option<(u64, u64, u64)>,
+) -> crate::telemetry::ToolsUsedSize {
     let items: Vec<serde_json::Value> = serde_json::from_str(value).unwrap_or_default();
+    let mcp_mark = value.contains(r#""mcp":true"#);
+    // 上界按出站版本取：2.1.319 起被丢掉的可能正是唯一那个长 MCP 项，成品里看不到 `"mcp":true`；读不出版本才看成品。
+    let v319 = version.map_or(mcp_mark, |v| v >= (2, 1, 319));
     let capped = capped.unwrap_or_else(|| {
-        let first_sentinel = items.first().and_then(|v| v.get("name")).and_then(|n| n.as_str())
-            == Some(TRUNCATED_SENTINEL);
-        let item_max = MAX_NAME_BYTES + r#"{"name":""},"#.len();
-        first_sentinel && (items.len() >= MAX_NAMES || value.len() + item_max > MAX_BYTES)
+        let item_max =
+            if v319 { ITEM_MAX_2_1_319 } else { MAX_NAME_BYTES + r#"{"name":""},"#.len() };
+        inferred_capped(value, &items, item_max)
     });
-    crate::telemetry::ToolsUsedSize { count: items.len(), bytes: value.len(), capped }
+    crate::telemetry::ToolsUsedSize {
+        count: items.len(),
+        bytes: value.len(),
+        capped,
+        connector_fields: value.contains(r#""directory_entry":"#) || value.contains(r#""url":"#),
+        mcp_mark,
+    }
+}
+
+/// 2.1.319 一项最长多少字节（连逗号）：名字 256 字节加 `"mcp":true`。名字只许 ASCII，不会再被转义撑长。
+const ITEM_MAX_2_1_319: usize = MAX_NAME_BYTES + r#"{"name":"","mcp":true},"#.len();
+
+/// 来访客户端自带的 2.1.319 头一项最长多少字节：官方的项还可能带连接器地址（`xf` 上限 2048 字节）、目录条目（`Tf` 上限
+/// 255 字节）与 `unresolved`。
+const CLIENT_ITEM_MAX_2_1_319: usize = MAX_NAME_BYTES
+    + 2048
+    + 255
+    + r#"{"name":"","mcp":true,"url":"","directory_entry":"","unresolved":true},"#.len();
+
+/// 透传的真实客户端自带这个头时（模拟路径之外）：按解析出来的内容**重建**，每项只留字符串的 `name` 与 `"mcp":true`，
+/// 连接器字段（`url` / `directory_entry` / `unresolved`，不论原文怎么转义）与别的一概不留——那是来访客户端自己那个账号的
+/// 连接器，出站换成池里的号就不该再带（luban 自己拼的头一律不带，见 [`Style`]）。不是 JSON 数组的整个不发（`None`），
+/// 不是对象或 `name` 不是字符串的那项丢掉。另返回照**原值**按官方 2.1.319 最长项推的这一次有没有丢名字——重建之后那串短了，
+/// 推不出来。
+pub(crate) fn strip_client_header(
+    value: &str,
+    version: Option<(u64, u64, u64)>,
+) -> (Option<HeaderValue>, bool) {
+    let item_max = if version.is_none_or(|v| v >= (2, 1, 319)) {
+        CLIENT_ITEM_MAX_2_1_319
+    } else {
+        MAX_NAME_BYTES + r#"{"name":""},"#.len()
+    };
+    let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(value) else {
+        return (None, false);
+    };
+    let capped = inferred_capped(value, &items, item_max);
+    let kept: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".into(), name.into());
+            if item.get("mcp").and_then(|m| m.as_bool()) == Some(true) {
+                out.insert("mcp".into(), true.into());
+            }
+            Some(ascii_json(&serde_json::Value::Object(out).to_string()))
+        })
+        .collect();
+    (HeaderValue::from_str(&format!("[{}]", kept.join(","))).ok(), capped)
+}
+
+/// 官方丢名字时队首换成哨兵，且那时要么写满 64 个、要么整串离 7168 字节不到一项（`item_max`）。
+fn inferred_capped(value: &str, items: &[serde_json::Value], item_max: usize) -> bool {
+    let first_sentinel = items.first().and_then(|v| v.get("name")).and_then(|n| n.as_str())
+        == Some(TRUNCATED_SENTINEL);
+    first_sentinel && (items.len() >= MAX_NAMES || value.len() + item_max > MAX_BYTES)
 }
 
 /// 对话里调过的工具，按出现先后、去重：用户与助手消息都扫三类调用块（官方 `a5`）——`tool_use` 先换成出站那个名字
@@ -404,7 +486,7 @@ fn latch(
     cred_id: i64,
     session_id: &str,
     used: Vec<String>,
-    render_header: bool,
+    render_header: Option<Style>,
 ) -> Option<(String, Option<Truncation>, bool)> {
     let now = Instant::now();
     let mut guard = LATCHES.lock();
@@ -432,18 +514,57 @@ fn latch(
             entry.names.push(name);
         }
     }
-    if !render_header {
-        return None;
-    }
-    let (value, truncation) = render(&entry.names);
+    let style = render_header?;
+    let (value, truncation) = render_with(&entry.names, &style);
     let capped = truncation.is_some();
     let report = truncation.filter(|_| !std::mem::replace(&mut entry.truncation_reported, true));
     Some((value, report, capped))
 }
 
-/// 照官方 `ny`：空名与超长名不写；非核心在前、核心在后；装不下（或有名字没写）时队首换哨兵重排，并给出写进去几个
-/// （不算哨兵）、丢了几个。
+/// 每一项怎么写（官方 2.1.319 `Nf` / `rS`）。2.1.318 及以前一律 `{"name":"…"}`；2.1.319 起 `tengu_jolly_wren`（默认开，
+/// 按号随 eval 记在内存，[`note_eval`]）开着时 MCP 工具（名字以 `mcp__` 开头，官方 `rm`）多 `"mcp":true`
+/// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00071`）。
+///
+/// **claude.ai 连接器的字段（`url` / `directory_entry` / `unresolved`，`tengu_precious_ember`）一律不带**：官方只给注册时
+/// 来源是 claude.ai、带连接器 id 的工具挂这些字段，而 luban 发出的工具全是来访客户端带来的，从来不是池里这个号自己注册的
+/// 连接器工具——名字恰好对得上也归属不明（同名的本地 MCP、别的号的连接器），没有可靠归属就不带。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Style {
+    /// 写 `"mcp":true`。
+    marks_mcp: bool,
+}
+
+impl Style {
+    /// 2.1.318 及以前的写法。
+    #[cfg(test)]
+    const PLAIN: Self = Self { marks_mcp: false };
+
+    fn of(cred_id: i64, version: &str) -> Self {
+        let v319 = super::parse_version(version).is_some_and(|v| v >= (2, 1, 319));
+        let jolly = JOLLY_WREN.read().get(&cred_id).copied().unwrap_or(true);
+        Self { marks_mcp: v319 && jolly }
+    }
+
+    fn item(&self, name: &str) -> String {
+        if !self.marks_mcp || !name.starts_with("mcp__") {
+            return name_item(name);
+        }
+        let mut item = serde_json::Map::new();
+        item.insert("name".into(), name.into());
+        item.insert("mcp".into(), true.into());
+        ascii_json(&serde_json::Value::Object(item).to_string())
+    }
+}
+
+/// [`render_with`] 的旧写法（2.1.318 及以前）。
+#[cfg(test)]
 fn render(latched: &[String]) -> (String, Option<Truncation>) {
+    render_with(latched, &Style::PLAIN)
+}
+
+/// 照官方 `ny`：空名与超长名不写；非核心在前、核心在后；装不下（或有名字没写）时队首换哨兵重排，并给出写进去几个
+/// （不算哨兵）、丢了几个。哨兵那项恒是 `{"name":"…"}`。
+fn render_with(latched: &[String], style: &Style) -> (String, Option<Truncation>) {
     let kept: Vec<&str> = latched
         .iter()
         .map(String::as_str)
@@ -455,26 +576,26 @@ fn render(latched: &[String]) -> (String, Option<Truncation>) {
         .filter(|n| !CORE_TOOLS.contains(n))
         .chain(kept.iter().copied().filter(|n| CORE_TOOLS.contains(n)))
         .collect();
-    let items = fit(&ordered);
+    // 逐项按需拼（[`fit`] 到预算就停）：锁存最多上千个名字，头里最多 64 个，别在锁里把装不下的也序列化一遍。
+    let items = fit(ordered.iter().map(|n| style.item(n)));
     if items.len() >= latched.len() {
         return (format!("[{}]", items.join(",")), None);
     }
-    let with_sentinel: Vec<&str> =
-        std::iter::once(TRUNCATED_SENTINEL).chain(ordered.iter().copied()).collect();
-    let items = fit(&with_sentinel);
+    let with_sentinel =
+        std::iter::once(name_item(TRUNCATED_SENTINEL)).chain(ordered.iter().map(|n| style.item(n)));
+    let items = fit(with_sentinel);
     let sent = items.len() - 1;
     (format!("[{}]", items.join(",")), Some(Truncation { sent, dropped: latched.len() - sent }))
 }
 
-/// 照官方 `rf`：逐个写成 `{"name":"…"}`，到 64 个或整串将超 7168 字节为止。
-fn fit(names: &[&str]) -> Vec<String> {
+/// 照官方 `rf`：拼好的各项依次放，到 64 个或整串将超 7168 字节为止；后面的不再拼。
+fn fit(rendered: impl Iterator<Item = String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut used = 2;
-    for name in names {
+    for item in rendered {
         if out.len() == MAX_NAMES {
             break;
         }
-        let item = name_item(name);
         let cost = item.len() + usize::from(!out.is_empty());
         if used + cost > MAX_BYTES {
             break;
@@ -488,7 +609,11 @@ fn fit(names: &[&str]) -> Vec<String> {
 /// `{"name":"…"}`：JSON 转义之后，`\u007f` 起的字符按 UTF-16 码元逐个写成小写 `\uXXXX`（官方
 /// `replace(/[\u007f-\uffff]/g, …)`，码点在基本平面之外的拆成一对代理），于是整串只剩 ASCII。
 fn name_item(name: &str) -> String {
-    let json = serde_json::json!({ "name": name }).to_string();
+    ascii_json(&serde_json::json!({ "name": name }).to_string())
+}
+
+/// 已转义好的 JSON 串里 `\u007f` 起的字符按 UTF-16 码元逐个写成小写 `\uXXXX`（见 [`name_item`]）。
+fn ascii_json(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
     for c in json.chars() {
         if (c as u32) < 0x7f {
@@ -542,6 +667,99 @@ mod tests {
             &features(serde_json::json!({"features": {"tengu_silly_shore": {"value": false}}})),
         );
         assert!(!sent_for(id, "2.1.318"), "silly_shore 下发关照样不带");
+        // 2.1.319 连 silly_shore 也删了：一律记、一律带。
+        assert!(sent_for(id, "2.1.319"), "2.1.319 起不看 silly_shore");
+        assert!(records_for(id, "2.1.319"));
+    }
+
+    /// 2.1.319 的写法（`cap/auto-2.1.319-20261106-confirm/2.1.319/00071`、`00081`）：MCP 工具多 `"mcp":true`，2.1.318 同一步
+    /// （`2.1.318/00070`）只有名字。claude.ai 连接器的字段一律不带（官方那条带地址，见 [`Style`] 为什么不带）。
+    #[test]
+    fn marks_mcp_tools_from_2_1_319() {
+        let id = -93_319;
+        let names: Vec<String> = ["mcp__claude_ai_Claude_Docs__guide", "Bash", "Write"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            render_with(&names, &Style::of(id, "2.1.319")).0,
+            r#"[{"name":"mcp__claude_ai_Claude_Docs__guide","mcp":true},{"name":"Bash"},{"name":"Write"}]"#
+        );
+        assert_eq!(
+            render_with(&names, &Style::of(id, "2.1.318")).0,
+            r#"[{"name":"mcp__claude_ai_Claude_Docs__guide"},{"name":"Bash"},{"name":"Write"}]"#
+        );
+    }
+
+    /// 透传的来访头里带着连接器字段：剥成只剩 `name` 与 `"mcp":true`；截断照原值、按 2.1.319 最长项（带长地址）推。
+    #[test]
+    fn strips_connector_fields_from_a_client_header() {
+        let v = r#"[{"name":"mcp__claude_ai_Docs__guide","mcp":true,"url":"https://docs.example/mcp","directory_entry":"d1","unresolved":true},{"name":"Bash"}]"#;
+        let (out, capped) = strip_client_header(v, Some((2, 1, 319)));
+        assert_eq!(
+            out.unwrap().to_str().unwrap(),
+            r#"[{"name":"mcp__claude_ai_Docs__guide","mcp":true},{"name":"Bash"}]"#
+        );
+        assert!(!capped);
+        let plain = r#"[{"name":"Bash"}]"#;
+        assert_eq!(
+            strip_client_header(plain, Some((2, 1, 319))).0.unwrap().to_str().unwrap(),
+            plain,
+            "没得剥原样"
+        );
+        assert!(strip_client_header(r#"[{"name":"x","url":"#, None).0.is_none(), "解析不了的不发");
+        let escaped = r#"[{"name":"mcp__a__b","mcp":true,"\u0075rl":"https://x.example/mcp"},{"name":7},"x"]"#;
+        assert_eq!(
+            strip_client_header(escaped, Some((2, 1, 319))).0.unwrap().to_str().unwrap(),
+            r#"[{"name":"mcp__a__b","mcp":true}]"#,
+            "按解析后的键重建：转义写的 url 照样剥，name 不是字符串的、不是对象的丢掉"
+        );
+        // 三个约 2 KB 地址的项加哨兵：原值离上限不到一个官方最长项，算截断。
+        let big = (0..3)
+            .map(|i| format!(r#"{{"name":"mcp__claude_ai_C{i}__t","mcp":true,"url":"https://c{i}.example{}"}}"#, "/seg".repeat(490)))
+            .collect::<Vec<_>>();
+        let value = format!(r#"[{{"name":"{TRUNCATED_SENTINEL}"}},{}]"#, big.join(","));
+        let (out, capped) = strip_client_header(&value, Some((2, 1, 319)));
+        assert!(capped, "{}", value.len());
+        assert!(!out.unwrap().to_str().unwrap().contains("url"));
+    }
+
+    /// `tengu_jolly_wren` 下发关就不写 `"mcp":true`，没下发按开。
+    #[test]
+    fn mcp_mark_follows_its_switch() {
+        let id = -93_324;
+        let item = || Style::of(id, "2.1.319").item("mcp__luban__search");
+        note_eval(
+            id,
+            &features(serde_json::json!({"features": {"tengu_jolly_wren": {"value": false}}})),
+        );
+        assert_eq!(item(), r#"{"name":"mcp__luban__search"}"#);
+        note_eval(id, &features(serde_json::json!({"features": {}})));
+        assert_eq!(item(), r#"{"name":"mcp__luban__search","mcp":true}"#, "没下发按开");
+    }
+
+    /// 被丢掉的正是唯一的 MCP 项、成品头里没有 `"mcp":true` 时，按出站版本 2.1.319 的上界照样认得出截断。
+    #[test]
+    fn a_dropped_lone_mcp_item_is_still_capped() {
+        let mut names: Vec<String> =
+            (0..63).map(|i| format!("Tool{i:03}_{}", "x".repeat(97))).collect();
+        names.push(format!("mcp__{}", "m".repeat(250)));
+        let (value, truncation) = render_with(&names, &Style::of(-93_325, "2.1.319"));
+        assert!(truncation.is_some(), "{}", value.len());
+        assert!(!value.contains(r#""mcp":true"#), "那个 MCP 项被丢了");
+        assert!(header_size(&value, None, Some((2, 1, 319))).capped, "{}", value.len());
+    }
+
+    /// 拼头按预算逐项拼：上千个名字也只序列化放得下的那些，结果与全拼再截断逐字相同。
+    #[test]
+    fn rendering_stops_at_the_budget() {
+        let names: Vec<String> = (0..1024).map(|i| format!("Tool{i:04}")).collect();
+        let (value, truncation) = render_with(&names, &Style::of(-93_326, "2.1.319"));
+        let all: Vec<String> = names.iter().map(|n| name_item(n)).collect();
+        let mut expect: Vec<String> = vec![name_item(TRUNCATED_SENTINEL)];
+        expect.extend(all.into_iter().take(MAX_NAMES - 1));
+        assert_eq!(value, format!("[{}]", expect.join(",")));
+        assert_eq!(truncation.map(|t| (t.sent, t.dropped)), Some((63, 961)));
     }
 
     /// 取值与排法对上 `cap/auto-2.1.312-20261028-full`：`00090` 全是核心工具按首次使用；`00200` 非核心的
@@ -945,9 +1163,9 @@ mod tests {
         assert_eq!(out, (None, Some(false)), "只有一个认不出的名字，没丢");
         let v = headers[SANDY_PLOVER_HEADER].to_str().unwrap().to_string();
         assert_eq!(v, format!(r#"[{{"name":"{TRUNCATED_SENTINEL}"}}]"#));
-        let size = header_size(&v, None);
+        let size = header_size(&v, None, None);
         assert_eq!((size.count, size.bytes, size.capped), (1, v.len(), false), "从头值推也不算");
-        assert!(header_size(&v, Some(true)).capped, "拼时知道的为准");
+        assert!(header_size(&v, Some(true), None).capped, "拼时知道的为准");
         // 真实客户端自带、写满 64 个且队首是哨兵：头值本身分不出来——「认不出的名字排在队首 + 63 个、一个没丢」与
         // 「65 个、截掉 2 个」拼出来逐字节相同（官方前者 `hit_cap: false`、后者 `true`）。透传拿不到客户端那头的
         // `dropped`，按常见得多的截断报 true；luban 自己拼的不走这条推断（上面 `Some(false)` 那条）。
@@ -956,11 +1174,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let ambiguous = format!("[{full}]");
-        assert!(header_size(&ambiguous, None).capped, "歧义时按截断");
-        assert!(!header_size(&ambiguous, Some(false)).capped, "拼时知道没丢的不受推断影响");
+        assert!(header_size(&ambiguous, None, None).capped, "歧义时按截断");
+        assert!(!header_size(&ambiguous, Some(false), None).capped, "拼时知道没丢的不受推断影响");
         // 没到边上的一律不算，哪怕队首是哨兵。
         let short = format!(r#"[{{"name":"{TRUNCATED_SENTINEL}"}},{{"name":"t0"}}]"#);
-        assert!(!header_size(&short, None).capped);
+        assert!(!header_size(&short, None, None).capped);
     }
 
     /// 启动时读回的那份与刚拉到的 eval 一样算数：重启前开着的号，重启后的额度探测照样带 `[]`；启动之后才到的 eval
