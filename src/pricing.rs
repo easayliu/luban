@@ -2,10 +2,12 @@
 //!
 //! 订阅账号本身按订阅计费，此处仅用于「等价 API 费用」的参考统计。
 //! 价目对齐官方 <https://platform.claude.com/docs/en/about-claude/pricing>
-//! （每百万 token，MTok，美元；最后核对 2026-10-08）。相对基础输入价的倍率：
+//! （每百万 token，MTok，美元；最后核对 2026-11-10）。相对基础输入价的倍率：
 //! - 缓存写（5 分钟）：×1.25；缓存写（1 小时）：×2.0——所有模型通用。
-//! - 缓存读：×0.10 通用；**Fable 5.1 / Mythos 5.1 例外为 ×0.025**（$0.25/MTok），
-//!   **Opus 5.5 / Sonnet 5.5 例外为 ×0.05**（$0.20 / $0.10 每 MTok）。
+//! - 缓存读：×0.10 通用；**Fable / Mythos 5.1、5.2 例外为 ×0.025**（5.1 $0.25/MTok，
+//!   5.2 $0.20/MTok），**Opus 5.5 / Sonnet 5.5 例外为 ×0.05**（$0.20 / $0.10 每 MTok）。
+//!
+//! Fable 5.2 / Mythos 5.2 降到 $8/$40（5 / 5.1 仍是 $10/$50），并支持快速模式（$16/$80）。
 //!
 //! 不做 >200K 长上下文加价——官方明确 4.6 及以后模型含 1M 上下文按标准价计，
 //! 故带 `[1m]` 后缀的模型名与裸 id 同价。**唯一例外是 Haiku 5.5**：按提示长度分两档，
@@ -20,7 +22,7 @@ const CACHE_WRITE_5M_MULT: f64 = 1.25;
 const CACHE_WRITE_1H_MULT: f64 = 2.0;
 /// 通用缓存读倍率（相对基础输入价）。
 const CACHE_READ_MULT: f64 = 0.10;
-/// Fable 5.1 / Mythos 5.1 的缓存读倍率——官方特例。
+/// Fable / Mythos 5.1、5.2 的缓存读倍率——官方特例（5.1 $0.25 / $10，5.2 $0.20 / $8）。
 const CACHE_READ_MULT_FABLE_5_1: f64 = 0.025;
 /// Opus 5.5 / Sonnet 5.5 的缓存读倍率——官方特例（Opus $0.20 / $4，Sonnet $0.10 / $2）。
 const CACHE_READ_MULT_5_5: f64 = 0.05;
@@ -30,6 +32,11 @@ const HAIKU_5_5_LONG_PROMPT_TOKENS: f64 = 100_000.0;
 /// 是否 Opus 5.5。`opus-5-5` 也含 `opus-5`，凡按 `opus-5` 匹配的地方都得先判它。
 fn is_opus_5_5(m: &str) -> bool {
     m.contains("opus-5-5") || m.contains("opus-5.5")
+}
+
+/// 是否 Fable 5.2 / Mythos 5.2——比 5 / 5.1 便宜（$8/$40），且支持快速模式。
+fn is_fable_5_2(m: &str) -> bool {
+    (m.contains("fable") || m.contains("mythos")) && (m.contains("-5-2") || m.contains("-5.2"))
 }
 
 /// 是否 Haiku 5.5——现役模型里唯一按提示长度分档计价的。
@@ -56,8 +63,14 @@ impl Rate {
 fn rate_for(model: &str) -> Option<Rate> {
     let m = model.to_ascii_lowercase();
     if m.contains("fable") || m.contains("mythos") {
-        // Fable / Mythos 系列统一 $10/$50；5.1 代的缓存读是 0.025×（$0.25/MTok），
-        // 5.0 代仍是通用的 0.10×（$1/MTok）。
+        // Fable / Mythos 5.2 为 $8/$40，缓存读 0.025×（$0.20/MTok）；5 / 5.1 为 $10/$50，
+        // 其中 5.1 的缓存读是 0.025×（$0.25/MTok），5.0 仍是通用的 0.10×（$1/MTok）。
+        if is_fable_5_2(&m) {
+            return Some(Rate {
+                cache_read_mult: CACHE_READ_MULT_FABLE_5_1,
+                ..Rate::new(8.0, 40.0)
+            });
+        }
         let is_5_1 = m.contains("-5-1") || m.contains("-5.1");
         Some(Rate {
             cache_read_mult: if is_5_1 { CACHE_READ_MULT_FABLE_5_1 } else { CACHE_READ_MULT },
@@ -100,11 +113,14 @@ fn rate_for(model: &str) -> Option<Rate> {
 }
 
 /// 快速模式（请求体顶层 `speed: "fast"`）下的价目：同一模型跑得更快，但按溢价计费。
-/// 目前仅 Opus 5.5 / Opus 5 / Opus 4.8 支持，均为标准价两倍：Opus 5.5 $8/$40，
-/// Opus 5 / 4.8 $10/$50。缓存读倍率沿用各自标准档。
+/// 目前仅 Fable 5.2 / Mythos 5.2、Opus 5.5 / Opus 5 / Opus 4.8 支持，均为标准价两倍：
+/// Fable 5.2 / Mythos 5.2 $16/$80，Opus 5.5 $8/$40，Opus 5 / 4.8 $10/$50。
+/// 缓存读倍率沿用各自标准档。
 /// 其它模型即便请求里带了 `speed`，上游也不会按 fast 计费，故返回 None 走标准价。
 fn fast_rate_for(m: &str) -> Option<Rate> {
-    if is_opus_5_5(m) {
+    if is_fable_5_2(m) {
+        Some(Rate { cache_read_mult: CACHE_READ_MULT_FABLE_5_1, ..Rate::new(16.0, 80.0) })
+    } else if is_opus_5_5(m) {
         Some(Rate { cache_read_mult: CACHE_READ_MULT_5_5, ..Rate::new(8.0, 40.0) })
     } else if m.contains("opus-5") || m.contains("opus-4-8") {
         Some(Rate::new(10.0, 50.0))
@@ -143,7 +159,7 @@ pub struct Usage<'a> {
 ///
 /// `speed` 为 `"fast"` 且模型支持快速模式时按溢价计，其余按标准价。缓存写区分 5 分钟 /
 /// 1 小时两档；若上游未返回细分，则将 `cache_creation_total` 整体按 5 分钟档计。
-/// 缓存读倍率按模型取（通用 0.10，Fable 5.1 / Mythos 5.1 为 0.025，Opus 5.5 / Sonnet 5.5
+/// 缓存读倍率按模型取（通用 0.10，Fable / Mythos 5.1、5.2 为 0.025，Opus 5.5 / Sonnet 5.5
 /// 为 0.05）。Haiku 5.5 的提示（输入 + 缓存写 + 缓存读）超过 100K 时整条按长提示档计。
 /// 模型未知返回 None（不计入）。
 pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
@@ -188,6 +204,10 @@ pub fn estimate_usd(u: Usage<'_>) -> Option<f64> {
 /// Haiku 5.5 按提示长度分两档，New API 只能表达一档，这里公开的是 100K 以内的短提示档
 /// （$0.10/$0.50）；本地统计（[`estimate_usd`]）按实际提示长度分档。
 pub const LISTED_MODELS: &[&str] = &[
+    "claude-fable-5-2",
+    "claude-fable-5-2[1m]",
+    "claude-mythos-5-2",
+    "claude-mythos-5-2[1m]",
     "claude-fable-5-1",
     "claude-fable-5-1[1m]",
     "claude-mythos-5-1",
@@ -272,6 +292,10 @@ mod tests {
         assert_eq!(rate("claude-fable-5-1"), (10.0, 50.0));
         assert_eq!(rate("claude-mythos-5"), (10.0, 50.0));
         assert_eq!(rate("claude-mythos-5-1"), (10.0, 50.0));
+        // Fable 5.2 / Mythos 5.2 降到 $8/$40，1M 变体同价。
+        assert_eq!(rate("claude-fable-5-2"), (8.0, 40.0));
+        assert_eq!(rate("claude-fable-5-2[1m]"), (8.0, 40.0));
+        assert_eq!(rate("claude-mythos-5-2"), (8.0, 40.0));
         // Sonnet 5 的 $2/$10 已是永久标准价，不再随时间涨回 $3/$15。
         assert_eq!(rate("claude-sonnet-5"), (2.0, 10.0));
         assert_eq!(rate("claude-sonnet-5[1m]"), (2.0, 10.0));
@@ -299,6 +323,11 @@ mod tests {
         );
         assert_eq!(find("claude-fable-5-1").cache_read_mult, 0.025);
         assert_eq!(find("claude-fable-5").cache_read_mult, 0.10);
+        let f52 = find("claude-fable-5-2[1m]");
+        assert_eq!(
+            (f52.input_per_mtok, f52.output_per_mtok, f52.cache_read_mult),
+            (8.0, 40.0, 0.025)
+        );
         let o55 = find("claude-opus-5-5[1m]");
         assert_eq!(
             (o55.input_per_mtok, o55.output_per_mtok, o55.cache_read_mult),
@@ -333,6 +362,8 @@ mod tests {
         assert_eq!(read("claude-fable-5-1"), Some(0.25), "Fable 5.1 缓存读 $0.25/MTok");
         assert_eq!(read("claude-fable-5-1[1m]"), Some(0.25));
         assert_eq!(read("claude-mythos-5-1"), Some(0.25), "Mythos 5.1 同价");
+        assert_eq!(read("claude-fable-5-2"), Some(0.2), "Fable 5.2 缓存读 $0.20/MTok");
+        assert_eq!(read("claude-mythos-5-2[1m]"), Some(0.2));
         assert_eq!(read("claude-fable-5"), Some(1.0), "Fable 5 仍是通用 0.10×");
         assert_eq!(read("claude-mythos-5"), Some(1.0));
         assert_eq!(read("claude-opus-5"), Some(0.5));
@@ -450,6 +481,12 @@ mod tests {
         // Opus 5.5 含 `opus-5` 子串，不能误落 Opus 5 的 $10/$50：标准 4+20=$24，fast 8+40=$48。
         assert_eq!(estimate_usd(io(usage("claude-opus-5-5", None))), Some(24.0));
         assert_eq!(estimate_usd(io(usage("claude-opus-5-5[1m]", Some("fast")))), Some(48.0));
+
+        // Fable 5.2 / Mythos 5.2：标准 8+40=$48，fast 16+80=$96；5.1 不支持 fast，仍按标准价。
+        assert_eq!(estimate_usd(io(usage("claude-fable-5-2", None))), Some(48.0));
+        assert_eq!(estimate_usd(io(usage("claude-fable-5-2[1m]", Some("fast")))), Some(96.0));
+        assert_eq!(estimate_usd(io(usage("claude-mythos-5-2", Some("fast")))), Some(96.0));
+        assert_eq!(estimate_usd(io(usage("claude-fable-5-1", Some("fast")))), Some(60.0));
 
         let fast_48 = fast_rate_for("claude-opus-4-8").unwrap();
         assert_eq!((fast_48.input, fast_48.output), (10.0, 50.0));
