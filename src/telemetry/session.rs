@@ -1132,6 +1132,9 @@ pub(super) struct TurnFacts {
     /// 没变（`cap/auto-2.1.321-20261110-*`）。
     /// 2.1.320 没抓，块名猜不出，先沿用这一版的。
     pub(super) v321: bool,
+    /// 2.1.322：失败 Bash 与 5xx 的错误栈只换了打包块名（摘要、行列不变）；失败 Bash 照旧带 `error_constructor: "Rx"`，
+    /// 5xx 不再带构造名（类名 `zmn`），别的事件键没变（`cap/auto-2.1.322-20261110-*`）。
+    pub(super) v322: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见

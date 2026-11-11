@@ -347,8 +347,17 @@ pub(super) struct PoolDelta {
     /// `removedForOtherCause` 里（原因 `denied` 不在官方 `l0r` 排除的那几种里）。
     denied_lead: bool,
     added: Vec<String>,
-    /// 其中刚在体里补了完整定义的（`tool_addition`，[`ANNOUNCE_HEADS`] 头两种），官方另记 `surfacedNames`、不进 `addedLines`。
+    /// 其中刚在体里补了完整定义的（`tool_addition`，[`ANNOUNCE_HEADS`] 头两种），官方另记 `surfacedNames`；它们照样在
+    /// `addedLines` 里（`cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00059`）。
     surfaced: Vec<String>,
+    /// 这一轮体里 `tool_addition` 块带的完整定义：（工具名, 定义紧凑 JSON 的 UTF-16 长度）。估值里 `surfacedDefinitions`
+    /// 那段按它算（[`Self::token_estimate`]），由 [`scan`] 从这一轮的消息里补。
+    surfaced_defs: Vec<(String, usize)>,
+    /// 「定义更新」那段（[`ANNOUNCE_HEADS`] 第二种 `…have updated definitions…`）的工具：已宣告过、按值定义过的工具定义变了
+    /// （官方 2.1.321 起 `R3r` 的 `xe`）。它们不在 [`Self::added`] / [`Self::surfaced`] 里——官方附件不把它们算进
+    /// `addedNames` / `addedLines` / `surfacedNames`，只记 `replacedNames` 并把新定义放进 `surfacedDefinitions`；只有这一段的
+    /// 一轮官方不报工具池汇总（`cap/auto-2.1.322-20261111-redefine` 请求 `00078` → 批次 `00085`：只有 `tengu_attachments`）。
+    replaced: Vec<String>,
     /// 连回来的 MCP 工具，按服务器归并（前缀, 个数）。
     readded: Vec<(String, usize)>,
     /// 正文逐个点名「又能用了」的工具（`N deferred tools are available again in this session (announced earlier …): A, B.`，
@@ -371,6 +380,39 @@ pub(super) struct PoolDelta {
 }
 
 impl PoolDelta {
+    /// 这份附件只有「定义更新」那段（官方 `nPi` 返回 `null`、`R3r` 单独组装）：附件照有，工具池汇总不报，估值按
+    /// 五个空名单 + `surfacedDefinitions` + `replacedNames` 算（`cap/auto-2.1.322-20261111-redefine` 批次 `00085`：118）。
+    pub(super) fn replace_only(&self) -> bool {
+        !self.replaced.is_empty()
+            && self.added.is_empty()
+            && self.surfaced.is_empty()
+            && self.readded.is_empty()
+            && self.still_defined.is_empty()
+            && self.removed.is_empty()
+            && self.retracted.is_empty()
+            && !self.retracted_incomplete
+            && !self.removed_incomplete
+            && !self.overflow
+            && self.failed.servers.is_empty()
+            && self.failed.count == 0
+            && self.failed.complete
+            && self.pending.names.is_empty()
+            && self.pending.count == 0
+            && self.pending.complete
+            && self.needs_auth.names.is_empty()
+            && self.needs_auth.count == 0
+            && self.needs_auth.complete
+    }
+
+    /// 按值补定义的那两种的个数（新增的 `surfacedNames`, 定义更新的 `replacedNames`），两样都没有是 `None`：官方 2.1.321 起
+    /// `R3r` 组装附件时报一条 `tengu_inline_tools_announced{definitions, replacements, pointers, withdrawals}`
+    /// （`cap/auto-2.1.322-20261111-redefine` 批次 `00076`：2 / 0，`00085`：0 / 1；`00070` 首轮 3 / 0）。`pointers`（连回来、
+    /// 定义没变的）与 `withdrawals`（按块撤掉的）从正文认不出，按 0。
+    pub(super) fn inline_counts(&self) -> Option<(usize, usize)> {
+        (!self.surfaced.is_empty() || !self.replaced.is_empty())
+            .then_some((self.surfaced.len(), self.replaced.len()))
+    }
+
     /// 一组提醒正文（同一段的几条消息）里的工具池段落；一段都没有是 `None`。
     pub(super) fn parse<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<Self> {
         let mut out = PoolDelta { budget: MAX_DELTA_BYTES, ..Default::default() };
@@ -554,15 +596,27 @@ impl PoolDelta {
     }
 
     /// `tengu_attachments` 里这条的估值（官方 `Co(Hen(附件))`）：把附件数据本身照官方的形状（`ePi` 的返回值加 `type`）转成
-    /// 紧凑 JSON，UTF-16 长度 ÷ 4 向上取整。`bashfail/00063` → 批次 `00065` 是 1085、`-fable/00060` → `00062` 是 1158，
-    /// 子代理 `-full/00107` → `00111` 是 180（子代理没有要登录的名单，那个键不在），三组逐个相同。
+    /// 紧凑 JSON，UTF-16 长度 ÷ 4 四舍五入（[`token_round`]）。`bashfail/00063` → 批次 `00065` 是 1085、`-fable/00060` → `00062` 是 1158，
+    /// 子代理 `-full/00107` → `00111` 是 180（交互式会话没有要登录的名单，那个键不在），三组逐个相同。
     ///
     /// 认不全的照认得的算：按服务器归并的走掉的一组只记 `mcp__<服务器>__*`，策略拦下的、地址保留的没有错误文本。
     pub(super) fn token_estimate(
         &self,
         history: Option<&PoolHistory>,
-        subagent: bool,
+        interactive: bool,
     ) -> Option<usize> {
+        // 只有定义更新：官方附件是 `R3r` 在空底子上组装的，只有五个空名单、`surfacedDefinitions` 与 `replacedNames`。
+        if self.replace_only() {
+            let att = json!({
+                "type": "deferred_tools_delta",
+                "addedNames": [],
+                "addedLines": [],
+                "removedNames": [],
+                "wireHiddenNames": [],
+                "readdedNames": [],
+            });
+            return Some(token_round(utf16_len(&att.to_string()) + self.by_value_len()?));
+        }
         // 附件数据没记全（预算、上限、名单截断、错误文本截断过、连回来的配不回名字）：照残缺的数据估出来的数不可靠，不报。
         if self.overflow
             || self.removed_incomplete
@@ -595,14 +649,10 @@ impl PoolDelta {
             .fresh_names(history)
             .map(|(_, back)| back.into_iter().map(str::to_string).collect())
             .unwrap_or_default();
-        // `addedLines`（官方 `Dr`）只有头一回逐行列出的：刚在体里补了完整定义的（`surfacedNames`）与连回来的（此前列过）
-        // 都不在里面。
-        let listed: Vec<String> = self
-            .added
-            .iter()
-            .filter(|n| !self.surfaced.contains(n) && !readded.contains(n))
-            .cloned()
-            .collect();
+        // `addedLines`（官方 `Dr`，未列过的加重新露面的）不含连回来的（此前列过）；刚在体里补了完整定义的（`surfacedNames`）
+        // 照样在里面（`cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00059` → 批次 `00062`：少了这三个名字差 27 个 token）。
+        let listed: Vec<String> =
+            self.added.iter().filter(|n| !readded.contains(n)).cloned().collect();
         let failed: Vec<Value> = self
             .failed
             .servers
@@ -655,14 +705,45 @@ impl PoolDelta {
         if !self.retracted.is_empty() || self.retracted_incomplete {
             return None;
         }
-        if !subagent {
+
+        // 要登录的服务器名单只有非交互（`-p` / SDK）才带（官方 `ye()` 即 `!isInteractive()` 时才算 `A3r`，否则 `undefined`、
+        // 键不在）：交互式的 `cap/auto-2.1.322-20261111-redefine` 两条附件、`-full/00107` 子代理那条都没有这个键，`bashfail`
+        // 几组有。
+        if !interactive {
             att["needsAuthMcpServers"] = names(&self.needs_auth.names);
         }
         att["failedMcpServers"] = Value::Array(failed);
         if !self.surfaced.is_empty() {
             att["surfacedNames"] = names(&self.surfaced);
         }
-        Some(utf16_len(&att.to_string()).div_ceil(4))
+        let len = utf16_len(&att.to_string()) + self.by_value_len()?;
+        Some(token_round(len))
+    }
+
+    /// 按值定义那两项的长度（拼在附件 JSON 末尾的 `,"surfacedDefinitions":[…]` 与 `,"replacedNames":[…]`）：官方 2.1.321 起
+    /// `R3r` 给刚补了完整定义的（`surfacedNames`）与定义更新的（`replacedNames`）各放一项 `{name, listing, definition}`——
+    /// `listing` 是 16 位摘要，`definition` 是工具定义 `qW` 的产物，键与体里 `tool_addition` 那份相同，按体里的定义算长度。
+    /// 有哪个找不到定义的，估不准（`None`）；两样都没有是 0。
+    /// `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00059`（三个 claude.ai 连接器）照此拼出 7349 字符、
+    /// `cap/auto-2.1.322-20261111-redefine` 请求 `00071`（新增两个）1712、`00078`（定义更新一个）472，都与会话记录里那条附件
+    /// 原文逐字同长。
+    fn by_value_len(&self) -> Option<usize> {
+        let defined: Vec<&String> = self.surfaced.iter().chain(&self.replaced).collect();
+        if defined.is_empty() {
+            return Some(0);
+        }
+        let mut len = r#","surfacedDefinitions":[]"#.len() + defined.len() - 1;
+        for n in &defined {
+            let (_, def) = self.surfaced_defs.iter().find(|(d, _)| d == *n)?;
+            // `{"name":<名字>,"listing":"<16 位>","definition":<定义>}`
+            len += utf16_len(&json!(n).to_string())
+                + r#"{"name":,"listing":"0123456789abcdef","definition":}"#.len()
+                + def;
+        }
+        if !self.replaced.is_empty() {
+            len += r#","replacedNames":"#.len() + utf16_len(&json!(self.replaced).to_string());
+        }
+        Some(len)
     }
 
     #[cfg(test)]
@@ -822,10 +903,15 @@ fn parse_text(t: &str, out: &mut PoolDelta) -> bool {
         if ANNOUNCE_HEADS.iter().any(|h| l.starts_with(h)) {
             let surfaced = ANNOUNCE_HEADS[..2].iter().any(|h| l.starts_with(h));
             let still_defined = l.starts_with(ANNOUNCE_HEADS[5]);
+            let replaced = l.starts_with(ANNOUNCE_HEADS[1]);
             let dropped = each_item(&mut it, MAX_NAME_LEN, |n| {
                 let cost = if surfaced || still_defined { 2 * n.len() } else { n.len() };
                 if !charge(&mut out.budget, cost) {
                     out.overflow = true;
+                    return;
+                }
+                if replaced {
+                    out.replaced.push(n.to_string());
                     return;
                 }
                 if surfaced {
@@ -1330,6 +1416,11 @@ impl PoolHistory {
                 self.retracted.insert(n);
             }
         }
+        // 只有定义更新的那份附件没有这三个名单（官方 `R3r` 在空底子上组装），账本里的上一份照旧（官方 `Hxe` 只在附件带了
+        // `failedMcpServers` 等字段时才换）。
+        if d.replace_only() {
+            return;
+        }
         self.last_failed = d.failed.clone();
         self.last_pending = d.pending.clone();
         self.last_needs_auth = d.needs_auth.clone();
@@ -1475,15 +1566,41 @@ pub(super) fn scan(msgs: &[Value], has_history: bool, tool_names: &[String]) -> 
         }
         h
     });
+    let mut delta = PoolDelta::parse(now.iter().flat_map(reminder_texts));
+    if let Some(d) = delta.as_mut().filter(|d| !d.surfaced.is_empty() || !d.replaced.is_empty()) {
+        d.surfaced_defs = tool_addition_defs(now);
+    }
     Scan {
         history,
-        delta: PoolDelta::parse(now.iter().flat_map(reminder_texts)),
+        delta,
         mcp: McpInstr::parse(now.iter().flat_map(reminder_texts)),
         total_tokens: now
             .iter()
             .flat_map(reminder_texts)
             .any(|t| t.contains("<total_tokens>") && t.contains("</total_tokens>")),
     }
+}
+
+/// 这一轮消息里 `tool_addition` 块带的完整定义（`{"type":"tool_addition","tool":{"type":"tool_definition","definition":{…}}}`）：
+/// （工具名, 定义紧凑 JSON 的 UTF-16 长度）。
+fn tool_addition_defs(msgs: &[Value]) -> Vec<(String, usize)> {
+    msgs.iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_addition"))
+        .filter_map(|b| {
+            let def = b.get("tool")?.get("definition")?;
+            let name = def.get("name")?.as_str()?;
+            Some((name.to_string(), utf16_len(&def.to_string())))
+        })
+        .collect()
+}
+
+/// 官方附件估值的取整（2.1.322 `R(e, n = 4) = Math.round(e / n)`，`Hen` → `mc` → `R`）：长度 ÷ 4 四舍五入（.5 进位）。
+/// 原先按向上取整，余 1 时多一个（`cap/auto-2.1.322-20261110-bashfail/2.1.322` 批次 `00062`：首轮 20521 字符报 5130、
+/// 续轮 7349 字符报 1837，长度取自会话记录里那两条附件原文，与这里拼出的逐字相同）。
+fn token_round(len: usize) -> usize {
+    (len + 2) / 4
 }
 
 /// JS 字符串长度（UTF-16 码元数），官方估值按它算。
@@ -1666,7 +1783,7 @@ impl McpInstr {
         });
         // 空的 `addedBlocks` 占 `[]`，换成各块（逗号比块数少一个）。
         let blocks = self.blocks_units.saturating_sub(usize::from(!self.added.is_empty()));
-        Some((utf16_len(&shell.to_string()) + blocks).div_ceil(4))
+        Some(token_round(utf16_len(&shell.to_string()) + blocks))
     }
 }
 
@@ -1832,14 +1949,30 @@ pub(super) struct PoolTurn<'a> {
     pub(super) mcp: Option<&'a McpInstr>,
 }
 
-impl PoolTurn<'_> {
+impl<'a> PoolTurn<'a> {
     /// 这一轮工具池变了、汇总要按这一轮报：有工具走掉，或接着已有对话的这一轮来了一条附件（新增、连回来、名单变化；官方
     /// 只在有变化时才组装附件），哪怕之前一条附件都没有过。会话头一轮的那条照模板，不在这里。
     /// `cap/auto-2.1.321-20261110-bashfail/2.1.321` 请求 `00063`（`-p` 工具结果续轮，新宣告 25 个）→ 批次 `00065`。
     pub(super) fn changed(&self) -> bool {
         self.departed.total > 0
             || self.departed.incomplete
-            || (self.delta.is_some() && self.continuation())
+            || (self.delta.is_some_and(|d| !d.replace_only()) && self.continuation())
+    }
+
+    /// 这一轮要列进 `tengu_attachments` 的工具池附件：有变化的（[`Self::changed`]），或接着已有对话、只有定义更新的那份
+    /// （[`PoolDelta::replace_only`]：附件照有，汇总不报）。
+    pub(super) fn attachment_delta(&self) -> Option<&'a PoolDelta> {
+        let d = self.delta?;
+        (self.changed() || (d.replace_only() && self.continuation())).then_some(d)
+    }
+
+    /// 接着已有对话（体里带着前面几段的历史，`--continue` 接回的会话头一条就是这样）而工具池没有变化：官方按历史里宣告过的
+    /// 算增量，没有变化就不组装附件，汇总那条也不报——首轮模板里那条不能照发（`cap/auto-2.1.322-20261110-full` 请求
+    /// `00763`：MCP 服务器这次没断开，批次 `00767` 与这个会话之后的批次里都没有 `tengu_deferred_tools_pool_change`；2.1.321
+    /// 那次 `00756` 碰巧有两个工具走掉，按 [`Self::changed`] 报）。历史里一条工具池附件都没有的不算（官方那时是整池头一回
+    /// 宣告，照报）；账本不在的（线程增量没接上底本）看不出，照旧。
+    pub(super) fn resumed_unchanged(&self) -> bool {
+        self.history.is_some_and(|h| h.turns > 0 && h.dtd_count() > 0) && !self.changed()
     }
 
     /// 这一轮接着已有对话：账本不在（线程增量没接上底本）的必是；在的看前面有没有过对话。
@@ -1897,6 +2030,17 @@ impl PoolTurn<'_> {
         }
         out
     }
+}
+
+/// `tengu_inline_tools_announced` 的 meta（[`PoolDelta::inline_counts`]）。
+pub(super) fn inline_announced(d: &PoolDelta) -> Option<Value> {
+    let (definitions, replacements) = d.inline_counts()?;
+    Some(json!({
+        "definitions": definitions,
+        "replacements": replacements,
+        "pointers": 0,
+        "withdrawals": 0,
+    }))
 }
 
 /// 汇总那条的模板事件：交互式在首次输入那段，`-p` 在启动那段（`cc_telemetry_template_*_sdk.json`）。续轮按这一轮的
@@ -2244,7 +2388,7 @@ mod tests {
             "addedBlocks": [first, second],
             "removedNames": [],
         });
-        assert_eq!(m.token_estimate(), Some(utf16_len(&expect.to_string()).div_ceil(4)));
+        assert_eq!(m.token_estimate(), Some(token_round(utf16_len(&expect.to_string()))));
     }
 
     /// 官方排序是 `localeCompare`（ASCII）：`alpha`、`Beta` 是两台；大写的 `Setup` 排在 `srv.one` 前面，对不上，并掉。
@@ -2620,7 +2764,7 @@ mod tests {
         });
         assert_eq!(
             d.token_estimate(Some(&h), false),
-            Some(utf16_len(&expect.to_string()).div_ceil(4))
+            Some(token_round(utf16_len(&expect.to_string())))
         );
     }
 
@@ -2652,7 +2796,10 @@ mod tests {
             "needsAuthMcpServers": [],
             "failedMcpServers": [],
         });
-        assert_eq!(d.token_estimate(None, false), Some(utf16_len(&expect.to_string()).div_ceil(4)));
+        assert_eq!(
+            d.token_estimate(None, false),
+            Some(token_round(utf16_len(&expect.to_string())))
+        );
     }
 
     /// 走掉的一组分不出子前缀、账本又配不回名字：只有它可能落进的那两种归属不报，别的照报。
@@ -2672,6 +2819,72 @@ mod tests {
 
     /// 恢复的身份看段落：逐行宣告的（`now available via ToolSearch` 那类，官方 `addedLines`）从来不是连回来的，不会连累别的
     /// 归属；`available again. Their definitions … still apply` 那段（官方 `stillDefinedNames`）明说是连回来的，不看账本。
+    /// 「定义更新」那段与新增分开记：不进 `added` / `surfaced`，只有它的一轮不算工具池变化；估值按 `replacedNames` 那种
+    /// 形状算，体里没有它的定义时估不准。
+    #[test]
+    fn updated_definitions_are_kept_apart_from_additions() {
+        let added = delta(&format!("{}\nmcp__a__x", ANNOUNCE_HEADS[0]));
+        let replaced = delta(&format!("{}\nmcp__a__x", ANNOUNCE_HEADS[1]));
+        assert_eq!(replaced.replaced, ["mcp__a__x"]);
+        assert!(
+            replaced.added.is_empty() && replaced.surfaced.is_empty() && replaced.replace_only()
+        );
+        assert!(added.replaced.is_empty() && !added.replace_only());
+        let h = PoolHistory::default();
+        assert_eq!(replaced.token_estimate(Some(&h), false), None, "没有定义");
+        assert_eq!(added.token_estimate(Some(&h), false), None, "没有定义");
+        let (mut replaced, mut added) = (replaced, added);
+        replaced.surfaced_defs = vec![("mcp__a__x".into(), 40)];
+        added.surfaced_defs = vec![("mcp__a__x".into(), 40)];
+        // 只有定义更新：五个空名单 + 一项定义 + replacedNames。
+        let base = r#"{"type":"deferred_tools_delta","addedNames":[],"addedLines":[],"removedNames":[],"wireHiddenNames":[],"readdedNames":[]}"#.len();
+        let defs = r#","surfacedDefinitions":[{"name":"mcp__a__x","listing":"0123456789abcdef","definition":}]"#.len() + 40;
+        let names = r#","replacedNames":["mcp__a__x"]"#.len();
+        assert_eq!(
+            replaced.token_estimate(Some(&h), false),
+            Some(token_round(base + defs + names))
+        );
+        assert!(added.token_estimate(Some(&h), false).is_some());
+        // 只有定义更新的一轮：附件照列，汇总不报。
+        let turn = PoolTurn {
+            departed: McpDeparted::default(),
+            history: Some(&PoolHistory { turns: 1, ..Default::default() }),
+            delta: Some(&replaced),
+            mcp: None,
+        };
+        assert!(!turn.changed() && turn.attachment_delta().is_some());
+    }
+
+    /// 同一份里还有不写名字的故障 / 要登录（名单空、个数却是 1、记为不全）的，不是纯定义更新：照报汇总，估值另按完整性判。
+    #[test]
+    fn hidden_server_states_are_not_a_pure_redefinition() {
+        let r = format!("{}\nmcp__a__x", ANNOUNCE_HEADS[1]);
+        for extra in [
+            format!("{HIDDEN_FAILED} are unavailable."),
+            format!("{HIDDEN_NEEDS_AUTH}, so its tools are unavailable."),
+        ] {
+            let d = delta(&format!("{r}\n\n{extra}"));
+            assert_eq!(d.replaced, ["mcp__a__x"], "{extra}");
+            assert!(!d.replace_only(), "{extra}");
+        }
+    }
+
+    /// 只有定义更新的那份附件不带服务器名单：账本里上一份失败 / 待连 / 要登录的名单照旧，不被清空。
+    #[test]
+    fn a_pure_redefinition_keeps_the_last_server_lists() {
+        let mut h = PoolHistory::default();
+        h.apply(&delta(&format!(
+            "{}\nmcp__a__x\n\n{FAILED_HEAD}for this session:\na (X): \"e\"\nb (X): \"e\"\nc (X): \"e\"",
+            ANNOUNCE_HEADS[0]
+        )));
+        assert_eq!(h.last_failed().count, 3);
+        let r = delta(&format!("{}\nmcp__a__x", ANNOUNCE_HEADS[1]));
+        assert!(r.replace_only());
+        h.apply(&r);
+        assert_eq!(h.last_failed().count, 3, "纯定义更新不动失败名单");
+        assert_eq!(h.dtd_count(), 2, "附件照样算一份");
+    }
+
     #[test]
     fn readd_identity_follows_the_paragraph_kind() {
         let listed_plus_back = delta(&format!(
@@ -2962,7 +3175,7 @@ mod tests {
         });
         assert_eq!(
             d.token_estimate(Some(&h), false),
-            Some(utf16_len(&expect.to_string()).div_ceil(4))
+            Some(token_round(utf16_len(&expect.to_string())))
         );
     }
 

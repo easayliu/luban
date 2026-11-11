@@ -9065,11 +9065,13 @@ fn mid_session_departures_are_reported_on_the_continuation_turn() {
 /// 抓包回归：带历史的那一轮工具池汇总按账本报，不是首轮模板的零值。原始请求原样喂进来，事件对官方同一轮那批：
 /// - `cap/auto-2.1.321-20261110-full` 请求 `00756` → 批次 `00760`：先 `removed_other: 2`，汇总 `priorAnnouncedCount: 415`
 ///   （3 个 `tool_addition` + 412 个只给名字的，同一条附件）、`dtdCount: 1`、失败 2 → 2 没变；
-/// - `cap/auto-2.1.319-20261106-confirm/2.1.319` 请求 `00162` → 批次 `00165`：只有汇总，409、1、失败 2 → 3 变了。
+/// - `cap/auto-2.1.319-20261106-confirm/2.1.319` 请求 `00162` → 批次 `00165`：只有汇总，409、1、失败 2 → 3 变了；
+/// - `cap/auto-2.1.322-20261110-full` 请求 `00763` → 批次 `00767`：同一场景，这次 MCP 服务器没断开、工具池没变，官方一条都不报
+///   （[`super::tool_pool::PoolTurn::resumed_unchanged`]）。
 ///
 /// 我们报的键是官方的子集、顺序相同；复算不出的 `messagesLength` / `attachmentCount` / `attachmentTypesSeen` 不报。
 #[test]
-fn pool_summary_matches_the_321_and_319_captures() {
+fn pool_summary_matches_the_captures() {
     let read = |dir: &str, prefix: &str| -> Option<(String, Vec<u8>)> {
         let dir = format!("{}/cap/{dir}", env!("CARGO_MANIFEST_DIR"));
         let path =
@@ -9119,6 +9121,7 @@ fn pool_summary_matches_the_321_and_319_captures() {
     };
     let cases = [
         ("auto-2.1.321-20261110-full", "00756_", "00760_"),
+        ("auto-2.1.322-20261110-full", "00763_", "00767_"),
         ("auto-2.1.319-20261106-confirm/2.1.319", "00162_", "00165_"),
     ];
     for (dir, req, batch) in cases {
@@ -9651,10 +9654,18 @@ fn an_unknown_declared_parent_leaves_its_identity_unknown() {
 }
 
 /// 冷启动时头一回见到的是半截的一轮（线程续轮）：不当成新输入，所接的回复认不出，本轮累计不报（不报成 1 次请求、0 个工具）。
-/// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063` 单独回放。
+/// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063`、`cap/auto-2.1.322-20261110-bashfail/2.1.322/00059` 各自单独回放。
 #[test]
 fn a_cold_start_on_a_thread_continuation_is_not_a_new_prompt() {
-    let rel = "auto-2.1.321-20261110-bashfail/2.1.321/00063_";
+    for rel in [
+        "auto-2.1.321-20261110-bashfail/2.1.321/00063_",
+        "auto-2.1.322-20261110-bashfail/2.1.322/00059_",
+    ] {
+        cold_start_on_continuation(rel);
+    }
+}
+
+fn cold_start_on_continuation(rel: &str) {
     let Some((body, betas)) = cap_request(rel) else {
         eprintln!("skipped: cap not present");
         return;
@@ -11596,20 +11607,26 @@ fn unknown_turn_stats_are_not_written_back() {
 }
 
 /// 子代理同父分叉：Explore 原包 `-full/00103`（create）后接两条同父续轮（`00107` 原样回放两次，回复 id 各不相同）——两条
-/// 的 API 深度都是父回复的加一，不按到达先后累加。
+/// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`。
 #[test]
 fn subagent_sibling_continuations_share_the_parent_depth() {
-    let dir = "auto-2.1.321-20261110-full";
-    if cap_request(&format!("{dir}/00103_")).is_none() {
+    for (dir, create, cont) in [
+        ("auto-2.1.321-20261110-full", "00103_", "00107_"),
+        ("auto-2.1.322-20261110-full", "00104_", "00107_"),
+    ] {
+        subagent_sibling_depths(dir, create, cont);
+    }
+}
+
+fn subagent_sibling_depths(dir: &str, create: &str, cont: &str) {
+    if cap_request(&format!("{dir}/{create}")).is_none() {
         eprintln!("skipped: cap/{dir} not present");
         return;
     }
     let t = Telemetry::default();
     let base = frozen_now() - Duration::from_secs(60);
     for (i, (f, reply)) in
-        [("00103_", None), ("00107_", Some("msg_b1")), ("00107_", Some("msg_b2"))]
-            .iter()
-            .enumerate()
+        [(create, None), (cont, Some("msg_b1")), (cont, Some("msg_b2"))].iter().enumerate()
     {
         let rel = format!("{dir}/{f}");
         let (body, betas) = cap_request(&rel).unwrap();
@@ -11635,7 +11652,7 @@ fn subagent_sibling_continuations_share_the_parent_depth() {
         .filter(|(_, e)| ev_name(e) == "tengu_api_query" && e["event_data"]["agent_id"].is_string())
         .map(|(_, e)| meta_of(e)["queryDepth"].clone())
         .collect();
-    assert_eq!(depths, [json!(2), json!(3), json!(3)]);
+    assert_eq!(depths, [json!(2), json!(3), json!(3)], "{dir}");
 }
 
 /// 回接旧的一轮：A 调了工具，之后夹了一次新输入（另起一轮、另一条查询链），再有一条续轮回传 A 那次的结果——它的 API 查询与
@@ -12004,11 +12021,19 @@ fn metas_named(events: &[Value], name: &str, agent: bool) -> Vec<Value> {
 
 /// 抓包回归：子代理的工具池汇总（`callSite: attachments_subagent`、`querySource` 是子代理自己的）首轮、续轮各一条，续轮
 /// 另有 MCP 服务器说明那条：`cap/auto-2.1.321-20261110-full` 请求 `00103`（Explore create）→ `00107`（continue）→ 批次
-/// `00111` 里子代理的那几条。
+/// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`。
 #[test]
-fn subagent_tool_result_turn_pool_summary_matches_the_321_capture() {
-    let dir = "auto-2.1.321-20261110-full";
-    let Some((batch, _)) = cap_request(&format!("{dir}/00111_")) else {
+fn subagent_tool_result_turn_pool_summary_matches_the_captures() {
+    for (dir, reqs, batch) in [
+        ("auto-2.1.321-20261110-full", ["00103_", "00107_"], "00111_"),
+        ("auto-2.1.322-20261110-full", ["00104_", "00107_"], "00112_"),
+    ] {
+        subagent_pool_summary(dir, reqs, batch);
+    }
+}
+
+fn subagent_pool_summary(dir: &str, reqs: [&str; 2], batch: &str) {
+    let Some((batch, _)) = cap_request(&format!("{dir}/{batch}")) else {
         eprintln!("skipped: cap/{dir} not present");
         return;
     };
@@ -12026,7 +12051,7 @@ fn subagent_tool_result_turn_pool_summary_matches_the_321_capture() {
     assert_eq!(official.len(), 2, "子代理首轮一条、续轮一条");
     let t = Telemetry::default();
     let base = frozen_now() - Duration::from_secs(60);
-    for (i, f) in ["00103_", "00107_"].iter().enumerate() {
+    for (i, f) in reqs.iter().enumerate() {
         let rel = format!("{dir}/{f}");
         let (body, betas) = cap_request(&rel).unwrap();
         let mut c = call(body, &format!("req_{f}"), if i == 0 { "tool_use" } else { "end_turn" });
@@ -12070,7 +12095,7 @@ fn subagent_tool_result_turn_pool_summary_matches_the_321_capture() {
         diff_against_official(&a[0], &b[0], "MCP 说明"),
         ["addedCount", "messagesLength", "attachmentCount"]
     );
-    // 续轮附件的估值：工具池那条按附件数据算（子代理没有要登录的名单），MCP 说明那条按服务器块算。
+    // 续轮附件的估值：工具池那条按附件数据算（交互式会话没有要登录的名单），MCP 说明那条按服务器块算。
     let (a, b) = (
         metas_named(&ours, "tengu_attachments", true),
         metas_named(&theirs, "tengu_attachments", true),
@@ -12188,15 +12213,17 @@ fn departures_on_a_tool_result_turn_are_reported() {
 /// 抓包回归：`-p` 工具结果续轮（线程增量）带一条新宣告的工具池附件，官方在续轮也报汇总——不只是走掉才报：
 /// - `cap/auto-2.1.321-20261110-bashfail/2.1.321` 请求 `00059`（create）→ `00063`（continue，新宣告 25 个）→ 批次 `00065`
 ///   第二条：`addedCount: 25`、`unlistedCount: 25`、`priorAnnouncedCount: 308`、`dtdCount: 1`；
-/// - `cap/auto-2.1.321-20261110-bashfail-fable/2.1.321` 请求 `00056` → `00060` → 批次 `00062` 同理。
+/// - `cap/auto-2.1.321-20261110-bashfail-fable/2.1.321` 请求 `00056` → `00060` → 批次 `00062` 同理；
+/// - `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00049` → `00059` → 批次 `00062` 同理。
 ///
 /// 首轮、续轮的工具池汇总与 MCP 服务器说明、续轮的 MCP 工具数刷新，键都是官方的子集、顺序相同、值逐个一致；续轮省掉的
 /// 只有复算不出的内部消息数、附件数。续轮附件的类型与估值也对官方。
 #[test]
-fn sdk_tool_result_turn_pool_summary_matches_the_321_bashfail_captures() {
+fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
     let cases = [
         ("auto-2.1.321-20261110-bashfail/2.1.321", ["00059_", "00063_"], "00065_"),
         ("auto-2.1.321-20261110-bashfail-fable/2.1.321", ["00056_", "00060_"], "00062_"),
+        ("auto-2.1.322-20261110-bashfail/2.1.322", ["00049_", "00059_"], "00062_"),
     ];
     for (dir, reqs, batch) in cases {
         let official_events: Vec<Value> = {
@@ -12323,6 +12350,113 @@ fn sdk_tool_result_turn_pool_summary_matches_the_321_bashfail_captures() {
         assert_eq!(est(&att, 0), est(&official_att, 0), "{dir}: 工具池估值");
         assert!((est(&att, 1) - est(&official_att, 1)).abs() <= 2, "{dir}: MCP 说明估值 {att}");
     }
+}
+
+/// 抓包回归：会话中途补完整定义与定义更新（`cap/auto-2.1.322-20261111-redefine`，本地 MCP 服务器 `bumper` 慢连、工具带
+/// `anthropic/alwaysLoad`，调 `bump` 后改 `probe` 的描述并发 `tools/list_changed`）。主线程 `00067` → `00071`（新增两个、
+/// 按值补定义）→ `00073` / `00074`（调 bump）→ `00078`（`probe` 定义更新）：
+/// - `00071` 那轮附件估值 428（批次 `00076`），工具池汇总 `addedCount: 2`；
+/// - `00078` 那轮只有定义更新：附件估值 118（批次 `00085`），**不报工具池汇总**。
+///
+/// 两个估值与会话记录里那两条附件原文（1712 / 472 字符）按官方四舍五入算出的相同。
+#[test]
+fn by_value_definitions_match_the_redefine_capture() {
+    let dir = "auto-2.1.322-20261111-redefine";
+    if cap_request(&format!("{dir}/00067_")).is_none() {
+        eprintln!("skipped: cap/{dir} not present");
+        return;
+    }
+    let reqs = [
+        ("00067_", "end_turn"),
+        ("00071_", "end_turn"),
+        ("00073_", "tool_use"),
+        ("00074_", "end_turn"),
+        ("00078_", "end_turn"),
+    ];
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let mut per_req: Vec<Vec<(String, Value)>> = Vec::new();
+    for (i, (f, stop)) in reqs.iter().enumerate() {
+        let rel = format!("{dir}/{f}");
+        let (body, betas) = cap_request(&rel).unwrap();
+        let mut c = call(body, &format!("req_{f}"), stop);
+        c.betas = betas;
+        c.ua_out = cap_header(&rel, "User-Agent").unwrap();
+        c.message_id = cap_reply_id(&rel).or_else(|| Some(format!("msg_{f}")));
+        c.agent.request_class = cap_header(&rel, "x-claude-code-request-class");
+        c.started_at = base + Duration::from_secs(10 * i as u64);
+        c.client_tools = true;
+        if *stop == "tool_use" {
+            c.tool_use_lens = vec![("mcp__bumper__bump".into(), 40)];
+        }
+        let before: usize = t.0.state.lock().pending.values().map(|p| p.events.len()).sum();
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let all: Vec<(String, Value)> = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+            .collect();
+        per_req.push(all[before.min(all.len())..].to_vec());
+    }
+    // 官方那两批里新输入那轮的附件事件：类型与估值整份比（体里没有 `<total_tokens>` 提醒，不列）。
+    let official_att = |batch: &str| -> Value {
+        let (body, _) = cap_request(&format!("{dir}/{batch}")).unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| ev_name(e) == "tengu_attachments")
+            .map(meta_of)
+            .find(|m| m["attachment_types"] == json!(["deferred_tools_delta"]))
+            .unwrap()
+    };
+    let ours_att = |evs: &[(String, Value)]| -> Value {
+        evs.iter()
+            .filter(|(n, _)| n == "tengu_attachments")
+            .map(|(_, m)| m.clone())
+            .next_back()
+            .expect("有附件事件")
+    };
+    let pools = |evs: &[(String, Value)]| -> Vec<Value> {
+        evs.iter()
+            .filter(|(n, _)| n == "tengu_deferred_tools_pool_change")
+            .map(|(_, m)| m.clone())
+            .collect()
+    };
+    let inline = |evs: &[(String, Value)]| -> Vec<Value> {
+        evs.iter()
+            .filter(|(n, _)| n == "tengu_inline_tools_announced")
+            .map(|(_, m)| m.clone())
+            .collect()
+    };
+    for (i, batch, defs, repl) in [(1, "00076_", 2, 0), (4, "00085_", 0, 1)] {
+        let (a, b) = (ours_att(&per_req[i]), official_att(batch));
+        for k in ["attachment_types", "attachment_token_estimates", "query_source"] {
+            assert_eq!(a[k], b[k], "{batch} {k}: {a}");
+        }
+        let inl = inline(&per_req[i]);
+        assert_eq!(inl.len(), 1, "{batch}");
+        assert_eq!(
+            (&inl[0]["definitions"], &inl[0]["replacements"]),
+            (&json!(defs), &json!(repl)),
+            "{batch}"
+        );
+    }
+    // `00073`：新输入，体里没有 `<total_tokens>` 提醒、也没有工具池附件——不报 `tengu_attachments`（官方同）。
+    assert!(
+        per_req[2].iter().all(|(n, _)| n != "tengu_attachments"),
+        "00073 不该有附件事件: {:?}",
+        per_req[2].iter().filter(|(n, _)| n == "tengu_attachments").collect::<Vec<_>>()
+    );
+    // `00071`：新增两个，汇总照报。
+    let p = pools(&per_req[1]);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert_eq!(p[0]["addedCount"], json!(2), "{}", p[0]);
+    // `00078`：只有定义更新，不报汇总。
+    assert!(pools(&per_req[4]).is_empty(), "定义更新那轮不报汇总: {:?}", pools(&per_req[4]));
 }
 
 /// 线程续轮显式发 `tools: []` 是把工具清空（官方只在沿用时才省略 `tools`）：报工具变了、不复用工具哈希；省略 `tools` 的照旧
@@ -12737,6 +12871,24 @@ fn version_2_1_321_moves_the_5xx_frame() {
         }
         assert!(seen > 0);
     }
+}
+
+/// 2.1.322（`cap/auto-2.1.322-20261110-retry`）：5xx 的栈哈希与行列照旧、顶帧换块；压缩后的类名 `zmn` 小写开头过不了校验，
+/// **不带 `error_constructor`**。
+#[test]
+fn version_2_1_322_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.322 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert!(m.get("error_constructor").is_none(), "2.1.322 {n}: {m}");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-hrr4cssb.js:5:1510")),
+            "2.1.322 {n}"
+        );
+    }
+    assert!(seen > 0);
 }
 
 /// 2.1.319（`cap/auto-2.1.319-20261106-retry`）：5xx 的栈哈希照旧、顶帧换块，照旧不带 `error_constructor`。
@@ -13990,6 +14142,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.322 只换了块名（`cap/auto-2.1.322-20261110-bashfail/2.1.322`）。
+        ("claude-cli/2.1.322 (external, cli)", "0cacd2d8980f", "chunk-9r1hbf9p.js:3632:9537"),
         ("claude-cli/2.1.321 (external, cli)", "0cacd2d8980f", "chunk-ne1755n5.js:3632:9537"),
         // 2.1.320 没抓，沿用 2.1.321 的。
         ("claude-cli/2.1.320 (external, cli)", "0cacd2d8980f", "chunk-ne1755n5.js:3632:9537"),
@@ -14017,9 +14171,9 @@ fn version_2_1_303_telemetry_shape() {
             "{ua}"
         );
         // 2.1.321 的 `ShellError` 压缩后是 `Rx`，带构造名、夹在消息摘要与栈摘要之间
-        // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`）；2.1.293 ~ 2.1.319 不带。
+        // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`），2.1.322 同；2.1.293 ~ 2.1.319 不带。
         let keys: Vec<&str> = err.as_object().unwrap().keys().map(String::as_str).collect();
-        if ua.contains("2.1.321") || ua.contains("2.1.320") {
+        if ua.contains("2.1.322") || ua.contains("2.1.321") || ua.contains("2.1.320") {
             assert_eq!(err["error_constructor"], json!("Rx"), "{ua}");
             let at = keys.iter().position(|k| *k == "error_constructor").unwrap();
             assert_eq!(

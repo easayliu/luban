@@ -468,6 +468,9 @@ pub(super) struct Subst<'a> {
     pub(super) seed: u32,
     /// 文件历史跟踪中的文件数（`tengu_file_history_snapshot_success.trackedFilesCount`），见 [`Files`]。
     pub(super) tracked_files: usize,
+    /// 这一轮客户端附的提醒里有 `<total_tokens>` 那条（[`super::tool_pool::Scan::total_tokens`]）。体归客户端时
+    /// （[`Self::client_tools`]）附件事件里的 `total_tokens_reminder` 跟它走，模拟路径照模板由 luban 补。
+    pub(super) body_total_tokens: bool,
     /// 正文里有延迟加载的工具（`defer_loading: true`）。没有就不发
     /// `tengu_deferred_tools_pool_change`、`tengu_attachments` 里也没有 `deferred_tools_delta`
     /// ——官方 API-key 端（全量声明、无 ToolSearch）正是这个形态（`cap/2.1.258-api/00002`、
@@ -958,6 +961,10 @@ where
             {
                 continue;
             }
+            // 接着已有对话、工具池没变：官方不报汇总那条（[`super::tool_pool::PoolTurn::resumed_unchanged`]）。
+            if e.name == "tengu_deferred_tools_pool_change" && subst.pool.resumed_unchanged() {
+                continue;
+            }
             // IDE 里抓的模板底子：2.1.285 起的自动抓包（终端里跑）一次都没有。启动段那两条
             // `ide_detect{found:true}` 同理——终端里是启动 30 秒后一条 `found:false`，由代码补
             // （`Session::take_ide_detect`）。
@@ -1043,11 +1050,50 @@ where
             {
                 types.retain(|t| t.as_str() != Some("auto_mode"));
             }
+            // 体归客户端：`<total_tokens>` 提醒这一轮体里没有就不列（`cap/auto-2.1.322-20261111-redefine` 请求 `00071` / `00078`
+            // 都没有，批次 `00076` / `00085` 只列 `deferred_tools_delta`）。模拟路径的提醒由 luban 补，照模板。
+            if e.name == "tengu_attachments"
+                && subst.client_tools
+                && !subst.body_total_tokens
+                && let Some(types) = meta.get_mut("attachment_types").and_then(|t| t.as_array_mut())
+            {
+                types.retain(|t| t.as_str() != Some("total_tokens_reminder"));
+            }
+            // 续轮那段模板里的附件只有 `<total_tokens>` 提醒；接着已有对话的这一轮带着工具池附件时官方照列它，估值按这一轮的正文算
+            // （`cap/auto-2.1.322-20261111-redefine` 批次 `00076` / `00085`：新输入那轮 `['deferred_tools_delta']`，428 / 118）。
+            let mut own_pool: Option<Option<usize>> = None;
+            if e.name == "tengu_attachments"
+                && version_at_least(subst.version, "2.1.319")
+                && let Some(d) = subst.pool.attachment_delta()
+                && let Some(types) = meta.get_mut("attachment_types").and_then(|t| t.as_array_mut())
+                && !types.iter().any(|t| t == "deferred_tools_delta")
+            {
+                types.insert(0, json!("deferred_tools_delta"));
+                own_pool = Some(d.token_estimate(subst.pool.history, !subst.sdk));
+            }
             // 模板里的附件事件都在主线程新输入之前：交互式紧随其后的是 `repl_main_thread`，
             // `-p` 是 `sdk`（`cap/auto-2.1.285-20260930/00448`）。
             if e.name == "tengu_attachments" && version_at_least(subst.version, "2.1.285") {
                 let source = if subst.sdk { "sdk" } else { "repl_main_thread" };
                 fill_attachment_estimates(&mut meta, source, subst.sdk, subst.model);
+                match own_pool {
+                    Some(Some(n)) => {
+                        if let Some(slot) = meta
+                            .get_mut("attachment_token_estimates")
+                            .and_then(|e| e.as_array_mut())
+                            .and_then(|a| a.first_mut())
+                        {
+                            *slot = json!(n.to_string());
+                        }
+                    }
+                    // 这一轮的工具池数据没记全：估值按位置一一对应，缺一项整份不报。
+                    Some(None) => {
+                        if let Some(o) = meta.as_object_mut() {
+                            o.shift_remove("attachment_token_estimates");
+                        }
+                    }
+                    None => {}
+                }
             }
             if e.name == "tengu_timer"
                 && meta.get("event").and_then(|x| x.as_str()) == Some("startup")
@@ -1236,6 +1282,27 @@ where
                         id.event_at(e.stage, "tengu_deferred_tools_pool_change_by_owner", t, &c, m),
                     ));
                 }
+            }
+            // 过滤、补完之后一种附件都没有：官方只在有附件时才报这一条（`cap/auto-2.1.322-20261111-redefine` 请求 `00073`：
+            // 体里没有 `<total_tokens>` 提醒、也没有工具池附件，那一轮没有 `tengu_attachments`）。
+            if e.name == "tengu_attachments"
+                && meta
+                    .get("attachment_types")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|t| t.is_empty())
+            {
+                continue;
+            }
+            // 2.1.321 起附件里有按值补的定义时，附件那条前面先报一条（同一毫秒，[`super::tool_pool::inline_announced`]）。
+            if e.name == "tengu_attachments"
+                && version_at_least(subst.version, "2.1.321")
+                && meta
+                    .get("attachment_types")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|t| t.iter().any(|x| x == "deferred_tools_delta"))
+                && let Some(m) = subst.pool.delta.and_then(super::tool_pool::inline_announced)
+            {
+                events.push((t, id.event_at(e.stage, "tengu_inline_tools_announced", t, &c, m)));
             }
             events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
             if !subst.sdk && !subst.pool_inline && e.name == "tengu_mcp_instructions_pool_change" {

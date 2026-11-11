@@ -166,7 +166,7 @@ impl EventBuilder<'_> {
             self.unknown_parent_scope = false;
         } else if (is_main || is_sub)
             && !new_prompt
-            && (self.subst.pool.changed() || self.subst.pool.mcp_changed())
+            && (self.subst.pool.attachment_delta().is_some() || self.subst.pool.mcp_changed())
         {
             // 工具结果配不上上一条回复里的调用（底本丢了之类），工具那串补不出来；这一轮正文里认得出的工具池变化与附件照报，
             // 时间同攒附件那刻。
@@ -190,15 +190,17 @@ impl EventBuilder<'_> {
         let TurnFacts { ref display_model, v285, .. } = *env.f;
         let query_source = env.query_source.as_str();
         self.emit_pool_turn(ta, is_sub);
-        let pool = self.subst.pool.delta.filter(|_| self.subst.pool.changed());
+        let pool = self.subst.pool.attachment_delta();
         let mcp = self.subst.pool.mcp.filter(|_| self.subst.pool.mcp_changed());
         let mut types = Vec::new();
         // 这两种附件的估值按这一轮的正文算（[`super::super::tool_pool::PoolDelta::token_estimate`]），不用固定值。
         let mut own_estimates = Vec::new();
         if let Some(d) = pool {
             types.push("deferred_tools_delta");
-            own_estimates
-                .push(("deferred_tools_delta", d.token_estimate(self.subst.pool.history, is_sub)));
+            own_estimates.push((
+                "deferred_tools_delta",
+                d.token_estimate(self.subst.pool.history, !shape.sdk),
+            ));
         }
         if let Some(m) = mcp {
             types.push("mcp_instructions_delta");
@@ -238,6 +240,13 @@ impl EventBuilder<'_> {
         }
         // billing-only 模拟没补 `<total_tokens>` 提醒（[`ApiCall::bare`]）。
         if !call.bare && !types.is_empty() {
+            // 2.1.321 起工具池附件里有按值补的定义时，附件那条前面先报一条（同一毫秒，
+            // [`super::super::tool_pool::inline_announced`]）。
+            if version_at_least(&env.f.version, "2.1.321")
+                && let Some(m) = pool.and_then(super::super::tool_pool::inline_announced)
+            {
+                self.push(ta, "tengu_inline_tools_announced", m);
+            }
             self.push(ta, "tengu_attachments", attachments);
         }
     }
@@ -686,6 +695,7 @@ impl EventBuilder<'_> {
             v318,
             v319,
             v321,
+            v322,
             bash_metered,
             prompt_seq,
             ..
@@ -1089,7 +1099,13 @@ impl EventBuilder<'_> {
             // 摘要、行列、块名都换了；2.1.320 没抓，先沿用这一版的。
             // 这一版 `ShellError` 压缩后的类名是 `Rx`，过得了构造名校验，**又带上了 `error_constructor`**（夹在消息摘要与栈摘要之间，
             // 同 2.1.291 那次）。
-            if v321 {
+            // 2.1.322（`cap/auto-2.1.322-20261110-bashfail` 与全量包里两条，同值；同一次跑的 2.1.321 对照仍是 0cacd2d8980f）
+            // 摘要、行列、类名都没变，只换了块名。
+            if v322 {
+                err["error_constructor"] = json!("Rx");
+                err["error_stack_hash"] = json!("0cacd2d8980f");
+                err["error_top_frame"] = json!("chunk-9r1hbf9p.js:3632:9537");
+            } else if v321 {
                 err["error_constructor"] = json!("Rx");
                 err["error_stack_hash"] = json!("0cacd2d8980f");
                 err["error_top_frame"] = json!("chunk-ne1755n5.js:3632:9537");

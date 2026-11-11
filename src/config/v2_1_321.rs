@@ -1,15 +1,15 @@
-//! 2.1.321 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.321 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.321 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.321 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.321 的 profile 表：2.1.321 来访的 beta 参照（[`cc_profile_at`]）。2.1.322 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.319（[`CC_PROFILES_2_1_319`]）完全相同**：两版可执行文件里的 beta 名字清单逐个相同（55 个），
 /// `cap/auto-2.1.321-20261110-full` 按场景逐条对 `cap/auto-2.1.319-20261106-full`，头顺序、beta、body 键、工具定义都没变。
 /// 这一版改的是提示词（见 [`CC_SYSTEM_REST`]：多一段隐私说明、模型清单换成 Fable 5.2、fast mode 那句改写）与模型表
 /// （新增 `claude-fable-5-2` / `claude-mythos-5-2`，默认 effort `medium`）。2.1.320 发布了但没抓，来访按 2.1.319 的表认。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_321: &[CcProfile] = &[
     at_321(CC_PROFILES_2_1_319[0]),
     at_321(CC_PROFILES_2_1_319[1]),
     at_321(CC_PROFILES_2_1_319[2]),

@@ -1148,6 +1148,11 @@ pub(super) fn error_trace(
         ("2.1.320" | "2.1.321", Some(s)) if s >= 500 => {
             Some((Some("Gmn"), "5b32b751db51", "chunk-wvydwysp.js:5:1510"))
         }
+        // 2.1.322 摘要与行列照旧、顶帧换了块；5xx 类压缩后是 `zmn`（小写开头），过不了构造名校验，**又不带
+        // `error_constructor`** 了（`cap/auto-2.1.322-20261110-retry`：两条 `tengu_api_retry` 与收尾的 `tengu_api_error`）。
+        ("2.1.322", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-hrr4cssb.js:5:1510"))
+        }
         _ => None,
     }
 }

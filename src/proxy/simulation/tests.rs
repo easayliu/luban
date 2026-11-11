@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.321."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.322."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.321."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.322."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1629,8 +1629,9 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.321-20261110-full`（fable-5-2 那条在 `-fable52`）逐项核**（下面列的是历次抓包用过的编号，2.1.321 用
-/// `00681`、`00363`、`00447`、`00593`、`00899` 与 `fable52/00068`）：六个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.322-20261110-full`（fable-5-2 那条在 `-fable52`）逐项核**
+/// （下面列的是历次抓包用过的编号，2.1.322 用 `00687`、`00366`、`00451`、`00598`、`00906` 与 `fable52/00074`；2.1.321 用
+/// `00681`、`00363`、`00447`、`00593`、`00899`）：六个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、`x-claude-code-sandy-plover`、顶层键序、
 /// `thinking`、`context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方
 /// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00686`、`00375`、`00611`、`00460`
@@ -1652,10 +1653,10 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_321_captures() {
-    // 末一条 fable-5-2 在单独那份抓包里（`cap/auto-2.1.321-20261110-fable52`，同一台机、同一个测试项目）。
+fn simulated_main_threads_match_the_2_1_322_captures() {
+    // 末一条 fable-5-2 在单独那份抓包里（`cap/auto-2.1.322-20261110-fable52`，同一台机、同一个测试项目）。
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for sub in ["auto-2.1.321-20261110-full", "auto-2.1.321-20261110-fable52"] {
+    for sub in ["auto-2.1.322-20261110-full", "auto-2.1.322-20261110-fable52"] {
         let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
         let Ok(entries) = std::fs::read_dir(&dir) else {
             eprintln!("skipped: cap/{sub} not present");
@@ -1696,12 +1697,12 @@ fn simulated_main_threads_match_the_2_1_321_captures() {
         cred
     };
     for (i, (sub, n, auto_mode)) in [
-        ("-full", "00681", false),
-        ("-full", "00363", false),
-        ("-full", "00447", false),
-        ("-full", "00593", false),
-        ("-full", "00899", true),
-        ("-fable52", "00068", true),
+        ("-full", "00687", false),
+        ("-full", "00366", false),
+        ("-full", "00451", false),
+        ("-full", "00598", false),
+        ("-full", "00906", true),
+        ("-fable52", "00074", true),
     ]
     .into_iter()
     .enumerate()
@@ -1806,7 +1807,7 @@ fn simulated_main_threads_match_the_2_1_321_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.321."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.322."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1815,7 +1816,7 @@ fn simulated_main_threads_match_the_2_1_321_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/8f9ad55d-9cdf-46a4-80aa-5ef7ff51db12/scratchpad/cal12",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/5052a84f-a921-4bcc-8ff8-77c566688ec2/scratchpad/cal13",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -2123,13 +2124,13 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.321 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315、2.1.320 没抓；
-/// 2.1.321 是当前模拟的版本，另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
+/// **2.1.309 ~ 2.1.322 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315、2.1.320 没抓；
+/// 2.1.322 是当前模拟的版本，另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍（这一版官方直连路径没改）；2.1.321 同样把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
 /// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。2.1.319 那份 WebFetch 页面处理与 kebab-case 命名多带
 /// `claude-code-side-query`，merge_beta 同样一项不多。
 #[test]
-fn every_auto_2_1_309_to_321_official_request_passes_through() {
+fn every_auto_2_1_309_to_322_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2140,12 +2141,17 @@ fn every_auto_2_1_309_to_321_official_request_passes_through() {
         ("auto-2.1.317-20261103-full", (2, 1, 317)),
         ("auto-2.1.318-20261104-full", (2, 1, 318)),
         ("auto-2.1.319-20261106-full", (2, 1, 319)),
-        // 当前模拟的版本：全量、`/model` 预热、重试、失败 Bash 与 Fable 5.2 的交互式会话都过一遍。
         ("auto-2.1.321-20261110-full", (2, 1, 321)),
         ("auto-2.1.321-20261110-model", (2, 1, 321)),
         ("auto-2.1.321-20261110-retry", (2, 1, 321)),
         ("auto-2.1.321-20261110-bashfail/2.1.321", (2, 1, 321)),
         ("auto-2.1.321-20261110-fable52", (2, 1, 321)),
+        // 当前模拟的版本：全量、`/model` 预热、重试、失败 Bash 都过一遍。
+        ("auto-2.1.322-20261110-full", (2, 1, 322)),
+        ("auto-2.1.322-20261110-model", (2, 1, 322)),
+        ("auto-2.1.322-20261110-retry", (2, 1, 322)),
+        ("auto-2.1.322-20261110-bashfail/2.1.322", (2, 1, 322)),
+        ("auto-2.1.322-20261110-fable52", (2, 1, 322)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");

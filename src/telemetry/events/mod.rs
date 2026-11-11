@@ -446,6 +446,7 @@ impl<'a> EventEnv<'a> {
             git: f.identity.vcs.is_some(),
             seed: self.req_hash,
             tracked_files: 0,
+            body_total_tokens: self.shape.pool_total_tokens,
         }
     }
 }
