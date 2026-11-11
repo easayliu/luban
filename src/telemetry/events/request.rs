@@ -49,7 +49,8 @@ impl EventBuilder<'_> {
         }
         // 续轮与侧查询在发请求前也判一次工具搜索模式（首次输入的那条在模板里）；它排在
         // 规范化那串之前（`cap/2.1.260-2` 与 `cap/2.1.280/00048` 都是）。
-        if !new_prompt {
+        // 工具表不知道（[`TurnFacts::tools_unknown`]，冷启动单独接到的半截续轮）：判不出来，不报，不报成「请求里没有工具」。
+        if !new_prompt && !env.f.tools_unknown {
             self.push(
                 ms(t0, -1),
                 "tengu_tool_search_mode_decision",
@@ -499,6 +500,30 @@ impl EventBuilder<'_> {
                     vec![("toolsHashKept", json!(t.tools_kept))],
                 );
             }
+            // 半截的增量（[`super::super::session::Tether::counts_unknown`]）：线程里第几条、整段与上一条的消息数都不知道。
+            if t.counts_unknown
+                && let Some(o) = decision.as_object_mut()
+            {
+                for k in ["turnsInThread", "messageCount", "prevMessageCount"] {
+                    o.shift_remove(k);
+                }
+            }
+            // 「上一条」只知道一半（[`super::super::session::Tether::prev_unknown`]）：上一条的消息数、线程里第几条、多出几条都
+            // 不知道。
+            if t.prev_unknown
+                && let Some(o) = decision.as_object_mut()
+            {
+                for k in ["turnsInThread", "prevMessageCount", "deltaMessageCount"] {
+                    o.shift_remove(k);
+                }
+            }
+            // 「上一条」的工具表不知道（[`super::super::session::Tether::tools_unknown`]）：工具变没变不报。
+            if t.tools_unknown
+                && let Some(o) = decision.as_object_mut()
+            {
+                o.shift_remove("changedTools");
+                o.shift_remove("toolsHashKept");
+            }
             self.push_dd_snake(t0, "tengu_tether_decision", decision);
             // 回声审计：客户端把上游回过来的 assistant 轮次原样带回去了没有。经代理转发的
             // 历史就是客户端自己拼的那份，按「全部原样」报。
@@ -525,6 +550,15 @@ impl EventBuilder<'_> {
                     "toolNameChanged": 0,
                     "callerDropped": 0
                 });
+                let mut echo = echo;
+                // 半截的增量：整段消息数、带回的助手轮次都不知道，不报。
+                if t.counts_unknown
+                    && let Some(o) = echo.as_object_mut()
+                {
+                    for k in ["messageCount", "turnsReceived", "turnsIdentical"] {
+                        o.shift_remove(k);
+                    }
+                }
                 self.push_dd_snake(t0, "tengu_tether_echo_audit", echo);
             }
         }

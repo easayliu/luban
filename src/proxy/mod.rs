@@ -100,6 +100,7 @@ pub(crate) mod cache_keepalive;
 pub(crate) mod client_data;
 pub(crate) mod curious_tower;
 pub(crate) mod dapper_dawn;
+pub(crate) mod finishing_notes;
 pub(crate) mod glowing_lark;
 pub(crate) mod heron_brook;
 pub(crate) mod lapis_anchor;

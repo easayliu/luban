@@ -78,7 +78,10 @@ const EARLY_STOPPING_HEAD: &str =
 /// 第四块末尾那两节（官方 2.1.293 起 system 段序 `…、original_games、heron_brook、…`，都在 `<total_tokens>` 之前）：`games`
 /// 是原创游戏那段（[`super::original_games`] 判开了才给），`served` 是下发的 `heron_brook` 正文。`heron_brook` 这一节在
 /// 模板里有内置的「提前收手」那段（haiku-5-5，官方 `Amr`）时就占着它的位置：下发了就整段换掉，没下发保留原样；原创游戏
-/// 那段总排在这一节前面。模板里没有那段的，两节依次插在 `<total_tokens>` 前、两段之间空一行，没有那行就接在末尾。
+/// 那段总排在这一节前面。模板里没有那段的，两节依次插在官方段序里后面那几节（[`LATER_HEADS`]：fable-5-2 模板的 `# Finishing work`、fable-5-1
+/// 模板的 `# Writing for the user`）最靠前的一节前，没有那些节就插在 `<total_tokens>` 前、两段之间空一行，那行也没有就
+/// 接在末尾。**先调 [`super::finishing_notes::fit_system_rest`]**（按号去掉 / 补上那两节）再调这里：此时下发的正文还没拼进来，
+/// 按标题找到的只会是模板自己的节，下发的正文里碰巧有同样的标题也不会串。
 /// `served` 在 2.1.293 之前不算（没有这一节）。两样都没有原样返回。在 [`super::lapis_anchor::fit_system_rest`] 之前调。
 pub(crate) fn fit_system_rest(
     rest: String,
@@ -93,8 +96,8 @@ pub(crate) fn fit_system_rest(
     }
     let mut out = rest;
     if let Some(at) = out.find(EARLY_STOPPING_HEAD) {
-        // 那段自己带空行，是模板里 `<total_tokens>` 前的最后一段：截到那行之前，没有那行就截到末尾。
-        let end = out[at..].find("\n\n<total_tokens>").map_or(out.len(), |n| at + n);
+        // 那段自己带空行，是模板里这一节的全部：截到后面那几节（[`LATER_HEADS`]）或 `<total_tokens>` 那行之前，都没有就截到末尾。
+        let end = later_section(&out[at..]).map_or(out.len(), |n| at + n - 2);
         let builtin = out[at..end].to_string();
         let heron = served.unwrap_or(&builtin);
         let section = match games {
@@ -105,7 +108,7 @@ pub(crate) fn fit_system_rest(
         return out;
     }
     let section = [games, served].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
-    match out.rfind("<total_tokens>").filter(|at| out[..*at].ends_with("\n\n")) {
+    match later_section(&out) {
         Some(at) => out.insert_str(at, &format!("{section}\n\n")),
         None => {
             out.push_str("\n\n");
@@ -113,6 +116,22 @@ pub(crate) fn fit_system_rest(
         }
     }
     out
+}
+
+/// 官方段序里排在这两节后面、模板里可能有的几节的标题行：`finishing_work`、`notes_and_feedback`（2.1.321，
+/// [`super::finishing_notes`]）、`willow_tern`（`# Writing for the user`，fable-5-1 那份模板有）。
+const LATER_HEADS: [&str; 3] =
+    ["# Finishing work\n", "# Memory, notes and feedback\n", "# Writing for the user\n"];
+
+/// `rest` 里这两节该插在谁前面：[`LATER_HEADS`] 里最靠前的那一节（标题行顶格、前面是空行），都没有就是末尾那行
+/// `<total_tokens>`；返回它的起点，一个都没有是 `None`。调用时下发的正文还没拼进来，找到的只会是模板自己的节。
+fn later_section(rest: &str) -> Option<usize> {
+    let para_start = |at: &usize| rest[..*at].ends_with("\n\n");
+    LATER_HEADS
+        .iter()
+        .filter_map(|h| rest.match_indices(h).map(|(at, _)| at).find(para_start))
+        .min()
+        .or_else(|| rest.rfind("<total_tokens>").filter(para_start))
 }
 
 #[cfg(test)]

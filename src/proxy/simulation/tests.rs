@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.319."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.321."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.319."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.321."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1629,7 +1629,8 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.319-20261106-full` 逐项核**：五个主线程模型各造一条第三方请求（只有一句
+/// **对着 `cap/auto-2.1.321-20261110-full`（fable-5-2 那条在 `-fable52`）逐项核**（下面列的是历次抓包用过的编号，2.1.321 用
+/// `00681`、`00363`、`00447`、`00593`、`00899` 与 `fable52/00068`）：六个主线程模型各造一条第三方请求（只有一句
 /// `hi` 和一段客户端 system）走模拟路径，出站的 beta、`anthropic-dispatch-id`、`x-claude-code-sandy-plover`、顶层键序、
 /// `thinking`、`context_management`、`thread`、基座、第四块、14 个内建工具、有没有 `<total_tokens>` 都要与那个模型的官方
 /// 主线程一致。opus / sonnet / haiku-4.5 / haiku-5-5 取默认权限模式 `thread: create` 的那轮（`00686`、`00375`、`00611`、`00460`
@@ -1651,13 +1652,17 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_319_captures() {
-    let dir = format!("{}/cap/auto-2.1.319-20261106-full", env!("CARGO_MANIFEST_DIR"));
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.319-20261106-full not present");
-        return;
-    };
-    let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
+fn simulated_main_threads_match_the_2_1_321_captures() {
+    // 末一条 fable-5-2 在单独那份抓包里（`cap/auto-2.1.321-20261110-fable52`，同一台机、同一个测试项目）。
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for sub in ["auto-2.1.321-20261110-full", "auto-2.1.321-20261110-fable52"] {
+        let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipped: cap/{sub} not present");
+            return;
+        };
+        files.extend(entries.filter_map(|e| Some(e.ok()?.path())));
+    }
     // 清单是默认值；正文照 2.1.303 抓包那个号的 v4 第 1 组那段喂进去（`assets/cc_agent_cerf_text_v4.txt`）——
     // 2.1.305 起不再读这个开关，出站的 cerf 说明必须仍是内置正文、与抓包一致；2.1.307 起清单也不读，清单外的
     // opus-5-5 一样用 cerf 那版。用独立的号喂进去，不动别的用例共用的测试凭证。
@@ -1690,18 +1695,25 @@ fn simulated_main_threads_match_the_2_1_319_captures() {
         crate::proxy::client_data::note_bootstrap(cred.id, "claude-sonnet-5-5", boot);
         cred
     };
-    for (i, (n, auto_mode)) in
-        [("00686", false), ("00375", false), ("00460", false), ("00611", false), ("00915", true)]
-            .into_iter()
-            .enumerate()
+    for (i, (sub, n, auto_mode)) in [
+        ("-full", "00681", false),
+        ("-full", "00363", false),
+        ("-full", "00447", false),
+        ("-full", "00593", false),
+        ("-full", "00899", true),
+        ("-fable52", "00068", true),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let cred = cred_for(i as i64);
         let path = files
             .iter()
             .find(|p| {
-                p.file_name()
-                    .and_then(|f| f.to_str())
-                    .is_some_and(|f| f.starts_with(n) && f.ends_with(".req.raw"))
+                p.parent().and_then(|d| d.to_str()).is_some_and(|d| d.ends_with(sub))
+                    && p.file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| f.starts_with(n) && f.ends_with(".req.raw"))
             })
             .unwrap_or_else(|| panic!("{n}"));
         let raw = std::fs::read(path).unwrap();
@@ -1794,7 +1806,7 @@ fn simulated_main_threads_match_the_2_1_319_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.319."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.321."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1803,7 +1815,7 @@ fn simulated_main_threads_match_the_2_1_319_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/99b66e7e-bab1-486b-91c2-6a8a38d805d2/scratchpad/cal10",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/8f9ad55d-9cdf-46a4-80aa-5ef7ff51db12/scratchpad/cal12",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -1821,9 +1833,14 @@ fn simulated_main_threads_match_the_2_1_319_captures() {
             "{model}"
         );
         let template = super::cc_system_rest(model).unwrap();
-        // opus 的原创游戏说明这次由 `heron_brook` 下发（能力本身被关掉），别的模型两样都没有。
+        // opus 的原创游戏说明这次由 `heron_brook` 下发（能力本身被关掉）；fable-5-2 没有下发，按模型默认带能力那段
+        // （2.1.321 `fable_5_2_prompt_bundle`）；别的模型两样都没有。
         let games = crate::proxy::original_games::applies(cred.id, model, sim.profile.version);
-        assert!(!games, "{model}: 下发的 heron_brook 已含这一段，能力那段不再单独出");
+        assert_eq!(
+            games,
+            model == "claude-fable-5-2",
+            "{model}: opus 下发的 heron_brook 已含这一段"
+        );
         let heron = crate::proxy::heron_brook::served(cred.id, model).map(|(t, _)| t);
         assert_eq!(heron.is_some(), model == "claude-opus-5-5", "{model}");
         let rest = crate::proxy::lapis_anchor::fit_system_rest(
@@ -1839,7 +1856,11 @@ fn simulated_main_threads_match_the_2_1_319_captures() {
         // 出站那块就是这样拼的（客户端的环境另算，只比原创游戏那段在不在、在末尾）。
         let out_rest = sys[3]["text"].as_str().unwrap();
         let games_text = crate::proxy::original_games::text_for(sim.profile.version);
-        assert_eq!(out_rest.contains(games_text), model == "claude-opus-5-5", "{model}");
+        assert_eq!(
+            out_rest.contains(games_text),
+            matches!(model, "claude-opus-5-5" | "claude-fable-5-2"),
+            "{model}"
+        );
         assert!(out_rest.matches(games_text).count() <= 1, "{model}: 不重复");
         // `<total_tokens>` 跟这个号这个模型的下发走：有没有与官方那条一致（opus / sonnet 没有，其余有）。
         let has_tt =
@@ -2102,12 +2123,13 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.319 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315 没抓）
+/// **2.1.309 ~ 2.1.321 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313 没有发布，2.1.315、2.1.320 没抓；
+/// 2.1.321 是当前模拟的版本，另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
 /// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。2.1.319 那份 WebFetch 页面处理与 kebab-case 命名多带
 /// `claude-code-side-query`，merge_beta 同样一项不多。
 #[test]
-fn every_auto_2_1_309_to_319_official_request_passes_through() {
+fn every_auto_2_1_309_to_321_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2118,12 +2140,20 @@ fn every_auto_2_1_309_to_319_official_request_passes_through() {
         ("auto-2.1.317-20261103-full", (2, 1, 317)),
         ("auto-2.1.318-20261104-full", (2, 1, 318)),
         ("auto-2.1.319-20261106-full", (2, 1, 319)),
+        // 当前模拟的版本：全量、`/model` 预热、重试、失败 Bash 与 Fable 5.2 的交互式会话都过一遍。
+        ("auto-2.1.321-20261110-full", (2, 1, 321)),
+        ("auto-2.1.321-20261110-model", (2, 1, 321)),
+        ("auto-2.1.321-20261110-retry", (2, 1, 321)),
+        ("auto-2.1.321-20261110-bashfail/2.1.321", (2, 1, 321)),
+        ("auto-2.1.321-20261110-fable52", (2, 1, 321)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");
             continue;
         };
-        assert!(seen >= 20, "{sub}: {seen}");
+        // 全量那几份每份上千条；`/model` 预热、失败 Bash 那两份小（失败 Bash 只有两条）。
+        let least = if sub.ends_with("-full") { 20 } else { 2 };
+        assert!(seen >= least, "{sub}: {seen}");
         assert!(bad.is_empty(), "{sub} {} 条：\n{}", bad.len(), bad.join("\n"));
     }
 }
@@ -2606,14 +2636,18 @@ fn system_rest_assets_are_verbatim() {
     for (asset, len, head) in [
         // 2.1.315 起 opus / sonnet / haiku-5-5 删了开头那句 `Write code that reads like…`（`cap/auto-2.1.316-20261031-full`
         // 三个模型的第四块都正好少 96 字节），以代词那句开头。
-        (config::CC_SYSTEM_REST, 4581, "When you use a pronoun for someone"),
+        // 2.1.321 四份都多一段隐私说明（467 字节，`tengu_prancy_pebble`，服务端强制开），`# Environment` 里模型清单换成
+        // Fable 5.2、fast mode 那句改写；fable 那份的自我介绍另改短了（`cap/auto-2.1.321-20261110-full`）。
+        (config::CC_SYSTEM_REST, 5048, "When you use a pronoun for someone"),
         (
             config::CC_SYSTEM_REST_FABLE,
-            10771,
+            11109,
             "Before you start, say in a line what you're about to do",
         ),
-        (config::CC_SYSTEM_REST_HAIKU, 16697, "# Text output (does not apply to tool calls)"),
-        (config::CC_SYSTEM_REST_HAIKU_5_5, 7373, "When you use a pronoun for someone"),
+        (config::CC_SYSTEM_REST_HAIKU, 17164, "# Text output (does not apply to tool calls)"),
+        (config::CC_SYSTEM_REST_HAIKU_5_5, 7840, "When you use a pronoun for someone"),
+        // fable-5-2（`cap/auto-2.1.321-20261110-fable52/00068`）：另去掉了原创游戏那段（按号插回）。
+        (config::CC_SYSTEM_REST_FABLE_5_2, 9574, "When you use a pronoun for someone"),
     ] {
         assert_eq!(asset.len(), len, "{head}");
         assert!(asset.starts_with(head), "{head}");
@@ -3384,6 +3418,179 @@ fn system_rest_follows_client_data_fetched_by_the_handshake() {
     let after = sim.rest.clone().unwrap();
     assert!(!after.contains(games) && after.contains("Served guidance."), "{after}");
     assert!(!sim.refresh_system_rest(cred.id), "重拼过的再调不动");
+}
+
+/// fable-5-2 的 `# Finishing work` / `# Memory, notes and feedback` 两节跟这个号这个模型的下发走（官方 2.1.321 `kT`）：默认
+/// 都有（`cap/auto-2.1.321-20261110-fable52/00068`），bootstrap 显式下发 `false` 的那一节重拼时去掉，另一节与别的段落不动。
+#[test]
+fn finishing_and_memory_sections_follow_client_data() {
+    use crate::proxy::finishing_notes::Section;
+    let cred = crate::credentials::Credential { id: 933_321, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-fable-5-2","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    );
+    let mut sim = detect_as(&body, all_on(), &cred).unwrap();
+    let before = sim.rest.clone().unwrap();
+    let (fin, mem) = (Section::FinishingWork.text(), Section::MemoryNotes.text());
+    let games = crate::proxy::original_games::TEXT;
+    assert!(before.contains(&format!("{games}\n\n{fin}\n\n{mem}")), "默认：原创游戏、两节依次排");
+    assert!(!before.contains("<total_tokens>"), "fable-5-2 没有 total_tokens_reminder 能力");
+    assert!(before.contains("This iteration of Claude is Claude Fable 5.2"));
+    let boot = serde_json::json!({"client_data": {"memory_guidance": false}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-fable-5-2",
+        boot.to_string().as_bytes(),
+    );
+    assert!(sim.refresh_system_rest(cred.id));
+    let after = sim.rest.clone().unwrap();
+    assert_eq!(after, before.replace(&format!("\n\n{mem}"), ""), "只少那一节");
+    let boot = serde_json::json!({"client_data": {"memory_guidance": false,
+        "finishing_work_guidance": false}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-fable-5-2",
+        boot.to_string().as_bytes(),
+    );
+    assert!(sim.refresh_system_rest(cred.id));
+    let after = sim.rest.clone().unwrap();
+    assert!(after.ends_with(games), "两节都关：以原创游戏那段收尾: {after}");
+}
+
+/// mythos-5-2（没有抓包，按 2.1.321 可执行文件）：与 fable-5-2 同一套 5.2 段落，只少自我介绍那段；走 fable 那行 profile，
+/// effort 是 medium，环境说明写 `Mythos 5.2`。mythos 更早的两代仍不认。
+#[test]
+fn mythos_5_2_shares_the_5_2_sections_without_the_fable_identity() {
+    let fable = super::cc_system_rest("claude-fable-5-2").unwrap();
+    let mythos = super::cc_system_rest("claude-mythos-5-2[1m]").unwrap();
+    let identity = fable
+        .split("\n\n")
+        .find(|p| p.starts_with("This iteration of Claude is Claude Fable 5.2"))
+        .unwrap();
+    assert_eq!(mythos, fable.replace(&format!("{identity}\n\n"), ""));
+    assert!(
+        !mythos.contains("This iteration of Claude is"),
+        "自我介绍只给 claude-fable- 开头的模型"
+    );
+    for kept in [
+        "You must treat information you learn about the user and their project as private.",
+        "The training of Fable 5.2 and Mythos 5.2 included measures",
+        "# Finishing work\n",
+        "# Memory, notes and feedback\n",
+    ] {
+        assert!(mythos.contains(kept), "{kept}");
+    }
+    assert!(super::cc_system_base("claude-mythos-5-2").is_some());
+    assert_eq!(super::cc_profile_kind_for("claude-mythos-5-2"), config::CcProfileKind::MainFable);
+    assert_eq!(
+        config::cc_outbound_effort(super::cc_profile_for("claude-mythos-5-2"), "claude-mythos-5-2"),
+        Some("medium")
+    );
+    assert!(
+        config::CC_MODEL_IDENTITIES
+            .iter()
+            .any(|(id, name, _)| (*id, *name) == ("claude-mythos-5-2", "Mythos 5.2"))
+    );
+    for old in ["claude-mythos-5", "claude-mythos-5-1"] {
+        assert!(super::cc_system_rest(old).is_none(), "{old}");
+        assert_eq!(super::cc_profile_kind_for(old), config::CcProfileKind::MainSonnet, "{old}");
+    }
+    // 出站：四块 system 加客户端自己那块，第四块以原创游戏、两节收尾，没有 `<total_tokens>`。
+    let cred = crate::credentials::Credential { id: 933_322, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-mythos-5-2","messages":[{"role":"user","content":"hi"}],"system":"你是助手","max_tokens":8}"#,
+    );
+    let sim = detect_as(&body, all_on(), &cred).unwrap();
+    let out = rewrite_body(&body, &cred, "fp", all_on(), Some(&sim), None);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let sys = v["system"].as_array().unwrap();
+    assert_eq!(sys.len(), 5, "{v}");
+    let rest = sys[3]["text"].as_str().unwrap();
+    assert!(rest.contains(crate::proxy::original_games::TEXT) && !rest.contains("<total_tokens>"));
+    assert!(rest.ends_with("not intermediate files."), "{rest}");
+    assert_eq!(v["output_config"], serde_json::json!({"effort": "medium"}));
+}
+
+/// mythos-5-2 借 fable 那行 profile 只为提示词与 beta：回退目标跟能力走（官方 2.1.321 内置目录里它没有 `refusal_fallback`），来访
+/// 自己写的 `fallbacks: "default"` 原样出站，不换成 fable 的 `[{"model":"claude-opus-5"}]`；fable-5-2 有这项能力，照旧归一。
+/// `Agent` 说明跟 `lean_prompt` 走（两个模型都有）：都是精简那版，与 fable-5-2 抓包里的逐字相同。
+#[test]
+fn mythos_5_2_keeps_its_fallbacks_and_gets_the_lean_agent_description() {
+    let cred = crate::credentials::Credential { id: 933_323, ..test_cred() };
+    let flags = store::ForwardFlags { sim_trim_tools: false, ..all_on() };
+    let out_of = |model: &str| {
+        let body = Bytes::from(format!(
+            r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"fallbacks":"default","max_tokens":8}}"#
+        ));
+        let sim = detect_as(&body, flags, &cred).unwrap();
+        let out = rewrite_body(&body, &cred, "fp", flags, Some(&sim), None);
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let (mythos, fable) = (out_of("claude-mythos-5-2"), out_of("claude-fable-5-2"));
+    assert_eq!(mythos["fallbacks"], "default", "没有 refusal_fallback 能力：来访的值不动");
+    assert_eq!(fable["fallbacks"], serde_json::json!([{"model": "claude-opus-5"}]));
+    let agent = |v: &serde_json::Value| {
+        v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "Agent")
+            .map(|t| t["description"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    assert_eq!(agent(&mythos), agent(&fable), "同一版精简说明");
+    let plain = agent(&out_of("claude-sonnet-5"));
+    assert_ne!(agent(&mythos), plain, "不是完整提示词模型的那版");
+    assert!(config::cc_model_lean_prompt("claude-mythos-5-2[1m]"));
+    assert!(!config::cc_model_lean_prompt("claude-mythos-5-1"), "luban 没接的两代不算");
+}
+
+/// 两节的开关与 `heron_brook` 下发的正文一起来（官方 2.1.321 段序 `…、heron_brook、finishing_work、notes_and_feedback、
+/// willow_tern、…`）：下发的正文自己以 `# Finishing work` 开头也不会被当成内置那一节删掉；fable-5-1 打开 `# Finishing work`
+/// 时它排在下发的正文之后、`# Writing for the user` 之前。
+#[test]
+fn served_heron_text_and_section_overrides_keep_the_official_order() {
+    use crate::proxy::finishing_notes::Section;
+    let fin = Section::FinishingWork.text();
+    let served = "# Finishing work\nServed guidance, not the built-in section.";
+    // fable-5-2：关掉内置的 `# Finishing work`，同时下发一段同名标题的正文。
+    let cred = crate::credentials::Credential { id: 933_324, ..test_cred() };
+    let boot = serde_json::json!({"client_data": {"finishing_work_guidance": false,
+        "tengu_heron_brook": served}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-fable-5-2",
+        boot.to_string().as_bytes(),
+    );
+    let body = Bytes::from(
+        r#"{"model":"claude-fable-5-2","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    );
+    let rest = detect_as(&body, all_on(), &cred).unwrap().rest.unwrap();
+    assert!(!rest.contains(fin), "内置那一节关掉了");
+    assert_eq!(rest.matches("# Finishing work\n").count(), 1, "只剩下发的那段");
+    let games = crate::proxy::original_games::TEXT;
+    assert!(
+        rest.contains(&format!("{games}\n\n{served}\n\n# Memory, notes and feedback\n")),
+        "原创游戏、下发的正文、Memory 一节依次排: {rest}"
+    );
+    // fable-5-1：默认没有这两节，下发打开 `# Finishing work`，同时下发 heron 正文。
+    let cred = crate::credentials::Credential { id: 933_325, ..test_cred() };
+    let boot = serde_json::json!({"client_data": {"finishing_work_guidance": true,
+        "tengu_heron_brook": "Served guidance."}});
+    crate::proxy::client_data::note_bootstrap(
+        cred.id,
+        "claude-fable-5-1",
+        boot.to_string().as_bytes(),
+    );
+    let body = Bytes::from(
+        r#"{"model":"claude-fable-5-1","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    );
+    let rest = detect_as(&body, all_on(), &cred).unwrap().rest.unwrap();
+    assert!(
+        rest.contains(&format!("Served guidance.\n\n{fin}\n\n# Writing for the user\n")),
+        "Heron → Finishing → Writing for the user: {rest}"
+    );
+    assert!(!rest.contains("# Memory, notes and feedback"));
 }
 
 /// 冷缓存的 haiku-5-5 会话：`detect` 时还没见过这个号这个模型的下发，按默认钉了带 `<total_tokens>` 的那档；等到 bootstrap

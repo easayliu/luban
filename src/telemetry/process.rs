@@ -78,16 +78,87 @@ impl Telemetry {
         // 线程增量请求先补成客户端视角的全量，再往下判类别（见 [`ThreadBase`]）。
         let is_delta = shape.thread_type.as_deref() == Some("continue");
         let mut filled_from_base = false;
+        // 没补全形态、只从只留身份的底本沿用了工具表（[`ThreadBase::tools_known`]）。
+        let mut tools_from_base = false;
+        // 确认接上的那份底本里记的回复：它的上游 request-id 与工具调用（同一条回复后面接了兄弟分支时，会话里「最近一条
+        // 回复」是别的分支，工具详情与 requestId 都得从这条所接的回复取）。
+        let mut parent_reply: Option<ParentReply> = None;
+        // 先按续轮指针挑底本（[`ThreadLine::select`]：按回复 id 留着的那几份里找），挑不出（指向没见过的回复）就不补——
+        // 拿对不上的底本补出来的消息数、工具、system 都是错的。
+        let line = st
+            .sessions
+            .get(&(call.cred_id, session_id.clone()))
+            .and_then(|s| s.thread_bases.get(&thread_key));
+        let parent_of = |base: &ThreadBase| ParentReply {
+            request_id: base.request_id.clone(),
+            calls: base.reply_calls.clone(),
+            depth: base.depth,
+            chain_id: base.chain_id.clone(),
+            prompt_id: base.prompt_id.clone(),
+            turn_started: base.turn_started,
+            turn: base.turn.clone(),
+            turn_unknown: base.turn_unknown,
+            total_tokens: base.total_tokens,
+            message_id: base.reply_id.clone(),
+            tether: base.tether.clone(),
+            model: base.model.clone(),
+            tools_hash: base.tools_hash.clone(),
+            tools_known: base.tools_known,
+        };
         if is_delta
-            && let Some(base) = st
+            && let Some(line) = line
+            && let Some((base, confirmed)) = line.select(shape.thread_prev_id.as_deref())
+        {
+            // 接的是一份只留身份的底本（它自己就是没接上的半截增量）：形态补不了，这条同样是半截的；身份照认。
+            if !base.shape_incomplete {
+                let auto_in_delta = shape.auto_marker || shape.permission_declared;
+                base.fill(&mut shape, auto_in_delta, confirmed);
+                filled_from_base = true;
+            } else if confirmed {
+                // 形态补不了，但带回的工具结果照样是那条回复调的工具：配上工具名，续轮那串工具事件才发得出来。
+                base.pair_orphan_results(&mut shape);
+                // 那条的工具表知道（它体里明说过，或它接的那条知道）：这条没带 `tools` 就沿用它的（321 `00088` → `00091`
+                // 冷回放 toolsCount 18）。
+                if base.tools_known && !shape.tools_declared {
+                    base.fill_tools(&mut shape);
+                    tools_from_base = true;
+                }
+            }
+            if confirmed {
+                parent_reply = Some(parent_of(&base));
+            }
+        } else if !is_delta
+            && let Some(prev) = shape.diag_prev_message_id.as_deref()
+            && let Some(line) = line
+            && let Some((base, true)) = line.select(Some(prev))
+        {
+            // 全量请求不用底本补形态（体里就是全量），但它声明接的那条回复（`diagnostics.previous_message_id`）照样决定
+            // 工具事件的身份、深度、查询链与本轮累计：回接过旧的一轮之后，会话里「最近一条回复」可能是旧轮那条。
+            parent_reply = Some(parent_of(&base));
+        } else if !is_delta
+            && shape.diag_prev_message_id.is_none()
+            && !shape.tool_uses.is_empty()
+            && let Some(line) = line
+            && let Some(base) =
+                line.find_by_tool_call(|id| shape.tool_uses.iter().any(|t| t.id == id))
+        {
+            // 没带父指针的全量续轮：它回传的工具结果是哪条回复调的，那条就是它接的回复（工具调用 id 只此一家）。
+            parent_reply = Some(parent_of(&base));
+        }
+        // 没带父指针的全量续轮回传的工具，哪份底本的回复都没调过、这条线程最近那条回复记下的调用里也没有：它接的不是最近那条，
+        // 所接的回复认不出（同明说的指针指向没见过的回复）。最近那条没调工具（正常的文本回复）同样如此——工具结果只能接调了它的
+        // 回复。只认成功回复记下的调用（[`Session::absorb_request`] 失败、取消的不记）；这条线程一条回复都没记过才看不出。
+        let implicit_parent_unknown = !is_delta
+            && parent_reply.is_none()
+            && shape.diag_prev_message_id.is_none()
+            && !shape.tool_uses.is_empty()
+            && st
                 .sessions
                 .get(&(call.cred_id, session_id.clone()))
-                .and_then(|s| s.thread_bases.get(&thread_key))
-        {
-            let auto_in_delta = shape.auto_marker || shape.permission_declared;
-            base.fill(&mut shape, auto_in_delta);
-            filled_from_base = true;
-        }
+                .and_then(|s| s.reply_calls.get(&thread_key))
+                .is_some_and(|calls| {
+                    !calls.iter().any(|c| shape.tool_uses.iter().any(|t| t.id == c.id))
+                });
         // 会话还没有：标题生成先扣住，等这个会话的主线程请求来建会话（见 [`State::presession`]）。
         // 必须在判会话来历（`resolve_lineage`）之前扣：那一步会把 `/clear` 的旧会话标成已清、把
         // `--continue` 的旧会话与启动标记删掉，标题拿走了，主线程那条就认不出来历了。只扣标题：
@@ -254,8 +325,33 @@ impl Telemetry {
                 sess.deferred.push((c, prev_end, at));
             }
         }
-        let (prev_reply_calls, git_outcome) =
-            sess.absorb_request(&call, &mut shape, kind, &thread_key, &agent_key);
+        // 这条主线程续轮不属于会话里最近这一轮：回接更早的一轮（所接回复的那一轮不是此刻这一轮），或接一条认不出的回复
+        // （不在底本里、也不是最近那条），或接的那条自己那一轮就说不准。会话状态被它改动之前整份存下，处理完放回
+        // （[`super::session::LatestState`]）。新输入照判（同 [`Session::advance_turn`]，冷启动的工具结果续轮不算新输入）。
+        let early_main = kind == Kind::Main;
+        let early_new_prompt = early_main
+            && (shape.new_prompt || (sess.main_requests == 0 && !cold_continuation(&shape)));
+        let declared_prev =
+            shape.thread_prev_id.as_deref().or(shape.diag_prev_message_id.as_deref());
+        let isolate = early_main
+            && !early_new_prompt
+            && match &parent_reply {
+                None => {
+                    implicit_parent_unknown
+                        || declared_prev
+                            .is_some_and(|d| sess.last_main_message_id.as_deref() != Some(d))
+                }
+                Some(p) => p.turn_unknown || p.turn.as_ref().is_some_and(|t| !sess.same_turn(t)),
+            };
+        let saved_latest = isolate.then(|| sess.snapshot_latest(&thread_key));
+        let (prev_reply_calls, git_outcome) = sess.absorb_request(
+            &call,
+            &mut shape,
+            kind,
+            &thread_key,
+            &agent_key,
+            parent_reply.as_ref().map(|p| p.calls.as_slice()),
+        );
         // 一轮结束（`end_turn`）才有 stop hook 与 turn_end；`tool_use` 是同一轮的中间步。
         let turn_over = call.stop_reason.as_deref().is_none_or(|s| s != "tool_use");
         // 这条请求客户端那头是失败的：收尾走 `tengu_api_error` 那一串，且没有任何用量。
@@ -263,7 +359,25 @@ impl Telemetry {
         // 客户端取消（见 [`ApiCall::aborted`]）：没有 success 也没有 error，收尾是取消那一串。
         let aborted = call.aborted && !failed;
         let is_main = kind == Kind::Main;
-        let flags = CallFlags { kind, is_main, turn_over, failed, aborted };
+        // 没补全形态的线程增量（底本没接上，体里只有新增那几条）：工具表、消息数都是半截的，不拿来更新线程配置（tether 的
+        // 上一条、工具长度表报过的 hash）——之后明说接回完整底本的续轮要跟的仍是此前那份。
+        let shape_partial = is_delta && !filled_from_base;
+        // 半截的增量里工具表知道：体里明说了，或从所接的那条沿用了。
+        let partial_tools_known = shape.tools_declared || tools_from_base;
+        // 半截的增量里没有助手消息：增量那几条就是末条助手之后的条数（同 [`ThreadBase::fill`]），这一项照样知道。
+        if shape_partial && shape.assistant_messages == 0 {
+            shape.after_last_assistant = shape.messages_len;
+        }
+        let flags = CallFlags {
+            kind,
+            is_main,
+            turn_over,
+            failed,
+            aborted,
+            shape_partial,
+            partial_tools_known,
+            post_compaction: false,
+        };
         let TurnStart {
             emit_first_turn,
             new_prompt,
@@ -282,6 +396,37 @@ impl Telemetry {
             prev_prompt_id,
             delegated_running,
         } = sess.advance_turn(&call, &shape, flags, &version, &prev_reply_calls);
+        // 这条新输入拒绝的是确认接上的那条回复里的工具（回接旧的一轮、中间夹过别的新输入时尤其如此）：拒绝那一串是那一轮
+        // 的事，挂它的 prompt、查询链与深度，不是会话里最近那一轮的。
+        let (prev_turn, prev_prompt_id) = match &parent_reply {
+            Some(p) if !rejected_calls.is_empty() => (
+                (
+                    if p.chain_id.is_empty() { prev_turn.0 } else { p.chain_id.clone() },
+                    p.depth,
+                    p.turn_started.or(prev_turn.2),
+                ),
+                if p.prompt_id.is_empty() { prev_prompt_id } else { p.prompt_id.clone() },
+            ),
+            _ => (prev_turn, prev_prompt_id),
+        };
+        // 续轮（不是新输入）确认接上了某条回复：它是那条回复所在那一轮的事——体里没带 `cc_prompt_id` 时 prompt 用那一轮的，
+        // 本轮起点也是那一轮的（回接旧的一轮时，会话里的 prompt 与起点已是后来那次新输入的）。
+        let parent_turn = parent_reply.as_ref().filter(|_| !new_prompt);
+        let prompt_id = match parent_turn {
+            Some(p) if shape.cc_prompt_id.is_none() && !p.prompt_id.is_empty() => {
+                p.prompt_id.clone()
+            }
+            _ => prompt_id,
+        };
+        // 主线程回接那一轮：首字出没出过、API 次数与耗时、首条回复的结束时刻这些本轮累计也换回那一轮的（夹在中间的别的
+        // 请求不算进去）。线性往下接的续轮，换回来的就是此刻的，没有变化。
+        // 回接的是更早的一轮（不是会话此刻这一轮）时只在这一次调用里借用：处理完把会话里较新那一轮的累计放回去
+        // （见下面 `record_call` 之后），不然之后接着那一轮的全量请求会读到这里换进来的旧累计。
+        if is_main && let Some(t) = parent_turn.and_then(|p| p.turn.as_ref()) {
+            sess.restore_turn(t);
+        }
+        let turn_started_at: Option<SystemTime> =
+            parent_turn.and_then(|p| p.turn_started).or(sess.turn_started);
         // 主线程与猜下一句走 `previousRequestId` 链；标题那类没有。
         //
         // **以出站体里那份 `cc_prev_req` 为准**（同 `cc_prompt_id` 的取法）：那是这条请求
@@ -299,17 +444,76 @@ impl Telemetry {
         let suggestion_fork = (kind == Kind::Suggestion && shape.suggestion_step > 0)
             .then(|| sess.suggestion_fork.clone())
             .flatten();
-        let previous_request_id = kind
-            .has_chain()
-            .then(|| {
-                shape.cc_prev_req.clone().or_else(|| match (&agent, &suggestion_fork) {
+        let prev_main_message_id = sess.last_main_message_id.clone();
+        // 这条所接的那条回复认不出：声明接的（续轮指针 / `diagnostics.previous_message_id`）既不在底本里、也不是最近那条，或没带
+        // 指针、回传的工具不是任何认得的回复调的。新输入也算——它声明接的那条回复的用量、request-id 同样无从得知（底本被
+        // 挤掉之后不能拿最近那条顶）。**凡是取「所接那条回复」的地方都看它**：`messageTokens`、`previousRequestId`、诊断里的
+        // `previousMessageId`、工具事件的 `messageID`，认不出就不报，不回落到会话里最近那条。
+        let parent_ref_unknown = parent_reply.is_none()
+            && matches!(kind, Kind::Main | Kind::Subagent)
+            && if new_prompt {
+                // 新输入声明接的回复（`diagnostics.previous_message_id`）不在底本里、也不是最近那条主线程回复：认不出。不靠
+                // 「被挤掉的记录」判（那份记录总有上限，挤得够多又会回落）。两种照旧回落、不算认不出：这个进程还没见过这个会话
+                // 的主线程回复（冷启动、`--resume`），或声明的正是刚被打断（Esc）的那条——它不进最近回复的记录。
+                // 线程增量里的新输入以续轮指针声明（`thread.previous_message_id`），全量的以 diagnostics 声明。
+                shape
+                    .thread_prev_id
+                    .as_deref()
+                    .or(shape.diag_prev_message_id.as_deref())
+                    .is_some_and(|d| {
+                        prev_main_message_id.as_deref().is_some_and(|latest| latest != d)
+                            && sess.interrupted_message_id.as_deref() != Some(d)
+                    })
+            } else {
+                implicit_parent_unknown
+                    || shape
+                        .thread_prev_id
+                        .as_deref()
+                        .or(shape.diag_prev_message_id.as_deref())
+                        .is_some_and(|declared| {
+                            let latest = if is_main {
+                                prev_main_message_id.as_deref()
+                            } else {
+                                agent.as_ref().and_then(|a| a.last_message_id.as_deref())
+                            };
+                            latest != Some(declared)
+                        })
+            };
+        // 续轮（不是新输入）所接的回复认不出：这一轮的来龙去脉（查询链、深度、轮累计）也说不准。
+        let parent_unknown = !new_prompt && parent_ref_unknown;
+        // 这条所在那一轮（主线程的一轮、子代理的那条支线）的来龙去脉说不准：所接的回复认不出，或接的那条自己那一轮就说不准
+        // （它底本上记着 [`ThreadBase::turn_unknown`]）。查询链、深度、轮时长都不报，底本也照记「说不准」传给接着它的续轮
+        // ——主线程、子代理一样。
+        // 子代理照支线状态回落、接的正是支线最近那条，而那条自己就说不准（[`AgentState::lineage_unknown`]）：同样说不准。
+        let follows_unknown_agent_reply = kind == Kind::Subagent
+            && parent_reply.is_none()
+            && sess.agents.get(&agent_key).is_some_and(|a| a.lineage_unknown);
+        // 主线程这个会话里一次新输入都没见过（冷启动后先接到的都是半截的续轮）：照会话状态回落的续轮，接的那一轮从没见过。
+        let session_turn_unseen = is_main && parent_reply.is_none() && sess.prompts_seen == 0;
+        let lineage_unknown = matches!(kind, Kind::Main | Kind::Subagent)
+            && !new_prompt
+            && (parent_unknown
+                || follows_unknown_agent_reply
+                || session_turn_unseen
+                || parent_reply.as_ref().is_some_and(|p| p.turn_unknown));
+        // 主线程这一轮的累计说不准：这条只在这一次调用里借用会话里的累计（照常累计、照常读出，但事件里不报），处理完原样放回
+        // （[`super::session::LatestState`]），也不记进它的底本——不然会话里那一轮与之后接着它的续轮都会带上这条的数。
+        let turn_stats_unknown = is_main && lineage_unknown;
+        // 所接回复认不出时，上一条请求是谁也不知道：只认体里自己声明的 `cc_prev_req`，不回落到会话里最近那条。
+        let previous_request_id = (kind.has_chain()
+            && (!parent_ref_unknown || shape.cc_prev_req.is_some()))
+        .then(|| {
+            shape
+                .cc_prev_req
+                .clone()
+                .or_else(|| parent_reply.as_ref().and_then(|p| p.request_id.clone()))
+                .or_else(|| match (&agent, &suggestion_fork) {
                     (Some(a), _) => a.last_request_id.clone(),
                     (None, Some(f)) => f.request_id.clone(),
                     (None, None) => sess.last_main_request_id.clone(),
                 })
-            })
-            .flatten();
-        let prev_main_message_id = sess.last_main_message_id.clone();
+        })
+        .flatten();
         let prev_main_request_id = sess.last_main_request_id.clone();
         let prev_main_depth = sess.last_main_depth;
         // `timeSinceLastApiCallMs` = **这条完成时刻 − 上一条完成时刻**（不分主线程/侧查询，
@@ -317,11 +521,18 @@ impl Telemetry {
         // 续轮 19.458−12.019=7439、猜下一句 21.385−19.458=1927，全部对上；用「这条开始」算
         // 的话并发的标题与主线程会出负数、续轮只剩工具执行那一秒。
         let (this_end, prev_end, time_since_last) = sess.note_end(&call, prev_end_override);
+        // `messageTokens` 是所接那条回复的总用量：确认接上的父回复按它自己的（回接旧的一轮、兄弟分支、接一条说不准的回复都
+        // 一样，用量是那条回复本身的）；所接的回复认不出就不报；其余照会话 / 支线里最近那条。
+        let parent_tokens = parent_reply.as_ref().and_then(|p| p.total_tokens);
+        // 压缩之后的第一条主线程请求从零算（`isPostCompaction`，321 `00204` 报 0）：压缩前那条回复的用量不算——哪怕它正是所接的那条。
         let message_tokens = match (&agent, &suggestion_fork) {
-            (Some(a), _) => a.prev_total,
-            (None, Some(f)) => f.total_tokens,
-            (None, None) if kind.has_chain() => sess.prev_total_input,
-            (None, None) => 0,
+            _ if post_compaction => Some(0),
+            _ if parent_ref_unknown => None,
+            _ if parent_tokens.is_some() => parent_tokens,
+            (Some(a), _) => Some(a.prev_total),
+            (None, Some(f)) => Some(f.total_tokens),
+            (None, None) if kind.has_chain() => Some(sess.prev_total_input),
+            (None, None) => Some(0),
         };
         if kind == Kind::Main && !sess.main_model_seen {
             sess.main_model_seen = true;
@@ -338,17 +549,37 @@ impl Telemetry {
         // 事件顶层 `model` 与 Datadog 的 `model` 是**会话主模型**（用户设置的那个），侧查询
         // 自己用的 haiku 只出现在 api 事件的 meta 里。
         let session_model = sess.last_model.clone().unwrap_or_else(|| sess.default_model.clone());
-        let model_changed =
-            is_main && sess.last_model.as_deref().is_some_and(|m| m != display_model);
-        // 同理：`diagnostics.previous_message_id` 是这条请求自己声明的那个，优先于会话状态。
-        let previous_message_id =
-            shape.diag_prev_message_id.clone().or_else(|| sess.last_message_id.clone());
+        // 模型换没换：确认接上了某条回复就跟那条比（中间夹着别的分支、半截增量时，会话里最近那条不是它所接的）。
+        let model_changed = is_main
+            && match parent_reply.as_ref().filter(|p| !p.model.is_empty()) {
+                Some(p) => p.model != display_model,
+                // 所接的回复认不出：上一条是什么模型不知道，不报（会话里最近那条不是它所接的）。
+                None if parent_ref_unknown => false,
+                None => sess.last_model.as_deref().is_some_and(|m| m != display_model),
+            };
+        // 同理：`diagnostics.previous_message_id` 是这条请求自己声明的那个，优先于会话状态；没声明时用确认接上的那条回复（没带
+        // 指针、按回传的工具认出的），所接的认不出就不报，都不是才回落到会话里最近那条回复。
+        let previous_message_id = shape
+            .diag_prev_message_id
+            .clone()
+            .or_else(|| parent_reply.as_ref().and_then(|p| p.message_id.clone()))
+            .or_else(|| (!parent_ref_unknown).then(|| sess.last_message_id.clone()).flatten());
         let tools_slot = match &agent {
             Some(a) => &a.tools_hash,
             None if kind.has_boundary() => &sess.tools_hash_main,
             None => &sess.tools_hash_side,
         };
-        let tools_changed = tools_slot.as_deref() != Some(shape.tools_hash.as_str());
+        // 半截的增量没带 `tools`：它的工具表不知道，不算变了（不重发长度表）。
+        // 确认接上了某条回复就跟那条的工具表比（同上，不跟别的分支刚报过的比）。
+        let reported = match parent_reply.as_ref().filter(|p| !p.tools_hash.is_empty()) {
+            Some(p) => Some(p.tools_hash.as_str()),
+            None => tools_slot.as_deref(),
+        };
+        // 所接的底本工具表不知道（只留身份、体里又没带 `tools`，[`ThreadBase::tools_known`]）：变没变说不准，不重发长度表。
+        let parent_tools_unknown = parent_reply.as_ref().is_some_and(|p| !p.tools_known);
+        let tools_changed = !(shape_partial && !partial_tools_known)
+            && !parent_tools_unknown
+            && reported != Some(shape.tools_hash.as_str());
         let counted = sess.counted;
         let started_wall = sess.started_wall;
         // queryDepth：主线程本轮第几次请求；猜下一句 = 主线程最后一次 + 2（抓包：0→2、1→3）；
@@ -356,10 +587,29 @@ impl Telemetry {
         // 它的摘要请求恒为 3、链另起（两份抓包 7 条都是）。
         // 主线程当前的链：猜下一句的 fork 统计里引用的是这条父链。
         let main_chain = sess.chain_id.clone();
-        let (chain_id, query_depth) = match &suggestion_fork {
+        let (mut chain_id, mut query_depth) = match &suggestion_fork {
             Some(f) => (f.chain_id.clone(), f.depth + 1),
             None => sess.chain_for(kind, agent.as_ref()),
         };
+        // 主线程或子代理的工具结果续轮确认接上了某条回复：深度是那条回复的加一、查询链是那条回复的，不是按处理先后累加
+        // ——同一条回复后面接了两条兄弟分支时，后到的那条在会话里的深度已被先到的那条推过一格；回接旧的一轮时，会话的
+        // 查询链已是后来那次新输入的。之后的累加也从这里接着（主线程的 `turn_depth`、子代理的步数）。
+        // 接的那条自己那一轮就说不准（[`ThreadBase::turn_unknown`]）：它记的深度、链本是猜的，不拿来接着推（深度与链这一条
+        // 也不报，见 `lineage_unknown`），也不让它改动子代理的步数。
+        if matches!(kind, Kind::Main | Kind::Subagent)
+            && !new_prompt
+            && let Some(p) = parent_reply.as_ref().filter(|p| !p.turn_unknown)
+        {
+            query_depth = p.depth + 1;
+            if !p.chain_id.is_empty() {
+                chain_id = p.chain_id.clone();
+            }
+            if kind == Kind::Main {
+                sess.turn_depth = query_depth;
+            } else if let Some(a) = sess.agents.get_mut(&agent_key) {
+                a.steps = query_depth.saturating_sub(2);
+            }
+        }
         // 分叉的回复调了工具：客户端会带着拒绝结果接着发，记下到这条为止的分叉。不再调工具（收尾）、失败、
         // 被取消，分叉就到此为止——会被重发的失败除外：客户端原样重发这一条，分叉还接着（重发那条照旧接这份）。
         // 猜下一句是后台请求，过载不重发。
@@ -411,11 +661,17 @@ impl Telemetry {
             }
         }
         let turn_started: DateTime<Utc> =
-            sess.turn_started.unwrap_or(call.started_at - Duration::from_millis(15)).into();
-        let first_text_in_turn = is_main && call.text_chars > 0 && !sess.turn_text_seen;
+            turn_started_at.unwrap_or(call.started_at - Duration::from_millis(15)).into();
+        // 这一轮说不准（[`TurnFacts::turn_stats_unknown`]）：这一轮此前出没出过字、从哪起都不知道，首字事件（含被打断那种）
+        // 不报——否则同一轮里接着它的几条会各报一次「首字」，时长也借自别的轮。
+        let first_text_in_turn =
+            is_main && call.text_chars > 0 && !sess.turn_text_seen && !turn_stats_unknown;
         // 一个字都还没出就被打断：首字事件报 `interrupted`（`cap/auto-2.1.285-20260930` 08:01:42.635）。
-        let first_text_interrupted =
-            is_main && aborted && call.text_chars == 0 && !sess.turn_text_seen;
+        let first_text_interrupted = is_main
+            && aborted
+            && call.text_chars == 0
+            && !sess.turn_text_seen
+            && !turn_stats_unknown;
         // 首字之前跑过的工具数 = 本轮此前的 + 这条续轮带回来的。
         let tool_calls_before = sess.turn_tool_calls + shape.tool_uses.len() as u32;
         let user_secs = sess.user_secs(&call, &shape, new_prompt);
@@ -492,6 +748,8 @@ impl Telemetry {
         // 2.1.319：错误栈换块，`tool_use_success` 多 `tool_input_stream_ms`、`tether_decision` 多 `toolsHashKept`，见
         // [`TurnFacts::v319`]。
         let v319 = version_at_least(&version, "2.1.319");
+        // 2.1.321：错误栈换块，见 [`TurnFacts::v321`]（2.1.320 没抓，按这一版）。
+        let v321 = version_at_least(&version, "2.1.320");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -651,30 +909,56 @@ impl Telemetry {
             .flatten()
             .filter(|(name, _)| {
                 // 体里那段在不在，得与下发一致：能力打开（`from`）时在；关掉（`off`）时只有 `heron_brook` 下发的正文里本就
-                // 含这一段才在（2.1.318 抓包那天 opus 就是这样，[`crate::proxy::original_games::heron_covers`]）。
-                let has = call
-                    .body
-                    .facts()
-                    .has_original_games_text(crate::proxy::original_games::text_for(&version));
+                // 含这一段才在（2.1.318 抓包那天 opus 就是这样，[`crate::proxy::original_games::heron_covers`]）。看的是
+                // 实际出站的 system（体归客户端的是客户端组装的，模拟的是 luban 组装的）；线程续轮只剩 billing 那块时看不出，
+                // 这一轮不报也不记已报。
+                let facts = call.body.facts();
+                let has = (facts.prompt_sent() && !call.sim_no_rest).then(|| {
+                    facts.has_original_games_text(crate::proxy::original_games::text_for(&version))
+                });
                 let expect = *name == "tengu_model_capability_from_client_data"
                     || crate::proxy::original_games::heron_covers(call.cred_id, &display_model);
-                !own_system || has == expect
+                has == Some(expect)
             })
             .filter(|(name, m)| {
                 let off = if *name == "tengu_model_capability_from_client_data" { "" } else { "-" };
                 let key = format!("{off}{}:{}", m["capability"], m["model"]);
                 sess.capability_logged.insert(key)
             });
+        // 2.1.321 的 `# Finishing work` / `# Memory, notes and feedback` 两节同一套判定、同一种事件
+        // （[`crate::proxy::finishing_notes`]），组装 system 时排在原创游戏那段后面算，事件也跟在它后面。体归客户端自己的
+        // 同样看实际出站：打开（`from`）时那一节的标题得在体里，关掉（`off`）时得不在。
+        let sections: Vec<(&'static str, Value)> = if is_main {
+            crate::proxy::finishing_notes::client_data_events(
+                call.cred_id,
+                &display_model,
+                &version,
+            )
+            .into_iter()
+            .filter(|(section, name, _)| {
+                // 同上看实际出站的 system；只剩 billing 那块（线程续轮）时看不出，这一轮不报也不记已报，等看得见的那一轮。
+                let has = call.body.facts().has_section(*section).filter(|_| !call.sim_no_rest);
+                has == Some(*name == "tengu_model_capability_from_client_data")
+            })
+            .filter(|(_, name, m)| {
+                let off = if *name == "tengu_model_capability_from_client_data" { "" } else { "-" };
+                let key = format!("{off}{}:{}", m["capability"], m["model"]);
+                sess.capability_logged.insert(key)
+            })
+            .map(|(_, name, m)| (name, m))
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let capability: Vec<(&'static str, Value)> =
+            capability.into_iter().chain(sections).collect();
         let via_template = if shape.sdk {
             continued_from.is_some() || (cleared_from.is_none() && is_new_session)
         } else {
             first_prompt_tpl
         };
-        let (capability_events, capability_inline): (Vec<_>, Vec<_>) = match capability {
-            Some(x) if via_template => (vec![x], Vec::new()),
-            Some(x) => (Vec::new(), vec![x]),
-            None => (Vec::new(), Vec::new()),
-        };
+        let (capability_events, capability_inline): (Vec<_>, Vec<_>) =
+            if via_template { (capability, Vec::new()) } else { (Vec::new(), capability) };
         // 组织配置那道闸：2.1.310 起、见过这个号的 eval 才按它改启动模板那条影子判定、在闸内再补真判定
         // （[`Subst::org_gate`]）。分桶按这台机器（`device_id`）算。
         let org_gate = if v310 {
@@ -704,18 +988,63 @@ impl Telemetry {
         } else {
             !call.bare
         };
-        let tether = (v280 && matches!(kind, Kind::Main | Kind::Subagent) && threads).then(|| {
-            sess.tether_for(&call, &shape, &display_model, is_main, &agent_key, post_compaction)
-        });
+        let tether_and_state = (v280 && matches!(kind, Kind::Main | Kind::Subagent) && threads)
+            .then(|| {
+                let flags = CallFlags { post_compaction, ..flags };
+                let parent = parent_reply.as_ref().and_then(|p| p.tether.as_ref());
+                sess.tether_for(&call, &shape, &display_model, flags, &agent_key, parent)
+            });
+        let (tether, tether_state) = match tether_and_state {
+            Some((t, s)) => (Some(t), Some(s)),
+            None => (None, None),
+        };
         // 这条线程的全量形态记下来，给下一条增量请求补（见 [`ThreadBase`]）。
         // 只记全量视角：不是增量（`create` 或没开线程），或增量已经按底本补全了。没补上的增量（底本
         // 丢了）不能拿来当底本。此前用「工具数 > 0」近似「是全量」，无工具的主线程对话（模拟路径不补
         // 工具时的第三方多轮）首轮就记不下，续轮报出的 system 长度、消息数都是增量那份。
-        if matches!(kind, Kind::Main | Kind::Subagent) && (!is_delta || filled_from_base) {
-            sess.thread_bases.insert(
-                thread_key.clone(),
-                ThreadBase::of(&shape, call.reply_input_chars, call.tool_use_lens.clone()),
+        // 指向没见过的回复的增量没补（`filled_from_base` 为 false），也就不存：留着已确认的那份，等真正接着它的那条来推进。
+        // 没接上底本的增量（`filled_from_base` 为 false）不当最新那份——留着已确认的那份，等真正接着它的那条来推进；但只要
+        // 有回复 id，就按 id 留一份只有身份的（[`ThreadBase::shape_incomplete`]）：之后明说接它、或回传它调的工具的续轮，
+        // 照样认得出接的是它（用量、调的工具、「那一轮说不准」都从这里来）。
+        if matches!(kind, Kind::Main | Kind::Subagent)
+            && (!is_delta || filled_from_base || call.message_id.is_some())
+        {
+            let mut base = ThreadBase::of(
+                &shape,
+                call.reply_input_chars,
+                call.tool_use_lens.clone(),
+                call.message_id.clone(),
             );
+            base.request_id = call.request_id.clone();
+            base.depth = query_depth;
+            base.chain_id = chain_id.clone();
+            base.prompt_id = prompt_id.clone();
+            base.turn_started = turn_started_at;
+            base.turn_unknown = lineage_unknown;
+            // 失败、取消的没有用量：接着它的续轮报的就是它自己报的那个（它接的那条的）。
+            base.total_tokens = if !failed && !aborted {
+                Some(
+                    call.input_tokens
+                        + call.cache_read_tokens
+                        + call.cache_creation_tokens
+                        + call.output_tokens,
+                )
+            } else {
+                message_tokens
+            };
+            base.reply_calls = Arc::new(call.tool_calls.clone());
+            base.model = display_model.clone();
+            // 这条处理完的线程配置（半截的增量没写进去，它的底本只留身份，不记）。
+            // 半截的增量记一份只知道一半的（[`TetherThread::partial`]），接着它的请求按它比。
+            base.tether = tether_state;
+            let line = sess.thread_bases.entry(thread_key.clone()).or_default();
+            if !is_delta || filled_from_base {
+                line.store(base);
+            } else {
+                base.shape_incomplete = true;
+                base.tools_known = partial_tools_known;
+                line.store_detached(base);
+            }
         }
 
         let marks =
@@ -737,6 +1066,21 @@ impl Telemetry {
             handback,
             agent_done,
         } = sess.record_call(&call, &shape, flags, marks, &display_model, &agent_key);
+        if kind == Kind::Subagent
+            && let Some(a) = sess.agents.get_mut(&agent_key)
+        {
+            a.lineage_unknown = lineage_unknown;
+        }
+        // 这条请求累计进这一轮之后，把那一轮此刻的累计记到它的底本上（回接它的续轮换回这份）。
+        if is_main
+            && !turn_stats_unknown
+            && let Some(reply) = call.message_id.as_deref()
+        {
+            let turn = sess.turn_stats();
+            if let Some(line) = sess.thread_bases.get_mut(&thread_key) {
+                line.set_turn(reply, turn);
+            }
+        }
         sess.counted = true;
         let ctx_model = if is_main { display_model.clone() } else { session_model };
         let dd_model = ctx_model.trim_end_matches("[1m]").to_string();
@@ -752,6 +1096,11 @@ impl Telemetry {
             (sess.turn_mcp_calls, sess.turn_toolsearch_calls);
         let turn_first_reply_end = sess.turn_first_reply_end.map(DateTime::<Utc>::from);
         let sess_turn_retry = sess.turn_retry_status;
+        // 这条（回接旧的一轮）的本轮累计都已取出、也记回了那一轮的底本：会话放回较新那一轮的累计与深度。必须在取完之后
+        // 放，不然这条自己的事件读到的是较新那一轮的。
+        if let Some(latest) = saved_latest {
+            sess.restore_latest(&thread_key, latest);
+        }
         let session_cwd = sess.cwd.clone();
         let betas_full = call.betas.clone().unwrap_or_default();
         let betas_own = session_betas(&betas_full, &version);
@@ -842,6 +1191,13 @@ impl Telemetry {
             prev_main_message_id,
             prev_main_request_id,
             prev_main_depth,
+            parent_reply_request_id: parent_reply.as_ref().and_then(|p| p.request_id.clone()),
+            parent_reply_message_id: parent_reply.as_ref().and_then(|p| p.message_id.clone()),
+            parent_reply_depth: parent_reply.as_ref().map(|p| p.depth),
+            parent_unknown,
+            lineage_unknown,
+            tools_unknown: shape_partial && !partial_tools_known,
+            turn_stats_unknown,
             prev_end,
             time_since_last,
             message_tokens,
@@ -886,6 +1242,7 @@ impl Telemetry {
             v317,
             v318,
             v319,
+            v321,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,
@@ -938,8 +1295,22 @@ impl Telemetry {
             thread_step,
             betas_session,
         };
+        // 建事件时拿出来用的文件大小表、心跳与文件账本，建到一半 panic（没料到的请求体）也得放回会话：外层只丢这一条的
+        // 事件（[`Telemetry::drain`]），会话之后的请求还要接着用它们。
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_events(&call, &shape, &facts, &mut file_sizes, &mut hb, &mut files)
+        }));
+        let built = match built {
+            Ok(b) => b,
+            Err(p) => {
+                sess.file_sizes = file_sizes;
+                sess.hb = hb;
+                sess.files = files;
+                std::panic::resume_unwind(p);
+            }
+        };
         let BuiltEvents { events, dd, probe_side, loc, decisions, post_compact_attachments } =
-            build_events(&call, &shape, &facts, &mut file_sizes, &mut hb, &mut files);
+            built;
         sess.note_attachments(&events);
         // 压缩成功：官方统计的是压缩那一刻内部消息表里的附件。压完之后表里只剩保留那组带的与压缩时放回去的
         // （[`BuiltEvents::post_compact_attachments`]），账本换成它，之后各轮再接着记（这一条自己的统计上面
@@ -1098,7 +1469,7 @@ pub(super) fn sleepy_key(model: &str) -> String {
     m.strip_suffix("[1m]").unwrap_or(&m).to_string()
 }
 
-/// 这条请求的角色与收尾方式，[`Session::advance_turn`] / [`Session::record_call`] 共用。
+/// 这条请求的角色与收尾方式，[`Session::advance_turn`] / [`Session::record_call`] / [`Session::tether_for`] 共用。
 #[derive(Clone, Copy)]
 struct CallFlags {
     kind: Kind,
@@ -1107,6 +1478,12 @@ struct CallFlags {
     turn_over: bool,
     failed: bool,
     aborted: bool,
+    /// 形态是半截的（没补全的线程增量）：不更新线程配置（见 [`Telemetry::process`] 里 `shape_partial`）。
+    shape_partial: bool,
+    /// 半截的增量里工具表知道（体里明说了，或从所接的只留身份的底本沿用了）。
+    partial_tools_known: bool,
+    /// 压缩之后的头一条主线程请求（[`Session::advance_turn`] 判出来之后才填，之前恒 false）。
+    post_compaction: bool,
 }
 
 /// [`Session::advance_turn`] 推进这一轮之后得到的量。
@@ -1159,9 +1536,13 @@ impl Session {
         kind: Kind,
         thread_key: &str,
         agent_key: &str,
+        parent_calls: Option<&[ToolCall]>,
     ) -> (Vec<ToolCall>, &'static str) {
-        // 续轮带回的工具结果配上一条回复里记下的调用：thread 续轮全靠它，全量请求也拿它补上判决。
-        if let Some(calls) = self.reply_calls.get(thread_key) {
+        // 续轮带回的工具结果配上一条回复里记下的调用：thread 续轮全靠它，全量请求也拿它补上判决。确认接上了某份底本的
+        // 线程续轮用那条回复自己的调用（[`ThreadBase::reply_calls`]），否则用这条线程最近一条回复的。
+        let latest = self.reply_calls.get(thread_key).map(Vec::as_slice);
+        let reply = parent_calls.or(latest);
+        if let Some(calls) = reply {
             for tu in shape.tool_uses.iter_mut() {
                 if let Some(c) = calls.iter().find(|c| c.id == tu.id) {
                     tu.apply_call(&c.name, &c.input, c.verdict.as_ref());
@@ -1170,9 +1551,15 @@ impl Session {
             }
         }
         // 上一条回复的工具调用：这条新输入若带着被拒的工具结果，要用它认出是哪个工具。
-        let prev_reply_calls = self.reply_calls.get(thread_key).cloned().unwrap_or_default();
-        if matches!(kind, Kind::Main | Kind::Subagent) && !call.aborted {
-            self.reply_calls.insert(thread_key.to_string(), call.tool_calls.clone());
+        let prev_reply_calls = reply.map(<[ToolCall]>::to_vec).unwrap_or_default();
+        // 失败的没有回复：客户端接着发的（重发、下一条）接的仍是此前那条，不拿空调用盖掉它。回复以调工具收尾、调用却一条没记下
+        // 的，记成「不知道」（删掉），不记成「没调工具」：后者是定论，没带指针的全量续轮回传工具时拿它判所接的不是最近那条。
+        if matches!(kind, Kind::Main | Kind::Subagent) && !call.aborted && call.failure.is_none() {
+            if call.tool_calls.is_empty() && call.stop_reason.as_deref() == Some("tool_use") {
+                self.reply_calls.remove(thread_key);
+            } else {
+                self.reply_calls.insert(thread_key.to_string(), call.tool_calls.clone());
+            }
         }
         if shape.cwd.is_some() {
             self.cwd = shape.cwd.clone();
@@ -1242,7 +1629,7 @@ impl Session {
         version: &str,
         prev_reply_calls: &[ToolCall],
     ) -> TurnStart {
-        let CallFlags { kind, is_main, turn_over, failed, aborted } = flags;
+        let CallFlags { kind, is_main, turn_over, failed, aborted, .. } = flags;
         // 首轮那串版本检查是「一轮跑完了」才发的，失败的那轮不算。
         let emit_first_turn = kind == Kind::Main && turn_over && !failed && !self.first_turn_done;
         if emit_first_turn {
@@ -1264,7 +1651,11 @@ impl Session {
         // 新一轮用户输入（只有主线程算）：prompt 计数 +1、换 prompt_id（优先用 billing header
         // 里客户端自己的）与 queryChainId、depth 归零。tool_result 续轮沿用上一轮的，depth +1。
         // 侧查询（标题、猜下一句）不动这些计数。
-        let new_prompt = is_main && (shape.new_prompt || self.prompts_seen == 0);
+        // 会话头一条主线程请求（这个进程里头一回见到这个会话；按主线程请求数判，不按新输入数——冷启动先接到几条半截的续轮，
+        // 之后那条没带父指针的也不是头一条）照算新输入，除非它分明是半截的一轮（[`cold_continuation`]）：那时它接的回复认
+        // 不出，本轮累计按说不准处理。
+        let new_prompt =
+            is_main && (shape.new_prompt || (self.main_requests == 0 && !cold_continuation(shape)));
         // 本轮发起方：请求自己声明的优先（新输入与续轮都带），没带就沿用本轮的。
         if let Some(o) = shape.turn_origin.as_deref() {
             if is_main {
@@ -1666,16 +2057,18 @@ impl Session {
         (if recorded { "live_recorded" } else { "from_snapshot" }, hash)
     }
 
-    /// 这条线的 tether 判定，并把线程状态记成这条的。
+    /// 这条线的 tether 判定，并把线程状态记成这条的。另返回这条处理完的线程配置，记进它的底本（[`ThreadBase::tether`]）：
+    /// 半截的增量也给一份只知道一半的（[`TetherThread::partial`]），接着它的请求按它比，不回落到别的分支写的那份。
     fn tether_for(
         &mut self,
         call: &ApiCall,
         shape: &RequestShape,
         display_model: &str,
-        is_main: bool,
+        flags: CallFlags,
         agent_key: &str,
-        post_compaction: bool,
-    ) -> Tether {
+        parent: Option<&TetherThread>,
+    ) -> (Tether, TetherThread) {
+        let CallFlags { is_main, shape_partial, partial_tools_known, post_compaction, .. } = flags;
         // tether 比 beta 时不算逐请求变的那两项（auto 模式的 `afk-mode`、`dangerous-tool-use`）：压缩前那条带、压缩后那条
         // 不带，官方照样报 `changedBetas: false`（`cap/auto-2.1.319-20261106-full/00209` → `00214`）。官方比之前还排过序，
         // 同一组换了先后不算变；只用于比较，出站头照原样。
@@ -1701,19 +2094,61 @@ impl Session {
         } else {
             &mut self.agents.get_mut(agent_key).expect("agent state exists").tether
         };
-        let t = tether_decide(
-            slot.as_ref(),
-            cleared,
-            post_compaction,
-            shape,
-            display_model,
-            &betas,
-            is_main,
-        );
+        // 「上一条」：确认接上的那条回复处理完时的线程配置（[`ThreadBase::tether`]）；没确认的照这条线程共享的那份。同一条线程
+        // 上交错着两条分支（D 接 X、E 接 A）时，各自跟自己所接的那条比，不跟另一条分支刚写进去的比。
+        let prev = parent.or(slot.as_ref());
+        // 半截的增量（[`CallFlags::shape_partial`]）：体里的 `thread: continue` 就是客户端判的接着用，配置没变；条数都是半截的，
+        // 不报。不拿半截的形态去比。
+        let partial_state = || TetherThread {
+            model: display_model.to_string(),
+            betas: betas.clone(),
+            effort: shape.effort.clone(),
+            tools_content: if partial_tools_known {
+                shape.tools_content_hash.clone()
+            } else {
+                String::new()
+            },
+            tools_known: partial_tools_known,
+            thinking_type: shape.thinking_type.clone(),
+            messages: 0,
+            turns: 0,
+            hashes: Vec::new(),
+            aborted: call.aborted,
+            partial: true,
+        };
+        if shape_partial && shape.thread_type.as_deref() == Some("continue") {
+            let t = Tether {
+                decision: "continue",
+                reason: "append",
+                changed_model: false,
+                changed_tools: false,
+                changed_betas: false,
+                changed_latched: false,
+                changed_thinking: false,
+                changed_effort: false,
+                tools_kept: true,
+                claimed_clear: false,
+                claimed_rewind: false,
+                claimed_compact: false,
+                unclaimed: false,
+                first_changed: -1,
+                turns: 0,
+                prev_messages: 0,
+                // 比上一条多出来的：服务端持有的那条回复加体里这几条（同补全了的续轮，`cap/auto-2.1.321` 00063 冷回放 3）。
+                delta: shape.messages_len + 1,
+                counts_unknown: true,
+                prev_unknown: false,
+                tools_unknown: false,
+                echo: true,
+            };
+            return (t, partial_state());
+        }
+        let t =
+            tether_decide(prev, cleared, post_compaction, shape, display_model, &betas, is_main);
         // 客户端视角的整段：完整体就是体里那些；线程续轮是上一条的、加服务端持有的那条回复（不知道内容）、加增量，
         // 再对齐到补全后的条数。
         let hashes: Vec<Option<u64>> = if shape.thread_type.as_deref() == Some("continue") {
-            let mut h = slot.as_ref().map(|p| p.hashes.clone()).unwrap_or_default();
+            let mut h = prev.map(|p| p.hashes.clone()).unwrap_or_default();
             h.push(None);
             h.extend(shape.message_hashes.iter().copied().map(Some));
             h.resize(shape.messages_len, None);
@@ -1721,7 +2156,16 @@ impl Session {
         } else {
             shape.message_hashes.iter().copied().map(Some).collect()
         };
-        *slot = Some(TetherThread {
+        // 半截的增量（[`CallFlags::shape_partial`]）照常判这一条，但不当成下一条要比的「上一条」。
+        if shape_partial {
+            return (t, partial_state());
+        }
+        let slot = if is_main {
+            &mut self.tether_main
+        } else {
+            &mut self.agents.get_mut(agent_key).expect("agent state exists").tether
+        };
+        let state = TetherThread {
             model: display_model.to_string(),
             betas,
             effort: shape.effort.clone(),
@@ -1731,8 +2175,11 @@ impl Session {
             turns: t.turns,
             hashes,
             aborted: call.aborted,
-        });
-        t
+            partial: false,
+            tools_known: true,
+        };
+        *slot = Some(state.clone());
+        (t, state)
     }
 
     /// 这条处理完，更新会话状态给下一条用。返回处理这条要的那几样「更新之前」的量。
@@ -1745,7 +2192,7 @@ impl Session {
         display_model: &str,
         agent_key: &str,
     ) -> CallRecord {
-        let CallFlags { kind, is_main, turn_over, failed, aborted } = flags;
+        let CallFlags { kind, is_main, turn_over, failed, aborted, shape_partial, .. } = flags;
         let TurnMarks { new_prompt, user_turn, first_text_in_turn, shell_snapshot_first, this_end } =
             marks;
         // 更新会话状态给下一条用。
@@ -1972,7 +2419,9 @@ impl Session {
                     + call.cache_read_tokens
                     + call.cache_creation_tokens
                     + call.output_tokens;
-                a.tools_hash = Some(shape.tools_hash.clone());
+                if !shape_partial {
+                    a.tools_hash = Some(shape.tools_hash.clone());
+                }
             }
             // `end_turn` 收尾就是子代理跑完了：收尾事件要它的全程统计，档案随之删掉。以
             // SubagentHandback 工具收尾的也是（客户端就地执行、不再发请求）。
@@ -1982,7 +2431,7 @@ impl Session {
         }
         // 长度表报过一次就不再重发——但失败那条压根没报（`tengu_tool_schema_sizes` 在官方
         // 那边就长在 `tengu_api_success` 里），别让它把「已报过」的标记占掉。
-        if !failed && !kind.is_agent() && kind != Kind::ModelValidation {
+        if !failed && !shape_partial && !kind.is_agent() && kind != Kind::ModelValidation {
             if kind.has_boundary() {
                 self.tools_hash_main = Some(shape.tools_hash.clone());
             } else {
@@ -1997,4 +2446,36 @@ impl Session {
             agent_done,
         }
     }
+}
+
+/// 线程增量确认接上的那条回复（[`super::session::ThreadLine::select`]）里记的东西：它的上游 request-id、回复里的工具
+/// 调用、queryDepth、queryChainId 与所在那一轮的 prompt id。这条增量带回的工具结果、拒绝都是那条回复的事。
+struct ParentReply {
+    request_id: Option<String>,
+    calls: Arc<Vec<ToolCall>>,
+    depth: u32,
+    chain_id: String,
+    prompt_id: String,
+    turn_started: Option<SystemTime>,
+    turn: Option<super::session::TurnStats>,
+    turn_unknown: bool,
+    total_tokens: Option<i64>,
+    message_id: Option<String>,
+    /// 那条请求处理完时的线程配置、模型与工具表 hash（[`ThreadBase::tether`]）：这条跟它比。
+    tether: Option<TetherThread>,
+    model: String,
+    tools_hash: String,
+    /// 那条的工具表知道（[`ThreadBase::tools_known`]）。
+    tools_known: bool,
+}
+
+/// 会话头一条却分明是半截的一轮（不是新输入）：线程续轮（`thread.type: continue`），或带着工具结果、又明说了接哪条回复
+/// （`diagnostics.previous_message_id`）的全量请求。客户端新进程（含 `--resume`）总以新输入、新建线程开头，不会这样——只有
+/// luban 自己冷启动、没见过这一轮的开头时才会接到（`cap/auto-2.1.321-20261110-bashfail/2.1.321/00063` 单独回放）。体里以工具
+/// 结果收尾、却没说接哪条回复的全量请求不算：新进程的首条照旧按第一次输入计。
+fn cold_continuation(shape: &RequestShape) -> bool {
+    !shape.new_prompt
+        && (shape.thread_type.as_deref() == Some("continue")
+            || (shape.diag_prev_message_id.is_some()
+                && (!shape.tool_uses.is_empty() || !shape.orphan_results.is_empty())))
 }

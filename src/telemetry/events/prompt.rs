@@ -203,8 +203,22 @@ impl EventBuilder<'_> {
             let shown = ms(prev_end_dt, 8);
             let wait = ((t0 - shown).num_milliseconds() / 2).clamp(300, 4_000);
             let t_rej = ms(shown, wait);
-            let prev_req = prev_main_request_id.clone().unwrap_or_default();
-            let prev_msg = prev_main_message_id.clone().unwrap_or_default();
+            // 被拒的是这条请求所接那条回复里的工具：确认接上了（线程续轮按指针挑中的底本）就整套按它——requestId、
+            // messageID、深度都是那条回复的，不是会话里先到的兄弟分支；回复 id 没确认时也先看这条请求自己声明接的那条。
+            let prev_req = env
+                .f
+                .parent_reply_request_id
+                .clone()
+                .or_else(|| prev_main_request_id.clone())
+                .unwrap_or_default();
+            let prev_msg = shape
+                .thread_prev_id
+                .clone()
+                .or_else(|| shape.diag_prev_message_id.clone())
+                .or_else(|| env.f.parent_reply_message_id.clone())
+                .or_else(|| prev_main_message_id.clone())
+                .unwrap_or_default();
+            let prev_main_depth = env.f.parent_reply_depth.unwrap_or(prev_main_depth);
             for (c, _) in rejected_calls {
                 let bash = c.name == "Bash";
                 self.push(
@@ -355,12 +369,14 @@ impl EventBuilder<'_> {
             if injected {
                 let queued = queued_delivered(u32::from(turn_origin == "peer"), v285, 6, v293);
                 self.push_dd(ms(t0, -12), "tengu_feature_ok", queued);
-                // 模板那段不套，工具搜索判定照有（`cap/2.1.285` 06:57:29.600）。
-                self.push(
-                    ms(t0, -1),
-                    "tengu_tool_search_mode_decision",
-                    tool_search_decision(shape, display_model, kind.is_agent()),
-                );
+                // 模板那段不套，工具搜索判定照有（`cap/2.1.285` 06:57:29.600）；工具表不知道时判不出来，不报。
+                if !env.f.tools_unknown {
+                    self.push(
+                        ms(t0, -1),
+                        "tengu_tool_search_mode_decision",
+                        tool_search_decision(shape, display_model, kind.is_agent()),
+                    );
+                }
             } else {
                 let seg = if first_prompt_tpl { &tpl.prompt } else { &tpl.prompt_next };
                 // 文件历史的快照在模板那条 `snapshot_success` 处：上次备份后改过的先各备份一版。
@@ -374,6 +390,20 @@ impl EventBuilder<'_> {
                     self.take_tpl(&tpl.first_prompt, t0);
                 } else {
                     self.take_tpl(&tpl.prompt_next, t0);
+                    // 续轮那段模板里没有延迟工具池那条（平常的续轮池子没变，官方不报）。这一轮有工具走掉时官方照报
+                    // （`cap/auto-2.1.321-20261110-full` 批次 `00760`、`cap/auto-2.1.319-20261106-confirm/2.1.319` 批次
+                    // `00165`）：借首次输入那段的那一条，位置、键照它，数目由 [`super::super::tool_pool::fill_summary`]
+                    // 改成这一轮的（2.1.321 另在前面按归属各报一条）。
+                    // 不只是走掉：接着已有对话的这一轮有工具池附件就报（[`super::super::tool_pool::PoolTurn::changed`]）。`-p`
+                    // 的那条在启动段，偏移是相对启动的，挪到提交前 16ms（交互式模板那条的位置）。
+                    if self.subst.pool.changed()
+                        && version_at_least(&env.f.version, "2.1.319")
+                        && let Some(e) = super::super::tool_pool::summary_template(tpl)
+                    {
+                        let in_prompt = tpl.prompt.iter().any(|p| std::ptr::eq(p, e));
+                        let anchor = if in_prompt { t0 } else { ms(t0, -16 - e.off) };
+                        self.take_tpl(std::slice::from_ref(e), anchor);
+                    }
                 }
             }
             // `tengu_lucky_cerf` 曝光：首次输入那段模板里有它（`-p` 的在启动那段），位置照模板；

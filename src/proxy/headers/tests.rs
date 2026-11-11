@@ -1145,7 +1145,7 @@ fn simulated_beta_matches_official() {
 /// auto 模式（`00947`，多 `dangerous-tool-use` 与 `afk-mode`），默认模式按 opus 那串，同 2.1.293。模拟请求不带
 /// `safeguards`，那两项都不该出现。没见过 eval 的号保活按关，串里也不该有 `cache-keepalive`。
 #[test]
-fn simulated_beta_matches_2_1_319() {
+fn simulated_beta_matches_2_1_321() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
          mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
@@ -1167,16 +1167,17 @@ fn simulated_beta_matches_2_1_319() {
          thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
          cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00070", "claude-opus-5-5", opus),
-        ("00375", "claude-sonnet-5-5", opus),
+        ("00681", "claude-opus-5-5", opus),
+        ("00363", "claude-sonnet-5-5", opus),
         ("同 opus", "claude-fable-5-1", opus),
-        ("00611", "claude-haiku-4-5-20251001", haiku),
-        ("00611", "claude-haiku-4-5", haiku),
-        ("00534", "claude-haiku-5-5", haiku_5_5),
-        ("00460", "haiku", haiku_5_5),
+        ("fable52/00068 同 opus", "claude-fable-5-2", opus),
+        ("00593", "claude-haiku-4-5-20251001", haiku),
+        ("00593", "claude-haiku-4-5", haiku),
+        ("00521", "claude-haiku-5-5", haiku_5_5),
+        ("00447", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.319");
+        assert_eq!(profile.version, "2.1.321");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1225,14 +1226,15 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.311（`cap/auto-2.1.311-20261027-full/00019` 等 16 条）去掉了 `thinking-token-count`，2.1.312
     // （`cap/auto-2.1.312-20261028-full/00021` 等 16 条）、2.1.314（`cap/auto-2.1.314-20261030-full/00019` 等）、2.1.316
     // （`cap/auto-2.1.316-20261031-full` 全量配对无 beta 差异）、2.1.317（`cap/auto-2.1.317-20261103-full` 同）、2.1.318
-    // （`cap/auto-2.1.318-20261104-full` 同）、2.1.319（`cap/auto-2.1.319-20261106-full` 同）同串。
+    // （`cap/auto-2.1.318-20261104-full` 同）、2.1.319（`cap/auto-2.1.319-20261106-full` 同）、2.1.321
+    // （`cap/auto-2.1.321-20261110-full` 同）同串。
     let quota = config::cc_profile_at(QuotaProbe, Some((2, 1, 310)));
     assert_eq!((quota.version, quota.beta), ("2.1.310", cases[2].2));
     let quota = config::cc_profile(QuotaProbe);
     assert_eq!(
         (quota.version, quota.beta),
         (
-            "2.1.319",
+            "2.1.321",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05"
         )
@@ -1271,7 +1273,7 @@ fn profile_betas_match_the_2_1_277_captures() {
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.319",
+            "2.1.321",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\

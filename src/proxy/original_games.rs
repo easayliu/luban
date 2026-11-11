@@ -66,7 +66,8 @@ pub(crate) fn forget_client_data(cred_id: i64, model: &str) {
 }
 
 /// 这个号拿 `model` 当主线程模型、客户端是 `version` 时，第四块带不带这一段：2.1.314 起，`client_data` 显式下发了就照它，
-/// 没下发按模型默认——规范名是 opus-5-5（`[1m]`、日期这类尾巴照认）的开、别的关（官方 `NP`）。读不出版本的按最新那版。
+/// 没下发按模型默认——规范名是 opus-5-5（`[1m]`、日期这类尾巴照认）的开，2.1.321 起 fable-5-2 / mythos-5-2 也开，别的关
+/// （官方 `NP`，[`on_by_default`]）。读不出版本的按最新那版。
 pub(crate) fn applies(cred_id: i64, model: &str, version: &str) -> bool {
     capability_on(cred_id, model, version) && !heron_covers(cred_id, model)
 }
@@ -76,7 +77,20 @@ fn capability_on(cred_id: i64, model: &str, version: &str) -> bool {
     if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 314)) {
         return false;
     }
-    served(cred_id, model).unwrap_or_else(|| canonical(model) == "claude-opus-5-5")
+    served(cred_id, model).unwrap_or_else(|| on_by_default(&canonical(model), version))
+}
+
+/// 规范名 `model` 在 `version` 那一版默认带不带这一段：opus-5-5（`opus_5_5_prompt_bundle`）；2.1.321 起另有 fable-5-2 /
+/// mythos-5-2（`fable_5_2_prompt_bundle`，`cap/auto-2.1.321-20261110-fable52/00068` 的 bootstrap 没有这一项、第四块里有）。
+/// 读不出版本的按最新那版。
+fn on_by_default(model: &str, version: &str) -> bool {
+    match model {
+        "claude-opus-5-5" => true,
+        "claude-fable-5-2" | "claude-mythos-5-2" => {
+            !crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 321))
+        }
+        _ => false,
+    }
 }
 
 /// 官方 `Fmr`：`heron_brook` 下发的正文里已有这一句开头，原创游戏那段就不再单独出（`original_games` 一节的条件是
@@ -113,7 +127,7 @@ pub(crate) fn client_data_event(
     }
     let on = served(cred_id, model)?;
     let model = canonical(model);
-    if on == (model == "claude-opus-5-5") {
+    if on == on_by_default(&model, version) {
         return None;
     }
     let name = if on {

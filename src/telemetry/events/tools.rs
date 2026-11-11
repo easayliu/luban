@@ -9,7 +9,6 @@ impl EventBuilder<'_> {
         let (call, shape) = (env.call, env.shape);
         let TurnFacts {
             kind,
-            ref display_model,
             is_main,
             new_prompt,
             ref agent,
@@ -23,7 +22,6 @@ impl EventBuilder<'_> {
             ..
         } = *env.f;
         let EventEnv { t0, .. } = *env;
-        let query_source = env.query_source.as_str();
         // 续轮：上一条回复里的工具调用在两次请求之间执行，把权限判定、执行、附件计算那串
         // 补在这条请求之前（`cap/2.1.260-2` 09:43:12–09:43:13）。权限判定发生在上一条回复
         // 流到工具块时，时间戳落在上一条结束之前。
@@ -31,16 +29,46 @@ impl EventBuilder<'_> {
         // 再攒附件），深度与消息 id 取它自己那条支线的上一条。
         let is_sub = kind == Kind::Subagent;
         if (is_main || is_sub) && !new_prompt && !shape.tool_uses.is_empty() {
+            // 所接的回复认不出（[`TurnFacts::parent_unknown`]）：这一串不报它的 requestId 与深度。
+            self.unknown_parent_scope = env.f.parent_unknown;
+            // 这一批工具结果算一批（文件账本的修改先后，[`super::super::files::Files::begin_batch`]）。
+            self.files.begin_batch();
             let prev_end_dt: DateTime<Utc> =
                 prev_end.unwrap_or(call.started_at - Duration::from_secs(1)).into();
-            // 工具是上一条主线程回复产生的：事件里的 requestId / messageID 都指上一条。
-            let prev_req = previous_request_id.clone().unwrap_or_default();
-            let prev_msg = if is_sub {
-                agent.as_ref().and_then(|a| a.last_message_id.clone()).unwrap_or_default()
+            // 工具是上一条主线程回复产生的：事件里的 requestId / messageID 都指上一条。回复 id 以这条请求自己声明接的那条
+            // 为准（`thread.previous_message_id`，没有再看 `diagnostics.previous_message_id`）：同一条回复后面接了两条兄弟
+            // 分支时，会话里「最近一条回复」是先到的那个兄弟，不是这条所接的。都没有才按会话状态。
+            // 确认接上了某条回复（线程增量按续轮指针挑中的底本）就整套按它：requestId、queryDepth 都是那条回复的，体里
+            // `cc_prev_req` 与它对不上时也不让它把兄弟分支的 requestId 配到这条回复的 messageID 上。
+            let prev_req = env
+                .f
+                .parent_reply_request_id
+                .clone()
+                .or_else(|| previous_request_id.clone())
+                .unwrap_or_default();
+            // 没带指针、按回传的工具调用认出父回复的（[`TurnFacts::parent_reply_message_id`]），用认出的那条。
+            let declared = shape
+                .thread_prev_id
+                .clone()
+                .or_else(|| shape.diag_prev_message_id.clone())
+                .or_else(|| env.f.parent_reply_message_id.clone());
+            // 所接的回复认不出：不拿最近那条顶（它不是这串工具的出处），没声明就不报 `messageID`。
+            let prev_msg = declared
+                .or_else(|| {
+                    if env.f.parent_unknown {
+                        None
+                    } else if is_sub {
+                        agent.as_ref().and_then(|a| a.last_message_id.clone())
+                    } else {
+                        prev_main_message_id.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let prev_depth = env.f.parent_reply_depth.unwrap_or(if is_sub {
+                query_depth.saturating_sub(1)
             } else {
-                prev_main_message_id.clone().unwrap_or_default()
-            };
-            let prev_depth = if is_sub { query_depth.saturating_sub(1) } else { prev_main_depth };
+                prev_main_depth
+            });
             let n = shape.tool_uses.len() as i64;
             // 问题 3：这一批里有要点头的工具时，上一条回复到这条请求的间隔大头是盯弹框的等待
             // （死时间，不属于任何工具的执行）。先按「间隔减去各工具一份合理执行」估出这段等待，
@@ -109,20 +137,6 @@ impl EventBuilder<'_> {
             // 工具都跑完，攒附件再发下一条。这两条的深度仍是上一条的（三个版本的抓包都是
             // 「下一条 api_query 的深度 − 1」：主线程 0→1、子代理 2→3…）。
             let ta = ms(t0, -4);
-            // 2.1.285 的子代理续轮不再报附件计算耗时（五条续轮前一条都没有）。
-            let labels: &[&str] =
-                if v285 && is_sub { &[] } else { &["agent_pending_messages", "memory_update"] };
-            for label in labels {
-                self.push(
-                    ta,
-                    "tengu_attachment_compute_duration",
-                    json!({ "label": label, "duration_ms": 0, "attachment_size_bytes": 0, "attachment_count": 0 }),
-                );
-            }
-            let mut attachments = json!({ "attachment_types": ["total_tokens_reminder"] });
-            if v285 {
-                fill_attachment_estimates(&mut attachments, query_source, shape.sdk, display_model);
-            }
             let results = shape.tool_uses.len();
             // 先 `query_before_attachments`、再攒附件、再 `query_after_attachments`（`cap/2.1.277`
             // 30 次、`cap/2.1.280` 5 次、`cap/2.1.285` 6 次都是这个顺序）。
@@ -137,10 +151,8 @@ impl EventBuilder<'_> {
                     "queryDepth": prev_depth
                 }),
             );
-            // billing-only 模拟没补 `<total_tokens>` 提醒（[`ApiCall::bare`]）。
-            if !self.env.call.bare {
-                self.push(ta, "tengu_attachments", attachments);
-            }
+            // 攒附件：工具池变化、各附件的计算耗时、附件那条（[`Self::emit_turn_attachments`]）。
+            self.emit_turn_attachments(ta, is_sub);
             self.push(
                 ms(ta, 1),
                 "tengu_query_after_attachments",
@@ -151,7 +163,130 @@ impl EventBuilder<'_> {
                     "queryDepth": prev_depth
                 }),
             );
+            self.unknown_parent_scope = false;
+        } else if (is_main || is_sub)
+            && !new_prompt
+            && (self.subst.pool.changed() || self.subst.pool.mcp_changed())
+        {
+            // 工具结果配不上上一条回复里的调用（底本丢了之类），工具那串补不出来；这一轮正文里认得出的工具池变化与附件照报，
+            // 时间同攒附件那刻。
+            self.emit_turn_attachments(ms(t0, -4), is_sub);
+        } else if is_sub && !new_prompt && self.subst.pool.first_turn() {
+            // 子代理头一轮：官方在它攒附件时报一条工具池汇总（`-full/00103` → 批次 `00111`：`addedCount: 399`、
+            // `dtdCount: 0`）；附件那条由子代理起步那串报（[`Self::emit_agent_steps`]）。
+            self.emit_pool_turn(ms(t0, -4), is_sub);
         }
+    }
+
+    /// 续轮攒附件那一刻：先工具池变化（[`Self::emit_pool_turn`]），再各附件的计算耗时，再 `tengu_attachments`——同一毫秒、
+    /// 按这个先后（`cap/auto-2.1.321-20261110-bashfail/2.1.321` 批次 `00065`、`-full` 批次 `00111` 的子代理那条）。
+    ///
+    /// 附件类型按这一轮实际有的：工具池附件（`deferred_tools_delta`）、MCP 服务器说明的增减（`mcp_instructions_delta`），再是
+    /// `<total_tokens>` 提醒——体归客户端的看体里有没有那条提醒（`00063` 没有，批次 `00065` 只列前两种），模拟路径照旧由
+    /// luban 补；一种都没有就不报。只看正文，与工具调用配不配得上无关。
+    fn emit_turn_attachments(&mut self, ta: DateTime<Utc>, is_sub: bool) {
+        let env = self.env;
+        let (call, shape) = (env.call, env.shape);
+        let TurnFacts { ref display_model, v285, .. } = *env.f;
+        let query_source = env.query_source.as_str();
+        self.emit_pool_turn(ta, is_sub);
+        let pool = self.subst.pool.delta.filter(|_| self.subst.pool.changed());
+        let mcp = self.subst.pool.mcp.filter(|_| self.subst.pool.mcp_changed());
+        let mut types = Vec::new();
+        // 这两种附件的估值按这一轮的正文算（[`super::super::tool_pool::PoolDelta::token_estimate`]），不用固定值。
+        let mut own_estimates = Vec::new();
+        if let Some(d) = pool {
+            types.push("deferred_tools_delta");
+            own_estimates
+                .push(("deferred_tools_delta", d.token_estimate(self.subst.pool.history, is_sub)));
+        }
+        if let Some(m) = mcp {
+            types.push("mcp_instructions_delta");
+            own_estimates.push(("mcp_instructions_delta", m.token_estimate()));
+        }
+        // `<total_tokens>` 那条只认这一轮客户端附的提醒（[`super::super::tool_pool::Scan::total_tokens`]），工具结果、
+        // 用户正文里出现同样的字不算；模拟路径照旧由 luban 补。
+        if !call.client_tools || shape.pool_total_tokens {
+            types.push("total_tokens_reminder");
+        }
+        for (label, duration_ms) in
+            compute_duration_samples(&env.f.version, is_sub, v285, self.subst.seed)
+        {
+            self.push(
+                ta,
+                "tengu_attachment_compute_duration",
+                json!({ "label": label, "duration_ms": duration_ms, "attachment_size_bytes": 0, "attachment_count": 0 }),
+            );
+        }
+        let mut attachments = json!({ "attachment_types": types });
+        if v285 {
+            fill_attachment_estimates(&mut attachments, query_source, shape.sdk, display_model);
+            // 这一轮的工具池 / MCP 说明数据没记全时估不准：估值按位置与类型一一对应，缺一项就整份不报。
+            if own_estimates.iter().any(|(_, n)| n.is_none()) {
+                if let Some(o) = attachments.as_object_mut() {
+                    o.shift_remove("attachment_token_estimates");
+                }
+            } else if let Some(est) =
+                attachments.get_mut("attachment_token_estimates").and_then(|e| e.as_array_mut())
+            {
+                for (slot, t) in est.iter_mut().zip(&types) {
+                    if let Some((_, Some(n))) = own_estimates.iter().find(|(k, _)| k == t) {
+                        *slot = json!(n.to_string());
+                    }
+                }
+            }
+        }
+        // billing-only 模拟没补 `<total_tokens>` 提醒（[`ApiCall::bare`]）。
+        if !call.bare && !types.is_empty() {
+            self.push(ta, "tengu_attachments", attachments);
+        }
+    }
+
+    /// 主线程或子代理续轮（不是新输入）攒附件那一刻的延迟工具池事件：这一轮工具池有变化（[`super::super::tool_pool::PoolTurn::changed`]）
+    /// 时，同新输入那一轮一样报按归属那几条与汇总——借汇总那条模板（交互式在首次输入段、`-p` 在启动段），由
+    /// [`super::super::tool_pool::fill_summary`] 按这一轮改，直接并进主队列（与同一毫秒的附件事件按先后排）。新输入的轮次由
+    /// [`Self::emit_new_prompt`] 报，这里只管续轮，不会重复。
+    fn emit_pool_turn(&mut self, at: DateTime<Utc>, is_sub: bool) {
+        let env = self.env;
+        let pool = self.subst.pool;
+        let deferred = pool.changed() || (is_sub && pool.first_turn());
+        if env.f.new_prompt
+            || !(env.f.is_main || is_sub)
+            || !(deferred || pool.mcp_changed())
+            || !version_at_least(&env.f.version, "2.1.319")
+        {
+            return;
+        }
+        // `-p` 主线程续轮：工具表刷新后 MCP 工具数变了先报一条（官方 `tengu_mcp_tools_refreshed_mid_turn`，与汇总同一毫秒、
+        // 在它前面；`bashfail` 两组 `00065` / `00062` 都有，交互式的抓包一条都没有）。
+        if env.f.is_main
+            && env.shape.sdk
+            && let Some((old, new)) = pool.mcp_refresh(env.shape.mcp_tools)
+        {
+            self.push(
+                at,
+                "tengu_mcp_tools_refreshed_mid_turn",
+                json!({ "oldMcpCount": old, "newMcpCount": new, "recovered": old == 0 && new > 0 }),
+            );
+        }
+        // 子代理那条：`callSite: attachments_subagent`、`querySource` 是它自己的（`-full` 批次 `00111`：
+        // `agent:builtin:Explore`）；按归属那几条的 `callSite` 跟着改。
+        if is_sub {
+            self.subst.pool_site =
+                Some(("attachments_subagent", env.query_source.as_str().to_string()));
+        }
+        self.subst.pool_inline = true;
+        if deferred && let Some(e) = super::super::tool_pool::summary_template(env.tpl) {
+            self.take_tpl_inline(std::slice::from_ref(e), ms(at, -e.off));
+        }
+        // MCP 服务器说明那条紧跟在汇总后面（同一毫秒）。
+        if pool.mcp_changed()
+            && let Some(e) = super::super::tool_pool::mcp_template(env.tpl)
+        {
+            self.take_tpl_inline(std::slice::from_ref(e), ms(at, -e.off));
+        }
+        self.subst.pool_inline = false;
+        self.subst.pool_site = None;
     }
 
     /// 模型调了这一轮没声明的工具（`Glob` 之类）：客户端找不到它，不走权限、不执行，只报
@@ -550,6 +685,7 @@ impl EventBuilder<'_> {
             v317,
             v318,
             v319,
+            v321,
             bash_metered,
             prompt_seq,
             ..
@@ -778,6 +914,10 @@ impl EventBuilder<'_> {
                 self.push_dd_snake(t_done, "tengu_bash_tool_command_executed", bash);
                 self.own_betas_scope = false;
                 self.emit_bash_mentions(command, t_done, prev_msg);
+                // 前台跑完的命令读到的文件记进这条线的读过名单（官方 `qSo`，后台跑的不记）。
+                if !backgrounded {
+                    self.note_bash_reads(command, tu);
+                }
                 self.push_dd(t_done, "tengu_feature_ok", feature("tool_bash"));
             }
         }
@@ -945,7 +1085,15 @@ impl EventBuilder<'_> {
             // 2.1.318（`cap/auto-2.1.318-20261104-bashfail` 两条，同一次跑的 2.1.317 对照复现出 9a93a625ab80）摘要、行列、块名都换了。
             // 2.1.319（`cap/auto-2.1.319-20261106-bashfail` 与全量包里那条，同值；同一次跑的 2.1.318 对照复现出 5f045de6ca68）
             // 摘要、行列、块名都换了。
-            if v319 {
+            // 2.1.321（`cap/auto-2.1.321-20261110-bashfail` 与全量包里三条，同值；同一次跑的 2.1.319 对照复现出 934df67089d3）
+            // 摘要、行列、块名都换了；2.1.320 没抓，先沿用这一版的。
+            // 这一版 `ShellError` 压缩后的类名是 `Rx`，过得了构造名校验，**又带上了 `error_constructor`**（夹在消息摘要与栈摘要之间，
+            // 同 2.1.291 那次）。
+            if v321 {
+                err["error_constructor"] = json!("Rx");
+                err["error_stack_hash"] = json!("0cacd2d8980f");
+                err["error_top_frame"] = json!("chunk-ne1755n5.js:3632:9537");
+            } else if v319 {
                 err["error_stack_hash"] = json!("934df67089d3");
                 err["error_top_frame"] = json!("chunk-24jdhyyr.js:3603:9437");
             } else if v318 {
@@ -1280,5 +1428,152 @@ mod tests {
         assert_eq!(keys(&short), ["externalWallMs"]);
         let long = tool_timing(&tu("WebFetch", none), 3_246, None, 7, 0);
         assert_eq!(keys(&long), ["externalWallMs", "modelCallMs", "preExternalMs"]);
+    }
+}
+
+/// 2.1.319 起（已核对 2.1.319 / 2.1.321 / 2.1.322 的可执行文件）每个附件生成器各自按 5% 抽样报
+/// `tengu_attachment_compute_duration`（官方 `jc`：`Math.random()<0.05`），耗时是实测毫秒。按这条调用的散列逐个生成器抽，
+/// 生成器取官方顺序里抓包出现过的那些（`cap/auto-2.1.318~321-*-full` 里工具结果那一步出现过的：主线程 34 种、子代理 16 种），耗时按同批抓包的
+/// 分布取（0ms 28%、1ms 45%、2ms 13%、3ms 及以上 14%）。这一轮真产出了附件的那几个（工具池、MCP 说明、`<total_tokens>`）
+/// 报的是附件大小与条数，luban 算不准，不抽。
+///
+/// 更早的版本照旧：两条 0ms（`agent_pending_messages`、`memory_update`），2.1.285 起的子代理续轮不报。
+fn compute_duration_samples(
+    version: &str,
+    is_sub: bool,
+    v285: bool,
+    seed: u32,
+) -> Vec<(&'static str, u64)> {
+    if !version_at_least(version, "2.1.319") {
+        if v285 && is_sub {
+            return Vec::new();
+        }
+        return vec![("agent_pending_messages", 0), ("memory_update", 0)];
+    }
+    // 工具结果那一步没有新输入，只跟输入走的生成器（@ 提及、MCP 资源、技能 / 子代理 / 同伴点名、ultra 关键词、输出风格）
+    // 不跑——`cap/auto-2.1.318~321-*-full` 与 `bashfail` 里工具结果之后那批一条都没有。
+    const MAIN: [&str; 34] = [
+        "nested_memory",
+        "queued_commands",
+        "sandbox_instructions",
+        "environment",
+        "model",
+        "session_settings",
+        "ultrathink_effort",
+        "agent_listing_delta",
+        "mcp_dropped_tools_delta",
+        "changed_files",
+        "dynamic_skill",
+        "skill_listing",
+        "plan_mode",
+        "plan_mode_exit",
+        "proactivity",
+        "auto_mode",
+        "auto_mode_exit",
+        "todo_reminders",
+        "agent_pending_messages",
+        "critical_system_reminder",
+        "silent_turn_reminder",
+        "budget_usd",
+        "workflow_keyword_request",
+        "workflow_size_guideline_change",
+        "ide_selection",
+        "ide_opened_file",
+        "queued_ide_selections",
+        "diagnostics",
+        "lsp_diagnostics",
+        "unified_tasks",
+        "async_hook_responses",
+        "memory_update",
+        "withheld_memory",
+        "token_usage",
+    ];
+    const SUB: [&str; 16] = [
+        "sandbox_instructions",
+        "model",
+        "session_settings",
+        "ultrathink_effort",
+        "agent_listing_delta",
+        "changed_files",
+        "dynamic_skill",
+        "skill_listing",
+        "plan_mode",
+        "plan_mode_exit",
+        "auto_mode",
+        "auto_mode_exit",
+        "todo_reminders",
+        "agent_pending_messages",
+        "critical_system_reminder",
+        "budget_usd",
+    ];
+    // 抓包里 0~7ms 的条数（再往上的很少，并进 7）。
+    const DURATIONS: [(u64, u64); 8] =
+        [(0, 150), (1, 240), (2, 70), (3, 31), (4, 15), (5, 14), (6, 7), (7, 5)];
+    let draw = |label: &str, salt: u8| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (seed, label, salt).hash(&mut h);
+        h.finish()
+    };
+    let total: u64 = DURATIONS.iter().map(|(_, n)| n).sum();
+    let labels: &[&str] = if is_sub { &SUB } else { &MAIN };
+    labels
+        .iter()
+        .filter(|l| draw(l, 0) % 100 < 5)
+        .map(|l| {
+            let mut x = draw(l, 1) % total;
+            let ms = DURATIONS
+                .iter()
+                .find(|(_, n)| {
+                    if x < *n {
+                        true
+                    } else {
+                        x -= n;
+                        false
+                    }
+                })
+                .map_or(0, |(d, _)| *d);
+            (*l, ms)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod compute_duration_tests {
+    use super::*;
+
+    /// 2.1.319 起按生成器各 5% 抽样：同一条调用结果固定，不同调用各不相同，平均每轮约两条；更早的版本照旧两条 0ms。
+    #[test]
+    fn samples_follow_the_official_five_percent() {
+        assert_eq!(
+            compute_duration_samples("2.1.318", false, true, 1),
+            vec![("agent_pending_messages", 0), ("memory_update", 0)]
+        );
+        assert!(compute_duration_samples("2.1.318", true, true, 1).is_empty());
+        let a = compute_duration_samples("2.1.321", false, true, 42);
+        assert_eq!(a, compute_duration_samples("2.1.321", false, true, 42));
+        let total: usize =
+            (0..2000).map(|s| compute_duration_samples("2.1.321", false, true, s).len()).sum();
+        let avg = total as f64 / 2000.0;
+        assert!((1.6..2.5).contains(&avg), "{avg}");
+        let subs: usize =
+            (0..2000).map(|s| compute_duration_samples("2.1.321", true, true, s).len()).sum();
+        assert!(subs > 0);
+        for s in 0..200 {
+            for (label, ms) in compute_duration_samples("2.1.321", false, true, s) {
+                assert!(ms <= 7);
+                assert!(
+                    ![
+                        "deferred_tools_delta",
+                        "mcp_instructions_delta",
+                        "total_tokens_reminder",
+                        "skill_mentions",
+                        "at_mentioned_files",
+                        "agent_mentions"
+                    ]
+                    .contains(&label)
+                );
+            }
+        }
     }
 }

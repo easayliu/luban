@@ -99,6 +99,9 @@ pub struct ApiCall {
     /// 没有环境说明与各类附件、没有 `thread`。宣告这些东西的事件（`tengu_attachments`、`tengu_context_announcement`
     /// 等）与 tether 三条一概不报：官方网关形态不用 thread 时 tether 一条都没有（`cap/auto-2.1.309-20261023-api`）。
     pub bare: bool,
+    /// 模拟路径这次没组装官方第四块（会话相关那块）：原创游戏那段、Finishing / Memory 两节在不在无从谈起，能力来源事件
+    /// 不按出站体判（客户端自带的 system 里就算有同名标题也不是那一块）。透传与 billing-only 恒 false。
+    pub sim_no_rest: bool,
     /// 实际出站的 `anthropic-dispatch-id`（真实客户端透传它自己的，模拟路径恒为 `v2d`，额度探测不带）。
     pub dispatch: Option<String>,
     /// 出站带了 `x-claude-code-sandy-plover`（[`crate::proxy::sandy_plover`]）：官方头一回在请求上补它时报一条
@@ -279,6 +282,8 @@ pub struct Capture {
     pub link_prompt_id: Option<String>,
     /// 见 [`ApiCall::bare`]。
     pub bare: bool,
+    /// 见 [`ApiCall::sim_no_rest`]。
+    pub sim_no_rest: bool,
     /// 见 [`ApiCall::tools_used_header`]。
     pub tools_used_header: bool,
     /// 见 [`ApiCall::tools_used_truncation`]。
@@ -346,6 +351,7 @@ impl Capture {
             client_tools: self.client_tools,
             link_prompt_id: self.link_prompt_id,
             bare: self.bare,
+            sim_no_rest: self.sim_no_rest,
             dispatch: self.dispatch,
             tools_used_header: self.tools_used_header,
             tools_used_truncation: self.tools_used_truncation,

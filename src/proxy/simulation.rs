@@ -135,12 +135,15 @@ fn system_rest(
     let games = super::original_games::applies(cred_id, model, profile.version)
         .then(|| super::original_games::text_for(profile.version));
     let heron = super::heron_brook::served(cred_id, model).map(|(t, _)| t);
-    let rest = super::heron_brook::fit_system_rest(
+    // 2.1.321 的 `# Finishing work` / `# Memory, notes and feedback` 两节跟这个号这个模型的下发走。先排它们、再拼原创游戏那段
+    // 与 `heron_brook` 的正文（官方段序 `…、original_games、heron_brook、finishing_work、notes_and_feedback、willow_tern、…`）：
+    // 这样按标题认节时下发的正文还不在里面。
+    let rest = super::finishing_notes::fit_system_rest(
         render_system_rest(template, env),
-        games,
-        heron.as_deref(),
-        profile.version,
+        super::finishing_notes::SECTIONS
+            .map(|s| super::finishing_notes::applies(cred_id, model, profile.version, s)),
     );
+    let rest = super::heron_brook::fit_system_rest(rest, games, heron.as_deref(), profile.version);
     Some(super::lapis_anchor::fit_system_rest(rest, lapis))
 }
 
@@ -871,7 +874,7 @@ pub(crate) fn has_cc_tool_profile(v: &serde_json::Value) -> bool {
 /// [`config::CC_SYSTEM_REST_HAIKU`]），按 [`cc_profile_kind_for`] 那套族名判挑哪份。
 fn is_claude_family(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f))
+    ["opus", "fable", "sonnet", "haiku"].iter().any(|f| m.contains(f)) || is_mythos_5_2(model)
 }
 
 /// 官方基座（2.1.293：haiku-4.5 一份长的，其余——含 haiku-5-5——同一份）；认不出的模型返回 `None`，只注入身份句
@@ -886,7 +889,7 @@ pub(super) fn cc_system_base(model: &str) -> Option<&'static str> {
     })
 }
 
-/// 官方第四块的模板（2.1.293：opus / sonnet 一份，fable、haiku-4.5、haiku-5-5 各一份）；认不出的模型 `None`、
+/// 官方第四块的模板（2.1.293：opus / sonnet 一份，fable、haiku-4.5、haiku-5-5 各一份；2.1.321 起 fable-5-2 另有一份）；认不出的模型 `None`、
 /// 第四块整个不补。2.1.260 时这里还要按族选模板、按模型查「powered by」那一行的模型名与
 /// 知识截止，2.1.277 起的第四块不再写这些，只剩记忆目录一处随机器变。
 pub(crate) fn cc_system_rest(model: &str) -> Option<&'static str> {
@@ -896,6 +899,10 @@ pub(crate) fn cc_system_rest(model: &str) -> Option<&'static str> {
     Some(match cc_profile_kind_for(model) {
         config::CcProfileKind::MainHaiku => config::CC_SYSTEM_REST_HAIKU,
         config::CcProfileKind::MainHaiku55 => config::CC_SYSTEM_REST_HAIKU_5_5,
+        config::CcProfileKind::MainFable if is_mythos_5_2(model) => {
+            CC_SYSTEM_REST_MYTHOS_5_2.as_str()
+        }
+        config::CcProfileKind::MainFable if is_fable_5_2(model) => config::CC_SYSTEM_REST_FABLE_5_2,
         config::CcProfileKind::MainFable if is_fable_5_1(model) => config::CC_SYSTEM_REST_FABLE,
         config::CcProfileKind::MainFable => CC_SYSTEM_REST_FABLE_5.as_str(),
         _ => config::CC_SYSTEM_REST,
@@ -908,6 +915,33 @@ fn is_fable_5_1(model: &str) -> bool {
     let bare = m.trim_end_matches("[1m]");
     bare == "claude-fable-5-1" || bare.starts_with("claude-fable-5-1-") || bare == "fable-5-1"
 }
+
+/// 规范名是不是 `claude-fable-5-2`（同上）：2.1.321 起它单独一份模板（[`config::CC_SYSTEM_REST_FABLE_5_2`]）。
+fn is_fable_5_2(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let bare = m.trim_end_matches("[1m]");
+    bare == "claude-fable-5-2" || bare.starts_with("claude-fable-5-2-") || bare == "fable-5-2"
+}
+
+/// 规范名是不是 `claude-mythos-5-2`（同上）。mythos 别的几代（5 / 5.1）仍不在 luban 认得的族里。
+pub(super) fn is_mythos_5_2(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let bare = m.trim_end_matches("[1m]");
+    bare == "claude-mythos-5-2" || bare.starts_with("claude-mythos-5-2-") || bare == "mythos-5-2"
+}
+
+/// mythos-5-2 的第四块：fable-5-2 那份去掉自我介绍那段。官方 2.1.321 内置目录给它的能力与 fable-5-2 只差一项
+/// `refusal_fallback`（`lean_prompt`、`fable_5_2_prompt_bundle` 都有），所以隐私说明、训练说明（`llm_rnd_capabilities` 认
+/// fable-5-2 与 mythos-5-2）、原创游戏、`# Finishing work`、`# Memory, notes and feedback` 这些共用；自我介绍那一节
+/// （`fable_identity`，官方 `dNr`）只认 `claude-fable-` 开头的规范名，mythos 没有。**没有抓包**（这个模型只对获批的
+/// 组织开放），按可执行文件拼。
+static CC_SYSTEM_REST_MYTHOS_5_2: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let t = config::CC_SYSTEM_REST_FABLE_5_2;
+    let at =
+        t.find("This iteration of Claude is Claude Fable 5.2").expect("fable-5-2 模板里有自我介绍");
+    let end = at + t[at..].find("\n\n").expect("自我介绍后面还有段落") + 2;
+    format!("{}{}", &t[..at], &t[end..])
+});
 
 /// fable-5 的第四块：fable 那份模板只把自我介绍段换成 Fable 5 那段（可执行文件按模型挑这一段，
 /// 见 [`config::CC_FABLE_5_IDENTITY`]）。给 fable-5 发「我是 Fable 5.1」是模型与提示词对不上。
@@ -1344,7 +1378,8 @@ pub(super) fn cc_profile_kind_for(model: &str) -> config::CcProfileKind {
         config::CcProfileKind::MainHaiku55
     } else if m.contains("haiku") {
         config::CcProfileKind::MainHaiku
-    } else if m.contains("fable") {
+    } else if m.contains("fable") || is_mythos_5_2(&m) {
+        // mythos-5-2 的内置目录条目与 fable-5-2 同一套能力（少一项 `refusal_fallback`），按 fable 那行。
         config::CcProfileKind::MainFable
     } else if m.contains("opus") {
         config::CcProfileKind::MainOpus

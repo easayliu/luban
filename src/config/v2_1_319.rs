@@ -1,9 +1,9 @@
-//! 2.1.319 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.319 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.319 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.319 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.319 的 profile 表：2.1.319 / 2.1.320 来访的 beta 参照（[`cc_profile_at`]）。2.1.321 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **除无工具 helper 与 `/model` 预热那两行外，各行除版本号外与 2.1.318（[`CC_PROFILES_2_1_318`]）完全相同**。2.1.319 起一次性侧查询的
 /// 两个公共入口（`mNr` / `r0e`）没显式给 `sendSideQueryBeta` 时按 `g4()` 取：firstParty、OAuth、走官方地址（或 diskless）
@@ -12,7 +12,7 @@ use super::*;
 /// 与标题同属 [`CcProfileKind::SessionTitleHaiku`]，那行 2.1.318 起就带）也带了；WebSearch 子调用（带工具，不走这两个入口）
 /// 与额度探测照旧不带。经自定义 `ANTHROPIC_BASE_URL` 的客户端不带，转发时补回，见 [`crate::proxy::merge_beta_for`]。
 /// 依据 `cap/auto-2.1.319-20261106-full`（场景同 2.1.318-full，测试项目换了干净的 `scratchpad/cal10`）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_319: &[CcProfile] = &[
     at_319(CC_PROFILES_2_1_318[0]),
     at_319(CC_PROFILES_2_1_318[1]),
     at_319(CC_PROFILES_2_1_318[2]),

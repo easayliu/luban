@@ -201,7 +201,7 @@ pub(super) struct Session {
     /// 这个会话里已经报过 `tengu_toasty_thimble_applied` 的模型（官方按对话、按模型锁存，`/clear` 换了对话从头算）。
     pub(super) batching_reminder_models: Vec<String>,
     /// 每条线程上一条完整请求的形态，键是 `main` 或 `agent:<支线号>`，见 [`ThreadBase`]。
-    pub(super) thread_bases: HashMap<String, ThreadBase>,
+    pub(super) thread_bases: HashMap<String, ThreadLine>,
     /// 会话里的子代理，按支线号（`x-claude-code-agent-id`）分开记。
     pub(super) agents: HashMap<String, AgentState>,
     /// 主线程派出去、子代理还没露面的那几次 `Agent` 调用的 `prompt`（取不到的记空串）。心跳里主线程续轮
@@ -300,6 +300,10 @@ pub(super) struct AgentState {
     pub(super) claim_checked: bool,
     /// 这条支线上一条回复的 `message.model`：下一条请求带回的工具结果是那条回复调的工具，改动行数记在它名下。
     pub(super) last_reply_model: Option<String>,
+    /// 这条支线最近那条请求的来龙去脉说不准（[`TurnFacts::lineage_unknown`]）：照它回落的下一条（接的正是它）同样说不准。
+    /// 主线程那边靠处理完放回会话状态（[`LatestState`]）做到这一点，子代理的支线状态不放回（那条请求确实是这条支线的），
+    /// 所以记在这里。
+    pub(super) lineage_unknown: bool,
     /// 工具长度表报过的那份 hash（`tengu_tool_schema_sizes` 每条支线首次报一次）。
     pub(super) tools_hash: Option<String>,
     /// 子代理类型（请求头 `x-claude-code-agent-type`）。它的摘要请求头上只有 `agent-id`，
@@ -359,6 +363,9 @@ pub(super) struct ThreadBase {
     pub(super) tool_lens: String,
     pub(super) deferred_tools: usize,
     pub(super) mcp_tools: usize,
+    /// 正文里直接带着定义的 MCP 工具名（[`RequestShape::mcp_tool_names`]）：没带 `tools` 的续轮沿用，ToolSearch 判定的
+    /// `mcpToolCount` 要数它们。
+    pub(super) mcp_tool_names: Vec<String>,
     pub(super) has_tool_search: bool,
     pub(super) tools_off: ToolsOff,
     pub(super) system_blocks: usize,
@@ -386,6 +393,36 @@ pub(super) struct ThreadBase {
     /// 这条回复里的工具调用（工具名 → 入参字符数之和，按首次出现排序，即
     /// [`ApiCall::tool_use_lens`]）。下一条增量请求只带 `tool_result`，工具名要从这里配。
     pub(super) reply_tools: Vec<(String, usize)>,
+    /// 叠上这条请求那条附件之后的延迟工具池账本（[`RequestShape::pool_after`]），下一条续轮接着用。
+    pub(super) pool_after: Option<Arc<super::tool_pool::PoolHistory>>,
+    /// 这条请求的回复的 message.id：下一条续轮的指针该指着它。
+    pub(super) reply_id: Option<String>,
+    /// 这条请求的上游 request-id 与它的回复里的工具调用：接着这条回复的续轮，工具事件的 requestId 与工具详情从这里取。
+    pub(super) request_id: Option<String>,
+    pub(super) reply_calls: Arc<Vec<ToolCall>>,
+    /// 这条请求的 queryDepth、queryChainId 与所在那一轮的 prompt id：回接这条回复的续轮（哪怕中间夹了别的新输入）
+    /// 仍是这一轮的事。
+    pub(super) depth: u32,
+    pub(super) chain_id: String,
+    pub(super) prompt_id: String,
+    /// 这条请求所在那一轮的起点（提交时刻），回接这条回复的续轮报 `turn_end` 的时长从这里算。
+    pub(super) turn_started: Option<SystemTime>,
+    /// 主线程这条请求处理完时那一轮的累计（[`TurnStats`]），回接这条回复的续轮换回它。
+    pub(super) turn: Option<TurnStats>,
+    /// 这条请求那一轮的累计说不准（它自己所接的回复就认不出）：接着它的续轮同样不报本轮累计。
+    pub(super) turn_unknown: bool,
+    /// 这条请求的总用量（输入 + 缓存读写 + 输出）：接着它的续轮报的 `messageTokens`。失败、取消的没有用量，记它自己报的
+    /// 那个（它接的那条的），没有就 `None`。
+    pub(super) total_tokens: Option<i64>,
+    /// 这条请求处理完时它所在线程的配置（tether 的「上一条」）、它的模型（展示名）：接着这条回复的续轮拿它比配置变没变、
+    /// 模型换没换——不拿会话里共享的那份（中间夹着别的分支时那份是别的分支的）。
+    pub(super) tether: Option<TetherThread>,
+    pub(super) model: String,
+    /// 只留了身份：这条是没接上底本的线程增量，体里只有新增那几条，形态（消息数、工具表、system）是半截的。不拿它补别的增量
+    /// 的形态，只认它的回复 id、request-id、调的工具、用量与「那一轮说不准」。
+    pub(super) shape_incomplete: bool,
+    /// 工具表是知道的：完整的底本，或只留身份、但体里明说了 `tools` 的那条（[`super::shape::RequestShape::tools_declared`]）。
+    pub(super) tools_known: bool,
 }
 
 impl ThreadBase {
@@ -393,8 +430,24 @@ impl ThreadBase {
         s: &RequestShape,
         reply_chars: usize,
         reply_tools: Vec<(String, usize)>,
+        reply_id: Option<String>,
     ) -> Self {
         ThreadBase {
+            pool_after: s.pool_after(),
+            reply_id,
+            request_id: None,
+            reply_calls: Arc::new(Vec::new()),
+            depth: 0,
+            chain_id: String::new(),
+            prompt_id: String::new(),
+            turn_started: None,
+            turn: None,
+            turn_unknown: false,
+            total_tokens: None,
+            tether: None,
+            model: String::new(),
+            shape_incomplete: false,
+            tools_known: true,
             tools_count: s.tools_count,
             tools_chars: s.tools_chars,
             tools_hash: s.tools_hash.clone(),
@@ -402,6 +455,7 @@ impl ThreadBase {
             tool_lens: s.tool_lens.clone(),
             deferred_tools: s.deferred_tools,
             mcp_tools: s.mcp_tools,
+            mcp_tool_names: s.mcp_tool_names.clone(),
             has_tool_search: s.has_tool_search,
             tools_off: s.tools_off,
             system_blocks: s.system_blocks,
@@ -425,64 +479,46 @@ impl ThreadBase {
         }
     }
 
-    /// 把一条增量请求的形态补成客户端视角的全量。auto 模式的提示在增量里没出现就沿用上一条的。
-    pub(super) fn fill(&self, s: &mut RequestShape, auto_in_delta: bool) {
-        // 工具集中途变了的续轮自己带着完整 `tools`（ToolSearch 刚载入工具、MCP 工具上线，
-        // `cap/auto-2.1.285-20260930/00054`），以它为准；没带 `tools` 键才沿用底本那份——显式 `tools: []` 是清空了。
-        if !s.tools_declared {
-            s.tools_count = self.tools_count;
-            s.tools_chars = self.tools_chars;
-            s.tools_hash = self.tools_hash.clone();
-            s.tools_content_hash = self.tools_content_hash.clone();
-            s.tool_lens = self.tool_lens.clone();
-            s.deferred_tools = self.deferred_tools;
-            s.mcp_tools = self.mcp_tools;
-            s.has_tool_search = self.has_tool_search;
-            s.tools_off = self.tools_off;
-        }
-        s.system_blocks = self.system_blocks;
-        s.system_chars = self.system_chars;
-        s.static_len = self.static_len;
-        s.dynamic_len = self.dynamic_len;
-        s.dynamic_hash = self.dynamic_hash.clone();
-        // 续轮省掉的是底本里有、这条没带的：system 恒省（增量只剩 billing），tools 只在这条没写 `tools` 键时省。
-        s.system_bytes = self.system_bytes;
-        s.omitted_system_bytes = self.system_bytes;
-        if s.tools_declared {
-            s.omitted_tools_bytes = 0;
-        } else {
-            s.tools_bytes = self.tools_bytes;
-            s.omitted_tools_bytes = self.tools_bytes;
-        }
-        s.omitted_bytes = s.omitted_system_bytes + s.omitted_tools_bytes;
-        if !auto_in_delta {
-            s.permission_mode = self.permission_mode;
-        }
-        // 增量里没有 assistant 时，全量视角下它前面紧挨着上一条回复：末条 assistant 之后的条数
-        // 就是增量的条数（`tether_live_outcome.deltaMessageCount`，`cap/2.1.285` 主线程续轮恒 2、
-        // 子代理续轮恒 1，正是增量体的条数）。
-        if s.assistant_messages == 0 {
-            s.after_last_assistant = s.messages_len;
-        }
+    /// 增量体里的 `tool_result` 配回这条回复里的工具名（[`Self::reply_tools`]）。只留身份的底本（形态补不了）也做这一步。
+    pub(super) fn pair_orphan_results(&self, s: &mut RequestShape) {
         // 增量体里的 `tool_result` 配回上一条回复里的工具调用，续轮那串工具事件（放行、执行、
         // 成功、攒附件）才发得出来（`cap/2.1.285`：主线程 `00115`、`00121`，子代理 `00127` 等
         // 五条）。回复里只记了每个工具名的入参总长，按出现顺序配：结果条数与工具名个数相同就
         // 一一对上（`00136`：Read、WebFetch），只有一个工具名就全是它（`00131`：三条 WebFetch），
         // 多出来的归最后一个；同名多次调用的入参长度均分。
-        if s.tool_uses.is_empty() && !s.orphan_results.is_empty() && !self.reply_tools.is_empty() {
+        // 回复流里按调用 id 记下了的（[`Self::reply_calls`]）先按 id 配：名字一开始就对，按名字取的东西（Read 的正文摘要）
+        // 不会因为按顺序暂配错名字而漏掉（`Read`、`Bash`、`Read` 那批第三条按顺序会暂配成 `Bash`）。
+        if s.tool_uses.is_empty()
+            && !s.orphan_results.is_empty()
+            && (!self.reply_tools.is_empty() || !self.reply_calls.is_empty())
+        {
             let names: Vec<&(String, usize)> = self.reply_tools.iter().collect();
-            let pick = |i: usize| names[i.min(names.len() - 1)];
+            let pick = |i: usize| names.get(i.min(names.len().saturating_sub(1))).copied();
             let calls_of = |name: &str| {
-                (0..s.orphan_results.len()).filter(|&i| pick(i).0 == name).count().max(1)
+                (0..s.orphan_results.len())
+                    .filter(|&i| pick(i).is_some_and(|p| p.0 == name))
+                    .count()
+                    .max(1)
             };
             s.tool_uses = s
                 .orphan_results
                 .iter()
                 .enumerate()
-                .map(|(i, r)| {
-                    let (name, input_total) = pick(i);
-                    let input_len = input_total / calls_of(name);
-                    ToolUse {
+                .filter_map(|(i, r)| {
+                    let call = self.reply_calls.iter().find(|c| c.id == r.id);
+                    let bash_output =
+                        call.and_then(|c| super::shape::bash_output(&c.name, &c.input, r));
+                    let (name, input_len) = match call {
+                        Some(c) => {
+                            (c.name.clone(), super::shape::tool_input_len(&c.name, &c.input))
+                        }
+                        None => {
+                            let (name, input_total) = pick(i)?;
+                            (name.clone(), input_total / calls_of(name))
+                        }
+                    };
+                    let name = &name;
+                    Some(ToolUse {
                         id: r.id.clone(),
                         name: name.clone(),
                         input_len,
@@ -514,11 +550,62 @@ impl ThreadBase {
                         .then(|| super::files::read_content(&r.text))
                         .flatten(),
                         read_dedup: r.read_dedup,
+                        bash_output,
                         image_hash: r.image_hash.clone(),
-                    }
+                    })
                 })
                 .collect();
         }
+    }
+
+    /// 没带 `tools` 键的增量沿用这份底本的工具表（显式 `tools: []` 是清空了，不沿用）。只留身份、但工具表知道的底本
+    /// （[`Self::tools_known`]）也只补这一样。
+    pub(super) fn fill_tools(&self, s: &mut RequestShape) {
+        if s.tools_declared {
+            return;
+        }
+        s.tools_count = self.tools_count;
+        s.tools_chars = self.tools_chars;
+        s.tools_hash = self.tools_hash.clone();
+        s.tools_content_hash = self.tools_content_hash.clone();
+        s.tool_lens = self.tool_lens.clone();
+        s.deferred_tools = self.deferred_tools;
+        s.mcp_tools = self.mcp_tools;
+        s.mcp_tool_names = self.mcp_tool_names.clone();
+        s.has_tool_search = self.has_tool_search;
+        s.tools_off = self.tools_off;
+    }
+
+    /// 把一条增量请求的形态补成客户端视角的全量。auto 模式的提示在增量里没出现就沿用上一条的。
+    pub(super) fn fill(&self, s: &mut RequestShape, auto_in_delta: bool, confirmed: bool) {
+        // 工具集中途变了的续轮自己带着完整 `tools`（ToolSearch 刚载入工具、MCP 工具上线，
+        // `cap/auto-2.1.285-20260930/00054`），以它为准；没带 `tools` 键才沿用底本那份——显式 `tools: []` 是清空了。
+        self.fill_tools(s);
+        s.system_blocks = self.system_blocks;
+        s.system_chars = self.system_chars;
+        s.static_len = self.static_len;
+        s.dynamic_len = self.dynamic_len;
+        s.dynamic_hash = self.dynamic_hash.clone();
+        // 续轮省掉的是底本里有、这条没带的：system 恒省（增量只剩 billing），tools 只在这条没写 `tools` 键时省。
+        s.system_bytes = self.system_bytes;
+        s.omitted_system_bytes = self.system_bytes;
+        if s.tools_declared {
+            s.omitted_tools_bytes = 0;
+        } else {
+            s.tools_bytes = self.tools_bytes;
+            s.omitted_tools_bytes = self.tools_bytes;
+        }
+        s.omitted_bytes = s.omitted_system_bytes + s.omitted_tools_bytes;
+        if !auto_in_delta {
+            s.permission_mode = self.permission_mode;
+        }
+        // 增量里没有 assistant 时，全量视角下它前面紧挨着上一条回复：末条 assistant 之后的条数
+        // 就是增量的条数（`tether_live_outcome.deltaMessageCount`，`cap/2.1.285` 主线程续轮恒 2、
+        // 子代理续轮恒 1，正是增量体的条数）。
+        if s.assistant_messages == 0 {
+            s.after_last_assistant = s.messages_len;
+        }
+        self.pair_orphan_results(s);
         s.messages_len += self.messages + 1;
         s.assistant_messages += self.assistant_messages + 1;
         s.input_text_chars += self.input_text_chars + self.reply_chars;
@@ -528,6 +615,237 @@ impl ThreadBase {
         s.doc_blocks += self.doc_blocks;
         s.doc_bytes += self.doc_bytes;
         s.estimated_tokens = estimate_tokens(&s.model, s.input_text_chars);
+        // 工具池账本：增量体里没有历史，从底本接，只接确认接对了的（[`Self::select`]）；看不出的留空，汇总里账本那几项
+        // 不报。
+        if s.pool_history.is_none() {
+            s.pool_history = if confirmed { self.pool_after.clone() } else { None };
+            s.settle_pool();
+        }
+    }
+}
+
+/// 主线程一轮里累计的那几样（[`Session`] 的 `turn_*`）：起点、首字出没出过、工具与 API 次数、API 总耗时、首条回复的
+/// 结束时刻、重试状态。线程底本按回复留一份（[`ThreadBase::turn`]），回接旧的一轮时整份换回来——夹在中间的别的新输入、
+/// 别的请求不该算进那一轮。
+#[derive(Clone, Debug, Default)]
+pub(super) struct TurnStats {
+    started: Option<SystemTime>,
+    text_seen: bool,
+    tool_calls: u32,
+    api_calls: u32,
+    api_ms: i64,
+    mcp_calls: u32,
+    toolsearch_calls: u32,
+    first_reply_end: Option<SystemTime>,
+    retry_status: Option<u16>,
+}
+
+impl Session {
+    /// 这一轮此刻的累计（[`TurnStats`]）。
+    pub(super) fn turn_stats(&self) -> TurnStats {
+        TurnStats {
+            started: self.turn_started,
+            text_seen: self.turn_text_seen,
+            tool_calls: self.turn_tool_calls,
+            api_calls: self.turn_api_calls,
+            api_ms: self.turn_api_ms,
+            mcp_calls: self.turn_mcp_calls,
+            toolsearch_calls: self.turn_toolsearch_calls,
+            first_reply_end: self.turn_first_reply_end,
+            retry_status: self.turn_retry_status,
+        }
+    }
+
+    /// 两份累计是不是同一轮（起点相同）。
+    pub(super) fn same_turn(&self, other: &TurnStats) -> bool {
+        self.turn_started == other.started
+    }
+
+    /// 换回某一轮的累计（回接旧的一轮时）。
+    pub(super) fn restore_turn(&mut self, t: &TurnStats) {
+        self.turn_started = t.started;
+        self.turn_text_seen = t.text_seen;
+        self.turn_tool_calls = t.tool_calls;
+        self.turn_api_calls = t.api_calls;
+        self.turn_api_ms = t.api_ms;
+        self.turn_mcp_calls = t.mcp_calls;
+        self.turn_toolsearch_calls = t.toolsearch_calls;
+        self.turn_first_reply_end = t.first_reply_end;
+        self.turn_retry_status = t.retry_status;
+    }
+}
+
+/// 会话里「最近这一轮」的整套状态：本轮累计与深度、最近一条主线程回复的 request / message id 与深度、它调的工具、当前
+/// prompt 与查询链。回接旧的一轮、或接一条认不出的回复的请求处理前整份存下，处理完原样放回（[`Session::restore_latest`]）：
+/// 那条请求不属于最近这一轮，不该把它的痕迹留给之后没带父指针、照会话状态回落的请求。
+pub(super) struct LatestState {
+    turn: TurnStats,
+    turn_depth: u32,
+    last_main_request_id: Option<String>,
+    last_main_message_id: Option<String>,
+    last_main_depth: u32,
+    last_main_reply_model: Option<String>,
+    reply_calls: Option<Vec<ToolCall>>,
+    prompt_id: String,
+    prev_prompt_id: String,
+    chain_id: String,
+    /// `messageTokens` 的来源（最近一条主线程请求的总 token），与会话里最近一条回复（任何请求）的 id 与结束时刻（没带
+    /// `diagnostics.previous_message_id` 的请求回落用它）。
+    prev_total_input: i64,
+    last_message_id: Option<String>,
+    last_message_end: Option<SystemTime>,
+    /// 最近一条主线程请求的模型：缓存诊断 `model_changed` 拿它比。
+    last_model: Option<String>,
+    /// 主线程线程配置的「上一条」与报过长度表的工具 hash：之后没带父指针、照会话状态比的请求（全量新输入）跟的是最近
+    /// 这一轮，不是回接旧轮那条留下的。
+    tether_main: Option<TetherThread>,
+    tools_hash_main: Option<String>,
+}
+
+impl Session {
+    pub(super) fn snapshot_latest(&self, thread_key: &str) -> LatestState {
+        LatestState {
+            turn: self.turn_stats(),
+            turn_depth: self.turn_depth,
+            last_main_request_id: self.last_main_request_id.clone(),
+            last_main_message_id: self.last_main_message_id.clone(),
+            last_main_depth: self.last_main_depth,
+            last_main_reply_model: self.last_main_reply_model.clone(),
+            reply_calls: self.reply_calls.get(thread_key).cloned(),
+            prompt_id: self.prompt_id.clone(),
+            prev_prompt_id: self.prev_prompt_id.clone(),
+            chain_id: self.chain_id.clone(),
+            prev_total_input: self.prev_total_input,
+            last_message_id: self.last_message_id.clone(),
+            last_message_end: self.last_message_end,
+            last_model: self.last_model.clone(),
+            tether_main: self.tether_main.clone(),
+            tools_hash_main: self.tools_hash_main.clone(),
+        }
+    }
+
+    pub(super) fn restore_latest(&mut self, thread_key: &str, s: LatestState) {
+        self.restore_turn(&s.turn);
+        self.turn_depth = s.turn_depth;
+        self.last_main_request_id = s.last_main_request_id;
+        self.last_main_message_id = s.last_main_message_id;
+        self.last_main_depth = s.last_main_depth;
+        self.last_main_reply_model = s.last_main_reply_model;
+        match s.reply_calls {
+            Some(c) => {
+                self.reply_calls.insert(thread_key.to_string(), c);
+            }
+            None => {
+                self.reply_calls.remove(thread_key);
+            }
+        }
+        self.prompt_id = s.prompt_id;
+        self.prev_prompt_id = s.prev_prompt_id;
+        self.chain_id = s.chain_id;
+        self.prev_total_input = s.prev_total_input;
+        self.last_message_id = s.last_message_id;
+        self.last_message_end = s.last_message_end;
+        self.last_model = s.last_model;
+        self.tether_main = s.tether_main;
+        self.tools_hash_main = s.tools_hash_main;
+    }
+}
+
+/// 一条线程（主线程或某个子代理）留着的底本：最新那份，与按回复 id 记的最近几份。续轮指针可能指向任何一条还在的回复
+/// ——同一条回复后面接了两条（重发、改了再发、并行的兄弟分支），之后还可能回头接较早那条——所以按回复 id 都留着，
+/// 不只留最新的。
+#[derive(Debug, Clone, Default)]
+pub(super) struct ThreadLine {
+    latest: Option<Arc<ThreadBase>>,
+    /// 带回复 id 的完整底本，新的在后，最多 [`THREAD_LINE_KEEP`] 份。
+    by_reply: VecDeque<Arc<ThreadBase>>,
+    /// 只留身份的底本（[`ThreadBase::shape_incomplete`]），新的在后，另占 [`THREAD_LINE_KEEP`] 份：与完整底本分开放，
+    /// 一串接不上的增量挤不掉还能被明说回接的完整底本。
+    detached: VecDeque<Arc<ThreadBase>>,
+}
+
+/// 每条线程按回复 id 留几份底本（完整的、只留身份的各这么多）。
+const THREAD_LINE_KEEP: usize = 16;
+
+impl ThreadLine {
+    /// 按回复 id 能找到的全部底本，新的优先：最新那份、其余完整的、只留身份的。
+    fn known(&self) -> impl Iterator<Item = &Arc<ThreadBase>> {
+        self.latest.iter().chain(self.by_reply.iter().rev()).chain(self.detached.iter().rev())
+    }
+
+    /// 一条线程增量（续轮指针 `prev`）该拿哪份底本补，与能不能确认接对了：
+    /// - 指针是留着的某份底本的回复（最新那份、完整的、只留身份的都算）：那份，确认；
+    /// - 缺 id（指针没带，或没指到、最新那份又没记回复 id——看不出接错没接错）：最新那份，不确认（形态照补，工具池账本
+    ///   不接）；
+    /// - 指针没指到任何留着的回复、最新那份有回复 id（指向没见过的回复）：`None`，不补。
+    pub(super) fn select(&self, prev: Option<&str>) -> Option<(Arc<ThreadBase>, bool)> {
+        if let Some(p) = prev
+            && let Some(b) = self.known().find(|b| b.reply_id.as_deref() == Some(p))
+        {
+            return Some((b.clone(), true));
+        }
+        let latest = self.latest.as_ref()?;
+        if prev.is_none() {
+            return Some((latest.clone(), false));
+        }
+        latest.reply_id.is_none().then(|| (latest.clone(), false))
+    }
+
+    /// 回复里调过某个工具（`has(工具调用 id)`）的那份底本，新的优先：没带父指针的全量续轮回传的工具结果是哪条回复调的，
+    /// 那条就是它接的回复。
+    pub(super) fn find_by_tool_call(&self, has: impl Fn(&str) -> bool) -> Option<Arc<ThreadBase>> {
+        self.known().find(|b| b.reply_calls.iter().any(|c| has(&c.id))).cloned()
+    }
+
+    /// 给回复 id 是 `reply_id` 的那份底本补上这条请求处理完时那一轮的累计（存底本时它还没累计进去）。
+    pub(super) fn set_turn(&mut self, reply_id: &str, turn: TurnStats) {
+        let patch = |b: &Arc<ThreadBase>| {
+            Arc::new(ThreadBase { turn: Some(turn.clone()), ..(**b).clone() })
+        };
+        for b in self.by_reply.iter_mut().filter(|b| b.reply_id.as_deref() == Some(reply_id)) {
+            *b = patch(b);
+        }
+        if let Some(l) = self.latest.as_mut().filter(|l| l.reply_id.as_deref() == Some(reply_id)) {
+            *l = patch(l);
+        }
+    }
+
+    /// 同一回复 id 只留一份：新存的那份顶掉两边旧的。
+    fn forget(&mut self, id: &str) {
+        self.by_reply.retain(|b| b.reply_id.as_deref() != Some(id));
+        self.detached.retain(|b| b.reply_id.as_deref() != Some(id));
+    }
+
+    /// 存一份只留身份的底本（[`ThreadBase::shape_incomplete`]）：只按回复 id 记下，不当最新那份——它的形态是半截的，不能给
+    /// 没带指针、照最新那份回落的增量拿去补；明说接它的、回传它调的工具的，照样认得出接的是它。
+    pub(super) fn store_detached(&mut self, base: ThreadBase) {
+        let Some(id) = base.reply_id.clone() else { return };
+        self.forget(&id);
+        self.detached.push_back(Arc::new(base));
+        while self.detached.len() > THREAD_LINE_KEEP {
+            self.detached.pop_front();
+        }
+    }
+
+    /// 存一份新底本。带回复 id 的按 id 记下（同 id 的换成新的）；没有回复 id 的（取消、中途断了）只在还没有带 id 的
+    /// 最新底本时顶上——不能让一条没有回复、谁也接不上的请求盖掉能被引用的那份。
+    pub(super) fn store(&mut self, base: ThreadBase) {
+        let base = Arc::new(base);
+        match base.reply_id.as_deref() {
+            Some(id) => {
+                self.forget(id);
+                self.by_reply.push_back(base.clone());
+                while self.by_reply.len() > THREAD_LINE_KEEP {
+                    self.by_reply.pop_front();
+                }
+                self.latest = Some(base);
+            }
+            None => {
+                if self.latest.as_ref().is_none_or(|l| l.reply_id.is_none()) {
+                    self.latest = Some(base);
+                }
+            }
+        }
     }
 }
 
@@ -548,6 +866,11 @@ pub(super) struct TetherThread {
     pub(super) hashes: Vec<Option<u64>>,
     /// 这条被中断了（Esc）：下一条另起时客户端认领的是回退（`claimedRewind`）。
     pub(super) aborted: bool,
+    /// 半截的增量记下的（[`super::process`] 的 `shape_partial`）：模型、beta、effort、thinking 是它自己体里的，工具表与
+    /// 消息数不知道（`tools_content` / `messages` / `hashes` 不可用）。接着它的请求只比知道的那几项。
+    pub(super) partial: bool,
+    /// 半截的增量里明说了 `tools`：它的工具表（`tools_content`）是知道的，接着它的请求照样比工具变没变。
+    pub(super) tools_known: bool,
 }
 
 /// 一条请求的 tether 判定结果，事件链里 `tether_decision` / `echo_audit` / `live_outcome`
@@ -578,6 +901,13 @@ pub(super) struct Tether {
     pub(super) turns: u32,
     pub(super) prev_messages: usize,
     pub(super) delta: usize,
+    /// 形态是半截的（没补全的线程增量，[`super::process`] 的 `shape_partial`）：判定照体里的续轮写（`continue/append`），
+    /// 线程里第几条、整段消息数、上一条消息数都不知道，不报。
+    pub(super) counts_unknown: bool,
+    /// 「上一条」只知道一半（[`TetherThread::partial`]）：工具变没变、上一条消息数、线程里第几条、多出几条都不知道，不报。
+    pub(super) prev_unknown: bool,
+    /// 「上一条」的工具表不知道：工具变没变（`changedTools` / `toolsHashKept`）不报。
+    pub(super) tools_unknown: bool,
     /// 线程里此前已有请求：只有这种才有 `tengu_tether_echo_audit`（主线程另起线程也算，
     /// 那是同一会话的回声；子代理只在续用时有）。
     pub(super) echo: bool,
@@ -714,9 +1044,30 @@ pub(super) struct TurnFacts {
     pub(super) prev_main_message_id: Option<String>,
     pub(super) prev_main_request_id: Option<String>,
     pub(super) prev_main_depth: u32,
+    /// 这条线程增量确认接上的那条回复（[`ThreadLine::select`]）的上游 request-id 与 queryDepth：它带回的工具结果是那条
+    /// 回复调的，工具事件的身份与深度都按它（同一条回复后面接了兄弟分支时，会话里「最近一条」是别的分支）。
+    pub(super) parent_reply_request_id: Option<String>,
+    /// 确认接上的那条回复的 message.id（请求没带指针、按回传的工具调用认出父回复时，工具事件的 `messageID` 用它）。
+    pub(super) parent_reply_message_id: Option<String>,
+    pub(super) parent_reply_depth: Option<u32>,
+    /// 这条续轮明说了接哪条回复（`thread.previous_message_id` / `diagnostics.previous_message_id`），可那条既不在线程
+    /// 底本里（逐出了、没见过），也不是会话里最近那条：它的 requestId、深度与那一轮的累计都无从得知。工具事件不报那两项，
+    /// `-p` 收尾不报首响应耗时与本轮累计——不拿会话里别轮的数充数。
+    pub(super) parent_unknown: bool,
+    /// 这条所在那一轮（主线程的一轮、子代理的支线）的来龙去脉说不准：所接回复认不出，或接的那条自己就说不准。查询链、深度、
+    /// 轮时长都不报。
+    pub(super) lineage_unknown: bool,
+    /// 工具表不知道：没补全的线程增量没带 `tools`、所接的又认不出工具表（冷启动单独接到的续轮）。`toolsCount` 那几项不报，
+    /// 不报成空表。
+    pub(super) tools_unknown: bool,
+    /// 这一轮的累计说不准（[`Self::parent_unknown`]，或所接那条回复自己那一轮就说不准）：`-p` 收尾不报首响应耗时与
+    /// 本轮累计。
+    pub(super) turn_stats_unknown: bool,
     pub(super) prev_end: Option<SystemTime>,
     pub(super) time_since_last: Option<u64>,
-    pub(super) message_tokens: i64,
+    /// `messageTokens`：所接那条回复的总用量（确认接上的父回复，否则会话 / 支线里最近那条的）；所接的回复认不出时 `None`，
+    /// 不报。
+    pub(super) message_tokens: Option<i64>,
     pub(super) default_model: String,
     pub(super) device_default_update: Option<String>,
     pub(super) model_changed: bool,
@@ -777,6 +1128,10 @@ pub(super) struct TurnFacts {
     /// `tool_input_stream_ms`（[`super::shape::ToolUse::input_stream_ms`]），`tengu_tether_decision` 在 `changedExtraBody`
     /// 后多 `toolsHashKept`（`cap/auto-2.1.319-20261106-*`）。
     pub(super) v319: bool,
+    /// 2.1.321：失败 Bash 与 5xx 的错误栈换块；失败 Bash 那条多 `error_constructor: "Rx"`、5xx 那几条多 `error_constructor: "Gmn"`，别的事件键
+    /// 没变（`cap/auto-2.1.321-20261110-*`）。
+    /// 2.1.320 没抓，块名猜不出，先沿用这一版的。
+    pub(super) v321: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见

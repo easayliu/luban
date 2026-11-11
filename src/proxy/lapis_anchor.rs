@@ -255,14 +255,18 @@ pub(crate) fn note_eval(cred_id: i64, features: &serde_json::Map<String, Value>)
 }
 
 /// `version` 那一版官方客户端的内置模型目录里，`model` 带不带 [`CAPABILITY`]：2.1.314 起 opus-5-5、sonnet-5-5 不带
-/// （认规范名，`[1m]`、日期这类尾巴照认），别的模型与更早的版本都带。读不出版本的按最新那版。
+/// （认规范名，`[1m]`、日期这类尾巴照认），2.1.321 目录里新增的 fable-5-2 / mythos-5-2 也不带
+/// （`cap/auto-2.1.321-20261110-fable52/00068` 没有那行），别的模型与更早的版本都带。读不出版本的按最新那版。
 fn has_capability(model: &str, version: &str) -> bool {
     if crate::proxy::parse_version(version).is_some_and(|v| v < (2, 1, 314)) {
         return true;
     }
     let canon = super::curious_tower::canonical_model(model);
     let canon = canon.strip_suffix("[1m]").unwrap_or(&canon);
-    !matches!(canon, "claude-opus-5-5" | "claude-sonnet-5-5")
+    !matches!(
+        canon,
+        "claude-opus-5-5" | "claude-sonnet-5-5" | "claude-fable-5-2" | "claude-mythos-5-2"
+    )
 }
 
 /// 这个号用 `model` 当主模型、客户端是 `version` 时现在该是哪一档（不钉住，见 [`session_mode`]）。

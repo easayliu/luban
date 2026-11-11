@@ -60,6 +60,8 @@ impl LastOp {
 struct FileRec {
     /// 已知的当前内容（还原不出或超过上限时为 `None`）。
     content: Option<String>,
+    /// `content` 是整份（Write、整读、Bash 整份读出来的）；分段读（带 offset / limit）记下的只是一段。
+    complete: bool,
     /// 当前大小（字节）。
     size: Option<usize>,
     /// 文件历史已经跟踪它。
@@ -74,6 +76,9 @@ struct FileRec {
     touched: u64,
     /// 读到的是图片（压缩后不恢复）。
     image: bool,
+    /// 这个会话里最后一次改它（Edit / Write）是第几批工具（[`Files::begin_batch`]）；0 是会话里没改过（修改时间早于这个
+    /// 会话里任何一次改动）。官方 `readFileState` 的 `timestamp` 是文件的修改时间，代理只知道这个先后。
+    written: u64,
     /// 哪几条线（主线程 / 各子代理）的 `readFileState` 里有它：官方那张表每个代理各一份，子代理读过的
     /// 文件主线程再读不算重读、压缩后也不恢复它们（`cap/auto-2.1.305-20261021-full` A0 的 Explore 子代理读了
     /// 主线程改过的 calc.py，官方没有 `file_read_reread`）。
@@ -90,6 +95,10 @@ struct Reader {
     touched: u64,
     /// 最近一次读只读了一段（带 offset / limit）：压缩后恢复时官方整份重读，代理不知道全文。
     partial: bool,
+    /// 这一笔记下时文件的修改先后（[`FileRec::written`]）：官方那张表的 `timestamp`，压缩后按它从新到旧挑。
+    stamp: u64,
+    /// 这一笔头一次进这条线的表的先后：`timestamp` 一样时官方保持表里的插入顺序。
+    born: u64,
 }
 
 /// 主线程那条线的代理键（子代理是它的 `agent-id`）。
@@ -100,6 +109,7 @@ impl FileRec {
     fn reader(&mut self, agent: &str, seq: u64) -> &mut Reader {
         if let Some(i) = self.readers.iter().position(|x| x.agent == agent) {
             self.readers[i].touched = seq;
+            self.readers[i].stamp = self.written;
             &mut self.readers[i]
         } else {
             self.readers.push(Reader {
@@ -107,6 +117,8 @@ impl FileRec {
                 last_op: LastOp::Read,
                 touched: seq,
                 partial: false,
+                stamp: self.written,
+                born: seq,
             });
             self.readers.last_mut().expect("just pushed")
         }
@@ -126,6 +138,8 @@ pub(super) struct Track {
 pub(crate) struct Files {
     map: HashMap<String, FileRec>,
     seq: u64,
+    /// 第几批工具（一条请求带回的那一批结果算一批，[`Self::begin_batch`]）：同一批里改的文件修改时间几乎相同，按批比先后。
+    batch: u64,
     /// 拍过几张快照（`snapshotCount`）：只有用户真正提交的才拍，客户端自己注入的那几轮（后台任务通知）
     /// 不算，所以不能拿输入序号顶替（A0 第 9、11、14 次输入是注入的，快照号就比输入号少）。官方只留最近
     /// 100 张（`XGt`），数到 100 封顶。
@@ -136,6 +150,11 @@ pub(crate) struct Files {
 }
 
 impl Files {
+    /// 开始记一批工具结果（一条请求带回的那一批）。
+    pub(super) fn begin_batch(&mut self) {
+        self.batch += 1;
+    }
+
     fn rec(&mut self, path: &str) -> &mut FileRec {
         if !self.map.contains_key(path) && self.map.len() >= MAX_FILES {
             // 跟踪中的文件留着（快照要数它们），只在没跟踪的里挑最久没碰的忘掉。
@@ -175,10 +194,11 @@ impl Files {
         let prior = self.prior_op(agent, path);
         let r = self.rec(path);
         if partial && r.content.is_some() {
-            // 分段读不动已知的全文（账本里的还是整份），只记一笔读过。
+            // 分段读不动已知的内容（账本里的还是原来那份），只记一笔读过。
         } else {
             r.size = Some(content.as_ref().map_or(size, String::len));
             r.content = content.filter(|c| c.len() <= CONTENT_HASH_MAX * 4);
+            r.complete = !partial && r.content.is_some();
         }
         r.image = image;
         let seq = r.touched;
@@ -186,6 +206,48 @@ impl Files {
         r.reader(agent, seq).partial = partial;
         self.fit_budget(path);
         prior
+    }
+
+    /// `agent` 这条线用 Bash（`cat` 这类）读到一个文件（[`super::bash_reads`]）：记一笔读，并更新账本里它的内容
+    /// （[`Self::note_bash_content`]）。
+    pub(super) fn note_bash_read(&mut self, agent: &str, path: &str, content: Option<String>) {
+        self.note_bash_content(path, content);
+        let r = self.rec(path);
+        let partial = !r.complete;
+        r.image = false;
+        let seq = r.touched;
+        let x = r.reader(agent, seq);
+        x.last_op = LastOp::Read;
+        x.partial = partial;
+        self.fit_budget(path);
+    }
+
+    /// Bash 整份读出来的内容（推算的：输出补上末尾换行）更新账本里的全文，不动谁读过它、读的先后。账本里只有分段读记下的
+    /// 一段（[`FileRec::complete`] 为假）不算准的全文，照样换上；账本里的全文与这次读到的不一样——按官方给模型的输出
+    /// 口径比（stdout 做过 `trimEnd()`，末尾的空白、换行都没了）——就是文件变了，换成这次读到的；一样的留着账本那份（末尾
+    /// 空白是准的）。这条线已经读过它时官方不动 `readFileState` 那一笔，但压缩后是从磁盘重读的，读回的是文件此刻的内容。
+    pub(super) fn note_bash_content(&mut self, path: &str, content: Option<String>) {
+        let Some(c) = content else { return };
+        let r = self.rec(path);
+        let replace = match (r.complete, r.content.as_deref()) {
+            // 两边先按官方 `Mw` 归一（CRLF 的文件 `cat` 出来也是 CRLF），再按 JS `trimEnd()` 比。
+            (true, Some(known)) => {
+                use super::bash_reads::normalize_file_text as mw;
+                mw(known).trim_end_matches(is_js_space) != mw(&c).trim_end_matches(is_js_space)
+            }
+            _ => true,
+        };
+        if replace {
+            r.size = Some(c.len());
+            r.content = (c.len() <= CONTENT_HASH_MAX * 4).then_some(c);
+            r.complete = r.content.is_some();
+        }
+        self.fit_budget(path);
+    }
+
+    /// 账本里这个文件准的全文（整份的，[`FileRec::complete`]）。
+    pub(super) fn known_content(&self, path: &str) -> Option<&str> {
+        self.map.get(path).filter(|r| r.complete).and_then(|r| r.content.as_deref())
     }
 
     /// `agent` 这条线之前读写过这个文件的那一笔（去重命中的重读不改账本，只要报 `priorOp`）。
@@ -225,6 +287,7 @@ impl Files {
         new: &str,
         replace_all: bool,
     ) -> (usize, usize) {
+        let batch = self.batch;
         let r = self.rec(path);
         // 删成空串、要删的那段不以换行结尾而原文里它后面跟着换行：连那个换行一起删，整行去掉
         // （官方 `B`：`a\nb\n` 里删 `a` 得 `b\n`，不是 `\nb\n`）。
@@ -240,13 +303,11 @@ impl Files {
             .as_deref()
             .map_or(1, |c| if replace_all { c.matches(old).count().max(1) } else { 1 });
         r.dirty = true;
+        r.written = batch;
         let seq = r.touched;
-        *r.reader(agent, seq) = Reader {
-            agent: agent.into(),
-            last_op: LastOp::EditWrite,
-            touched: seq,
-            partial: false,
-        };
+        let x = r.reader(agent, seq);
+        x.last_op = LastOp::EditWrite;
+        x.partial = false;
         if let Some(c) = r.content.as_mut() {
             let before = std::mem::take(c);
             *c = if replace_all { before.replace(old, new) } else { before.replacen(old, new, 1) };
@@ -271,20 +332,20 @@ impl Files {
         content: &str,
         created: bool,
     ) -> (usize, usize) {
+        let batch = self.batch;
         let r = self.rec(path);
+        r.written = batch;
         let seq = r.touched;
-        *r.reader(agent, seq) = Reader {
-            agent: agent.into(),
-            last_op: LastOp::EditWrite,
-            touched: seq,
-            partial: false,
-        };
+        let x = r.reader(agent, seq);
+        x.last_op = LastOp::EditWrite;
+        x.partial = false;
         let diff = match r.content.as_deref() {
             Some(old) if !created => line_diff(old, content),
             _ if content.is_empty() => (0, 0),
             _ => (content.matches('\n').count() + 1, 0),
         };
         r.content = (content.len() <= CONTENT_HASH_MAX * 4).then(|| content.to_string());
+        r.complete = r.content.is_some();
         r.size = Some(content.len());
         r.dirty = true;
         self.fit_budget(path);
@@ -310,6 +371,7 @@ impl Files {
                 break;
             }
             total -= r.content.take().map_or(0, |c| c.len());
+            r.complete = false;
         }
     }
 
@@ -353,14 +415,25 @@ impl Files {
                 (!r.image
                     && !is_memory_file(p)
                     && !p.contains("/.claude/plans/")
+                    && !is_tool_artifact(p)
                     && !skip.iter().any(|s| s == p))
                 .then_some((p, r, reader))
             })
             .collect();
-        all.sort_by_key(|(_, _, x)| std::cmp::Reverse(x.touched));
+        // 官方 `x0r` 按 `readFileState` 的 `timestamp`（文件修改时间）从新到旧排，一样的保持表里的插入顺序（稳定排序）：
+        // 读进来的是读那会儿的修改时间、改过的是改的那一刻。同一批里改的几个文件修改时间只差几毫秒，按插入顺序近似
+        // （`cap/auto-2.1.321-20261110-full` 00200 那批先改 calc.py 再改 test_calc.py，00212 恢复 calc.py 在前）。
+        all.sort_by_key(|(_, _, x)| (std::cmp::Reverse(x.stamp), x.born));
         all.into_iter()
             .take(n)
-            .map(|(p, r, x)| (p.clone(), if x.partial { None } else { r.content.clone() }))
+            .map(|(p, r, _)| {
+                // 官方压缩后整份从磁盘重读（不管这条线当初是不是分段读的）：账本里有准的全文就是它；只有一段（分段读记下的）
+                // 不是全文，读回的哈希不知道。
+                // 读回走的是 Read：正文按官方 Read 的口径（`_vs`：去开头 BOM、CRLF 换成 LF、去掉末尾单独的 `\r`）再算哈希、
+                // 挂进附件——账本里 Write 记下的原始字节可能是 CRLF。
+                let text = r.content.as_deref().filter(|_| r.complete);
+                (p.clone(), text.map(super::bash_reads::read_tool_text))
+            })
             .collect()
     }
 
@@ -368,6 +441,17 @@ impl Files {
     pub(super) fn has_plan_file(&self) -> bool {
         self.map.keys().any(|p| p.contains("/.claude/plans/"))
     }
+}
+
+/// 官方压缩后恢复文件时跳过的工具产物（2.1.321 `Wkr`）：文件名以 `artifact-` 开头、且直接放在名为 `tool-results` 的
+/// 目录里（都不分大小写）。
+fn is_tool_artifact(path: &str) -> bool {
+    // 官方先规范化（`ht`）再判：`tool-results//artifact-…`、`tool-results/./artifact-…` 一样算。
+    let normalized = super::bash_reads::ledger_key(path, None);
+    let mut parts = normalized.rsplit('/');
+    let name = parts.next().unwrap_or("");
+    let dir = parts.next().unwrap_or("");
+    name.to_lowercase().starts_with("artifact-") && dir.to_lowercase() == "tool-results"
 }
 
 /// 官方压缩后恢复文件时跳过的记忆文件（`ydr`：加载过的 CLAUDE.md / CLAUDE.local.md / 规则文件那张表）。
@@ -512,7 +596,7 @@ fn split_js_space(s: &str) -> Vec<&str> {
 }
 
 /// ECMAScript 正则 `\s` 的字符集合。
-fn is_js_space(c: char) -> bool {
+pub(super) fn is_js_space(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
@@ -802,6 +886,159 @@ mod tests {
         assert_eq!(f.snapshot(), [(2, 8), (2, 2)]);
     }
 
+    /// 别的线 Write 记下了准的全文，这条线再用 `cat` 看：留着那份全文，不拿从输出推算的（补了末尾换行的）去盖。
+    #[test]
+    fn a_bash_read_keeps_known_content() {
+        let mut f = Files::default();
+        f.begin_batch();
+        f.apply_write("agent-1", "/p/x.txt", "no newline", true);
+        f.note_bash_read(MAIN_READER, "/p/x.txt", Some("no newline\n".into()));
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/x.txt".to_string(), Some("no newline".to_string()))]
+        );
+        // 账本里没有全文：用推算的；推算不出只记读过。
+        f.note_bash_read(MAIN_READER, "/p/y.txt", Some("y\n".into()));
+        f.note_bash_read(MAIN_READER, "/p/z.txt", None);
+        let got = f.restore_candidates(MAIN_READER, 5, &[]);
+        assert!(got.contains(&("/p/y.txt".to_string(), Some("y\n".to_string()))));
+        assert!(got.contains(&("/p/z.txt".to_string(), None)));
+    }
+
+    /// 账本里只有分段读记下的一段：Bash 整份读出来的照样换上，读回时按全文算哈希；分段那一段本身不当全文报。
+    #[test]
+    fn a_bash_read_replaces_a_fragment() {
+        let mut f = Files::default();
+        f.note_read("agent-1", "/p/two.txt", Some("first".into()), 5, true, false);
+        f.note_read(MAIN_READER, "/p/frag.txt", Some("first".into()), 5, true, false);
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/frag.txt".to_string(), None)],
+            "只有一段，不知道全文"
+        );
+        f.note_bash_read(MAIN_READER, "/p/two.txt", Some("first\nsecond\n".into()));
+        let got = f.restore_candidates(MAIN_READER, 5, &[]);
+        assert!(
+            got.contains(&("/p/two.txt".to_string(), Some("first\nsecond\n".to_string()))),
+            "{got:?}"
+        );
+    }
+
+    /// 账本里的全文与这次 `cat` 读到的不一样（文件后来变了）：换成这次读到的；只差客户端裁掉的末尾换行的不算变。
+    #[test]
+    fn a_bash_read_of_changed_content_replaces_it() {
+        let mut f = Files::default();
+        f.apply_write("agent-1", "/p/x.txt", "old", true);
+        f.note_bash_read(MAIN_READER, "/p/x.txt", Some("new\n".into()));
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/x.txt".to_string(), Some("new\n".to_string()))]
+        );
+        f.apply_write("agent-1", "/p/y.txt", "same", true);
+        f.note_bash_read(MAIN_READER, "/p/y.txt", Some("same\n".into()));
+        assert!(
+            f.restore_candidates(MAIN_READER, 5, &[])
+                .contains(&("/p/y.txt".to_string(), Some("same".to_string())))
+        );
+    }
+
+    /// 末尾带空格 / tab 的文件：客户端给模型的输出做过 `trimEnd()`，按那个口径比一样就不算变，留着账本里准的全文。
+    #[test]
+    fn trailing_whitespace_is_not_a_change() {
+        let mut f = Files::default();
+        for (p, body) in [("/p/sp.txt", "last column \n"), ("/p/tab.txt", "last column\t\n")] {
+            f.apply_write(MAIN_READER, p, body, true);
+            f.note_bash_content(p, Some("last column\n".into()));
+            assert!(
+                f.restore_candidates(MAIN_READER, 5, &[])
+                    .contains(&(p.to_string(), Some(body.to_string())))
+            );
+        }
+    }
+
+    /// 同一条线先分段读、后来 `cat` 读到全文：那一笔还是分段的（官方不动它），但压缩后整份从磁盘重读，报全文的哈希。
+    #[test]
+    fn a_partial_read_then_cat_restores_the_full_text() {
+        let mut f = Files::default();
+        f.note_read(MAIN_READER, "/p/two.txt", Some("first".into()), 5, true, false);
+        f.note_bash_content("/p/two.txt", Some("first\nsecond\n".into()));
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/two.txt".to_string(), Some("first\nsecond\n".to_string()))]
+        );
+    }
+
+    /// JS 的 `trimEnd()` 连 U+FEFF 一起裁掉：只差它与换行的不算变。
+    #[test]
+    fn a_trailing_bom_is_not_a_change() {
+        let mut f = Files::default();
+        f.apply_write(MAIN_READER, "/p/bom.txt", "last column\u{feff}\n", true);
+        f.note_bash_content("/p/bom.txt", Some("last column\n".into()));
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/bom.txt".to_string(), Some("last column\u{feff}\n".to_string()))]
+        );
+    }
+
+    /// 直接放在 `tool-results` 目录里、名字以 `artifact-` 开头的工具产物压缩后不读回（官方 `Wkr`）；同目录普通文件、别处同名
+    /// 文件照读回。
+    #[test]
+    fn tool_artifacts_are_not_restored() {
+        let mut f = Files::default();
+        for p in [
+            "/s/tool-results/artifact-1234.txt",
+            "/s/tool-results//artifact-2.txt",
+            "/s/tool-results/./artifact-3.txt",
+            "~/tool-results//artifact-4.txt",
+            "tool-results/artifact-5.txt",
+            "/s/tool-results/out.txt",
+            "/s/other/artifact-1234.txt",
+        ] {
+            f.note_read(MAIN_READER, p, Some("x".into()), 1, false, false);
+        }
+        let got: Vec<String> =
+            f.restore_candidates(MAIN_READER, 5, &[]).into_iter().map(|(p, _)| p).collect();
+        assert!(!got.contains(&"/s/tool-results/artifact-1234.txt".to_string()), "{got:?}");
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    /// 文件名只差末尾一个空格的两个文件是两回事：Bash 读带空格的那个不改另一个的内容。
+    #[test]
+    fn a_trailing_space_name_is_a_different_file() {
+        use super::super::bash_reads::{bash_reads, ledger_key};
+        let mut f = Files::default();
+        f.note_read(MAIN_READER, "/p/a.txt", Some("plain\n".into()), 6, false, false);
+        let r = bash_reads("cat '/p/a.txt '").pop().unwrap();
+        f.note_bash_read(MAIN_READER, &ledger_key(&r.path, None), Some("spaced\n".into()));
+        let got = f.restore_candidates(MAIN_READER, 5, &[]);
+        assert!(got.contains(&("/p/a.txt".to_string(), Some("plain\n".to_string()))), "{got:?}");
+        assert!(got.contains(&("/p/a.txt ".to_string(), Some("spaced\n".to_string()))), "{got:?}");
+    }
+
+    /// Write 记下的是 CRLF 原文，压缩读回走 Read：正文按 LF（官方 `Mw`）给出，哈希与 Read 读到的一致。
+    #[test]
+    fn restored_text_is_normalized_like_read() {
+        let mut f = Files::default();
+        f.apply_write(MAIN_READER, "/p/crlf.txt", "\u{feff}a\r\nb\r\n", true);
+        assert_eq!(
+            f.restore_candidates(MAIN_READER, 5, &[]),
+            [("/p/crlf.txt".to_string(), Some("a\nb\n".to_string()))]
+        );
+    }
+
+    /// 末尾没有换行的 CRLF 文件：`cat` 出来的输出与账本全文按 `Mw` 归一后一样，不算变，读回仍是原文（`a\nb`），不是补了
+    /// 换行的推算正文；末尾单独的 `\r` 读回时去掉（官方 Read）。
+    #[test]
+    fn crlf_without_final_newline_keeps_known_text() {
+        let mut f = Files::default();
+        f.apply_write(MAIN_READER, "/p/c.txt", "\u{feff}a\r\nb", true);
+        f.note_bash_content("/p/c.txt", Some("a\r\nb\n".into()));
+        f.apply_write(MAIN_READER, "/p/r.txt", "final text\r", true);
+        let got = f.restore_candidates(MAIN_READER, 5, &[]);
+        assert!(got.contains(&("/p/c.txt".to_string(), Some("a\nb".to_string()))), "{got:?}");
+        assert!(got.contains(&("/p/r.txt".to_string(), Some("final text".to_string()))), "{got:?}");
+    }
+
     /// 读状态按线分：子代理读过的文件主线程再读不算重读、压缩后也不恢复；压缩清掉主线程的读状态。
     #[test]
     fn read_state_is_per_agent_and_cleared_by_compaction() {
@@ -812,17 +1049,25 @@ mod tests {
         assert!(f.restore_candidates(m, 5, &[]).is_empty());
         assert_eq!(f.note_read(m, "/p/a.md", Some("# a\n".into()), 4, false, false), None);
         assert_eq!(f.prior_op(m, "/p/a.md"), Some(LastOp::Read));
+        f.begin_batch();
         f.apply_edit(m, "/p/a.md", "# a", "# b", false);
         assert_eq!(f.prior_op(m, "/p/a.md"), Some(LastOp::EditWrite));
+        f.begin_batch();
         f.note_read(m, "/p/big.md", None, 10, true, false);
         f.note_read(m, "/p/logo.png", None, 10, false, true);
         f.note_read(m, "/p/CLAUDE.md", Some("x".into()), 1, false, false);
+        f.note_read(m, "/p/old.md", Some("o".into()), 1, false, false);
+        // 按修改先后（官方 `timestamp`）从新到旧：会话里改过的 a.md 在前；之后才读、会话里没改过的按进表先后。
         let got = f.restore_candidates(m, 5, &[]);
         assert_eq!(
             got,
-            [("/p/big.md".to_string(), None), ("/p/a.md".to_string(), Some("# b\n".to_string()))]
+            [
+                ("/p/a.md".to_string(), Some("# b\n".to_string())),
+                ("/p/big.md".to_string(), None),
+                ("/p/old.md".to_string(), Some("o".to_string())),
+            ]
         );
-        assert_eq!(f.restore_candidates(m, 5, &["/p/a.md".to_string()]).len(), 1);
+        assert_eq!(f.restore_candidates(m, 5, &["/p/a.md".to_string()]).len(), 2);
         f.compacted(m);
         assert_eq!(f.prior_op(m, "/p/a.md"), None);
         assert_eq!(f.prior_op("agent-1", "/p/a.md"), Some(LastOp::Read));

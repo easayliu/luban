@@ -20,9 +20,14 @@ pub(super) struct BodyFacts {
     tool_inputs: Vec<Box<str>>,
     /// 顶层 `model`（扣住的标题建会话前要它，那时还没处理形态）。
     pub(super) model: Option<String>,
-    /// [`crate::proxy::original_games::TEXTS`] 里每一种写法在不在体里（按原始字节找），见
+    /// [`crate::proxy::original_games::TEXTS`] 里每一种写法在不在 `system` 里，见
     /// [`Self::has_original_games_text`]。
     original_games: [bool; crate::proxy::original_games::TEXTS.len()],
+    /// 2.1.321 的 `# Finishing work` / `# Memory, notes and feedback` 两节在不在 `system` 里，见
+    /// [`Self::has_section`]；`None` 是看不出（第四块没组装）。
+    finishing_notes: [Option<bool>; 2],
+    /// `system` 里有第四块（会话相关那块，认同一块里的 `# Session-specific guidance` 与 `# Environment` 两节）：没有就看不出那几段在不在，见 [`Self::prompt_sent`]。
+    prompt_sent: bool,
     /// 首条用户消息的各个文本块（字符串内容算一块），认领派遣（`claim_delegation`）用。
     pub(super) first_user_texts: Vec<String>,
     /// 体的 JS 字符串长度（UTF-16 码元数；不是合法 UTF-8 时退回字节数），`requestBodyChars` 用。
@@ -33,6 +38,19 @@ impl BodyFacts {
     fn of(body: &[u8]) -> Self {
         let v = serde_json::from_slice::<Value>(body).ok();
         let mut shape = v.as_ref().and_then(|v| shape_of(v, body));
+        // 提示词里的段落只在 `system` 里找：用户消息、工具结果里出现同样的文字（贴进来的日志、读到的文件）不是客户端
+        // 组装的提示词，不能算数。
+        let system = v.as_ref().map(system_texts).unwrap_or_default();
+        // 原创游戏那段、Finishing / Memory 两节都在第四块（会话相关那块）里。第四块没组装（线程续轮的增量体只剩 billing
+        // 那一块，或只有身份与基座）时在不在看不出，不能当「缺了」。认第四块看同一块里官方必有的两节（顶格）：
+        // `# Session-specific guidance` 与 `# Environment`（五份模板都有），只带其中一个标题的自定义 system 不算。模拟路径
+        // 另由 [`ApiCall::sim_no_rest`] 直接告知这次组没组装。
+        let heading = |block: &str, h: &str| {
+            block.starts_with(&format!("{h}\n")) || block.contains(&format!("\n{h}\n"))
+        };
+        let prompt_sent = system.iter().any(|block| {
+            heading(block, "# Session-specific guidance") && heading(block, "# Environment")
+        });
         let tool_inputs = shape
             .iter_mut()
             .flat_map(|s| &mut s.tool_uses)
@@ -42,10 +60,19 @@ impl BodyFacts {
             shape,
             tool_inputs,
             model: v.as_ref().and_then(model_of),
-            original_games: crate::proxy::original_games::TEXTS.map(|t| {
-                let t = t.as_bytes();
-                body.windows(t.len()).any(|w| w == t)
+            original_games: crate::proxy::original_games::TEXTS
+                .map(|t| system.iter().any(|block| block.contains(t))),
+            finishing_notes: crate::proxy::finishing_notes::SECTIONS.map(|s| {
+                // 标题行连同官方正文第一行（[`crate::proxy::finishing_notes::Section::signature`]）顶格、在一块的开头或前面是
+                // 空行：正文里顺带提到这个标题的、别处只借了同名标题的都不算。
+                let sig = s.signature();
+                prompt_sent.then(|| {
+                    system.iter().any(|block| {
+                        block.starts_with(sig) || block.contains(&format!("\n\n{sig}"))
+                    })
+                })
             }),
+            prompt_sent,
             first_user_texts: v.as_ref().map(first_user_texts).unwrap_or_default(),
             chars: std::str::from_utf8(body).map(js_len).unwrap_or(body.len()),
         }
@@ -72,11 +99,35 @@ impl BodyFacts {
             .then(|| self.tool_inputs.iter().map(|s| s.len()).sum())
     }
 
-    /// `text`（[`crate::proxy::original_games::text_for`] 给出的某一版正文）在不在体里。
+    /// `section` 那一节在不在 `system` 里（标题行连同官方正文第一行顶格）；`system` 只有 billing 那一块时看不出，`None`。
+    pub(super) fn has_section(
+        &self,
+        section: crate::proxy::finishing_notes::Section,
+    ) -> Option<bool> {
+        self.finishing_notes[section as usize]
+    }
+
+    /// `system` 里组装了第四块：否则那里头的段落在不在都看不出。
+    pub(super) fn prompt_sent(&self) -> bool {
+        self.prompt_sent
+    }
+
+    /// `text`（[`crate::proxy::original_games::text_for`] 给出的某一版正文）在不在 `system` 里。
     pub(super) fn has_original_games_text(&self, text: &str) -> bool {
         let i = crate::proxy::original_games::TEXTS.iter().position(|t| *t == text);
         debug_assert!(i.is_some(), "original_games::TEXTS 漏了 text_for 给出的一种写法");
         i.is_some_and(|i| self.original_games[i])
+    }
+}
+
+/// 顶层 `system` 的各段正文：字符串算一段，数组取各块的 `text`。
+fn system_texts(v: &Value) -> Vec<&str> {
+    match v.get("system") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(blocks)) => {
+            blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -177,5 +228,83 @@ impl std::ops::Deref for CallBody {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         &self.raw
+    }
+}
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+    use crate::proxy::finishing_notes::Section;
+
+    /// 提示词里的段落只认 `system` 里的：用户消息、工具结果里出现同样的标题或正文不算，`system` 正文里顺带提到标题
+    /// （不在行首）也不算。
+    #[test]
+    fn prompt_sections_are_read_from_the_system_blocks_only() {
+        let games = crate::proxy::original_games::TEXT;
+        let fin = Section::FinishingWork.text();
+        let facts = |v: Value| BodyFacts::of(v.to_string().as_bytes());
+        let in_messages = facts(
+            json!({"model": "claude-opus-5-5", "system": [{"type": "text", "text": "base\n\n# Session-specific guidance\n - g\n\n# Environment\n - x"}],
+            "messages": [
+                {"role": "user", "content": format!("log:\n\n{fin}\n\n# Memory, notes and feedback\nx\n\n{games}")},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": format!("\n\n{fin}")}]}
+            ]}),
+        );
+        assert_eq!(in_messages.has_section(Section::FinishingWork), Some(false));
+        assert_eq!(in_messages.has_section(Section::MemoryNotes), Some(false));
+        assert!(!in_messages.has_original_games_text(games));
+
+        let in_system = facts(json!({"model": "claude-fable-5-2", "system": [
+            {"type": "text", "text": "billing"},
+            {"type": "text", "text": format!("intro\n\n# Session-specific guidance\n - g\n\n# Environment\n - x\n\n{games}\n\n{fin}\n\nmentions # Memory, notes and feedback\ninline")}
+        ], "messages": [{"role": "user", "content": "hi"}]}));
+        assert_eq!(in_system.has_section(Section::FinishingWork), Some(true));
+        assert_eq!(in_system.has_section(Section::MemoryNotes), Some(false), "不在行首的不算");
+        assert!(in_system.has_original_games_text(games));
+
+        // 字符串形态的 system、整块就是那一节。
+        let mem = Section::MemoryNotes.text();
+        let whole = facts(
+            json!({"model": "m", "system": format!("# Session-specific guidance\n - g\n\n# Environment\n - x\n\n{mem}"), "messages": []}),
+        );
+        assert_eq!(whole.has_section(Section::MemoryNotes), Some(true));
+        assert_eq!(whole.has_section(Section::FinishingWork), Some(false));
+    }
+
+    /// 只借了同名标题的段落（`heron_brook` 下发的正文、客户端自己的提示词）不是内置那一节；线程续轮 system 只剩 billing
+    /// 那一块时看不出，不当成缺了。
+    #[test]
+    fn a_borrowed_heading_is_not_the_builtin_section_and_billing_only_is_unknown() {
+        let facts = |v: Value| BodyFacts::of(v.to_string().as_bytes());
+        let borrowed = facts(json!({"model": "claude-fable-5-2", "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli;"},
+            {"type": "text", "text": "intro\n\n# Session-specific guidance\n - g\n\n# Environment\n - x\n\n# Finishing work\nHeron's own guidance about wrapping up."}
+        ], "messages": []}));
+        assert_eq!(borrowed.has_section(Section::FinishingWork), Some(false));
+
+        let billing_only = facts(json!({"model": "claude-fable-5-2", "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli;"}
+        ], "messages": []}));
+        assert_eq!(billing_only.has_section(Section::FinishingWork), None);
+        assert_eq!(billing_only.has_section(Section::MemoryNotes), None);
+        assert!(!billing_only.prompt_sent(), "原创游戏那段同样看不出");
+        assert!(borrowed.prompt_sent());
+
+        // 只有身份与基座、第四块没组装：同样看不出。
+        let no_fourth = facts(json!({"model": "claude-fable-5-2", "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli;"},
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type": "text", "text": "You are an agent working with the user toward their goals."}
+        ], "messages": []}));
+        assert!(!no_fourth.prompt_sent());
+
+        // 只带 `# Environment` 一个标题的自定义 system 不是官方第四块。
+        let custom = facts(json!({"model": "claude-fable-5-2", "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli;"},
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type": "text", "text": "# Environment\nMy own environment notes."}
+        ], "messages": []}));
+        assert!(!custom.prompt_sent());
+        assert_eq!(no_fourth.has_section(Section::FinishingWork), None);
     }
 }

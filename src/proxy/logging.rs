@@ -583,6 +583,7 @@ impl Drop for ReqLog {
                 client_tools: cap.client_tools,
                 link_prompt_id: cap.link_prompt_id,
                 bare: cap.bare,
+                sim_no_rest: cap.sim_no_rest,
                 dispatch: cap.dispatch,
                 tools_used_header: cap.tools_used_header,
                 tools_used_truncation: cap.tools_used_truncation,
@@ -898,6 +899,7 @@ pub(super) fn telemetry_capture(
         client_tools: upstream.sim.is_none(),
         link_prompt_id: upstream.client_link.as_ref().and_then(|(_, l)| l.prompt_id.clone()),
         bare: upstream.sim.as_ref().is_some_and(|s| s.billing_only),
+        sim_no_rest: upstream.sim.as_ref().is_some_and(|s| !s.billing_only && s.rest.is_none()),
         tools_used_header: upstream
             .headers
             .contains_key(crate::proxy::sandy_plover::SANDY_PLOVER_HEADER),

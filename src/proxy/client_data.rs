@@ -280,6 +280,7 @@ pub(crate) fn bump() {
 
 /// 交给按 `client_data` 走的那几个开关（只动内存）。
 fn apply(cred_id: i64, model: &str, data: &serde_json::Value) {
+    super::finishing_notes::note_client_data(cred_id, model, data);
     super::heron_brook::note_client_data(cred_id, model, data);
     super::lapis_anchor::note_client_data(cred_id, model, data);
     super::original_games::note_client_data(cred_id, model, data);
@@ -288,6 +289,7 @@ fn apply(cred_id: i64, model: &str, data: &serde_json::Value) {
 
 /// 那几个开关里这个（号, 模型）的条目一并清掉。
 fn forget(cred_id: i64, model: &str) {
+    super::finishing_notes::forget_client_data(cred_id, model);
     super::heron_brook::forget_client_data(cred_id, model);
     super::lapis_anchor::forget_client_data(cred_id, model);
     super::original_games::forget_client_data(cred_id, model);

@@ -276,7 +276,10 @@ impl<'a> EventEnv<'a> {
         o.insert("is_error".into(), json!(error_kind.is_some()));
         o.insert("is_subagent".into(), json!(kind.is_agent()));
         o.insert("goal_active".into(), json!(false));
-        o.insert("duration_ms".into(), json!(duration));
+        // 这一轮从哪起认不出（[`TurnFacts::turn_stats_unknown`]）：时长不报。
+        if !self.f.lineage_unknown {
+            o.insert("duration_ms".into(), json!(duration));
+        }
         o.insert("query_source".into(), json!(self.query_source));
         o.insert("query_source_category".into(), json!(kind.category()));
         Value::Object(o)
@@ -352,6 +355,21 @@ impl<'a> EventEnv<'a> {
             "dropReportUnmatched": false
         });
         let mut live = live;
+        // 半截的增量（[`super::session::Tether::counts_unknown`]）：整段消息数与线程里第几条不知道，不报；增量条数照报。
+        if t.counts_unknown
+            && let Some(o) = live.as_object_mut()
+        {
+            o.shift_remove("messageCount");
+            o.shift_remove("turnsInThread");
+            // 省掉了多少字节要底本里 system / tools 的大小，半截的增量没有。
+            o.shift_remove("omittedBytes");
+        }
+        // 「上一条」只知道一半：线程里第几条不知道。
+        if t.prev_unknown
+            && let Some(o) = live.as_object_mut()
+        {
+            o.shift_remove("turnsInThread");
+        }
         if v285 {
             insert_after(
                 &mut live,
@@ -404,8 +422,11 @@ impl<'a> EventEnv<'a> {
             resumed: f.resumed,
             prompt_index: f.prompt_seq,
             deferred: self.shape.deferred_tools > 0,
-            mcp_disconnected: self.shape.mcp_disconnected,
-            tool_search: tool_search_decision(self.shape, &f.display_model, f.kind.is_agent()),
+            pool: self.shape.pool_turn(),
+            pool_site: None,
+            pool_inline: false,
+            tool_search: (!f.tools_unknown)
+                .then(|| tool_search_decision(self.shape, &f.display_model, f.kind.is_agent())),
             sdk: self.shape.sdk,
             tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
@@ -470,6 +491,9 @@ pub(super) struct EventBuilder<'a> {
     pub(super) cleared: Option<ClearIds>,
     /// 正在补报上一轮的事（[`Self::emit_rejected_tools`]）：这期间 `push*` 发的事件挂上一轮 prompt。
     pub(super) prev_prompt_scope: bool,
+    /// 正在补报所接回复（父回复未知，[`TurnFacts::parent_unknown`]）里工具的那一串：`push` 去掉 `requestId` 与
+    /// `queryDepth`。
+    pub(super) unknown_parent_scope: bool,
     /// 正在发 meta 里 `model` 是这条请求自己模型的事件（子代理里的 Bash）：这期间 `push*` 的顶层 `betas`
     /// （事件与 Datadog 两边）报这条请求自己那份会话级 beta（`TurnFacts::betas_own`），不是主线程那份。
     /// 官方事件的顶层 `betas` 跟 meta 的 `model` 走：带了就按那个模型取，没带才是主线程的
@@ -522,6 +546,7 @@ impl<'a> EventBuilder<'a> {
             dd: Vec::with_capacity(6),
             main_side: Vec::new(),
             tpl_events: Vec::new(),
+            unknown_parent_scope: false,
             tpl_dd: Vec::new(),
             probe_side: None,
         }
@@ -545,14 +570,35 @@ impl<'a> EventBuilder<'a> {
         if !sample_event(name, &env.f.version, &mut extra) {
             return;
         }
+        self.strip_unknown_parent(&mut extra);
         let ctx = self.ctx_at(dt);
         self.events.push((dt, env.f.identity.event(name, dt, &ctx, extra)));
     }
 
     /// 同一条事件同时进事件链与 Datadog，两边是同一份 meta。
+    /// 所接回复认不出时（[`Self::unknown_parent_scope`]）去掉它的 `requestId` 与 `queryDepth`：主事件流与 Datadog 两份
+    /// 都在复制之前去掉。
+    fn strip_unknown_parent(&self, extra: &mut Value) {
+        let Some(o) = extra.as_object_mut() else { return };
+        if self.unknown_parent_scope {
+            o.shift_remove("requestId");
+            o.shift_remove("queryDepth");
+            if o.get("messageID").is_some_and(|m| m.as_str() == Some("")) {
+                o.shift_remove("messageID");
+            }
+        }
+        // 这条所在那一轮认不出（[`TurnFacts::parent_unknown`] / [`TurnFacts::turn_stats_unknown`]）：查询链与深度都是
+        // 那一轮的，同样无从得知，整条调用的事件都不报。
+        if self.env.f.lineage_unknown {
+            o.shift_remove("queryChainId");
+            o.shift_remove("queryDepth");
+        }
+    }
+
     pub(super) fn push_dd(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
         scrub_mcp_tool(name, &mut extra);
+        self.strip_unknown_parent(&mut extra);
         self.push(dt, name, extra.clone());
         let ctx = self.ctx_at(dt);
         self.dd.push(env.f.identity.dd_entry(name, &ctx, &env.f.dd_model, extra));
@@ -562,6 +608,7 @@ impl<'a> EventBuilder<'a> {
     pub(super) fn push_dd_snake(&mut self, dt: DateTime<Utc>, name: &str, mut extra: Value) {
         let env = self.env;
         scrub_mcp_tool(name, &mut extra);
+        self.strip_unknown_parent(&mut extra);
         let flat = snake_flat(&extra);
         self.push(dt, name, extra);
         let ctx = self.ctx_at(dt);
@@ -580,6 +627,23 @@ impl<'a> EventBuilder<'a> {
         );
         self.tpl_events.extend(ev);
         self.tpl_dd.extend(d);
+    }
+
+    /// 同 [`Self::take_tpl`]，但直接并进主队列：模板队列整体排在主队列后面，同一毫秒里要排在别的事件前面的（续轮的
+    /// 工具池汇总在附件事件前）用这个。
+    /// 身份与上下文同 [`Self::push`]（这条调用自己的：子代理的带它的 `agent_id`），不是模板段那份主线程身份。
+    pub(super) fn take_tpl_inline(&mut self, tpl: &[TplEvent], anchor: DateTime<Utc>) {
+        let env = self.env;
+        let (ev, d) = emit_template(
+            tpl,
+            anchor,
+            &env.f.identity,
+            |dt| self.ctx_at(dt),
+            &env.f.dd_model,
+            &self.subst,
+        );
+        self.events.extend(ev);
+        self.dd.extend(d);
     }
 
     /// 登记一处心跳触发（只在主线程那条时间线上：子代理自己的请求不是主循环，也不改界面运行态，

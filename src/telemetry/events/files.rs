@@ -121,6 +121,10 @@ impl EventBuilder<'_> {
             return;
         };
         let ext = file_ext(&path).to_lowercase();
+        // 账本按规范化过的路径记（官方 `readFileState` 的键，[`super::super::bash_reads::ledger_key`]）：`a/./b`、`~/x`、相对
+        // 路径落到同一份上；事件里的 `filePathHash` 也按规范化过的算（官方先 `ht` 再算哈希）。
+        let path =
+            super::super::bash_reads::tool_path_key(&path, self.env.f.session_cwd.as_deref());
         match tu.name.as_str() {
             "Read" => {
                 // 重读账本里已有的文件：先报一条 `file_read_reread{priorOp}`（上一次是读、改还是种进来的）。
@@ -267,6 +271,53 @@ impl EventBuilder<'_> {
         }
     }
 
+    /// Bash 读到的文件（官方 `qSo`）：`cat` / `sed -n` / `head` 这类读法认出来的每个文件（[`super::super::bash_reads`]），
+    /// 这条线还没读过的记一笔读——压缩后恢复文件从这张表里挑（`cap/auto-2.1.321-20261110-full` 00183 `cat` 任务输出，
+    /// 00212 报恢复）。整份读的内容就是输出（补回末尾换行），分段读、`grep` 只记读过、不知全文。
+    pub(super) fn note_bash_reads(&mut self, command: &str, tu: &ToolUse) {
+        let Some(out) = tu.bash_output.as_ref() else { return };
+        let reads = super::super::bash_reads::bash_reads(command);
+        if reads.is_empty() {
+            return;
+        }
+        let agent = self.reader();
+        let cwd = self.env.f.session_cwd.clone();
+        for r in reads {
+            // `grep` / `rg` 没匹配上（退出码 1，输出为空）官方不记。
+            if r.requires_exit_zero && out.empty {
+                continue;
+            }
+            // 官方先把路径裁掉首尾空白再规范化（`ht`），读的是那个文件、再核它的内容在不在输出里（`D5s`）。
+            let path = super::super::bash_reads::tool_path_key(&r.path, cwd.as_deref());
+            // 输出只有这一条子命令的（[`super::super::bash_reads::BashRead::sole`]）才是文件内容；混着别的输出、好几个文件
+            // 拼在一起的、正文落盘只给了预览的，只记读过。
+            let content =
+                out.text.as_deref().and_then(|t| super::super::bash_reads::full_content(&r, t));
+            // 命令里的路径首尾带空白（shell 读的是名字带空白的那个文件，官方核的是裁掉之后那个）：输出不是那个文件的。账本里
+            // 那个文件的全文与输出一样才算核过（照记一笔读，不改内容）；不一样或不知道，官方那步核不过，不记。
+            if r.path.trim_matches(super::super::files::is_js_space) != r.path {
+                // 官方 `D5s`：那个文件读的那一段（`O5s`）包含在输出里就算核过（不要求相等）。输出不知道（落盘、太大）时官方
+                // 不核、照记（`h === undefined`）。
+                use super::super::bash_reads::bash_read_verified;
+                let same = match self.files.known_content(&path) {
+                    Some(known) => bash_read_verified(&r, known, out.text.as_deref()),
+                    None => false,
+                };
+                if same && self.files.prior_op(&agent, &path).is_none() {
+                    self.files.note_bash_read(&agent, &path, None);
+                }
+                continue;
+            }
+            // 这条线已经读写过它：官方不动那一笔（`qSo` 里 `n.get(V)` 就返回），但文件此刻的内容照样记下（压缩后从磁盘
+            // 重读）。
+            if self.files.prior_op(&agent, &path).is_some() {
+                self.files.note_bash_content(&path, content);
+            } else {
+                self.files.note_bash_read(&agent, &path, content);
+            }
+        }
+    }
+
     /// Bash 命令里提到的文件（官方 `s8s` 的 Bash 分支）：每种扩展名一条 `file_activity{bash_mention}`，
     /// 只在成功时报，排在 `bash_tool_command_executed` 之后、`tool_bash` 之前（`cap/auto-2.1.306-20261021-full/00664`）。
     pub(super) fn emit_bash_mentions(
@@ -312,8 +363,8 @@ impl EventBuilder<'_> {
     /// `/compact` 收尾：2.1.305 起先报摘要回包的形态（`compact_summary_reply`，`turn_end` 后 3ms），再把最近读写
     /// 过的文件（至多 5 个，越近越前；记忆文件、计划文件、图片与保留那组里刚读过的不算，见
     /// [`Files::restore_candidates`]）重新读回——每个一条读取上限覆盖，再各一条带内容哈希的
-    /// `file_operation{read}` 与 `post_compact_file_restore_success`。2.1.305 是读与恢复成对交错，2.1.296 ~
-    /// 2.1.303 是三种各自成串（`cap/auto-2.1.305-20261021-full` A0 .367 ~ .371；`auto-2.1.303-20261019-full` 同场景）。
+    /// `file_operation{read}` 与 `post_compact_file_restore_success`。几个文件是并发读回的，读与成功的交错各次不同，按最常见
+    /// 的三种各自成串报（见下）。挑哪几个、先后按官方 `x0r`（[`Files::restore_candidates`]）。
     /// 恢复完再把延迟工具池与 MCP 说明池按保留下来的那几条消息重宣告一遍（A0 .373 / .378，303 .749 / .751）。
     /// 返回恢复了几个文件（`restoredAttachmentCount` 用）。
     pub(super) fn emit_compact_restore(&mut self, t2: DateTime<Utc>) -> usize {
@@ -338,6 +389,12 @@ impl EventBuilder<'_> {
         }
         let kept_reads =
             env.shape.compact_stats.as_ref().map(|s| s.kept_reads.clone()).unwrap_or_default();
+        // 保留组里 Read 的路径按账本的口径规范化再比（`a/./b` 与 `a/b` 是同一个文件）。
+        let cwd = env.f.session_cwd.clone();
+        let kept_reads: Vec<String> = kept_reads
+            .iter()
+            .map(|p| super::super::bash_reads::tool_path_key(p, cwd.as_deref()))
+            .collect();
         let files = self.files.restore_candidates(MAIN_READER, 5, &kept_reads);
         let tl = ms(t2, 8);
         for _ in &files {
@@ -354,19 +411,13 @@ impl EventBuilder<'_> {
             }
             op
         };
-        if env.f.v305 {
-            for (i, (path, content)) in files.iter().enumerate() {
-                let t = ms(t2, 10 + i as i64);
-                self.push(t, "tengu_file_operation", op(path, content));
-                self.push(t, "tengu_post_compact_file_restore_success", json!({}));
-            }
-        } else {
-            for (path, content) in &files {
-                self.push(ms(t2, 10), "tengu_file_operation", op(path, content));
-            }
-            for _ in &files {
-                self.push(ms(t2, 11), "tengu_post_compact_file_restore_success", json!({}));
-            }
+        // 官方几个文件并发读回（`Promise.all`），读与恢复成功怎么交错看哪个先读完：2.1.300 ~ 2.1.322 的十八份抓包里
+        // 十一份是先连发读、再连发成功（321 `00212`），按最常见的这种报。
+        for (path, content) in &files {
+            self.push(ms(t2, 10), "tengu_file_operation", op(path, content));
+        }
+        for _ in &files {
+            self.push(ms(t2, 11), "tengu_post_compact_file_restore_success", json!({}));
         }
         // 两个池子的重宣告：meta 照首次输入模板里那两条，`callSite` / `querySource` 换成压缩的，
         // `messagesLength` 是保留下来的消息数（延迟工具池只在正文有延迟工具时有，见 `Subst::deferred`）。
@@ -440,12 +491,17 @@ impl EventBuilder<'_> {
         let hit_rate =
             if total_in > 0 { call.cache_read_tokens as f64 / total_in as f64 } else { 0.0 };
         let groups = shape.assistant_messages + 2;
-        let pre = message_tokens.max(0) as u64 + st.trailing;
+        let pre = message_tokens.unwrap_or(0).max(0) as u64 + st.trailing;
         // 摘要在压缩后那条 user 消息里套着固定的开头与结尾（约 300 字）。
         let summary = qc(&"x".repeat(call.text_chars + 300));
+        let kept: Vec<String> = st
+            .kept_reads
+            .iter()
+            .map(|p| super::super::bash_reads::tool_path_key(p, self.env.f.session_cwd.as_deref()))
+            .collect();
         let restored: u64 = self
             .files
-            .restore_candidates(MAIN_READER, 5, &st.kept_reads)
+            .restore_candidates(MAIN_READER, 5, &kept)
             .iter()
             .map(|(p, c)| {
                 // 恢复的文件以「Called the Read tool with the following input: …」加 `cat -n` 正文挂进去。

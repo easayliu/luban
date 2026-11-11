@@ -2832,7 +2832,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.319."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.321."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -5139,7 +5139,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 319)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 321)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6602,6 +6602,16 @@ fn env_note_matches_the_2_1_293_captures() {
             |s: &str| s.lines().find(|l| l.starts_with("- code-review: ")).map(str::to_owned);
         let mut want = keep.join("\n\n").replace(session, &sim.session_id);
         if let (Some(old), Some(new)) = (review(&want), review(config::CC_ENV_SKILLS)) {
+            want = want.replace(&old, &new);
+        }
+        // 2.1.321 又改写了 claude-api 那一条（`read FIRST, before you answer…`、末尾多 `; if nothing hits, load this skill`，
+        // `cap/auto-2.1.321-20261110-full/00068`）：那一条跨三行，从它起到下一条之前整段换成当前资产里的。
+        let api = |s: &str| {
+            let at = s.find("- claude-api: ")?;
+            let end = s[at..].find("\n- ").map_or(s.len(), |n| at + n);
+            Some(s[at..end].to_owned())
+        };
+        if let (Some(old), Some(new)) = (api(&want), api(config::CC_ENV_SKILLS)) {
             want = want.replace(&old, &new);
         }
         let want = want.replace("Today's date is 2026-10-08.", "");

@@ -825,6 +825,7 @@ async fn a_successful_retry_reports_the_body_it_actually_sent(pool: sqlx::PgPool
             client_tools: false,
             link_prompt_id: None,
             bare: false,
+            sim_no_rest: false,
             tools_used_header: false,
             tools_used_truncation: None,
             tools_used_size: None,

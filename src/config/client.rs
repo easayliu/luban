@@ -12,7 +12,7 @@
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
 /// 同一个客户端不会一边自称 2.1.308、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.319 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.321 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -127,7 +127,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.319";
+pub const CC_VERSION_BASE: &str = "2.1.321";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -140,10 +140,10 @@ pub const CC_VERSION_BASE: &str = "2.1.319";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.319-20261106-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
-/// UA `claude-cli/2.1.319`；2.1.313 没有发布，2.1.315 发布了但没抓）。
+/// 依据：`cap/auto-2.1.321-20261110-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
+/// UA `claude-cli/2.1.321`；2.1.313 没有发布，2.1.315、2.1.320 发布了但没抓）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.319";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.321";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -195,6 +195,13 @@ pub const CC_SYSTEM_BASE_HAIKU: &str = include_str!("../assets/cc_system_base_ha
 /// `<total_tokens>15000000 tokens left</total_tokens>` 与 2.1.277 同一个数。fable 与 haiku 2.1.291
 /// 起各有一份（[`CC_SYSTEM_REST_FABLE`]、[`CC_SYSTEM_REST_HAIKU`]）。
 ///
+/// 2.1.321（`cap/auto-2.1.321-20261110-full/00681`、`00363` 等）三处改动，四份模板同样改了：`# Session-specific guidance`
+/// 前（fable 那份在自我介绍前）多一段隐私说明「You must treat information you learn about the user and their project as
+/// private…」（467 字节，官方 `user_privacy` 一节，开关 `tengu_prancy_pebble`：代码默认关，服务端对所有号强制下发 true，
+/// 全新配置目录也拿到 true，模板里直接带上）；`# Environment` 的模型清单 `Fable 5.1: 'claude-fable-5-1'` 换成
+/// `Fable 5.2: 'claude-fable-5-2'`；fast mode 那句改成「gives faster output on this session's model if it supports fast
+/// mode, and otherwise switches the session to Claude Opus」。fable-5-2 另有一份（[`CC_SYSTEM_REST_FABLE_5_2`]）。
+///
 /// 2.1.293（`cap/auto-2.1.293-20261008-full/00419`、`00256`）只改了 `# Environment` 那行模型列表：
 /// `The most recent Claude models are the Claude 5 family and Haiku 4.5.` 去掉 `and Haiku 4.5`，
 /// `Haiku 4.5: 'claude-haiku-4-5-20251001'` 换成 `Haiku 5.5: 'claude-haiku-5-5'`。fable 与 haiku-4.5
@@ -236,8 +243,19 @@ pub const CC_SYSTEM_REST: &str = include_str!("../assets/cc_system_rest.txt");
 /// user` 两节（可执行文件按模型挑，不是账号开关）。占位与去掉的两段同 [`CC_SYSTEM_REST`]。
 pub const CC_SYSTEM_REST_FABLE: &str = include_str!("../assets/cc_system_rest_fable.txt");
 
-/// [`CC_SYSTEM_REST_FABLE`] 里 fable-5-1 的自我介绍段（逐字取自那份模板）。
-pub const CC_FABLE_5_1_IDENTITY: &str = "This iteration of Claude is Claude Fable 5.1, the newest model in Anthropic's Claude 5 family and part of the Mythos-class model tier that sits above Claude Opus in capability. Claude Fable 5.1 and Claude Mythos 5.1 share the same underlying model. Claude Fable 5.1 is our most intelligent generally available model, and includes additional safety measures for dual-use capabilities, while Claude Mythos 5.1 is available without those measures to only approved organizations. Fable 5.1 is the most advanced generally available Claude model. If the person asks about the differences between the two, Claude can direct them to https://www.anthropic.com/claude/fable for more information.";
+/// 2.1.321 fable-5-2 主线程的第四块模板：`cap/auto-2.1.321-20261110-fable52/00068` 的 `system[3]`（10513 字节）。可执行
+/// 文件按模型能力 `fable_5_2_prompt_bundle` 挑：没有 [`CC_SYSTEM_REST_FABLE`] 开头那句与 `# Delivering work`、`# Writing
+/// for the user`、自主运行那几段，自我介绍换成 Fable 5.2 那段、后面跟一段训练说明（`llm_rnd_capabilities`），`# Context
+/// management` 之后是 `# Finishing work` 与 `# Memory, notes and feedback` 两节（能力 `finishing_work_guidance` /
+/// `memory_guidance`）。原创游戏那段这个模型默认也有，排在 `# Finishing work` 前面，模板里不收，由
+/// [`crate::proxy::heron_brook::fit_system_rest`] 按号插。fable-5-2 没有 `total_tokens_reminder` 能力，抓包里没有
+/// `<total_tokens>` 那行；模板照别的几份留着它，由 [`crate::proxy::lapis_anchor`] 按档去掉。占位与去掉的两段同
+/// [`CC_SYSTEM_REST`]。
+pub const CC_SYSTEM_REST_FABLE_5_2: &str = include_str!("../assets/cc_system_rest_fable_5_2.txt");
+
+/// [`CC_SYSTEM_REST_FABLE`] 里 fable-5-1 的自我介绍段（逐字取自那份模板）。2.1.321 起改短了：「the newest model」换成
+/// 「a model」，去掉「is our most intelligent generally available model, and」（`cap/auto-2.1.321-20261110-full/00899`）。
+pub const CC_FABLE_5_1_IDENTITY: &str = "This iteration of Claude is Claude Fable 5.1, a model in Anthropic's Claude 5 family and part of the Mythos-class model tier that sits above Claude Opus in capability. Claude Fable 5.1 and Claude Mythos 5.1 share the same underlying model. Claude Fable 5.1 includes additional safety measures for dual-use capabilities, while Claude Mythos 5.1 is available without those measures to only approved organizations. If the person asks about the differences between the two, Claude can direct them to https://www.anthropic.com/claude/fable for more information.";
 
 /// 其余 fable 模型（fable-5）的自我介绍段：2.1.291 可执行文件按模型挑这一段（`function qIo`：
 /// 规范名恰为 `claude-fable-5-1` 用上面那段，其余 fable 用这段），逐字取自同一处字符串常量。
@@ -320,8 +338,10 @@ pub const CC_NATIVE_1M_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-fable-5",
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-mythos-5",
     "claude-mythos-5-1",
+    "claude-mythos-5-2",
 ];
 
 /// 环境说明里「You are powered by the model named …」那行的模型名与知识截止，逐条取自抓包
@@ -330,6 +350,10 @@ pub const CC_NATIVE_1M_MODELS: &[&str] = &[
 pub const CC_MODEL_IDENTITIES: &[(&str, &str, &str)] = &[
     ("claude-opus-5-5", "Opus 5.5", "June 2026"),
     ("claude-fable-5-1", "Fable 5.1", "June 2026"),
+    // `cap/auto-2.1.321-20261110-fable52/00068`。
+    ("claude-fable-5-2", "Fable 5.2", "June 2026"),
+    // 没有抓包，取自 2.1.321 内置模型目录（`display_name` / `knowledge_cutoff`）。
+    ("claude-mythos-5-2", "Mythos 5.2", "June 2026"),
     ("claude-sonnet-5-5", "Sonnet 5.5", "June 2026"),
     // `cap/auto-2.1.293-20261008-full/00344`。
     ("claude-haiku-5-5", "Haiku 5.5", "June 2026"),
@@ -540,6 +564,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.319-20261106-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致。
     ("2.1.319", "2026-11-05T18:14:18Z"),
+    // `cap/auto-2.1.321-20261110-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.321", "2026-11-09T15:53:28Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

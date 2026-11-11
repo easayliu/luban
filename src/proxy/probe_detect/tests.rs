@@ -61,7 +61,8 @@ async fn probe_reply_is_a_minimal_200_in_the_shape_the_request_asks_for() {
             "output_tokens",
             "output_tokens_details",
             "service_tier",
-            "inference_geo"
+            "inference_geo",
+            "speed"
         ]
     );
     let base58 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b));
@@ -562,6 +563,7 @@ async fn probe_reply_follows_the_real_prewarm_reply_per_model() {
         ("claude-opus-5-5", "claude-opus-5-5", 35, ok),
         ("claude-haiku-5-5", "claude-haiku-5-5", 35, ok),
         ("claude-fable-5-1", "claude-fable-5-1", 35, ok),
+        ("claude-fable-5-2", "claude-fable-5-2", 35, ok),
         ("claude-opus-5", "claude-opus-5", 33, ok),
         ("claude-fable-5", "claude-fable-5", 33, ok),
         ("claude-opus-4-8", "claude-opus-4-8", 33, ok),
@@ -580,6 +582,17 @@ async fn probe_reply_follows_the_real_prewarm_reply_per_model() {
         assert_eq!(msg["content"][0]["text"], text, "{model}");
         // 旧一代（回一个字的那些）没有 `output_tokens_details`。
         assert_eq!(msg["usage"].get("output_tokens_details").is_some(), text == ok, "{model}");
+        // 11 月的回包（`cap/auto-2.1.321-20261110-model/00065` ~ `00086`、`00020`）：5.5 三个与 fable-5-1 / fable-5-2 的
+        // `inference_geo` 是 `global`，别的照旧 `not_available`；`speed` 每条都有。
+        let global = ["opus-5-5", "sonnet-5-5", "haiku-5-5", "fable-5-1", "fable-5-2"]
+            .iter()
+            .any(|m| model.starts_with(&format!("claude-{m}")));
+        assert_eq!(
+            msg["usage"]["inference_geo"],
+            if global { "global" } else { "not_available" },
+            "{model}"
+        );
+        assert_eq!(msg["usage"]["speed"], "standard", "{model}");
     }
 
     let headers = crate::proxy::probe_reply(Some("claude-opus-5"), Some(1), false, Some("HKG"))

@@ -86,8 +86,10 @@ const CATALOG_IDS: &[&str] = &[
     "claude-opus-5-5",
     "claude-fable-5",
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-mythos-5",
     "claude-mythos-5-1",
+    "claude-mythos-5-2",
     "claude-3-opus",
     "claude-3-sonnet",
     "claude-3-haiku",
@@ -99,8 +101,10 @@ const BEDROCK_REGIONS: &[&str] = &["us", "eu", "apac", "jp", "au", "us-gov", "gl
 /// 官方 `p0` 解析不了时按家族子串认的那串（按它的先后，先中先得）。规范名与子串不同的两项（`claude-opus-4`、
 /// `claude-sonnet-4`）是正则 `claude-opus-4(?!-\d(?!\d))`：后面紧跟 `-<一位数>` 的不算。
 const FAMILY_SUBSTRINGS: &[(&str, &str)] = &[
+    ("claude-fable-5-2", "claude-fable-5-2"),
     ("claude-fable-5-1", "claude-fable-5-1"),
     ("claude-fable-5", "claude-fable-5"),
+    ("claude-mythos-5-2", "claude-mythos-5-2"),
     ("claude-mythos-5-1", "claude-mythos-5-1"),
     ("claude-mythos-5", "claude-mythos-5"),
     ("claude-opus-5-5", "claude-opus-5-5"),

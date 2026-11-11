@@ -330,6 +330,13 @@ const PREWARM_REPLIES: &[PrewarmReply] = &[
         input_tokens: 35,
         old_gen_text: None,
     },
+    // `cap/auto-2.1.321-20261110-model/00078`。
+    PrewarmReply {
+        prefix: "claude-fable-5-2",
+        full_name: None,
+        input_tokens: 35,
+        old_gen_text: None,
+    },
     PrewarmReply { prefix: "claude-opus-5", full_name: None, input_tokens: 33, old_gen_text: None },
     PrewarmReply {
         prefix: "claude-sonnet-5",
@@ -397,6 +404,22 @@ fn prewarm_reply_of(model: &str) -> (&str, u64, Option<&'static str>) {
         }
         None => (model, 33, None),
     }
+}
+
+/// 预热回包 `usage.inference_geo` 的取值：11 月起上游给 opus-5-5 / sonnet-5-5 / haiku-5-5 / fable-5-1 / fable-5-2 回
+/// `global`（`cap/auto-2.1.318-20261104-model`、`cap/auto-2.1.319-20261106-model`、`cap/auto-2.1.321-20261110-model/00065`
+/// ~ `00086`），haiku-4.5 仍是 `not_available`（同包 `00020`）；别的模型没有新样本，照 10 月那份
+/// （`cap/auto-2.1.296-20261013-prewarm`）给 `not_available`。同一批回包里 `usage` 末尾都多了 `speed: "standard"`
+/// （haiku-4.5 也有），不分模型。
+fn prewarm_inference_geo(model: &str) -> &'static str {
+    const GLOBAL: [&str; 5] = [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        "claude-fable-5-2",
+    ];
+    if GLOBAL.iter().any(|p| model.starts_with(p)) { "global" } else { "not_available" }
 }
 
 /// 各账号最近一次上游回包 `cf-ray` 里的机房代码（`a49a3231df555df6-HKG` 的 `HKG`），由转发回程与
@@ -513,7 +536,8 @@ pub(crate) fn probe_reply(
         usage["output_tokens_details"] = serde_json::json!({ "thinking_tokens": 0 });
     }
     usage["service_tier"] = "standard".into();
-    usage["inference_geo"] = "not_available".into();
+    usage["inference_geo"] = prewarm_inference_geo(model).into();
+    usage["speed"] = "standard".into();
     let msg = serde_json::json!({
         "model": model,
         "id": upstream_like_id("msg", msg_ms),

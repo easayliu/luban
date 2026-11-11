@@ -386,6 +386,9 @@ pub(super) fn tether_decide(
         turns: 1,
         prev_messages,
         delta: 0,
+        counts_unknown: false,
+        prev_unknown: false,
+        tools_unknown: false,
         echo: false,
     };
     // `/clear` 之后的头一条：线程指针没了，上一份状态（消息数）还在、工具哈希那份清了（`cap/auto-2.1.291-20261006-full/00356`
@@ -400,6 +403,46 @@ pub(super) fn tether_decide(
             None => fresh("create", "first_request", 0),
         };
     };
+    // 上一条是半截的增量：只比它体里有的模型、beta、effort、thinking；工具表与消息数不知道（[`Tether::prev_unknown`]）。
+    // 那几项都没变就按接着用报（明说 `thread: create` 的照它另起，原因说不准按回退报，不认领）。
+    if p.partial {
+        let changed_model = p.model != model;
+        let changed_betas = p.betas != betas;
+        let changed_thinking = p.thinking_type != shape.thinking_type;
+        let changed_effort = p.effort != shape.effort;
+        // 它体里明说了 `tools` 的，工具变没变照比。
+        let changed_tools = p.tools_known && p.tools_content != shape.tools_content_hash;
+        let unknown = |t: Tether| Tether {
+            prev_unknown: true,
+            tools_unknown: !p.tools_known,
+            tools_kept: p.tools_known && !changed_tools,
+            ..t
+        };
+        if changed_model
+            || changed_tools
+            || changed_betas
+            || changed_thinking
+            || changed_effort
+            || post_compaction
+        {
+            return unknown(Tether {
+                changed_model,
+                changed_tools,
+                changed_betas,
+                changed_latched: post_compaction
+                    || model.contains("haiku") && !p.model.contains("haiku"),
+                changed_thinking,
+                changed_effort,
+                claimed_compact: post_compaction,
+                echo: is_main,
+                ..fresh("create", "config_changed", 0)
+            });
+        }
+        if shape.thread_type.as_deref() == Some("create") {
+            return unknown(Tether { echo: is_main, ..fresh("create", "history_rewound", 0) });
+        }
+        return unknown(Tether { echo: true, ..fresh("continue", "append", 0) });
+    }
     let changed_model = p.model != model;
     let changed_tools = p.tools_content != shape.tools_content_hash;
     let tools_kept = !changed_tools;

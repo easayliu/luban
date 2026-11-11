@@ -81,7 +81,9 @@ impl EventBuilder<'_> {
                 put("echoWireToolInputs", json!(true));
             }
             put("messageCount", json!(shape.messages_len));
-            put("messageTokens", json!(message_tokens));
+            if let Some(m) = message_tokens {
+                put("messageTokens", json!(m));
+            }
             put("inputTokens", json!(call.input_tokens));
             put("outputTokens", json!(call.output_tokens));
             put("cachedInputTokens", json!(call.cache_read_tokens));
@@ -268,10 +270,13 @@ impl EventBuilder<'_> {
             } else if modern && kind.has_boundary() {
                 put("systemPromptSource", json!("live_unrecorded"));
             }
-            put("toolsCharLength", json!(shape.tools_chars));
-            put("toolsCount", json!(shape.tools_count));
-            put("deferredToolsCount", json!(shape.deferred_tools));
-            put("toolSchemasHash", json!(&shape.tools_hash));
+            // 工具表不知道（[`TurnFacts::tools_unknown`]）：不报成空表。
+            if !env.f.tools_unknown {
+                put("toolsCharLength", json!(shape.tools_chars));
+                put("toolsCount", json!(shape.tools_count));
+                put("deferredToolsCount", json!(shape.deferred_tools));
+                put("toolSchemasHash", json!(&shape.tools_hash));
+            }
             put("requestBodyEncoding", json!("identity"));
             put("requestBodyChars", json!(body_chars));
             // 2.1.285：组请求体的耗时，每条都报，0 或 1ms。
@@ -568,7 +573,9 @@ impl EventBuilder<'_> {
                 put("effort_level", json!(e));
             }
             put("messageCount", json!(shape.messages_len));
-            put("messageTokens", json!(message_tokens));
+            if let Some(m) = message_tokens {
+                put("messageTokens", json!(m));
+            }
             put("durationMs", json!(total));
             put("durationMsIncludingRetries", json!(env.duration_including_retries()));
             put("attempt", json!(env.retry.attempt()));
@@ -910,7 +917,10 @@ impl EventBuilder<'_> {
         let EventEnv { t_end, .. } = *env;
         let t4 = ms(t_end, 4);
         let start = ms(turn_started, -42);
-        if outcome == SdkOutcome::Success {
+        // 所接的回复认不出（[`TurnFacts::parent_unknown`]）：这一轮从哪起、此前跑过几次请求都不知道，首响应耗时与
+        // 本轮累计的那几项都不报。
+        let unknown_turn = env.f.parent_unknown || env.f.turn_stats_unknown;
+        if outcome == SdkOutcome::Success && !unknown_turn {
             let first = turn_first_reply_end.unwrap_or(t_end);
             self.push(
                 t4,
@@ -945,11 +955,25 @@ impl EventBuilder<'_> {
             "mcp_pending_at_start": 0,
             "mcp_pending_at_end": 0
         });
+        if unknown_turn && let Some(o) = result.as_object_mut() {
+            for k in [
+                "num_turns",
+                "duration_ms",
+                "duration_api_ms",
+                "saw_retry",
+                "tool_use_count",
+                "mcp_tool_calls",
+                "toolsearch_calls",
+                "builtin_tool_calls",
+            ] {
+                o.shift_remove(k);
+            }
+        }
         // 本轮重试过就在 `saw_compact` 之后报各次重试状态码的最大值（整轮累计，首条重试过、之后工具续轮正常收尾的
         // 照样报），请求最终失败再报它的状态码（R2：529 / 529）。
         let failed_status = env.call.failure.as_ref().and_then(|f| f.status);
         let extra: Vec<(&str, Value)> = [
-            sess_turn_retry.map(|s| ("retry_status", json!(s))),
+            sess_turn_retry.filter(|_| !unknown_turn).map(|s| ("retry_status", json!(s))),
             failed_status
                 .filter(|_| outcome == SdkOutcome::Failed)
                 .map(|s| ("api_error_status", json!(s))),

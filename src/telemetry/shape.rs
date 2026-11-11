@@ -49,6 +49,9 @@ pub(super) struct ToolUse {
     /// Read 成功时从结果还原出的原文（[`super::files::read_content`]），`file_operation.contentHash`
     /// 与文件历史的大小用它。别的工具、读图片、落了盘的为 `None`。
     pub(super) read_content: Option<String>,
+    /// Bash 成功时的输出（只留命令可能是读文件的：[`bash_output`]）：官方 Bash 跑完把 `cat` 这类读到的文件记进
+    /// `readFileState`（[`super::bash_reads`]），整份读的内容就是这份输出。
+    pub(super) bash_output: Option<BashOutput>,
     /// 结果里第一张图片 base64 的哈希，见 [`ToolResultInfo::image_hash`]。
     pub(super) image_hash: Option<String>,
     /// Read 命中了去重（文件没变、又是同一段），见 [`ToolResultInfo::read_dedup`]。
@@ -184,10 +187,23 @@ pub(super) struct RequestShape {
     /// （`cap/auto-2.1.319-20261106-full` fable 那几轮，带它的 `00917`、`00923` 是 true，别的 false），会话里这个模型头一回带时
     /// 报 `feature_ok{batching_reminder}` 与 `tengu_toasty_thimble_applied`。
     pub(super) send_time_nudge: bool,
-    /// 这一轮新加的那段「延迟工具不再可用（MCP 服务器断开）」提醒里列了几个工具（末条 assistant 之后那几条里找）：
-    /// 2.1.319 的 `tengu_deferred_tools_pool_change` 按它报 `removedCount` 与 `departed_disconnected`
-    /// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00162` 带了两项，批次 `00165` 报 2、2）。历史里先前那几轮的不再数。
-    pub(super) mcp_disconnected: usize,
+    /// 这一轮（末条 assistant 之后那几条）新加的工具池附件里走掉的工具（[`super::tool_pool::PoolDelta::departed`]）：
+    /// 2.1.319 起 `tengu_deferred_tools_pool_change` 按它报 `removedCount` 与按原因分的 `departed_*`
+    /// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00162` 两项、服务器在「没连上」名单里，批次 `00165` 报
+    /// `departed_disconnected: 2`；`cap/auto-2.1.321-20261110-full/00756` 两项、服务器不在名单里，批次 `00760` 报
+    /// `departed_not_offered: 2`——提醒开头那句两种情况一字不差，只能靠名单分），2.1.321 另在它前面按归属报
+    /// `tengu_deferred_tools_pool_change_by_owner`。由 [`Self::settle_pool`] 从下面两项算出。
+    pub(super) mcp_departed: super::tool_pool::McpDeparted,
+    /// 这一轮之前的工具池账本（[`super::tool_pool::PoolHistory`]）；线程续轮的增量体里没有历史，由底本补，补不上是 `None`。
+    pub(super) pool_history: Option<Arc<super::tool_pool::PoolHistory>>,
+    /// 这一轮的那条工具池附件（[`super::tool_pool::PoolDelta`]），没有是 `None`。
+    pub(super) pool_delta: Option<Arc<super::tool_pool::PoolDelta>>,
+    /// 这一轮的 MCP 服务器说明附件（[`super::tool_pool::McpInstr`]），没有是 `None`。
+    pub(super) pool_mcp: Option<Arc<super::tool_pool::McpInstr>>,
+    /// 这一轮客户端附的提醒里有 `<total_tokens>` 那条（[`super::tool_pool::Scan::total_tokens`]）。
+    pub(super) pool_total_tokens: bool,
+    /// 出站工具表里的 MCP 工具名（[`super::tool_pool::KnownServers`] 用它确认 MCP 服务器说明里的服务器名）。
+    pub(super) mcp_tool_names: Vec<String>,
     /// `{"Agent":3078,…}` 那串 JSON。
     pub(super) tool_lens: String,
     pub(super) deferred_tools: usize,
@@ -327,11 +343,63 @@ pub(super) struct RequestShape {
     pub(super) dynamic_hash: String,
     /// 顶层 `thread.type`（`create` / `continue`），见 [`ThreadBase`]。
     pub(super) thread_type: Option<String>,
+    /// 顶层 `thread.previous_message_id`：线程续轮接的是哪一条回复（重发同一条续轮时与上一次相同）。
+    pub(super) thread_prev_id: Option<String>,
     /// 消息里出现过 auto 模式的进入/退出提示（`permission_mode` 是从消息里判的）。
     pub(super) auto_marker: bool,
     pub(super) device_id: Option<String>,
     pub(super) session_id: Option<String>,
     pub(super) account_uuid: Option<String>,
+}
+
+impl RequestShape {
+    /// 按这一轮的附件与账本算走掉的工具（[`Self::mcp_departed`]）：解析完、线程底本补上账本后各算一次。
+    pub(super) fn settle_pool(&mut self) {
+        // MCP 服务器说明里的 `## <名字>` 按账本、本轮宣告、工具表里已知的服务器重新划块（[`super::tool_pool::McpInstr::resolve`]）。
+        if let Some(m) = self.pool_mcp.as_deref() {
+            let mut known = super::tool_pool::KnownServers::default();
+            if let Some(h) = self.pool_history.as_deref() {
+                known.history(h);
+            }
+            if let Some(d) = self.pool_delta.as_deref() {
+                known.delta(d);
+            }
+            self.mcp_tool_names.iter().for_each(|n| known.tool(n));
+            let mut m = m.clone();
+            m.resolve(|n| known.knows(n));
+            self.pool_mcp = Some(Arc::new(m));
+        }
+        self.mcp_departed = self
+            .pool_delta
+            .as_deref()
+            .map(|d| d.departed(self.pool_history.as_deref()))
+            .unwrap_or_default();
+    }
+
+    /// 这一轮之后的账本：这一轮之前的叠上这一轮的那条附件，给下一条线程续轮接着用。
+    pub(super) fn pool_after(&self) -> Option<Arc<super::tool_pool::PoolHistory>> {
+        let history = self.pool_history.as_ref()?;
+        let mut next = (**history).clone();
+        if let Some(delta) = self.pool_delta.as_deref() {
+            next.apply(delta);
+        }
+        if let Some(m) = self.pool_mcp.as_deref() {
+            next.apply_mcp(m);
+        }
+        // 这一轮连同回复也成了下一条的历史。
+        next.turns += 1;
+        Some(Arc::new(next))
+    }
+
+    /// 汇总那条要的这一轮事实与账本（[`super::tool_pool::PoolTurn`]）。
+    pub(super) fn pool_turn(&self) -> super::tool_pool::PoolTurn<'_> {
+        super::tool_pool::PoolTurn {
+            departed: self.mcp_departed,
+            history: self.pool_history.as_deref(),
+            delta: self.pool_delta.as_deref(),
+            mcp: self.pool_mcp.as_deref(),
+        }
+    }
 }
 
 /// 内容块数组里 text 的字符数（tool_result 的 content 既可能是字符串也可能是块数组）。
@@ -379,10 +447,13 @@ pub(super) fn orphan_results_of(messages: &[Value]) -> Vec<ToolResultInfo> {
 
 /// 去掉结果末尾客户端追加的 `\n<system-reminder>…</system-reminder>`。只去它自己那个换行：
 /// 命令输出本身的末行换行官方照算（`00412`：`…deletions(-)\n` 报 119）。
+/// 客户端追加的提醒总是另起一行：最后那个开标签不在行首（正文里字面写着的标签，比如 Read 的编号行
+/// `12\t<system-reminder>…`）就不是追加的，到此为止，不再往前找。
 pub(super) fn strip_trailing_reminder(text: &str) -> &str {
     let mut t = text;
     while t.trim_end().ends_with("</system-reminder>")
         && let Some(at) = t.rfind("<system-reminder>")
+        && (at == 0 || t[..at].ends_with('\n'))
     {
         t = t[..at].strip_suffix('\n').unwrap_or(&t[..at]);
     }
@@ -578,6 +649,44 @@ pub(super) fn tool_results_of(msg: &Value) -> Vec<ToolResultInfo> {
         .unwrap_or_default()
 }
 
+/// [`ToolUse::bash_output`]：Bash 跑完的输出与退出码。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BashOutput {
+    /// 输出正文；落盘只给了预览、或太大没留的为 `None`（读了哪些文件照样认得出，内容认不出）。
+    pub(super) text: Option<String>,
+    /// 没有输出（客户端换上了空输出占位）。只有一个 `grep` / `rg` 的命令没输出就是没匹配上、退出码 1（客户端不当错误、
+    /// 也不加 `Exit code` 前缀），官方不记（[`super::bash_reads::BashRead::requires_exit_zero`]）；有输出就是匹配上了。
+    pub(super) empty: bool,
+}
+
+/// 留多大的 Bash 输出给 [`ToolUse::bash_output`]：与文件账本留内容的上限同量级（再大的文件官方也不算内容哈希）。
+const BASH_OUTPUT_KEEP: usize = 4 * 102_400;
+
+/// [`ToolUse::bash_output`]：Bash 成功、没落盘、不太大，且命令里出现了会读文件的命令名（[`super::bash_reads`] 认的那几个；
+/// 这里只粗筛，按工作目录剥过前缀之后的命令再细认）。
+pub(super) fn bash_output(name: &str, input: &Value, r: &ToolResultInfo) -> Option<BashOutput> {
+    const READERS: [&str; 10] =
+        ["cat", "nl", "bat", "sed", "head", "tail", "grep", "rg", "egrep", "fgrep"];
+    if name != "Bash" || r.is_error {
+        return None;
+    }
+    let cmd = input.get("command")?.as_str()?;
+    if !READERS.iter().any(|w| cmd.contains(w)) {
+        return None;
+    }
+    let empty = r.no_output_of.as_deref() == Some("Bash") || r.text.trim().is_empty();
+    // 没有输出时客户端换上的占位（`(Bash completed with no output)`）不是输出本身：输出是空的。落盘只给了预览、太大的，
+    // 正文不可用。
+    let text = if r.no_output_of.as_deref() == Some("Bash") {
+        Some(String::new())
+    } else if r.persisted.is_some() || r.persisted_preview || r.text.len() > BASH_OUTPUT_KEEP {
+        None
+    } else {
+        Some(r.text.clone())
+    };
+    Some(BashOutput { text, empty })
+}
+
 /// `toolInputSizeBytes`：客户端校验过的入参序列化后的长度（UTF-16 计，与 `bashCommandLen` 同一口径——
 /// 含中文破折号的 Write 按字节数会多出 16）。Edit 的入参客户端会补上默认的 `"replace_all":false`
 /// （官方 330 = 模型给的 310 + 20）。
@@ -650,8 +759,10 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                                 && r.read_dedup.is_none()
                         })
                         .and_then(|r| super::files::read_content(&r.text));
+                    let bash_output = hit.and_then(|r| bash_output(&name, &input, r));
                     Some(ToolUse {
                         read_content,
+                        bash_output,
                         read_dedup: hit.and_then(|r| r.read_dedup),
                         image_hash: hit.and_then(|r| r.image_hash.clone()),
                         id,
@@ -683,25 +794,6 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
 /// 2.1.319 发送时补在消息末尾的那条 system 提醒（官方 `bm`，`tengu_toasty_thimble` / `tengu_gentle_parasol` 控制，fable 那几条
 /// 带）：不进对话历史，每次发送时重新附上。
 pub(super) const SEND_TIME_NUDGE: &str = "First privately list what you need next; then request every item that doesn't depend on another's result in this one response.";
-
-/// 「延迟工具不再可用」那段提醒的开头（2.1.319）。
-const MCP_DISCONNECTED_HEAD: &str =
-    "The following deferred tools are no longer available (their MCP server disconnected).";
-
-/// 一条消息里那段提醒列了几个工具：开头那行之后、空行之前，每行一个工具名。
-fn disconnected_tools_listed(m: &Value) -> usize {
-    let count = |t: &str| {
-        t.find(MCP_DISCONNECTED_HEAD)
-            .map_or(0, |i| t[i..].lines().skip(1).take_while(|l| !l.trim().is_empty()).count())
-    };
-    match m.get("content") {
-        Some(Value::String(s)) => count(s),
-        Some(Value::Array(b)) => {
-            b.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).map(count).sum()
-        }
-        _ => 0,
-    }
-}
 
 /// 这条消息是发送时临时补的提醒（[`SEND_TIME_NUDGE`]）：`system` 角色、正文就是那一句（字符串或单个文本块）。
 fn is_send_time_nudge(m: &Value) -> bool {
@@ -1049,6 +1141,12 @@ pub(super) fn error_trace(
         // 2.1.319 摘要照旧、顶帧换了块，照旧不带构造名（`cap/auto-2.1.319-20261106-retry` 那条 529）。
         ("2.1.319", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-jmrd53pe.js:5:1510"))
+        }
+        // 2.1.321 摘要照旧、顶帧换了块；5xx 类压缩后是 `Gmn`，过得了构造名校验，**又带上了 `error_constructor`**
+        // （`cap/auto-2.1.321-20261110-retry/00099`：两条 `tengu_api_retry` 与收尾的 `tengu_api_error` 都带）。2.1.320 没抓，
+        // 块名与压缩后的类名都猜不出，先沿用这一版的。
+        ("2.1.320" | "2.1.321", Some(s)) if s >= 500 => {
+            Some((Some("Gmn"), "5b32b751db51", "chunk-wvydwysp.js:5:1510"))
         }
         _ => None,
     }
@@ -1519,6 +1617,12 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     (shape.device_id, shape.session_id, shape.account_uuid) = parse_user_id(v);
     shape.thread_type =
         v.get("thread").and_then(|t| t.get("type")).and_then(|t| t.as_str()).map(str::to_string);
+    shape.thread_prev_id = v
+        .get("thread")
+        .and_then(|t| t.get("previous_message_id"))
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string);
     // 这条请求自己声明的上一条 message.id（官方主线程每条都带，首轮是 `null`）。
     shape.diag_prev_message_id = v
         .get("diagnostics")
@@ -1609,6 +1713,7 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
             if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
                 if name.starts_with("mcp__") {
                     shape.mcp_tools += 1;
+                    shape.mcp_tool_names.push(name.to_string());
                 }
                 if name == "ToolSearch" {
                     shape.has_tool_search = true;
@@ -1650,13 +1755,18 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         let nudges = msgs.iter().filter(|m| is_send_time_nudge(m)).count();
         shape.messages_len = msgs.len() - nudges;
         shape.send_time_nudge = nudges > 0;
-        shape.mcp_disconnected = msgs
-            .iter()
-            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-            .map_or(&msgs[..], |i| &msgs[i + 1..])
-            .iter()
-            .map(disconnected_tools_listed)
-            .sum();
+        // 延迟工具池：历史叠成账本、这一轮的那条附件单拎出来（[`super::tool_pool::scan`]）。线程续轮的增量体里没有历史，
+        // 账本由线程底本补（[`super::session::ThreadBase::fill`]）。
+        let scan = super::tool_pool::scan(
+            msgs,
+            shape.thread_type.as_deref() != Some("continue"),
+            &shape.mcp_tool_names,
+        );
+        shape.pool_history = scan.history.map(Arc::new);
+        shape.pool_delta = scan.delta.map(Arc::new);
+        shape.pool_mcp = scan.mcp.map(Arc::new);
+        shape.pool_total_tokens = scan.total_tokens;
+        shape.settle_pool();
         let last_assistant =
             msgs.iter().rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
         // 体里没有 assistant 的（首轮完整体）记 0，线程续轮的增量另由底本补（[`super::session::ThreadBase::fill`]）。

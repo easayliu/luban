@@ -35,6 +35,7 @@ use crate::config;
 
 mod bash_ast;
 mod bash_kinds;
+mod bash_reads;
 mod bash_repeat;
 mod body;
 mod call;
@@ -50,6 +51,7 @@ mod shape;
 mod template;
 #[cfg(test)]
 mod tests;
+mod tool_pool;
 mod tools;
 mod upload;
 
@@ -176,10 +178,21 @@ impl Telemetry {
                 }
                 continue;
             };
-            // 解析在锁外，见 [`Self::process_parsed`]。
-            let shape = call.body.facts().shape();
-            let mut st = self.0.state.lock();
-            Self::process_parsed(&mut st, call, shape, true, None);
+            // 解析在锁外，见 [`Self::process_parsed`]。一条调用处理时出了 panic（某种没料到的请求体），只丢这一条：消费者
+            // 是唯一的，它一退出 `draining` 就一直是 true，之后的调用只进不出、队列满了全丢。状态锁是 parking_lot 的，
+            // 展开时随守卫释放，不会中毒。
+            let request_id = call.request_id.clone();
+            let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let shape = call.body.facts().shape();
+                let mut st = self.0.state.lock();
+                Self::process_parsed(&mut st, call, shape, true, None);
+            }));
+            if handled.is_err() {
+                tracing::error!(
+                    request_id = request_id.as_deref().unwrap_or(""),
+                    "telemetry processing panicked; this call's events are dropped"
+                );
+            }
         }
     }
 

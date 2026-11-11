@@ -94,7 +94,7 @@ pub(crate) fn outbound_carries_fallbacks(
     // 数组、才会让上游换模型重跑，别的族原样出站（上游 400、不重跑），一律不算。
     if billing_only {
         return client.is_some_and(|f| f.is_string())
-            && model.is_some_and(|m| cc_profile_for(m).fallbacks.is_some());
+            && model.is_some_and(|m| official_fallbacks_for(m).is_some());
     }
     // 字段缺失或是字符串：luban 有计划就写计划（[`ensure_fallbacks`] 会把任何字符串换掉），
     // 没计划就是没带——字符串不算，见函数文档。
@@ -197,6 +197,16 @@ pub(crate) fn ensure_fallbacks(v: &mut serde_json::Value, plan: &str) -> bool {
     true
 }
 
+/// 这个模型的官方回退字面量（[`config::CcProfile::fallbacks`]），没有 `refusal_fallback` 能力的模型是 `None`。
+/// mythos-5-2 借的是 fable 那行 profile（提示词、beta 同 fable-5-2），但官方 2.1.321 内置目录里它**没有**
+/// `refusal_fallback`（fable-5-2 有），不能跟着拿到 fable 的回退目标：来访自己写的 `fallbacks` 原样出站。
+pub(in crate::proxy) fn official_fallbacks_for(model: &str) -> Option<&'static str> {
+    if crate::proxy::simulation::is_mythos_5_2(model) {
+        return None;
+    }
+    cc_profile_for(model).fallbacks
+}
+
 /// `fallbacks` 的**形态**归一（模拟路径上没有计划时走这条：族开关关着，或学到过该模型不收）：
 /// 2.1.258 的官方 fable 发字符串 `"default"`（配 `server-side-fallback-2026-07-01`），2.1.260
 /// 起换成数组 `[{"model":"claude-opus-5"}]`（`cap/2.1.260/00018`，配 `-06-01`）。模拟出来的是
@@ -210,6 +220,11 @@ pub(in crate::proxy) fn normalize_fallbacks(
     v: &mut serde_json::Value,
     profile: &config::CcProfile,
 ) -> bool {
+    // 回退目标跟模型的 `refusal_fallback` 能力走，不跟提示词那行 profile 走（[`official_fallbacks_for`]）。
+    let model = v.get("model").and_then(|m| m.as_str());
+    if model.is_some_and(crate::proxy::simulation::is_mythos_5_2) {
+        return false;
+    }
     let Some(official) = profile.fallbacks else { return false };
     // 只认字符串形态的旧写法；已经是数组（或别的我们不认识的形态）就不动。
     if !v.get("fallbacks").is_some_and(|f| f.is_string()) {
