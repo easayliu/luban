@@ -15,7 +15,7 @@ import {
 } from 'lucide-react'
 import { getBilling, type BillingDim, type BillingRow } from '@/api/billing'
 import { useI18n } from '@/lib/i18n'
-import { useMe } from '@/lib/role'
+import { useMe, useShareLink } from '@/lib/role'
 import { useDocumentTitle } from '@/lib/use-document-title'
 import { cacheHitRate, cn, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
 import { AppFooter } from '@/components/app-footer'
@@ -102,6 +102,7 @@ export function BillingPage({
   const { t, locale } = useI18n()
   const me = useMe().data
   const role = me?.role
+  const shareLink = useShareLink()
   const [range, setRange] = useState<RangeKey>('month')
   const [focus, setFocus] = useState<Focus | null>(null)
   const [dim, setDim] = useState<BillingDim | null>(null)
@@ -112,6 +113,8 @@ export function BillingPage({
 
   // 当前身份、当前下钻下能用哪些拆分方式。
   const dims: BillingDim[] = useMemo(() => {
+    // 分享链接不给按成员、按接入 Key 拆（后端拒绝，见 `web::billing::get_billing`）。
+    if (shareLink) return ['cred', 'model', 'group', 'day']
     if (role === 'admin' || role === 'viewer') {
       return focus ? ['cred', 'model', 'group', 'key', 'day'] : ['owner', 'cred', 'model', 'key', 'group', 'day']
     }
@@ -119,7 +122,7 @@ export function BillingPage({
       return focus ? ['cred', 'model', 'group', 'day'] : ['owner', 'cred', 'model', 'group', 'day']
     }
     return ['cred', 'model', 'group', 'day']
-  }, [role, focus])
+  }, [role, focus, shareLink])
   const activeDim = dim && dims.includes(dim) ? dim : dims[0]
   const { from, to, days } = rangeOf(range)
 

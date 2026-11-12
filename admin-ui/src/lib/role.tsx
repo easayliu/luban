@@ -1,11 +1,13 @@
 import { createContext, useContext, useEffect, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getMe, type Me, type MemberCaps, type Role } from '@/api/auth'
-import { ROLE_KEY, getToken } from '@/api/client'
+import { ROLE_KEY, SHARE_TOKEN_PREFIX, getToken } from '@/api/client'
 
 const ROLES: readonly Role[] = ['admin', 'viewer', 'agent', 'user']
 
 function roleHint(): Role | null {
+  // 本标签页用的是分享凭据（可能只存在 sessionStorage 里，localStorage 记的是别人的身份）。
+  if (getToken()?.startsWith(SHARE_TOKEN_PREFIX)) return 'viewer'
   try {
     const v = localStorage.getItem(ROLE_KEY)
     return ROLES.includes(v as Role) ? (v as Role) : null
@@ -79,6 +81,24 @@ export function ReadOnlyScope({ readOnly, children }: { readOnly: boolean; child
 }
 
 
+
+/**
+ * 拿分享链接进来的访客。比访客密码登录的再收一层（后端 `auth::SHARE_LINK_DENIED`）：
+ * 请求明细、请求查询、设备与会话一概不给，只看号池状态、用量与费用。界面上相应入口直接不出现。
+ *
+ * 按本地会话 token 的前缀判，不等 `/auth/me`：同步可得，入口不会先闪出来再消失。
+ */
+export function useShareLink(): boolean {
+  return getToken()?.startsWith(SHARE_TOKEN_PREFIX) ?? false
+}
+
+/**
+ * 访客身份（访客密码或分享链接）。与 [useReadOnly] 不同：代理看下属的号也是只读，但出口代理
+ * 这类只对访客藏的东西（后端只对访客清空）要按身份判，不按只读判。
+ */
+export function useIsViewer(): boolean {
+  return useRole() === 'viewer'
+}
 
 /** 管理员：系统设置、接入 Key 这类全站的东西只有它能动。 */
 export function useIsAdmin(): boolean {

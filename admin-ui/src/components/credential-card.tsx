@@ -13,7 +13,7 @@ import {
 } from 'lucide-react'
 import { priorityTierName, type Credential } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useReadOnly, useShareLink } from '@/lib/role'
 import {
   cn,
   displayCredentialLabel,
@@ -134,7 +134,8 @@ function FooterStat({
   hint: ReactNode
   ariaLabel: string
   srLabel?: string
-  onClick: () => void
+  /** 不给就只是读数、点不开（分享链接看不到设备、会话与请求明细）。 */
+  onClick?: () => void
 }) {
   return (
     <Tooltip>
@@ -142,12 +143,14 @@ function FooterStat({
         className={cn(
           // 图标与数字之间窄卡上收成 2px，理由见页脚处的注。
           'relative flex min-w-0 shrink items-center gap-0.5 rounded-sm text-left font-medium text-xs tabular-nums outline-none @min-[22rem]/card:gap-1',
-          'transition-colors hover:underline hover:underline-offset-4 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+          onClick ? 'cursor-pointer' : 'cursor-default',
+          'transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+          onClick && 'hover:underline hover:underline-offset-4',
           'pointer-coarse:after:absolute pointer-coarse:after:top-1/2 pointer-coarse:after:left-1/2 pointer-coarse:after:size-full pointer-coarse:after:min-h-11 pointer-coarse:after:min-w-11 pointer-coarse:after:-translate-x-1/2 pointer-coarse:after:-translate-y-1/2',
         )}
         onClick={onClick}
         aria-label={ariaLabel}
-        aria-haspopup="dialog"
+        aria-haspopup={onClick ? 'dialog' : undefined}
       >
         <Icon className={cn('size-3.5 shrink-0', iconClassName)} />
         <span className={cn('min-w-0 truncate', valueClassName)}>{value}</span>
@@ -189,6 +192,10 @@ export const CredentialCard = memo(function CredentialCard({
   const [rpmOpen, setRpmOpen] = useState(false)
   const [quotaOpen, setQuotaOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
+  // 分享链接看不到设备、会话与请求明细（后端拒绝），读数格不再点得开。
+  const shareLink = useShareLink()
+  const openDevices = shareLink ? undefined : () => setDevicesOpen(true)
+  const openUsage = shareLink ? undefined : () => setUsageOpen(true)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [testing, setTesting] = useState(false)
 
@@ -707,7 +714,7 @@ export const CredentialCard = memo(function CredentialCard({
               hint={deviceUsageHint}
               ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
               srLabel={devicePolicy.label}
-              onClick={() => setDevicesOpen(true)}
+              onClick={openDevices}
             />
           )}
           {/* 会话名额，与设备名额并排、同一个对话框：图标颜色是策略，数字颜色是占用。 */}
@@ -719,7 +726,7 @@ export const CredentialCard = memo(function CredentialCard({
             hint={sessionUsageHint}
             ariaLabel={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
             srLabel={sessionPolicy.label}
-            onClick={() => setDevicesOpen(true)}
+            onClick={openDevices}
           />
           {/* 当前 RPM 与两格名额同一副面孔，点开的是 RPM 上限对话框。分母是生效上限、不限时 ∞。 */}
           <FooterStat
@@ -757,7 +764,7 @@ export const CredentialCard = memo(function CredentialCard({
             hint={costHint}
             ariaLabel={t(`查看 ${credentialLabel} 的请求明细`, `View the request log for ${credentialLabel}`)}
             srLabel={t('累计等价 API 费用', 'Cumulative equivalent API cost')}
-            onClick={() => setUsageOpen(true)}
+            onClick={openUsage}
           />
           {/* 开关钉在最右。 */}
           <div className="order-last ml-auto flex shrink-0 items-center gap-2">
@@ -796,12 +803,12 @@ export const CredentialCard = memo(function CredentialCard({
           />
           <CredentialDevicesDialog
             cred={cred}
-            open={devicesOpen}
+            open={devicesOpen && !shareLink}
             onOpenChange={setDevicesOpen}
             limit={limit}
             sessionLimit={actions.sessionLimit}
           />
-          <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
+          {!shareLink && <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />}
           <DeleteCredentialDialog
             cred={cred}
             actions={actions}

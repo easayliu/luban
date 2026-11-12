@@ -76,7 +76,7 @@ export function SettingsPage({
     {
       key: 'security',
       label: t('控制台安全', 'Console security'),
-      navDescription: t('管理密码与访客密码', 'Admin and viewer passwords'),
+      navDescription: t('管理密码、访客密码与分享链接', 'Passwords and share links'),
       icon: LockKeyholeIcon,
     },
   ] as const

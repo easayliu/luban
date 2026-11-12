@@ -68,7 +68,14 @@ fn app(state: &crate::web::AppState) -> Router {
             .route("/exchange", post(who))
             .route("/groups", get(who).post(who))
             .route("/provision-keys", get(who).post(who))
+            .route("/share-links", get(who).post(who))
             .route("/proxies", get(who))
+            .route("/usage", get(who))
+            .route("/credentials/{id}/sessions", get(who))
+            .route("/credentials/{id}/devices", get(who))
+            .route("/credentials/{id}/sessions/{session_key}/events", get(who))
+            .route("/credentials/{id}/slots/{slot}/events", get(who))
+            .route("/credentials/{id}/stats", get(who))
             .route_layer(axum::middleware::from_fn_with_state(state.clone(), super::require_login))
             .with_state(state.clone()),
     )
@@ -226,6 +233,71 @@ async fn members_are_scoped_to_their_own_things(pool: sqlx::PgPool) {
     assert_eq!(s(Method::GET, "/api/auth/me".into(), &u, String::new()).await, StatusCode::OK);
 }
 
+/// 分享链接以访客身份放行：只能读、不给分享链接列表；到期、删除、清除管理密码后即 401。
+#[sqlx::test]
+async fn share_link_acts_as_viewer_until_expired_or_deleted(pool: sqlx::PgPool) {
+    let state = test_state(pool.clone()).await;
+    set_admin_password(&state, "pw1234").await;
+    let app = app(&state);
+    let key = crate::store::generate_prefixed_key(crate::store::SHARE_KEY_PREFIX);
+    let link = state.store.create_share_link("demo", &key, 3600).await.unwrap();
+    let k = Some(key.as_str());
+
+    assert_eq!(call(&app, Method::GET, "/api/credentials", k, "").await, StatusCode::OK);
+    assert_eq!(call(&app, Method::GET, "/api/auth/me", k, "").await, StatusCode::OK);
+    assert_eq!(call(&app, Method::POST, "/api/auth/logout", k, "").await, StatusCode::OK);
+    for (m, uri) in [
+        (Method::POST, "/api/credentials/disabled"),
+        (Method::GET, "/api/settings"),
+        (Method::GET, "/api/export"),
+        (Method::GET, "/api/users"),
+        (Method::GET, "/api/share-links"),
+        (Method::POST, "/api/share-links"),
+        (Method::GET, "/api/proxies"),
+        (Method::GET, "/api/usage"),
+        (Method::GET, "/api/credentials/1/usage"),
+        (Method::GET, "/api/credentials/1/sessions"),
+        (Method::GET, "/api/credentials/1/devices"),
+        (Method::GET, "/api/credentials/1/sessions/s1/events"),
+        (Method::GET, "/api/credentials/1/slots/0/events"),
+    ] {
+        assert_eq!(call(&app, m, uri, k, "{}").await, StatusCode::FORBIDDEN, "{uri}");
+    }
+    // 汇总统计照给（按设备、按客户端的拆分由 handler 清空）。
+    assert_eq!(call(&app, Method::GET, "/api/credentials/1/stats", k, "").await, StatusCode::OK);
+    // 同样的明细，访客密码登录的仍看得到：收紧的只是分享链接。
+    state.store.upsert_viewer(&super::hash_password_blocking("view-pw").unwrap()).await.unwrap();
+    let viewer = state.store.viewer_user().await.unwrap().unwrap();
+    let v = session_for(&state, viewer.id).await;
+    for uri in ["/api/usage", "/api/credentials/1/usage", "/api/credentials/1/devices"] {
+        assert_eq!(call(&app, Method::GET, uri, Some(&v), "").await, StatusCode::OK, "{uri}");
+    }
+    // 退出登录不作废链接。
+    assert_eq!(call(&app, Method::GET, "/api/credentials", k, "").await, StatusCode::OK);
+    // 形态不符、伪造的一律 401。
+    for bad in ["lbs-short", "lbs-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"] {
+        assert_eq!(
+            call(&app, Method::GET, "/api/credentials", Some(bad), "").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // 到期：401。
+    sqlx::query("UPDATE share_links SET expires_at = unixepoch() - 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(call(&app, Method::GET, "/api/credentials", k, "").await, StatusCode::UNAUTHORIZED);
+    // 删除：401。
+    sqlx::query("UPDATE share_links SET expires_at = unixepoch() + 3600")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(call(&app, Method::GET, "/api/credentials", k, "").await, StatusCode::OK);
+    state.store.delete_share_link(link.id).await.unwrap();
+    assert_eq!(call(&app, Method::GET, "/api/credentials", k, "").await, StatusCode::UNAUTHORIZED);
+}
+
 /// 访客只能打 GET，`/export`、`/users` 也不给；admin 全部放行。
 #[sqlx::test]
 async fn viewer_is_read_only_and_admin_sees_everything(pool: sqlx::PgPool) {
@@ -240,6 +312,12 @@ async fn viewer_is_read_only_and_admin_sees_everything(pool: sqlx::PgPool) {
     let theirs = add_cred(&state, user, "r-user").await;
 
     assert_eq!(call(&app, Method::GET, "/api/credentials", Some(&v), "").await, StatusCode::OK);
+    // 请求明细与会话只对分享链接收掉，访客密码登录的照常能看。
+    assert_eq!(call(&app, Method::GET, "/api/usage", Some(&v), "").await, StatusCode::OK);
+    assert_eq!(
+        call(&app, Method::GET, &format!("/api/credentials/{theirs}/sessions"), Some(&v), "").await,
+        StatusCode::OK
+    );
     assert_eq!(call(&app, Method::GET, "/api/settings", Some(&v), "").await, StatusCode::FORBIDDEN);
     assert_eq!(call(&app, Method::GET, "/api/export", Some(&v), "").await, StatusCode::FORBIDDEN);
     assert_eq!(call(&app, Method::GET, "/api/users", Some(&v), "").await, StatusCode::FORBIDDEN);
@@ -848,4 +926,22 @@ async fn changing_the_password_needs_the_current_one(pool: sqlx::PgPool) {
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
     assert!(super::reserve_login_attempt("pw-user", true), "登录计数不受影响");
+}
+
+/// 访客看到的 JSON 里，任意层级的出口代理字段都置成 null，其余原样。
+#[test]
+fn proxy_fields_are_hidden_from_viewers() {
+    let mut v = serde_json::json!([
+        { "id": 1, "proxy": "http://u:p@h:1", "proxy_id": 3, "proxy_label": "东京", "label": "a" },
+        { "id": 2, "proxy": null, "nested": { "logs": [{ "proxy": "socks5h://h:2" }] } },
+    ]);
+    assert!(super::hide_viewer_fields(&mut v));
+    assert_eq!(
+        v,
+        serde_json::json!([
+            { "id": 1, "proxy": null, "proxy_id": null, "proxy_label": null, "label": "a" },
+            { "id": 2, "proxy": null, "nested": { "logs": [{ "proxy": null }] } },
+        ])
+    );
+    assert!(!super::hide_viewer_fields(&mut v), "已经置空的不算改动");
 }

@@ -81,18 +81,28 @@ pub(super) const KEY_PREFIX_LEN: usize = 10;
 
 /// 生成一把新 Key：种类前缀 + [`KEY_RANDOM_LEN`] 位字母数字。
 pub fn generate_key(kind: KeyKind) -> String {
+    generate_prefixed_key(kind.prefix())
+}
+
+/// 生成一把带 `prefix` 的 Key：前缀 + [`KEY_RANDOM_LEN`] 位字母数字。分享链接等别处的凭据共用。
+pub fn generate_prefixed_key(prefix: &str) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut bytes = [0u8; KEY_RANDOM_LEN];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     let body: String =
         bytes.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect();
-    format!("{}{body}", kind.prefix())
+    format!("{prefix}{body}")
 }
 
 /// 明文是否符合该种 Key 的形态（前缀、长度、字符集）。鉴权先过这一关再查库，胡乱填写的
 /// Bearer 无须劳动数据库。
 pub fn looks_like_key(key: &str, kind: KeyKind) -> bool {
-    key.strip_prefix(kind.prefix()).is_some_and(|body| {
+    looks_like_prefixed_key(key, kind.prefix())
+}
+
+/// 明文是否符合 [`generate_prefixed_key`] 生成的形态。
+pub fn looks_like_prefixed_key(key: &str, prefix: &str) -> bool {
+    key.strip_prefix(prefix).is_some_and(|body| {
         body.len() == KEY_RANDOM_LEN && body.bytes().all(|b| b.is_ascii_alphanumeric())
     })
 }

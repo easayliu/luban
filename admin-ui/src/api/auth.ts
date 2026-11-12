@@ -57,6 +57,8 @@ export interface Me {
   member_caps?: MemberCaps | null
   /** 实例名称，多个 luban 之间区分用；未命名为 null。 */
   instance_name?: string | null
+  /** 拿分享链接进来的：链接的到期时间（unix 秒）；其余为 null。 */
+  share_expires_at?: number | null
 }
 
 /**
@@ -95,4 +97,38 @@ export async function setup(password: string, token: string): Promise<LoginResul
  */
 export async function changePassword(password: string, currentPassword: string): Promise<void> {
   await api.post('/auth/password', { password, current_password: currentPassword })
+}
+
+/** 分享链接：管理员签发、带有效期的只读访问凭据（不含明文）。 */
+export interface ShareLink {
+  id: number
+  label: string
+  /** 明文开头几位，列表里认链接用。 */
+  prefix: string
+  created_at: number
+  expires_at: number
+  last_used_at: number | null
+}
+
+/** 分享链接凭据的前缀，与后端 `store::SHARE_KEY_PREFIX` 一致。 */
+export const SHARE_KEY_PREFIX = 'lbs-'
+
+/** 链接里放凭据的位置：`#/share/<key>`。hash 不随请求发往服务端，不会落进访问日志。 */
+export const shareUrl = (key: string) =>
+  `${window.location.origin}${window.location.pathname}#/share/${key}`
+
+export async function listShareLinks(): Promise<ShareLink[]> {
+  const { data } = await api.get<ShareLink[]>('/share-links')
+  return data
+}
+
+/** 新建分享链接，回含明文 key 的那条——明文只回这一次。 */
+export async function createShareLink(label: string, ttlSecs: number): Promise<ShareLink & { key: string }> {
+  const { data } = await api.post<ShareLink & { key: string }>('/share-links', { label, ttl_secs: ttlSecs })
+  return data
+}
+
+/** 删除（撤销）分享链接：持有者下一次请求即被退出。 */
+export async function deleteShareLink(id: number): Promise<void> {
+  await api.delete(`/share-links/${id}`)
 }

@@ -47,6 +47,7 @@ mod secret;
 mod select;
 mod session_events;
 mod settings;
+mod share_links;
 mod stats;
 #[cfg(test)]
 mod tests;
@@ -78,6 +79,7 @@ pub use select::*;
 use session_events::*;
 pub use session_events::{SESSION_EVENT_RETENTION_SECS, SessionEvent};
 pub use settings::*;
+pub use share_links::*;
 pub use stats::*;
 pub use thinking_blocks::{THINKING_BLOCK_CAP, thinking_block_fingerprint};
 pub use usage::*;

@@ -11,6 +11,7 @@ import {
   RotateCwIcon,
   Trash2Icon,
   UsersIcon,
+  XIcon,
 } from 'lucide-react'
 import {
   addProxy,
@@ -42,6 +43,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogClose,
@@ -56,6 +58,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Form } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from '@/components/ui/menu'
 import { Spinner } from '@/components/ui/spinner'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -72,6 +75,8 @@ import { locationLabel, ProxyBatchImportDialog, runConcurrently } from '@/compon
  * 名称还剩 100 出头。
  */
 const COL = {
+  // 基础样式对含勾选框的格写了 w-px，固定列宽得同样带 has- 前缀才压得住（同账号池）。
+  select: 'w-10 has-[[role=checkbox]]:w-10 pl-4 pr-0',
   name: 'w-auto md:w-[28%]',
   url: 'hidden w-auto md:table-cell',
   used: 'w-18',
@@ -112,6 +117,9 @@ export function ProxiesPage({
   )
 }
 
+/** 批量删除确认框删的是哪一批：测试失败项，还是手动勾选的。 */
+type BulkDelete = { kind: 'failed' | 'selected'; targets: SavedProxy[] }
+
 /** 弹框里正在处理哪一条代理、做什么。 */
 type Pending =
   | { kind: 'add' }
@@ -132,7 +140,9 @@ function ProxyPoolContent() {
   // 记下是哪个批量按钮在跑：两个按钮互斥，但转圈只转被点的那个。
   const [batchRunning, setBatchRunning] = useState<'all' | 'failed' | null>(null)
   const [onlyFailed, setOnlyFailed] = useState(false)
-  const [confirmDeleteFailed, setConfirmDeleteFailed] = useState(false)
+  const [bulkDelete, setBulkDelete] = useState<BulkDelete | null>(null)
+  // 勾选按 id 记；列表刷新后已不存在的 id 在下面按当前列表过滤掉，不必另行清理。
+  const [selected, setSelected] = useState<Set<number>>(() => new Set())
   const [importOpen, setImportOpen] = useState(false)
   const [pending, setPending] = useState<Pending | null>(null)
 
@@ -171,6 +181,12 @@ function ProxyPoolContent() {
     onSuccess: (_r, proxy) => {
       toastManager.add({ title: t('已删除代理', 'Proxy deleted'), type: 'success' })
       dismissResult(proxy.url)
+      setSelected((prev) => {
+        if (!prev.has(proxy.id)) return prev
+        const next = new Set(prev)
+        next.delete(proxy.id)
+        return next
+      })
       setPending(null)
       invalidate()
       qc.invalidateQueries({ queryKey: ['credentials'] })
@@ -181,17 +197,22 @@ function ProxyPoolContent() {
     },
   })
 
-  const removeFailed = useMutation({
-    mutationFn: (targets: SavedProxy[]) => deleteProxies(targets.map((p) => p.id)),
-    onSuccess: (deleted, targets) => {
+  const removeMany = useMutation({
+    mutationFn: ({ targets }: BulkDelete) => deleteProxies(targets.map((p) => p.id)),
+    onSuccess: (deleted, { kind, targets }) => {
       setResults((prev) => {
         const next = { ...prev }
         for (const p of targets) delete next[p.url]
         return next
       })
-      setConfirmDeleteFailed(false)
+      setSelected((prev) => {
+        const next = new Set(prev)
+        for (const p of targets) next.delete(p.id)
+        return next
+      })
+      setBulkDelete(null)
       // 筛选跟着这批失败项一起结束：不复位的话，下次测出失败会一下子只剩失败项，像是代理被删了。
-      setOnlyFailed(false)
+      if (kind === 'failed') setOnlyFailed(false)
       invalidate()
       qc.invalidateQueries({ queryKey: ['credentials'] })
       toastManager.add({
@@ -200,7 +221,7 @@ function ProxyPoolContent() {
       })
     },
     onError: (e) => {
-      setConfirmDeleteFailed(false)
+      setBulkDelete(null)
       onError(t('删除代理失败', 'Failed to delete proxies'), e)
     },
   })
@@ -224,8 +245,26 @@ function ProxyPoolContent() {
   // 失败项清空后（重测都通了 / 删光了）自动回到全部列表，不留一个空的筛选结果。
   const filtering = onlyFailed && failedProxies.length > 0
   const visibleProxies = filtering ? failedProxies : proxies
-  const failedInUse = failedProxies.filter((p) => p.credential_count > 0)
-  const failedInUseAccounts = failedInUse.reduce((n, p) => n + p.credential_count, 0)
+  const selectedProxies = proxies.filter((p) => selected.has(p.id))
+  const visibleSelected = visibleProxies.filter((p) => selected.has(p.id)).length
+  const allVisibleSelected = visibleProxies.length > 0 && visibleSelected === visibleProxies.length
+  // 全选只管当前列出来的这些（筛着失败项时就是失败项），与账号池「全选当前筛选结果」同口径。
+  const selectVisible = (checked: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      for (const p of visibleProxies) {
+        if (checked) next.add(p.id)
+        else next.delete(p.id)
+      }
+      return next
+    })
+  const toggleOne = (id: number, checked: boolean) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
 
   return (
     <div className="space-y-3 sm:space-y-4">
@@ -309,13 +348,48 @@ function ProxyPoolContent() {
               size="sm"
               variant="destructive-outline"
               disabled={batchRunning !== null}
-              onClick={() => setConfirmDeleteFailed(true)}
+              onClick={() => setBulkDelete({ kind: 'failed', targets: failedProxies })}
             >
               <Trash2Icon />
               {t('删除', 'Delete')}
             </Button>
           </div>
         </div>
+      )}
+
+      {/* 勾选后出现，版式同账号池的批量操作条：左边已选计数与清空，右边动作。 */}
+      {selectedProxies.length > 0 && (
+        <Card render={<section aria-label={t('批量操作', 'Batch actions')} />} className="rounded-2xl">
+          <div className="flex min-h-14 flex-wrap items-center gap-2 px-4 py-3 sm:gap-3 sm:px-5">
+            <div className="mr-auto flex items-center gap-1">
+              <Label className="cursor-pointer font-normal text-xs">
+                <Checkbox
+                  checked={selectedProxies.length === proxies.length}
+                  indeterminate={selectedProxies.length < proxies.length}
+                  onCheckedChange={(checked) => setSelected(checked ? new Set(proxies.map((p) => p.id)) : new Set())}
+                />
+                <span aria-live="polite">
+                  {t('已选', 'Selected')}{' '}
+                  <span className="tnum font-semibold text-foreground">{selectedProxies.length}</span>
+                  <span className="text-muted-foreground"> / {proxies.length}</span>
+                </span>
+              </Label>
+              <Hint label={t('清空选择', 'Clear selection')}>
+                <Button size="icon-sm" variant="ghost" onClick={() => setSelected(new Set())} aria-label={t('清空选择', 'Clear selection')}>
+                  <XIcon />
+                </Button>
+              </Hint>
+            </div>
+            <Button
+              size="sm"
+              variant="destructive-outline"
+              aria-label={t('删除所选代理', 'Delete selected proxies')}
+              onClick={() => setBulkDelete({ kind: 'selected', targets: selectedProxies })}
+            >
+              <Trash2Icon />{t('删除', 'Delete')}
+            </Button>
+          </div>
+        </Card>
       )}
 
       {proxiesQuery.isPending ? (
@@ -347,6 +421,14 @@ function ProxyPoolContent() {
         <Table className="table-fixed" variant="card">
           <TableHeader>
             <TableRow>
+              <TableHead className={COL.select}>
+                <Checkbox
+                  checked={allVisibleSelected}
+                  indeterminate={visibleSelected > 0 && !allVisibleSelected}
+                  onCheckedChange={(checked) => selectVisible(checked)}
+                  aria-label={filtering ? t('全选失败项', 'Select all failed') : t('全选', 'Select all')}
+                />
+              </TableHead>
               <TableHead className={COL.name}>{t('名称', 'Name')}</TableHead>
               <TableHead className={COL.url}>{t('地址', 'URL')}</TableHead>
               <TableHead className={COL.used}>{t('使用账号', 'In use')}</TableHead>
@@ -361,6 +443,8 @@ function ProxyPoolContent() {
                 proxy={proxy}
                 result={results[proxy.url]}
                 testing={testing.has(proxy.url)}
+                selected={selected.has(proxy.id)}
+                onSelectedChange={(checked) => toggleOne(proxy.id, checked)}
                 onTest={() => runTest(proxy.url)}
                 onPending={(kind) => setPending({ kind, proxy })}
               />
@@ -450,53 +534,86 @@ function ProxyPoolContent() {
         )}
       </AlertDialog>
 
-      <AlertDialog open={confirmDeleteFailed} onOpenChange={setConfirmDeleteFailed}>
-        <AlertDialogPopup>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {t(
-                `删除 ${failedProxies.length} 条测试失败的代理`,
-                `Delete ${failedProxies.length} failed prox${failedProxies.length === 1 ? 'y' : 'ies'}`,
-              )}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {failedInUse.length > 0
-                ? t(
-                    `其中 ${failedInUse.length} 条仍被 ${failedInUseAccounts} 个账号使用。删除仅会将其从代理池移除，这些账号的代理设置保持不变，仍将使用这些不可用的代理；如需更换，请先在「调整使用账号」中调整。`,
-                    `${failedInUse.length} of them ${failedInUse.length === 1 ? 'is' : 'are'} still used by ${failedInUseAccounts} account${failedInUseAccounts === 1 ? '' : 's'}. Deleting only removes them from the pool; those accounts keep using the unreachable proxy. Reassign them under “Manage accounts” first if needed.`,
-                  )
-                : t('这些代理未被任何账号使用，删除后将从代理池移除。', 'No accounts use these proxies. They will be removed from the pool.')}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <ul className="max-h-48 space-y-1 overflow-y-auto px-4 pb-4 text-sm sm:px-6" role="list">
-            {failedProxies.map((p) => (
-              <li key={p.id} className="flex items-baseline gap-2">
-                <span className="truncate">{p.label}</span>
-                {p.credential_count > 0 && (
-                  <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-                    {t(`${p.credential_count} 个账号使用中`, `${p.credential_count} in use`)}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-          <AlertDialogFooter>
-            <AlertDialogClose render={<Button variant="outline" />}>
-              {t('取消', 'Cancel')}
-            </AlertDialogClose>
-            <Button
-              variant="destructive"
-              loading={removeFailed.isPending}
-              // 弹窗开着时单条重测可能把失败项清空，空列表发出去后端会回 400。
-              disabled={failedProxies.length === 0}
-              onClick={() => removeFailed.mutate(failedProxies)}
-            >
-              {t('删除', 'Delete')}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogPopup>
+      <AlertDialog
+        open={bulkDelete !== null}
+        onOpenChange={(next) => { if (!next && !removeMany.isPending) setBulkDelete(null) }}
+      >
+        {/* 目标按当前列表现算：弹框开着时单条重测通过的失败项、或别处刚删掉的代理，不再算在这批里。 */}
+        {bulkDelete && (() => {
+          const live = bulkDelete.kind === 'failed'
+            ? failedProxies
+            : bulkDelete.targets.filter((p) => proxies.some((q) => q.id === p.id))
+          const bulk = { kind: bulkDelete.kind, targets: live }
+          return <BulkDeleteBody bulk={bulk} pending={removeMany.isPending} onConfirm={() => removeMany.mutate(bulk)} />
+        })()}
       </AlertDialog>
     </div>
+  )
+}
+
+/**
+ * 批量删除确认框的内容：测试失败项与手动勾选共用。标题说明删的是哪一批，正文提醒仍在使用的
+ * 账号不会跟着改代理，下面列出这批代理。
+ */
+function BulkDeleteBody({
+  bulk,
+  pending,
+  onConfirm,
+}: {
+  bulk: BulkDelete
+  pending: boolean
+  onConfirm: () => void
+}) {
+  const { t } = useI18n()
+  const { kind, targets } = bulk
+  const n = targets.length
+  const inUse = targets.filter((p) => p.credential_count > 0)
+  const inUseAccounts = inUse.reduce((sum, p) => sum + p.credential_count, 0)
+  const stillBroken = kind === 'failed'
+  return (
+    <AlertDialogPopup>
+      <AlertDialogHeader>
+        <AlertDialogTitle>
+          {kind === 'failed'
+            ? t(`删除 ${n} 条测试失败的代理`, `Delete ${n} failed prox${n === 1 ? 'y' : 'ies'}`)
+            : t(`删除所选的 ${n} 条代理`, `Delete ${n} selected prox${n === 1 ? 'y' : 'ies'}`)}
+        </AlertDialogTitle>
+        <AlertDialogDescription>
+          {inUse.length > 0
+            ? stillBroken
+              ? t(
+                  `其中 ${inUse.length} 条仍被 ${inUseAccounts} 个账号使用。删除仅会将其从代理池移除，这些账号的代理设置保持不变，仍将使用这些不可用的代理；如需更换，请先在「调整使用账号」中调整。`,
+                  `${inUse.length} of them ${inUse.length === 1 ? 'is' : 'are'} still used by ${inUseAccounts} account${inUseAccounts === 1 ? '' : 's'}. Deleting only removes them from the pool; those accounts keep using the unreachable proxy. Reassign them under “Manage accounts” first if needed.`,
+                )
+              : t(
+                  `其中 ${inUse.length} 条仍被 ${inUseAccounts} 个账号使用。删除仅会将其从代理池移除，这些账号的代理设置保持不变。`,
+                  `${inUse.length} of them ${inUse.length === 1 ? 'is' : 'are'} still used by ${inUseAccounts} account${inUseAccounts === 1 ? '' : 's'}. Deleting only removes them from the pool; those accounts’ proxy settings stay unchanged.`,
+                )
+            : t('这些代理未被任何账号使用，删除后将从代理池移除。', 'No accounts use these proxies. They will be removed from the pool.')}
+        </AlertDialogDescription>
+      </AlertDialogHeader>
+      <ul className="max-h-48 space-y-1 overflow-y-auto px-4 pb-4 text-sm sm:px-6" role="list">
+        {targets.map((p) => (
+          <li key={p.id} className="flex items-baseline gap-2">
+            <span className="shrink-0 text-muted-foreground tabular-nums">#{p.id}</span>
+            <span className="truncate">{p.label}</span>
+            {p.credential_count > 0 && (
+              <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                {t(`${p.credential_count} 个账号使用中`, `${p.credential_count} in use`)}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <AlertDialogFooter>
+        <AlertDialogClose render={<Button variant="outline" />}>
+          {t('取消', 'Cancel')}
+        </AlertDialogClose>
+        <Button variant="destructive" loading={pending} disabled={n === 0} onClick={onConfirm}>
+          {t('删除', 'Delete')}
+        </Button>
+      </AlertDialogFooter>
+    </AlertDialogPopup>
   )
 }
 
@@ -508,12 +625,16 @@ function ProxyRow({
   proxy,
   result,
   testing,
+  selected,
+  onSelectedChange,
   onTest,
   onPending,
 }: {
   proxy: SavedProxy
   result: ProxyTestResult | undefined
   testing: boolean
+  selected: boolean
+  onSelectedChange: (checked: boolean) => void
   onTest: () => void
   onPending: (kind: 'edit' | 'accounts' | 'delete') => void
 }) {
@@ -530,7 +651,14 @@ function ProxyRow({
         : '')
 
   return (
-    <TableRow>
+    <TableRow data-state={selected ? 'selected' : undefined}>
+      <TableCell className={cn(COL.select, 'ps-[calc(--spacing(4)-1px)]!')}>
+        <Checkbox
+          checked={selected}
+          onCheckedChange={onSelectedChange}
+          aria-label={t(`选择 ${proxy.label}`, `Select ${proxy.label}`)}
+        />
+      </TableCell>
       <TableCell className={COL.name}>
         {/* id 打在名称前面（上号脚本按它指定代理），灰色等宽、不随名称截断。 */}
         <p className="flex min-w-0 items-baseline gap-1.5">

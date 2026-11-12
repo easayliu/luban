@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { SearchIcon } from 'lucide-react'
-import { listUsage, type UsageLog } from '@/api/credentials'
+import { listUsage, type AccountSubscription, type UsageLog } from '@/api/credentials'
 import { useSeesWholePool } from '@/lib/role'
 import { useI18n } from '@/lib/i18n'
 import {
   cacheWriteTiers, cn, displayCredentialLabel, extractError, formatFullTime, formatMs, formatUsd, parseSessionKey, sideClassLabel,
 } from '@/lib/utils'
+import { AccountTierBadge, isOrgAccount } from '@/components/credential-shared'
 import { ClampedDescription } from '@/components/settings-group'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -97,6 +98,7 @@ export function RequestLookupDialog({
     enabled: open && (filter != null || submitted !== ''),
   })
   const rows = query.data?.logs ?? []
+  const accounts = new Map((query.data?.accounts ?? []).map((a) => [a.id, a]))
   const drillTitle = filter
     ? t(
         `${filter.label} · 近 ${filter.hours} 小时 · 最近 ${rows.length.toLocaleString(locale)} 条`,
@@ -188,7 +190,14 @@ export function RequestLookupDialog({
             </Empty>
           ) : (
             <ul className="space-y-2" aria-label={t('查询结果', 'Results')}>
-              {rows.map((log) => <LookupRow key={log.id} log={log} locale={locale} />)}
+              {rows.map((log) => (
+                <LookupRow
+                  key={log.id}
+                  log={log}
+                  account={log.cred_id == null ? undefined : accounts.get(log.cred_id)}
+                  locale={locale}
+                />
+              ))}
             </ul>
           )}
         </DialogPanel>
@@ -211,7 +220,7 @@ function sessionTitle(log: UsageLog): string | undefined {
   return `in:  ${log.session_id_in ?? '—'}\nout: ${log.session_id ?? '—'}`
 }
 
-function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
+function LookupRow({ log, account, locale }: { log: UsageLog; account?: AccountSubscription; locale: string }) {
   const { t, language } = useI18n()
   // 代理和用户：设备、会话这几格后端已抹掉（见 `web::usage::for_owner`），整格不出。
   const full = useSeesWholePool()
@@ -236,6 +245,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
               : t('（账号已删除）', '(account deleted)')}
         </span>
         {log.cred_id != null && <span className="tabular-nums text-muted-foreground">#{log.cred_id}</span>}
+        {account && <AccountTierBadge cred={account} size="sm" />}
         <span className="ml-auto tabular-nums text-muted-foreground">{formatFullTime(log.ts, language)}</span>
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
@@ -276,6 +286,7 @@ function LookupRow({ log, locale }: { log: UsageLog; locale: string }) {
         </Fact>
         </>)}
       </dl>
+      {account && <SubscriptionFacts account={account} />}
       {(log.ua || log.ua_out) && (
         <Hint label={log.ua_out && log.ua_out !== log.ua ? `${log.ua ?? '—'}\n→ ${log.ua_out}` : log.ua}>
           <p className="mt-2 truncate border-t pt-1.5 text-2xs text-muted-foreground">
@@ -447,6 +458,60 @@ function ForensicTags({ log }: { log: UsageLog }) {
         </Hint>
       )}
     </div>
+  )
+}
+
+/**
+ * 账号订阅信息一栏：订阅状态与开始时间、额度档、席位、超额用量，口径同账号详情页「账号信息」。
+ * 是账号当前的资料，不是请求那一刻的快照。拉不到的项不列，一项都没有时整栏不出。
+ */
+function SubscriptionFacts({ account }: { account: AccountSubscription }) {
+  const { t, language } = useI18n()
+  const startedMs = account.subscription_created_at ? Date.parse(account.subscription_created_at) : NaN
+  const startedAt = Number.isFinite(startedMs) ? Math.floor(startedMs / 1000) : null
+  const org = isOrgAccount(account)
+  const hasAny = account.subscription_status || startedAt !== null || account.rate_limit_tier
+    || (org && account.seat_tier) || account.extra_usage_enabled !== null || account.org_type
+  if (!hasAny) return null
+  return (
+    <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 border-t pt-2 sm:grid-cols-3">
+      {(account.subscription_status || startedAt !== null) && (
+        <Fact label={t('订阅', 'Subscription')}>
+          <span className="flex items-center gap-1.5">
+            {account.subscription_status && (
+              <Badge size="sm" variant={account.subscription_status === 'active' ? 'success' : 'warning'}>
+                <span className="font-mono">{account.subscription_status}</span>
+              </Badge>
+            )}
+            {startedAt !== null && (
+              <Hint label={account.subscription_created_at}>
+                <span>{t(`${formatFullTime(startedAt, language)} 开始`, `since ${formatFullTime(startedAt, language)}`)}</span>
+              </Hint>
+            )}
+          </span>
+        </Fact>
+      )}
+      {account.org_type && (
+        <Fact label={t('组织类型', 'Organisation type')}>
+          <Hint label={org ? account.org_name : undefined}>
+            <span className="font-mono">{account.org_type}</span>
+          </Hint>
+        </Fact>
+      )}
+      {account.rate_limit_tier && (
+        <Fact label={t('额度档', 'Rate limit tier')}>
+          <Hint label={account.rate_limit_tier}><span className="font-mono">{account.rate_limit_tier}</span></Hint>
+        </Fact>
+      )}
+      {org && account.seat_tier && (
+        <Fact label={t('席位', 'Seat')}><span className="font-mono">{account.seat_tier}</span></Fact>
+      )}
+      {account.extra_usage_enabled !== null && (
+        <Fact label={t('超额用量', 'Extra usage')}>
+          {account.extra_usage_enabled ? t('已启用', 'Enabled') : t('已停用', 'Disabled')}
+        </Fact>
+      )}
+    </dl>
   )
 }
 

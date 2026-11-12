@@ -164,6 +164,20 @@ impl CredentialStore {
         rows.iter().map(row_to_cred).collect()
     }
 
+    /// 按一组 id 批量读取（不存在的跳过，顺序不保证）。请求查询给结果附账号订阅信息用。
+    pub async fn get_many(&self, ids: &[i64]) -> Result<Vec<Credential>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLS} FROM credentials WHERE id = ANY($1)"
+        )))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_cred).collect()
+    }
+
     /// 按 id 读取单条。
     pub async fn get(&self, id: i64) -> Result<Option<Credential>> {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(

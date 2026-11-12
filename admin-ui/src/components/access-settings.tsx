@@ -5,6 +5,7 @@ import {
   EyeIcon,
   GaugeIcon,
   KeyRoundIcon,
+  Link2Icon,
   LockKeyholeIcon,
   MessagesSquareIcon,
   SaveIcon,
@@ -40,6 +41,7 @@ import { mcpServerName } from '@/lib/instance'
 import { useMe } from '@/lib/role'
 import { ApiKeysSettings, setupSnippet, SnippetBlock } from '@/components/api-keys-settings'
 import { CopyButton } from '@/components/copy-button'
+import { ShareLinksSettings } from '@/components/share-links-settings'
 import { MIN_PASSWORD_LENGTH, PasswordInput } from '@/components/password-input'
 import { ErrorState, LoadingState } from '@/components/state-placeholders'
 import { extractError, formatDuration } from '@/lib/utils'
@@ -322,6 +324,16 @@ export function SecuritySettingsContent() {
         )}
       >
         <ViewerPassword />
+      </SettingsGroup>
+      <SettingsGroup
+        icon={Link2Icon}
+        title={t('分享链接', 'Share links')}
+        description={t(
+          '给多人只读查看：每条链接单独设有效期，到期自动失效，可随时删除。',
+          'Read-only access for several people: each link has its own expiry and can be revoked at any time.',
+        )}
+      >
+        <ShareLinksSettings />
       </SettingsGroup>
     </div>
   )

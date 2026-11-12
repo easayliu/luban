@@ -54,6 +54,24 @@ pub(super) struct UsagePage {
     /// 本轮翻页的锚点：请求里带了 `until` 就是它，否则是当前最大 id；空集为 null。
     anchor: Option<i64>,
     pub(super) logs: Vec<store::UsageLog>,
+    /// 本页流水涉及的账号的订阅信息（仅全局 `/usage` 给；按号的接口页面本就知道是哪个号）。
+    /// 是账号**当前**的资料，不是请求发生那一刻的快照；已删的号不在里面。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    accounts: Vec<AccountSubscription>,
+}
+
+/// 请求查询里随流水下发的账号订阅信息，字段同账号详情页「账号信息」那几项。
+#[derive(serde::Serialize)]
+struct AccountSubscription {
+    id: i64,
+    tier: Option<String>,
+    org_type: Option<String>,
+    org_name: Option<String>,
+    rate_limit_tier: Option<String>,
+    seat_tier: Option<String>,
+    subscription_status: Option<String>,
+    subscription_created_at: Option<String>,
+    extra_usage_enabled: Option<bool>,
 }
 
 /// 列出最近的用量日志（按时间倒序）。
@@ -107,6 +125,7 @@ pub(super) struct CredentialStatsResp {
 pub(super) async fn get_credential_stats(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    share: Option<Extension<auth::ViaShareLink>>,
     Path(id): Path<i64>,
     Query(q): Query<SeriesQuery>,
 ) -> Result<Json<CredentialStatsResp>, ApiError> {
@@ -116,8 +135,9 @@ pub(super) async fn get_credential_stats(
     let (since, bucket_secs, tz) = q.normalized();
     let mut stats =
         state.store.credential_stats(id, since, bucket_secs, tz, 20).await.map_err(internal)?;
-    // 按设备、按客户端的拆分是下游使用者的设备 id 与 UA，号主不该看到，理由见 [`for_owner`]。
-    if actor.scope().owner().is_some() {
+    // 按设备、按客户端的拆分是下游使用者的设备 id 与 UA，号主不该看到，理由见 [`for_owner`]；
+    // 分享链接同样不给（见 `auth::SHARE_LINK_DENIED`）。
+    if actor.scope().owner().is_some() || share.is_some() {
         stats.by_device.clear();
         stats.by_client.clear();
     }
@@ -198,5 +218,30 @@ async fn usage_page(
     if owner_view {
         logs = logs.into_iter().map(for_owner).collect();
     }
-    Ok(Json(UsagePage { total, total_cost, anchor, logs }))
+    let accounts = if cred_id.is_none() {
+        let mut ids: Vec<i64> = logs.iter().filter_map(|l| l.cred_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        state
+            .store
+            .get_many(&ids)
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|c| AccountSubscription {
+                id: c.id,
+                tier: c.tier,
+                org_type: c.org_type,
+                org_name: c.org_name,
+                rate_limit_tier: c.rate_limit_tier,
+                seat_tier: c.seat_tier,
+                subscription_status: c.subscription_status,
+                subscription_created_at: c.subscription_created_at,
+                extra_usage_enabled: c.extra_usage_enabled,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(UsagePage { total, total_cost, anchor, logs, accounts }))
 }

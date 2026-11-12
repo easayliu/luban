@@ -497,7 +497,19 @@ export interface UsagePage {
   /** 本轮翻页的锚点 id；空集为 null。 */
   anchor: number | null
   logs: UsageLog[]
+  /**
+   * 本页流水涉及的账号的订阅信息，只有全局 `/usage` 给（请求查询用）。是账号当前的资料，
+   * 不是请求那一刻的快照；已删的号不在里面。
+   */
+  accounts?: AccountSubscription[]
 }
+
+/** 请求查询结果里附带的账号订阅信息，字段同 {@link Credential} 的同名项。 */
+export type AccountSubscription = Pick<
+  Credential,
+  | 'id' | 'tier' | 'org_type' | 'org_name' | 'rate_limit_tier' | 'seat_tier'
+  | 'subscription_status' | 'subscription_created_at' | 'extra_usage_enabled'
+>
 
 /**
  * 取某账号请求明细的一页（按时间倒序）。

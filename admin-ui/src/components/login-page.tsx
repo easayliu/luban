@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ArrowRightIcon, LockKeyholeIcon } from 'lucide-react'
 import { getAuthState, login } from '@/api/auth'
-import { setToken } from '@/api/client'
+import { SHARE_ENDED_KEY, setToken } from '@/api/client'
 import { rememberRole } from '@/lib/role'
 import { extractError } from '@/lib/utils'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardDescription, CardHeader, CardPanel, CardTitle } from '@/components/ui/card'
 import { Field, FieldError, FieldLabel } from '@/components/ui/field'
@@ -25,6 +26,16 @@ export function LoginPage({ onSuccess }: { onSuccess: (token: string) => void })
   // App 已拉过这份鉴权状态，这里直接命中缓存。
   const { data: authState } = useQuery({ queryKey: ['auth-state'], queryFn: getAuthState })
   const viewerEnabled = authState?.viewer_enabled ?? false
+  // 拿分享链接进来、链接到期或被删后被退回这里：说一句，别让人对着登录框发愣。
+  const [shareEnded] = useState(() => {
+    try {
+      const ended = sessionStorage.getItem(SHARE_ENDED_KEY) === '1'
+      sessionStorage.removeItem(SHARE_ENDED_KEY)
+      return ended
+    } catch {
+      return false
+    }
+  })
 
   useDocumentTitle(t('控制台登录 · Luban', 'Console sign-in · Luban'))
 
@@ -54,6 +65,14 @@ export function LoginPage({ onSuccess }: { onSuccess: (token: string) => void })
           </div>
         </div>
 
+        {shareEnded && (
+          <Alert className="mb-4" variant="warning">
+            <AlertTitle>{t('分享链接无效或已失效', 'Share link invalid or expired')}</AlertTitle>
+            <AlertDescription>
+              {t('链接有误、已到期或已被撤销，请向管理员索取新的链接。', 'The link is incorrect, has expired or has been revoked. Ask the admin for a new one.')}
+            </AlertDescription>
+          </Alert>
+        )}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base leading-tight">

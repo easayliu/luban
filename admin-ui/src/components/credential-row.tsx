@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { priorityTierName, type Credential } from '@/api/credentials'
 import { localize, useI18n, type Language } from '@/lib/i18n'
-import { useReadOnly } from '@/lib/role'
+import { useReadOnly, useShareLink } from '@/lib/role'
 import { useMediaQuery } from '@/lib/use-media-query'
 import { CredentialDevicesDialog } from '@/components/credential-devices-dialog'
 import { CredentialProxyDialog } from '@/components/credential-proxy-dialog'
@@ -253,6 +253,9 @@ export const CredentialRow = memo(function CredentialRow({
   const [rpmOpen, setRpmOpen] = useState(false)
   const [quotaOpen, setQuotaOpen] = useState(false)
   const [usageOpen, setUsageOpen] = useState(false)
+  // 分享链接看不到设备、会话与请求明细（后端拒绝）：读数格点不开，明细对话框不挂。
+  const shareLink = useShareLink()
+  const openDevices = shareLink ? undefined : () => setDevicesOpen(true)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameName, setRenameName] = useState(cred.label)
@@ -422,7 +425,8 @@ export const CredentialRow = memo(function CredentialRow({
                     type="button"
                     size="xs"
                     variant="ghost"
-                    onClick={() => setDevicesOpen(true)}
+                    className={cn(!openDevices && 'cursor-default hover:bg-transparent')}
+                    onClick={openDevices}
                     aria-label={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
                   >
                     <Badge variant={deviceUsage.variant} size="sm" className="tabular-nums">
@@ -440,7 +444,8 @@ export const CredentialRow = memo(function CredentialRow({
                     type="button"
                     size="xs"
                     variant="ghost"
-                    onClick={() => setDevicesOpen(true)}
+                    className={cn(!openDevices && 'cursor-default hover:bg-transparent')}
+                    onClick={openDevices}
                     aria-label={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
                   >
                     <Badge variant={sessionUsage.variant} size="sm" className="tabular-nums">
@@ -597,7 +602,7 @@ export const CredentialRow = memo(function CredentialRow({
                 usage={deviceUsage}
                 title={t(`已绑定设备 ${cred.device_count}/${effectiveLimit} · ${policy.label}策略 · 点击查看`, `Bound devices ${cred.device_count}/${effectiveLimit} · ${policy.label} policy · click to view`)}
                 ariaLabel={t(`查看 ${credentialLabel} 的已绑定设备`, `View bound devices for ${credentialLabel}`)}
-                onClick={() => setDevicesOpen(true)}
+                onClick={openDevices}
               />
             )}
             <SlotMeterRow
@@ -607,7 +612,7 @@ export const CredentialRow = memo(function CredentialRow({
               usage={sessionUsage}
               title={t(`活跃会话 ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label}策略 · 点击查看`, `Active sessions ${cred.session_count}/${sessionEffectiveLimit} · ${sessionPolicy.label} policy · click to view`)}
               ariaLabel={t(`查看 ${credentialLabel} 的会话`, `View sessions for ${credentialLabel}`)}
-              onClick={() => setDevicesOpen(true)}
+              onClick={openDevices}
             />
             <SlotMeterRow
               icon={GaugeIcon}
@@ -663,12 +668,12 @@ export const CredentialRow = memo(function CredentialRow({
       <DeferredMount open={devicesOpen || usageOpen || confirmDelete || renameOpen || proxyOpen || rpmOpen || quotaOpen || testing}>
         <CredentialDevicesDialog
           cred={cred}
-          open={devicesOpen}
+          open={devicesOpen && !shareLink}
           onOpenChange={setDevicesOpen}
           limit={actions.limit}
           sessionLimit={actions.sessionLimit}
         />
-        <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
+        {!shareLink && <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />}
         <DeleteCredentialDialog
           cred={cred}
           actions={actions}
@@ -1462,7 +1467,8 @@ function SlotMeterRow({
   usage: ReturnType<typeof deviceUsageMeta>
   title: string
   ariaLabel: string
-  onClick: () => void
+  /** 不给就只是读数、点不开（分享链接看不到设备与会话）。 */
+  onClick?: () => void
 }) {
   const pct = limit > 0 ? Math.min(100, Math.round((count / limit) * 100)) : 0
   // 文字用 `-foreground` 那一支：`--destructive` / `--warning` 是给填充用的底色，
@@ -1483,8 +1489,8 @@ function SlotMeterRow({
         size="xs"
         onClick={onClick}
         aria-label={ariaLabel}
-        aria-haspopup="dialog"
-        className="col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center justify-start gap-x-1.5 rounded border-0 px-1 font-normal text-xs leading-none sm:h-4 sm:text-xs [&_svg]:mx-0"
+        aria-haspopup={onClick ? 'dialog' : undefined}
+        className={cn(!onClick && 'cursor-default hover:bg-transparent', "col-span-3 grid h-4 w-full min-w-0 grid-cols-subgrid items-center justify-start gap-x-1.5 rounded border-0 px-1 font-normal text-xs leading-none sm:h-4 sm:text-xs [&_svg]:mx-0")}
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
         <span className={cn('text-left tabular-nums', numberClass)}>

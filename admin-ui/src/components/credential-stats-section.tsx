@@ -8,7 +8,7 @@ import {
   type CredentialStatsGroup,
 } from '@/api/credentials'
 import { useI18n } from '@/lib/i18n'
-import { useSeesWholePool } from '@/lib/role'
+import { useSeesWholePool, useShareLink } from '@/lib/role'
 import {
   cn,
   extractError,
@@ -200,7 +200,9 @@ function legendOf(metric: Metric, t: Translate): ChartLegendItem[] {
  */
 export function CredentialStatsSection({ cred }: { cred: Credential }) {
   const { t, locale } = useI18n()
-  const full = useSeesWholePool()
+  // 分享链接同样看不到按设备、按客户端的拆分（后端清空），也不能下钻到请求查询（后端拒绝）。
+  const shareLink = useShareLink()
+  const full = useSeesWholePool() && !shareLink
   const [range, setRange] = useState<RangeKey>('7d')
   const [metric, setMetric] = useState<Metric>('requests')
   const [view, setView] = useState<'chart' | 'table'>('chart')
@@ -616,7 +618,9 @@ function StatsBreakdown({
   const { t, language } = useI18n()
   // 代理和用户：按设备、按客户端是下游使用者的身份，后端不给（见 `web::usage::get_credential_stats`），
   // 两个切换项一并不出。
-  const full = useSeesWholePool()
+  // 分享链接同样看不到按设备、按客户端的拆分（后端清空），也不能下钻到请求查询（后端拒绝）。
+  const shareLink = useShareLink()
+  const full = useSeesWholePool() && !shareLink
   const dimensions: Dimension[] = full ? ['model', 'device', 'client', 'status'] : ['model', 'status']
   const [by, setBy] = useState<Dimension>('model')
   const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
@@ -688,7 +692,7 @@ function StatsBreakdown({
           <TableBody className={COMPACT_TABLE_BODY_CLASS}>
             {rows.map((row) => {
               const share = total > 0 ? row.requests / total : 0
-              const drillable = by === 'model' && row.key !== ''
+              const drillable = by === 'model' && row.key !== '' && !shareLink
               const drill = () => setDrill({ credId, model: row.key, label: row.key, hours })
               return (
                 <TableRow

@@ -104,6 +104,8 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/provision-keys/{id}", post(update_provision_key).delete(delete_provision_key))
         .route("/mcp-keys", get(list_mcp_keys).post(create_mcp_key))
         .route("/mcp-keys/{id}", post(update_mcp_key).delete(delete_mcp_key))
+        .route("/share-links", get(list_share_links).post(create_share_link))
+        .route("/share-links/{id}", delete(delete_share_link))
         .route("/users", get(list_users).post(create_user))
         .route("/users/{id}", delete(delete_user))
         .route("/users/{id}/password", post(set_user_password))

@@ -18,7 +18,7 @@ import {
 } from '@/lib/utils'
 import { localize, useI18n, type Language } from '@/lib/i18n'
 import { useReauthorize } from '@/lib/reauthorize'
-import { useIsAdmin, useMemberCaps, useReadOnly } from '@/lib/role'
+import { useIsAdmin, useMemberCaps, useReadOnly, useShareLink, useIsViewer } from '@/lib/role'
 import { getSettings } from '@/api/settings'
 import {
   AlertDialog, AlertDialogClose, AlertDialogDescription, AlertDialogFooter,
@@ -966,6 +966,7 @@ function useCredentialMenuGroups(
   const { refresh, prio, cooldown } = actions
   const reauthorize = useReauthorize()
   const readOnly = useReadOnly()
+  const shareLink = useShareLink()
   // 代理和用户最高只能调到 P2（见 MemberCaps）。
   const minPriority = useMemberCaps()?.min_priority ?? PRIORITY_MIN
   const detail: CredentialMenuItem[] = h.showDetail === false
@@ -1046,7 +1047,8 @@ function useCredentialMenuGroups(
     { key: 'delete', icon: <Trash2Icon />, label: t('删除', 'Delete'), onSelect: h.onRequestDelete, destructive: true },
   ]
   // 访客只留看的两项。连通性测试也不给：它会真发一条请求、耗额度、可能把号打进冷却。
-  if (readOnly) return [detail, main.filter((item) => item.key === 'usage')].filter((g) => g.length > 0)
+  // 分享链接连请求明细也不给（后端拒绝），只留「查看详情」。
+  if (readOnly) return [detail, shareLink ? [] : main.filter((item) => item.key === 'usage')].filter((g) => g.length > 0)
   return [detail, main, priority, danger].filter((g) => g.length > 0)
 }
 
@@ -2286,7 +2288,10 @@ export function proxyLabelParts(proxy: string): { scheme: string | null; host: s
  */
 export function useProxyName(): (cred: Pick<Credential, 'proxy' | 'proxy_id' | 'proxy_label'>) => ReactNode {
   const { t } = useI18n()
-  const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
+  // 访客拿不到代理池（后端拒绝），号上的代理字段也已置空，不必去请求。按身份判、不按只读判，
+  // 代理看下属的号虽是只读，代理池照常要用。
+  const isViewer = useIsViewer()
+  const { data } = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000, enabled: !isViewer })
   const byId = useMemo(() => new Map((data ?? []).map((p) => [p.id, p])), [data])
   return ({ proxy, proxy_id, proxy_label }) => {
     if (!proxy) return null

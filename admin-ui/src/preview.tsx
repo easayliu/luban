@@ -1157,6 +1157,19 @@ queryClient.setQueryData<UsagePage>(['credential-usage', 1, 0, 'first', 25], {
   anchor: previewUsageLogs[0]?.id ?? null,
   logs: previewUsageLogs,
 })
+// 请求查询（`?dialog=lookup`）：带一条结果与账号订阅信息。
+queryClient.setQueryData<UsagePage>(['request-lookup', 'req_Q3k9ZpL2mNv701Xb'], {
+  total: 1,
+  total_cost: previewUsageLogs[1]?.cost_usd ?? 0,
+  anchor: previewUsageLogs[1]?.id ?? null,
+  logs: previewUsageLogs.slice(1, 2),
+  accounts: [{
+    id: banned.id, tier: banned.tier, org_type: banned.org_type, org_name: banned.org_name,
+    rate_limit_tier: banned.rate_limit_tier, seat_tier: banned.seat_tier,
+    subscription_status: banned.subscription_status, subscription_created_at: banned.subscription_created_at,
+    extra_usage_enabled: banned.extra_usage_enabled,
+  }],
+})
 // 账号分组：多于一个时添加账号弹窗才出分组选择。
 queryClient.setQueryData(['groups'], [
   { id: 1, name: '默认分组', note: '', is_default: true, created_at: now - 30 * 86400, credential_count: 9, grants: null },
@@ -1269,7 +1282,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 </div>
 
                 <AddAccount open={previewDialog === 'add'} onOpenChange={closePreviewDialog} />
-                <RequestLookupDialog open={previewDialog === 'lookup'} onOpenChange={closePreviewDialog} />
+                <RequestLookupDialog open={previewDialog === 'lookup'} onOpenChange={closePreviewDialog} initialId="req_Q3k9ZpL2mNv701Xb" />
                 <AccessSettings open={previewDialog === 'access'} onOpenChange={closePreviewDialog} />
                 <ForwardingSettings open={previewDialog === 'forwarding'} onOpenChange={closePreviewDialog} />
               </PreviewAccountRoute>

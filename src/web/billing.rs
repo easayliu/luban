@@ -105,8 +105,18 @@ async fn scope_owners(
 pub(super) async fn get_billing(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    share: Option<Extension<auth::ViaShareLink>>,
     Query(q): Query<BillingQuery>,
 ) -> Result<Json<BillingResp>, ApiError> {
+    // 分享链接只看汇总：按成员、按接入 Key 拆会露出控制台用户名与 Key 名称（下游使用者的
+    // 身份），拆分与筛选一并不给，口径同 `auth::SHARE_LINK_DENIED`。
+    if share.is_some()
+        && (matches!(q.by, store::BillingDim::Owner | store::BillingDim::Key)
+            || q.owner_id.is_some()
+            || q.key_id.is_some())
+    {
+        return Err(forbidden_view());
+    }
     let now = chrono::Utc::now().timestamp();
     let to = q.to.unwrap_or(now + 3600);
     let from = q.from.unwrap_or(to - 7 * 86400).max(to - MAX_RANGE_SECS);

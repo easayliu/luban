@@ -86,7 +86,7 @@ import { ToggleGroup, ToggleGroupItem, ToggleGroupSeparator } from '@/components
 import { Toolbar, ToolbarGroup, ToolbarSeparator } from '@/components/ui/toolbar'
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip'
 import { useI18n, type Language } from '@/lib/i18n'
-import { ReadOnlyScope, useCanManageUsers, useMe, useReadOnly, useSeesWholePool } from '@/lib/role'
+import { ReadOnlyScope, useCanManageUsers, useMe, useReadOnly, useSeesWholePool, useIsViewer } from '@/lib/role'
 import { useDebounced } from '@/lib/use-debounced'
 import { cacheHitRate, cn, displayCredentialLabel, formatPercent, formatUsd } from '@/lib/utils'
 
@@ -733,10 +733,12 @@ export function CredentialWorkspace({ data, state, actions }: CredentialWorkspac
   )
   // 代理筛选：按号绑的出站代理缩小（直连 / 自定义 / 代理池某一条），筛出来全选后用批量操作里的
   // 「出站代理」整批换掉。它是号的一项属性，与套餐同级：下拉计数跟着成员筛选走，不影响概览各格。
-  const proxiesQuery = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000 })
+  // 访客看不到出口代理（后端拒 `/proxies`、号上的代理字段置空），整个筛选不出。
+  const isViewer = useIsViewer()
+  const proxiesQuery = useQuery({ queryKey: ['proxies'], queryFn: listProxies, staleTime: 60_000, enabled: !isViewer })
   const proxyGroups = useMemo(
-    () => proxyFacets(evaluatedPool.map((evaluation) => evaluation.credential), proxiesQuery.data, t),
-    [evaluatedPool, proxiesQuery.data, t],
+    () => isViewer ? [] : proxyFacets(evaluatedPool.map((evaluation) => evaluation.credential), proxiesQuery.data, t),
+    [isViewer, evaluatedPool, proxiesQuery.data, t],
   )
   // 选中的那条代理已没有号在用（刚整批换走）时按「全部」算，同成员筛选。
   const activeProxy = proxyGroups.flat().find((item) => item.value === proxy)

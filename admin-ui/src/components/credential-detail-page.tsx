@@ -28,7 +28,7 @@ import {
 } from '@/api/credentials'
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/lib/i18n'
-import { ReadOnlyScope, useMemberCaps, useReadOnly } from '@/lib/role'
+import { ReadOnlyScope, useMemberCaps, useReadOnly, useShareLink, useIsViewer } from '@/lib/role'
 import { useDocumentTitle } from '@/lib/use-document-title'
 import { useMediaQuery } from '@/lib/use-media-query'
 import {
@@ -345,6 +345,7 @@ function DetailBody({
 }: {
   overview: ReactNode
   stats: ReactNode
+  /** 为 null 时这一块（与手机上的页签）不出现：分享链接看不到请求明细与设备会话。 */
   requests: ReactNode
   bindings: ReactNode
 }) {
@@ -367,8 +368,8 @@ function DetailBody({
   const tabs: { key: DetailTab; label: string }[] = [
     { key: 'overview', label: t('概览', 'Overview') },
     { key: 'stats', label: t('统计', 'Stats') },
-    { key: 'requests', label: t('请求', 'Requests') },
-    { key: 'bindings', label: t('设备', 'Devices') },
+    ...(requests == null ? [] : [{ key: 'requests' as const, label: t('请求', 'Requests') }]),
+    ...(bindings == null ? [] : [{ key: 'bindings' as const, label: t('设备', 'Devices') }]),
   ]
   const panels: Record<DetailTab, ReactNode> = { overview, stats, requests, bindings }
   const change = (value: unknown) => {
@@ -460,6 +461,10 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
   const actions = useCredentialActions(cred, () => setRenaming(false), undefined, onDeleted)
   const { toggle } = actions
   const readOnly = useReadOnly()
+  // 分享链接看不到设备、会话与请求明细（后端拒绝）：读数点不开，「最近请求」「设备与会话」两块不出。
+  const shareLink = useShareLink()
+  const openDevices = shareLink ? undefined : () => setDevicesOpen(true)
+  const openUsage = shareLink ? undefined : () => setUsageOpen(true)
   const evaluation = evaluateCredential(cred, now, language)
   const { status } = evaluation
   const credentialLabel = displayCredentialLabel(cred.label, language)
@@ -560,9 +565,9 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
       <StatsRow
         cred={cred}
         now={now}
-        onDevices={() => setDevicesOpen(true)}
+        onDevices={openDevices}
         onRpm={() => setRpmOpen(true)}
-        onUsage={() => setUsageOpen(true)}
+        onUsage={openUsage}
       />
 
       <DetailBody
@@ -583,8 +588,8 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
           </>
         )}
         stats={<CredentialStatsSection cred={cred} />}
-        requests={<RecentUsageSection cred={cred} onViewAll={() => setUsageOpen(true)} />}
-        bindings={<BindingsSection cred={cred} onManage={() => setDevicesOpen(true)} />}
+        requests={shareLink ? null : <RecentUsageSection cred={cred} onViewAll={() => setUsageOpen(true)} />}
+        bindings={shareLink ? null : <BindingsSection cred={cred} onManage={() => setDevicesOpen(true)} />}
       />
 
       <DeferredMount open={renaming || proxyOpen || devicesOpen || usageOpen || confirmDelete || rpmOpen || quotaOpen || testing}>
@@ -601,12 +606,12 @@ function CredentialDetail({ cred, onDeleted }: { cred: Credential; onDeleted: ()
         <CredentialQuotaDialog cred={cred} open={quotaOpen} onOpenChange={setQuotaOpen} quotaPause={actions.quotaPause} />
         <CredentialDevicesDialog
           cred={cred}
-          open={devicesOpen}
+          open={devicesOpen && !shareLink}
           onOpenChange={setDevicesOpen}
           limit={actions.limit}
           sessionLimit={actions.sessionLimit}
         />
-        <CredentialUsageDialog cred={cred} open={usageOpen} onOpenChange={setUsageOpen} />
+        <CredentialUsageDialog cred={cred} open={usageOpen && !shareLink} onOpenChange={setUsageOpen} />
         <DeleteCredentialDialog cred={cred} actions={actions} open={confirmDelete} onOpenChange={setConfirmDelete} />
         <ConnectivityTestDialog cred={cred} open={testing} onOpenChange={setTesting} />
       </DeferredMount>
@@ -636,9 +641,10 @@ function StatsRow({
 }: {
   cred: Credential
   now: number
-  onDevices: () => void
+  /** 不给就只是读数、点不开（分享链接）。 */
+  onDevices?: () => void
   onRpm: () => void
-  onUsage: () => void
+  onUsage?: () => void
 }) {
   const { t, language, locale } = useI18n()
   const ratio = (count: number, limit: number) =>
@@ -674,7 +680,7 @@ function StatsRow({
         statusHint={t('已绑定设备 / 生效上限。点击查看设备或调整上限', 'Bound devices / effective limit. Click to view devices or adjust the limit')}
         icon={SmartphoneIcon}
         tone={levelTone(deviceUsageMeta(cred.device_count, cred.device_limit_effective).level)}
-        opensDetail
+        opensDetail={!!onDevices}
         onClick={onDevices}
       />
       )}
@@ -686,7 +692,7 @@ function StatsRow({
         statusHint={t('活跃会话 / 生效上限。点击查看会话或调整上限', 'Active sessions / effective limit. Click to view sessions or adjust the limit')}
         icon={MessagesSquareIcon}
         tone={levelTone(deviceUsageMeta(cred.session_count, cred.session_limit_effective).level)}
-        opensDetail
+        opensDetail={!!onDevices}
         onClick={onDevices}
       />
       <OverviewMetric
@@ -696,7 +702,7 @@ function StatsRow({
         statusHint={t('按公开价目表估算的等价 API 费用，不是账单金额。点击查看请求明细', 'Equivalent API cost estimated from the public price list, not a bill. Click to view the request log')}
         icon={WalletCardsIcon}
         tone="neutral"
-        opensDetail
+        opensDetail={!!onUsage}
         onClick={onUsage}
       />
       <OverviewMetric
@@ -1302,6 +1308,7 @@ function ScheduleSection({
   const groupsDialog = <SetGroupsDialog cred={cred} open={groupsOpen} onOpenChange={setGroupsOpen} />
   // 访客：「修改」与优先级下拉都不给。手机上那几行整行可点，点开的对话框是只读的，照常留着。
   const readOnly = useReadOnly()
+  const isViewer = useIsViewer()
   const edit = (onClick: () => void) => readOnly ? null : (
     <Button type="button" size="sm" variant="outline" onClick={onClick}>{t('修改', 'Edit')}</Button>
   )
@@ -1348,7 +1355,9 @@ function ScheduleSection({
       <SettingsGroup icon={SlidersHorizontalIcon} title={t('调度配置', 'Scheduling')}>
         {row(t('账号分组', 'Account groups'), groupNames, () => { if (!readOnly) setGroupsOpen(true) })}
         {groupsDialog}
-        {row(t('出站代理', 'Outbound proxy'), proxyName(cred) ?? t('直连', 'Direct'), onProxy)}
+        {/* 访客看不到出口代理（后端已置空），不显示这一行，免得一律读成「直连」。按身份判、不按只读判：
+            代理看下属的号也是只读，但出口代理照常看得到。 */}
+        {!isViewer && row(t('出站代理', 'Outbound proxy'), proxyName(cred) ?? t('直连', 'Direct'), onProxy)}
         {row(
           t('提前暂停调度', 'Early pause'),
           `5h ${pause(cred.quota_pause_pct_effective)} · 7d ${pause(cred.quota_pause_pct_7d_effective)}`,
@@ -1376,14 +1385,16 @@ function ScheduleSection({
         {edit(() => setGroupsOpen(true))}
       </SettingsRow>
       {groupsDialog}
-      <SettingsRow
-        label={t('出站代理', 'Outbound proxy')}
-        description={cred.proxy
-          ? <span className="break-all font-mono text-xs">{proxyMaskedUrl(cred.proxy)}</span>
-          : t('直连', 'Direct')}
-      >
-        {edit(onProxy)}
-      </SettingsRow>
+      {!isViewer && (
+        <SettingsRow
+          label={t('出站代理', 'Outbound proxy')}
+          description={cred.proxy
+            ? <span className="break-all font-mono text-xs">{proxyMaskedUrl(cred.proxy)}</span>
+            : t('直连', 'Direct')}
+        >
+          {edit(onProxy)}
+        </SettingsRow>
+      )}
       <SettingsRow
         label={t('提前暂停调度阈值', 'Early pause threshold')}
         description={t(

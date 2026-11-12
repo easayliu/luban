@@ -2,6 +2,7 @@ import { Fragment, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { getUsageBreakdown, type BreakdownBy, type BreakdownRow } from '@/api/metrics'
 import { useI18n } from '@/lib/i18n'
+import { useShareLink } from '@/lib/role'
 import { cacheHitRate, cn, extractError, formatPercent, formatTokens, formatUsd } from '@/lib/utils'
 import { formatMs, formatTokensPerSec } from '@/components/ttft-trend-dialog'
 import { AccountTierBadge } from '@/components/credential-shared'
@@ -39,6 +40,8 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
   // 点某一行 → 打开请求明细，带上模型 / 账号与时间范围：看到某个模型 p95 飙高之后，
   // 排查是两步而不是再去请求日志页翻。
   const [drill, setDrill] = useState<UsageDrillFilter | null>(null)
+  // 分享链接不能下钻到请求查询（后端拒绝），行只当读数。
+  const shareLink = useShareLink()
   const openRow = (row: BreakdownRow) => setDrill(
     rowsBy === 'model'
       ? { model: row.key, label: row.label || row.key, hours }
@@ -124,7 +127,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
           </TableHeader>
           <TableBody className={COMPACT_TABLE_BODY_CLASS}>
             {rows.map((row) => (
-              <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={() => openRow(row)} />
+              <BreakdownTr key={row.key} row={row} kind={kind} locale={locale} onOpen={shareLink ? undefined : () => openRow(row)} />
             ))}
           </TableBody>
           {/* 合计是表格的一部分，落在 tfoot 里、和「API 价」那一列对齐；口径收进悬浮层。 */}
@@ -153,7 +156,7 @@ export function UsageBreakdown({ hours, kind }: { hours: number; kind: 'latency'
         </Table>
       )}
       <RequestLookupDialog
-        open={drill != null}
+        open={drill != null && !shareLink}
         onOpenChange={(open) => { if (!open) setDrill(null) }}
         filter={drill ?? undefined}
       />
@@ -170,7 +173,8 @@ function BreakdownTr({
   row: BreakdownRow
   kind: 'latency' | 'cache'
   locale: string
-  onOpen: () => void
+  /** 不给就不能点（分享链接）。 */
+  onOpen?: () => void
 }) {
   const { t } = useI18n()
   const rate = cacheHitRate(row.cache.input_tokens, row.cache.cached_tokens)
@@ -178,20 +182,26 @@ function BreakdownTr({
   const written5m = Math.max(0, row.cache.written_tokens - row.cache.written_1h_tokens)
   const noLatency = row.latency.count === 0
   return (
-    <TableRow className="cursor-pointer hover:bg-muted/40" onClick={onOpen}>
+    <TableRow className={cn(onOpen && 'cursor-pointer hover:bg-muted/40')} onClick={onOpen}>
       {/* 宽度上限写在里面这层：auto 布局的表格不认 td 的 max-width，名称 + 徽章会把列撑开或溢出。 */}
       <TableCell>
         <span className="flex w-max min-w-0 max-w-64 items-center gap-1.5">
           {/* 「点击查看该组最近的请求」原先挂在整行上；行里不再套提示，并到这枚名称按钮上，顺带补上被截断的全名。 */}
-          <Hint
-            label={row.label
-              ? `${row.label}\n${t('点击查看该组最近的请求', 'Click to view recent requests in this group')}`
-              : t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
-          >
-            <Button variant="link" className={COMPACT_TABLE_LINK_CLASS} onClick={onOpen}>
-              {row.label || '—'}
-            </Button>
-          </Hint>
+          {onOpen ? (
+            <Hint
+              label={row.label
+                ? `${row.label}\n${t('点击查看该组最近的请求', 'Click to view recent requests in this group')}`
+                : t('点击查看该组最近的请求', 'Click to view recent requests in this group')}
+            >
+              <Button variant="link" className={COMPACT_TABLE_LINK_CLASS} onClick={onOpen}>
+                {row.label || '—'}
+              </Button>
+            </Hint>
+          ) : (
+            <Hint label={row.label || '—'}>
+              <span className="min-w-0 truncate">{row.label || '—'}</span>
+            </Hint>
+          )}
           {/* 按账号拆时带套餐：Max 号和 Pro 号上游的排队本来就不同，混着比延迟没有意义。 */}
           {/* 与账号卡片同一枚徽章：组织号带楼形图标、套餐名去掉重复的组织前缀（Team Standard → Standard）。 */}
           {row.plan && <span className="shrink-0"><AccountTierBadge cred={row.plan} size="xs" /></span>}

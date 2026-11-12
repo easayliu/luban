@@ -19,6 +19,9 @@
 //!
 //! **只读访客**只放行 `GET`/`HEAD`，再去掉几条读也不该给的（见 [`VIEWER_DENIED`]），响应体里
 //! 的代理密码统一打码（[`redact_url_credentials`]）。
+//!
+//! **分享链接**（`lbs-` 开头的 Bearer，见 `store::share_links`）是 admin 签发、带到期时间的
+//! 访客凭据：认出来就以访客身份放行，判据与打码同上，到期或删掉即 401。
 
 use axum::{
     Extension, Json,
@@ -505,11 +508,13 @@ fn access_of(path: &str) -> Access {
 /// - `/authorize`：生成 PKCE 存进内存，是「添加账号」的第一步，算写；
 /// - `/export`：迁移文件带全部账号的明文 token 和接入 key，看到就等于能用；
 /// - `/settings`、`/learned-rejections`：只有系统设置页用，而系统设置整页不对访客开放
-///   （`/settings` 还带着明文接入 key）。`/proxies` 不在此列：账号页要靠它显示代理名称，
-///   地址里的密码由 [`redact_url_credentials`] 遮掉；
+///   （`/settings` 还带着明文接入 key）；
+/// - `/proxies`：出口代理一概不给访客看，号上带的代理字段也在响应里置空（见
+///   [`VIEWER_HIDDEN_FIELDS`]）；
 /// - `/users`：访客是来看号池的，用不着控制台账号名单；
 /// - `/api-keys`：带着查看明文的接口，看到就等于能用。
 /// - `/provision-keys`、`/mcp-keys`：访客建不了 Key，列表也没必要看。
+/// - `/share-links`：分享链接由 admin 管理，持链接的访客不该看到还发给了谁。
 const VIEWER_DENIED: &[&str] = &[
     "/authorize",
     "/export",
@@ -519,6 +524,50 @@ const VIEWER_DENIED: &[&str] = &[
     "/api-keys",
     "/provision-keys",
     "/mcp-keys",
+    "/share-links",
+    "/proxies",
+];
+
+/// 给访客的 JSON 响应里一律置空的字段（任意层级的对象里出现都算）：出口代理的地址、在代理池
+/// 里的 id 与名称。号列表、详情、请求记录都带着它们，逐个 handler 去掉总会漏，统一在出口处理。
+/// 置成 null 而不是删掉键：前端按「直连」那一支走，字段缺失反倒可能让哪处读成 undefined 出错。
+const VIEWER_HIDDEN_FIELDS: &[&str] = &["proxy", "proxy_id", "proxy_label"];
+
+/// 把 `v` 里所有对象的 [`VIEWER_HIDDEN_FIELDS`] 置空，回是否改动过。
+fn hide_viewer_fields(v: &mut serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (k, child) in map.iter_mut() {
+                if VIEWER_HIDDEN_FIELDS.contains(&k.as_str()) {
+                    if !child.is_null() {
+                        *child = serde_json::Value::Null;
+                        changed = true;
+                    }
+                } else {
+                    changed |= hide_viewer_fields(child);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            items.iter_mut().fold(false, |acc, item| hide_viewer_fields(item) | acc)
+        }
+        _ => false,
+    }
+}
+
+/// 分享链接在访客之上再收掉的接口（`MatchedPath` 形态，不带 `/api`，含其下的子路径）：
+/// 逐条请求的明细与下游使用者的身份——请求记录与请求查询（带请求 id、会话 id、UA、来访头
+/// 与请求体结构摘要）、设备与会话列表（设备 id、会话标识）及会话事件。链接是发出去的东西，
+/// 泄漏了也只该露出号池状态、用量与费用这些汇总。账号统计里按设备、按客户端的分组由
+/// `web::usage::get_credential_stats` 清空。
+const SHARE_LINK_DENIED: &[&str] = &[
+    "/usage",
+    "/credentials/{id}/usage",
+    "/credentials/{id}/devices",
+    "/credentials/{id}/sessions",
+    "/credentials/{id}/slots",
 ];
 
 /// 访客能不能打这个请求：只读方法，且不在 [`VIEWER_DENIED`] 里。退出登录例外：它是
@@ -646,6 +695,9 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
     if token.starts_with(store::PROVISION_KEY_PREFIX) {
         return provision_key_request(&state, token.to_owned(), req, next).await;
     }
+    if token.starts_with(store::SHARE_KEY_PREFIX) {
+        return share_link_request(&state, token.to_owned(), req, next).await;
+    }
     let token_hash = sha256_hex(token);
     let row = match state.store.session_lookup(&token_hash).await {
         Ok(Some(row)) => row,
@@ -702,6 +754,51 @@ pub async fn require_login(State(state): State<AppState>, req: Request, next: Ne
     req.extensions_mut().insert(actor);
     let resp = next.run(req).await;
     if redact { redact_for_viewer(resp, viewer).await } else { resp }
+}
+
+/// 请求是拿分享链接来的（放进请求扩展），`/auth/me` 据此回到期时间。
+#[derive(Debug, Clone, Copy)]
+pub struct ViaShareLink {
+    pub expires_at: u64,
+}
+
+/// 带分享链接的请求：认出未到期的链接，以访客身份放行（判据与打码同访客会话）。
+///
+/// 身份的 id 记 0：不对应任何控制台账号（账号 id 从 1 起），访客看全部，id 本就用不上。
+/// 退出登录照常放行，但不作废链接——同一条链接可能发给了不止一个人，收回靠 admin 删除。
+async fn share_link_request(
+    state: &AppState,
+    token: String,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let invalid = || (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    if !store::looks_like_prefixed_key(&token, store::SHARE_KEY_PREFIX) {
+        return invalid();
+    }
+    let hit = match state.store.share_link_lookup(&token).await {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return invalid(),
+        Err(e) => return internal(e).into_response(),
+    };
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = path.strip_prefix("/api").unwrap_or(&path);
+    let share_denied =
+        SHARE_LINK_DENIED.iter().any(|d| path == *d || path.starts_with(&format!("{d}/")));
+    if !viewer_allowed(req.method(), path) || share_denied {
+        return (StatusCode::FORBIDDEN, "read-only viewer: this action is not allowed")
+            .into_response();
+    }
+    if let Err(e) = state.store.touch_share_link(hit.id).await {
+        tracing::warn!(error = %e, "failed to record share link use");
+    }
+    req.extensions_mut().insert(Actor { id: 0, username: hit.label, role: UserRole::Viewer });
+    req.extensions_mut().insert(ViaShareLink { expires_at: hit.expires_at });
+    redact_for_viewer(next.run(req).await, true).await
 }
 
 /// 请求是拿上号 Key 来的（放进请求扩展）。上号时没指定代理就自动从代理池分配，见
@@ -1068,6 +1165,7 @@ pub async fn change_password(
     if cleared {
         // 访客跟着清：否则下回重设管理密码时，早先发出去的访客密码悄悄又能用了。
         state.store.delete_viewer().await.map_err(internal)?;
+        state.store.delete_all_share_links().await.map_err(internal)?;
         state.store.delete_all_sessions().await.map_err(internal)?;
     }
     tracing::info!(
@@ -1100,10 +1198,16 @@ pub struct MeResp {
     /// 实例名称（见 [`store::INSTANCE_NAME`]），未命名为 null。人人可见：标签页标题与 MCP Key
     /// 的接入命令都要用，而 `/settings` 只对 admin 开放。
     instance_name: Option<String>,
+    /// 拿分享链接进来的：链接的到期时间（unix 秒），其余为 null。
+    share_expires_at: Option<u64>,
 }
 
 /// 当前登录身份（已鉴权）。前端据此决定显示哪些页面、藏掉哪些按钮。
-pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor>) -> Json<MeResp> {
+pub async fn me(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    share: Option<Extension<ViaShareLink>>,
+) -> Json<MeResp> {
     let admin = actor.is_admin();
     Json(MeResp {
         id: actor.id,
@@ -1115,6 +1219,7 @@ pub async fn me(State(state): State<AppState>, Extension(actor): Extension<Actor
         member_caps: matches!(actor.role, UserRole::Agent | UserRole::User)
             .then(|| crate::web::MemberCaps::of(&state.store)),
         instance_name: state.store.instance_name(),
+        share_expires_at: share.map(|Extension(s)| s.expires_at),
     })
 }
 
@@ -1271,6 +1376,26 @@ async fn redact_for_viewer(resp: Response, viewer: bool) -> Response {
         Ok(b) => b,
         Err(e) => return internal(e).into_response(),
     };
+    // 访客：JSON 里的出口代理字段先整段置空（见 [`VIEWER_HIDDEN_FIELDS`]）。
+    let is_json = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    let mut bytes = bytes;
+    if viewer
+        && is_json
+        && let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && hide_viewer_fields(&mut v)
+    {
+        match serde_json::to_vec(&v) {
+            Ok(out) => {
+                parts.headers.remove(header::CONTENT_LENGTH);
+                bytes = axum::body::Bytes::from(out);
+            }
+            Err(e) => return internal(e).into_response(),
+        }
+    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     };

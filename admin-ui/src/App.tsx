@@ -2,9 +2,9 @@ import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { PlusIcon, SearchIcon } from 'lucide-react'
 import { listCredentials } from '@/api/credentials'
-import { getAuthState, logout } from '@/api/auth'
+import { SHARE_KEY_PREFIX, getAuthState, logout } from '@/api/auth'
 import { getSettings } from '@/api/settings'
-import { TOKEN_KEY, UNAUTHORIZED_EVENT, getToken, setToken, clearToken } from '@/api/client'
+import { TOKEN_KEY, UNAUTHORIZED_EVENT, getToken, setShareToken, setToken, clearToken } from '@/api/client'
 import { numberOneOf, oneOf, usePersisted } from '@/lib/persisted'
 import {
   SORT_DIR_DEFAULT,
@@ -57,6 +57,7 @@ import {
   useIsAdmin,
   useReadOnly,
   useSeesWholePool,
+  useShareLink,
 } from '@/lib/role'
 
 // 设置页是另一棵大树（访问控制、转发、设备三块），账号页从不用它，
@@ -152,6 +153,17 @@ function readMainRoute(): MainPage | null {
   const match = /^#\/(proxies|users|billing)(?:[/?]|$)/.exec(window.location.hash)
   return match ? (match[1] as MainPage) : null
 }
+
+// 分享链接（`#/share/lbs-…`）：把链接里的凭据当会话存下，以访客身份进入，并把凭据从地址栏抹掉，
+// 免得随截图、书签或再转发流出去。本浏览器已有正式登录时只换本标签页，见 `setShareToken`。
+// 写成函数而非顶层裸块：压缩后 `}` 紧跟正则字面量，vite 的模块词法分析会误判而整包构建失败。
+function consumeShareLink() {
+  const match = /^#\/share\/([A-Za-z0-9-]+)/.exec(window.location.hash)
+  if (!match || !match[1].startsWith(SHARE_KEY_PREFIX)) return
+  setShareToken(match[1])
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#/`)
+}
+consumeShareLink()
 
 // 代理池原来是系统设置里的一个分区（`#/settings/proxies`），挪成一级页面后旧书签原地改到新地址。
 if (/^#\/settings\/proxies(?:[/?]|$)/.test(window.location.hash)) {
@@ -382,6 +394,7 @@ function App() {
   const readOnly = useReadOnly()
   const isAdmin = useIsAdmin()
   const seesWholePool = useSeesWholePool()
+  const shareLink = useShareLink()
   const canManageUsers = useCanManageUsers()
   // 系统设置只对管理员开放（后端也拒 `/settings`），用户管理只对管理员与代理开放，代理池不给访客：深链接、
   // 书签进来的落回账号池。只对确认过的身份清路由；身份未明时下面只是先不渲染，查回来有权限
@@ -531,8 +544,8 @@ function App() {
                 </Button>
               </Hint>
             )}
-            {/* 请求查询看的是全池，只给管理员与访客。 */}
-            {seesWholePool && (
+            {/* 请求查询看的是全池，只给管理员与访客；分享链接不给（后端拒绝 `/usage`）。 */}
+            {seesWholePool && !shareLink && (
               <Hint label={t('按请求 ID 查询请求记录', 'Look up a request by ID')}>
                 <Button
                   aria-label={t('请求查询', 'Request lookup')}

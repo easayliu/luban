@@ -641,7 +641,7 @@ async fn billing_scope_follows_the_hierarchy(pool: sqlx::PgPool) {
         Query(serde_urlencoded_query(&s))
     };
     let call = |who: &store::User, by: &str, owner: Option<i64>| {
-        get_billing(State(state.clone()), Extension(Actor::from(who.clone())), q(by, owner))
+        get_billing(State(state.clone()), Extension(Actor::from(who.clone())), None, q(by, owner))
     };
     let owners = |resp: Json<BillingResp>| {
         let v = serde_json::to_value(&resp.0).unwrap();
@@ -675,6 +675,19 @@ async fn billing_scope_follows_the_hierarchy(pool: sqlx::PgPool) {
     assert_eq!(call(&sub, "owner", None).await.err().map(|e| e.0), Some(StatusCode::FORBIDDEN));
     assert_eq!(owners(call(&sub, "cred", None).await.unwrap()).len(), 1);
     assert_eq!(owners(call(&admin, "owner", None).await.unwrap()).len(), 4);
+
+    // 分享链接（访客身份）：按成员、按接入 Key 拆与按成员筛一律 403，其余照给。
+    let share = |by: &str, owner: Option<i64>| {
+        let actor = Actor { id: 0, username: "share".into(), role: UserRole::Viewer };
+        let via = Extension(auth::ViaShareLink { expires_at: u64::MAX });
+        get_billing(State(state.clone()), Extension(actor), Some(via), q(by, owner))
+    };
+    for (by, owner) in [("owner", None), ("key", None), ("cred", Some(sub.id))] {
+        assert_eq!(share(by, owner).await.err().map(|e| e.0), Some(StatusCode::FORBIDDEN), "{by}");
+    }
+    assert_eq!(owners(share("cred", None).await.unwrap()).len(), 4);
+    assert!(share("model", None).await.is_ok());
+    assert!(share("day", None).await.is_ok());
 }
 
 /// 测试用：把查询串解析成 [`BillingQuery`]。

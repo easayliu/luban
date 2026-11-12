@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { LogoMark } from '@/components/logo-mark'
 import { useInstanceName } from '@/lib/instance'
+import { formatFullTime } from '@/lib/utils'
 import { LanguageMenuItem } from '@/components/language-switcher'
 import { ThemeMenuItem } from '@/components/theme-switcher'
 import { Badge } from '@/components/ui/badge'
@@ -71,7 +72,7 @@ export function AppHeader({
   nav?: ReactNode
   onNavigateHome?: () => void
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const readOnly = useReadOnly()
   const me = useMe().data
   const instanceName = useInstanceName()
@@ -92,8 +93,12 @@ export function AppHeader({
   )
   // 访客登录时常驻一枚「只读」：按钮都藏了，不说明的话像是页面坏了。代理和用户常驻身份与
   // 用户名：他们看到的账号池只有自己名下的号，得一眼看出是以谁的身份在看。
+  const shareExpiresAt = me?.share_expires_at
   const readOnlyBadge = readOnly ? (
-    <Hint label={t('以访客身份登录：仅可查看，不可修改', 'Signed in as a viewer: read-only access')}>
+    <Hint label={shareExpiresAt
+      ? t(`通过分享链接查看：仅可查看，不可修改；有效期至 ${formatFullTime(shareExpiresAt, language)}`, `Viewing via a share link: read-only access, valid until ${formatFullTime(shareExpiresAt, language)}`)
+      : t('以访客身份登录：仅可查看，不可修改', 'Signed in as a viewer: read-only access')}
+    >
       <Badge className="shrink-0" variant="warning">
         {t('只读', 'Read-only')}
       </Badge>
