@@ -53,8 +53,14 @@ COPY --from=frontend /app/admin-ui/dist ./admin-ui/dist
 # 先删掉空 main 留下的产物：crate 名没变，不删的话有让 cargo 误判为「已是最新」的余地，
 # 那会把一个空壳二进制打进镜像（起来就是 CMD 立刻退出，且不报错）。依赖的产物不动，
 # 所以这一步只重编 luban 自己。
+#
+# 只删产物不够：rust:1 镜像 11-12 后换了新 cargo，中间产物不再放 target/release/deps，
+# 删不到，cargo 就把空 main 重新拷出来、0.1s 收工（v0.3.294~296 的镜像就是空壳）。
+# 所以再 touch 一下源码，让它按修改时间必然重编；编完按大小兜底，空壳直接让构建失败。
 RUN rm -f target/release/luban target/release/deps/luban-* \
-    && cargo build --release
+    && find src -name '*.rs' -exec touch {} + \
+    && cargo build --release \
+    && test "$(stat -c %s target/release/luban)" -gt 5000000
 
 # ---------- 运行时 ----------
 FROM debian:bookworm-slim
