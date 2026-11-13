@@ -105,7 +105,7 @@ pub struct CcProfile {
     /// 出站头 `x-claude-code-request-class` 的取值。2.1.277 起官方每条 `/v1/messages` 都带
     /// （`cap/2.1.277`）：主线程与「猜下一句」是 `main`，SDK 子代理是 `subagent`，标题生成与
     /// 额度探测是 `auxiliary`（无工具 helper 与安全分类没有 2.1.277 样本，按用途归入后两者）。
-    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.322）。
+    /// 老版本的表里也填了同样的值，但只有模拟路径会写这个头，而模拟路径恒用 [`CC_PROFILES`]（2.1.323）。
     pub request_class: &'static str,
     /// 顶层 `output_config.effort` 的取值：2.1.277 起 opus / fable / sonnet 主线程恒带
     /// `{"effort":"high"}`（`cap/2.1.277/00023`、`00031`、`00357`），2.1.280 的 opus 变成
@@ -453,15 +453,16 @@ pub fn cc_model_beta(profile: &CcProfile, model: &str) -> std::borrow::Cow<'stat
     )
 }
 
-/// 按 kind 取**当前模拟版本**（2.1.322，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
-/// 落回 [`CC_PROFILES_2_1_321`]、[`CC_PROFILES_2_1_319`]、[`CC_PROFILES_2_1_318`]、[`CC_PROFILES_2_1_317`]、[`CC_PROFILES_2_1_316`]、[`CC_PROFILES_2_1_314`]、[`CC_PROFILES_2_1_312`]、[`CC_PROFILES_2_1_311`]、[`CC_PROFILES_2_1_310`]、[`CC_PROFILES_2_1_309`]、[`CC_PROFILES_2_1_308`]、[`CC_PROFILES_2_1_307`]、[`CC_PROFILES_2_1_306`]、[`CC_PROFILES_2_1_305`]、[`CC_PROFILES_2_1_303`]、[`CC_PROFILES_2_1_301`]、[`CC_PROFILES_2_1_300`]、[`CC_PROFILES_2_1_299`]、[`CC_PROFILES_2_1_296`]、[`CC_PROFILES_2_1_293`]、[`CC_PROFILES_2_1_291`]、[`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
+/// 按 kind 取**当前模拟版本**（2.1.323，[`CC_PROFILES`]）的 profile；那张表没编的 kind 依次
+/// 落回 [`CC_PROFILES_2_1_322`]、[`CC_PROFILES_2_1_321`]、[`CC_PROFILES_2_1_319`]、[`CC_PROFILES_2_1_318`]、[`CC_PROFILES_2_1_317`]、[`CC_PROFILES_2_1_316`]、[`CC_PROFILES_2_1_314`]、[`CC_PROFILES_2_1_312`]、[`CC_PROFILES_2_1_311`]、[`CC_PROFILES_2_1_310`]、[`CC_PROFILES_2_1_309`]、[`CC_PROFILES_2_1_308`]、[`CC_PROFILES_2_1_307`]、[`CC_PROFILES_2_1_306`]、[`CC_PROFILES_2_1_305`]、[`CC_PROFILES_2_1_303`]、[`CC_PROFILES_2_1_301`]、[`CC_PROFILES_2_1_300`]、[`CC_PROFILES_2_1_299`]、[`CC_PROFILES_2_1_296`]、[`CC_PROFILES_2_1_293`]、[`CC_PROFILES_2_1_291`]、[`CC_PROFILES_2_1_285`]（SDK 子代理）、[`CC_PROFILES_2_1_280`]、[`CC_PROFILES_2_1_277`] 与
 /// [`CC_PROFILES_2_1_260`]（安全分类）。表是常量，三张都查不到即编译期就漏写了一行，故直接兜底到 `MainOpus`
 /// 而不是返回 `Option`——调用点没有「没有 profile」这种状态可处理。
 ///
-/// 模拟路径只发主线程五行（四族，haiku 分 4.5 与 5.5），2.1.322 表里都有；落回旧表的 kind 只用作认来访形态的参照。
+/// 模拟路径只发主线程五行（四族，haiku 分 4.5 与 5.5），2.1.323 表里都有；落回旧表的 kind 只用作认来访形态的参照。
 pub fn cc_profile(kind: CcProfileKind) -> &'static CcProfile {
     CC_PROFILES
         .iter()
+        .chain(CC_PROFILES_2_1_322)
         .chain(CC_PROFILES_2_1_321)
         .chain(CC_PROFILES_2_1_319)
         .chain(CC_PROFILES_2_1_318)
@@ -506,8 +507,8 @@ pub fn cc_profile_exact(kind: CcProfileKind, version: &str) -> Option<&'static C
         .find(|p| p.kind == kind && p.version == version)
 }
 
-/// 二十八张 profile 表，按版本从旧到新。
-pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 28] {
+/// 二十九张 profile 表，按版本从旧到新。
+pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 29] {
     [
         CC_PROFILES_2_1_258,
         CC_PROFILES_2_1_260,
@@ -536,6 +537,7 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 28] {
         CC_PROFILES_2_1_318,
         CC_PROFILES_2_1_319,
         CC_PROFILES_2_1_321,
+        CC_PROFILES_2_1_322,
         CC_PROFILES,
     ]
 }
@@ -545,7 +547,8 @@ pub(super) fn cc_profile_tables() -> [&'static [CcProfile]; 28] {
 /// `version` 是 `(major, minor, patch)`，来自客户端 UA（`claude-cli/x.y.z`）。分档：
 /// - 低于 2.1.260 取 [`CC_PROFILES_2_1_258`]；**读不出版本时也取旧那份**——绝大多数在跑的
 ///   客户端还不是 2.1.260，猜新的一版等于给它们集体换一套形态；
-/// - 2.1.322 及以上查 [`CC_PROFILES`]，没行的 kind 依次再查 2.1.321 及更早各表（同下）；
+/// - 2.1.323 及以上查 [`CC_PROFILES`]，没行的 kind 依次再查 2.1.322 及更早各表（同下）；
+/// - 2.1.322 查 [`CC_PROFILES_2_1_322`]，同样依次落回；
 /// - 2.1.321 查 [`CC_PROFILES_2_1_321`]，同样依次落回；
 /// - 2.1.319 / 2.1.320 查 [`CC_PROFILES_2_1_319`]（2.1.320 没抓），同样依次落回；
 /// - 2.1.318 查 [`CC_PROFILES_2_1_318`]，同样依次落回；
@@ -590,7 +593,34 @@ pub fn cc_profile_at(kind: CcProfileKind, version: Option<(u64, u64, u64)>) -> &
     // 2.1.260 表是所有版本的最后兜底：它是唯一编全了九个 kind 的一张。
     let at_260 = || find(CC_PROFILES_2_1_260).unwrap_or(&CC_PROFILES_2_1_260[0]);
     match version {
-        Some(v) if v >= (2, 1, 322) => find(CC_PROFILES)
+        Some(v) if v >= (2, 1, 323) => find(CC_PROFILES)
+            .or_else(|| find(CC_PROFILES_2_1_322))
+            .or_else(|| find(CC_PROFILES_2_1_321))
+            .or_else(|| find(CC_PROFILES_2_1_319))
+            .or_else(|| find(CC_PROFILES_2_1_318))
+            .or_else(|| find(CC_PROFILES_2_1_317))
+            .or_else(|| find(CC_PROFILES_2_1_316))
+            .or_else(|| find(CC_PROFILES_2_1_314))
+            .or_else(|| find(CC_PROFILES_2_1_312))
+            .or_else(|| find(CC_PROFILES_2_1_311))
+            .or_else(|| find(CC_PROFILES_2_1_310))
+            .or_else(|| find(CC_PROFILES_2_1_309))
+            .or_else(|| find(CC_PROFILES_2_1_308))
+            .or_else(|| find(CC_PROFILES_2_1_307))
+            .or_else(|| find(CC_PROFILES_2_1_306))
+            .or_else(|| find(CC_PROFILES_2_1_305))
+            .or_else(|| find(CC_PROFILES_2_1_303))
+            .or_else(|| find(CC_PROFILES_2_1_301))
+            .or_else(|| find(CC_PROFILES_2_1_300))
+            .or_else(|| find(CC_PROFILES_2_1_299))
+            .or_else(|| find(CC_PROFILES_2_1_296))
+            .or_else(|| find(CC_PROFILES_2_1_293))
+            .or_else(|| find(CC_PROFILES_2_1_291))
+            .or_else(|| find(CC_PROFILES_2_1_285))
+            .or_else(|| find(CC_PROFILES_2_1_280))
+            .or_else(|| find(CC_PROFILES_2_1_277))
+            .unwrap_or_else(at_260),
+        Some(v) if v >= (2, 1, 322) => find(CC_PROFILES_2_1_322)
             .or_else(|| find(CC_PROFILES_2_1_321))
             .or_else(|| find(CC_PROFILES_2_1_319))
             .or_else(|| find(CC_PROFILES_2_1_318))

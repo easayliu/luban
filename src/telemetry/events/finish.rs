@@ -280,8 +280,22 @@ impl EventBuilder<'_> {
             put("requestBodyEncoding", json!("identity"));
             put("requestBodyChars", json!(body_chars));
             // 2.1.285：组请求体的耗时，每条都报，0 或 1ms。
+            // 2.1.323 起组体耗时里还含拼 sandy-plover 头的等待（`wait_ms`，紧跟其后）：会话起头那一批等过查盘，
+            // `requestPrepareMs` 是等待再加几毫秒（标题 0–5、主线程 1、`-p` 1–2，`cap/auto-2.1.323-20261113-full`），别的
+            // 等待为 0、组体照旧 0 或 1。
+            let wait = (env.f.v323 && call.chain_tools_used_header())
+                .then(|| env.f.startup_wait.unwrap_or(0));
             if v285 {
-                put("requestPrepareMs", json!((req_hash / 41) % 2));
+                let prep = match env.f.startup_wait.filter(|_| wait.is_some()) {
+                    Some(w) if shape.sdk => w + 1 + req_hash % 2,
+                    Some(w) if kind == Kind::Title => w + req_hash % 6,
+                    Some(w) => w + 1,
+                    None => (req_hash / 41) % 2,
+                };
+                put("requestPrepareMs", json!(prep));
+            }
+            if let Some(w) = wait {
+                put("wait_ms", json!(w));
             }
             put("gzipSkipReason", json!(gzip_skip));
             put("fastMode", json!(shape.fast_mode));

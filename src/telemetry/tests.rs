@@ -5927,6 +5927,10 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
     assert_eq!(ctx("2.1.311", opus, true), (26, 7742 - 1152));
     // 2.1.317 只有 ShareOnboardingGuide 那 21 落到 `-p` 头上（抓包 7763）。
     assert_eq!(ctx("2.1.317", opus, true), (26, 7763 - 1152));
+    // 2.1.323 交互式 Artifact 加电子表格那一类 +4（`cap/auto-2.1.323-20261113-full` 各族 15633→15637）。
+    assert_eq!(ctx("2.1.323", opus, false), (34, 15600 - 1152 + 4));
+    assert_eq!(ctx("2.1.323", h55, false), (33, 15570 - 1152 + 4));
+    assert_eq!(ctx("2.1.323", h45, false), (37, 16071 - 1152 + 4));
 
     // 关掉 Artifact（带官方工具集 Agent+Read，留着 ListAgents / SendFeedback，只少 Artifact 一组）时，
     // `artifact_schema_delta` 不加（`!off.artifact` 为假），连 Artifact 的 schema 一起减：opus 主线程
@@ -5952,6 +5956,265 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
         ctx_off_artifact("2.1.308"),
         "关 Artifact 时 309 == 308"
     );
+}
+
+/// 2.1.323 起 `-p` 的 `context_size` 只算首条请求真正发出了 schema 的内建工具（按工具记录：`Agent` 补回出站时删掉的
+/// `name` / `team_name` / `mode`），延迟池里没发过的不算，并报 `non_mcp_tools_tokens_excludes_unsent: true`。
+/// `cap/auto-2.1.323-20261113-full` 六个 `-p` 会话首条（`01379` 等）原样回放：12 个工具、3197；2.1.322 照旧按全部工具。
+/// 显式空工具集报 0、受限工具集只算启用的且不报遗漏；没有 `tools` 数组（未知）照旧。
+#[test]
+fn sdk_context_size_counts_only_the_sent_schemas_from_2_1_323() {
+    let Some((body, betas)) = cap_request("auto-2.1.323-20261113-full/01379_") else {
+        eprintln!("skipped: cap not present");
+        return;
+    };
+    let run = |ua: &str| {
+        let t = Telemetry::default();
+        let mut c = call(body.clone(), "req_ctx_p", "end_turn");
+        c.betas = betas.clone();
+        c.ua_out = ua.into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending
+            .values()
+            .flat_map(|p| &p.events)
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let m = run("claude-cli/2.1.323 (external, sdk-cli)");
+    assert_eq!(m["non_mcp_tools_tokens"], json!(3197), "{m}");
+    assert_eq!(m["non_mcp_tools_tokens_excludes_unsent"], json!(true), "{m}");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys.last(), Some(&"non_mcp_tools_tokens_excludes_unsent"), "排在最后");
+    let old = run("claude-cli/2.1.322 (external, sdk-cli)");
+    assert!(old.get("non_mcp_tools_tokens_excludes_unsent").is_none(), "{old}");
+    assert_ne!(old["non_mcp_tools_tokens"], json!(3197));
+
+    // 同一条改工具集再回放（官方的标记看实际启用的工具里有没有缺 schema 的，不看工具总数）。
+    let ctx_with = |edit: &dyn Fn(&mut Value)| {
+        let mut v: Value = serde_json::from_slice(&body).unwrap();
+        edit(&mut v);
+        let t = Telemetry::default();
+        let mut c = call(v.to_string().into_bytes(), "req_ctx_p2", "end_turn");
+        c.betas = betas.clone();
+        c.ua_out = "claude-cli/2.1.323 (external, sdk-cli)".into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending
+            .values()
+            .flat_map(|p| &p.events)
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    // 去掉延迟池那段宣告（受限工具集里本来就没有延迟工具）。
+    let drop_pool = |v: &mut Value| {
+        for m in v["messages"].as_array_mut().unwrap() {
+            if let Some(blocks) = m["content"].as_array_mut() {
+                blocks.retain(|b| {
+                    !b["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("deferred tools are now available"))
+                });
+            }
+        }
+    };
+    // 显式空工具集（`tools: []`）：已知为空，计 0，不报遗漏。
+    let empty = ctx_with(&|v| {
+        v["tools"] = json!([]);
+        drop_pool(v);
+    });
+    assert_eq!(empty["non_mcp_tools_tokens"], json!(0), "{empty}");
+    assert!(empty.get("non_mcp_tools_tokens_excludes_unsent").is_none(), "{empty}");
+    // 受限工具集（`--tools Read`）：启用的那个都发了，只算 Read（268），不报遗漏。
+    let read_only = ctx_with(&|v| {
+        let read =
+            v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "Read").unwrap().clone();
+        v["tools"] = json!([read]);
+        drop_pool(v);
+    });
+    assert_eq!(read_only["non_mcp_tools_tokens"], json!(268), "{read_only}");
+    assert!(read_only.get("non_mcp_tools_tokens_excludes_unsent").is_none(), "{read_only}");
+    // 宣告了延迟工具、却一个都没发（工具表已知为空）：照样算遗漏。
+    let none_sent = ctx_with(&|v| v["tools"] = json!([]));
+    assert_eq!(none_sent["non_mcp_tools_tokens"], json!(0));
+    assert_eq!(none_sent["non_mcp_tools_tokens_excludes_unsent"], json!(true));
+    // 延迟加载但已带着完整 schema 的内建工具照算（`00217` 里的 ExitPlanMode / WebFetch / WebSearch：126 + 139 + 208，
+    // 按 JS 四舍五入）；占位不算。其余延迟工具仍没发，标记照报。
+    let loaded = cap_request("auto-2.1.323-20261113-full/00217_").map(|(b, _)| {
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                ["ExitPlanMode", "WebFetch", "WebSearch"].contains(&t["name"].as_str().unwrap())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    if let Some(loaded) = loaded {
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.iter().all(|t| t["defer_loading"] == true));
+        let with_loaded = ctx_with(&|v| {
+            v["tools"].as_array_mut().unwrap().extend(loaded.iter().cloned());
+        });
+        assert_eq!(with_loaded["non_mcp_tools_tokens"], json!(3197 + 473), "{with_loaded}");
+        assert_eq!(with_loaded["non_mcp_tools_tokens_excludes_unsent"], json!(true));
+    }
+    // 工具表未知（没有 `tools` 键）：没法知道准备了哪些，照旧按全部工具报、不带标记。
+    let unknown = ctx_with(&|v| {
+        v.as_object_mut().unwrap().remove("tools");
+    });
+    assert_eq!(unknown["non_mcp_tools_tokens"], old["non_mcp_tools_tokens"], "{unknown}");
+    assert!(unknown.get("non_mcp_tools_tokens_excludes_unsent").is_none());
+
+    // Agent 已经带着那三项（开了 agent teams）就不再补；别的工具照出站长度算。
+    let agent = json!({"type": "object", "properties": {"name": {}, "prompt": {}}});
+    assert_eq!(
+        super::shape::recorded_schema_tokens("Agent", &agent),
+        (agent.to_string().len() as f64 / 4.0).round() as u64
+    );
+    let stripped = json!({"type": "object", "properties": {"prompt": {}}});
+    assert_eq!(
+        super::shape::recorded_schema_tokens("Agent", &stripped),
+        ((stripped.to_string().len() + 526) as f64 / 4.0).round() as u64,
+        "补回 526 字符"
+    );
+}
+
+/// 2.1.323 `-p` 恢复会话、把工具集收紧成 Read：历史里宣告过的延迟内建工具这一轮明确撤回了（「no longer available in this
+/// session」那段），先把本轮工具池变更叠上，再看仍启用的工具缺不缺 schema——全撤回了就不报遗漏；不撤回（仍启用、没发）才报。
+#[test]
+fn sdk_context_size_applies_this_turns_withdrawals_before_judging() {
+    let Some((body, betas)) = cap_request("auto-2.1.323-20261113-full/01379_") else {
+        eprintln!("skipped: cap not present");
+        return;
+    };
+    let first: Value = serde_json::from_slice(&body).unwrap();
+    // 首轮宣告的延迟内建工具名（`01379` 那条 system 消息里「now available via ToolSearch」那段）。
+    let announce = first["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|b| b["text"].as_str().map(str::to_owned))
+        .find(|t| t.contains("deferred tools are now available"))
+        .unwrap();
+    let at = announce.find("The following deferred tools are now available").unwrap();
+    let builtin: Vec<String> = announce[at..]
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter(|l| !l.starts_with("mcp__"))
+        .map(str::to_owned)
+        .collect();
+    assert!(builtin.iter().any(|n| n == "WebSearch"), "{builtin:?}");
+    let read =
+        first["tools"].as_array().unwrap().iter().find(|t| t["name"] == "Read").unwrap().clone();
+    let resumed = |withdraw: bool| {
+        let mut v = first.clone();
+        v["tools"] = json!([read.clone()]);
+        let msgs = v["messages"].as_array_mut().unwrap();
+        msgs.push(json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}));
+        msgs.push(json!({"role": "user", "content": [{"type": "text", "text": "hi again"}]}));
+        // 官方工具池变更是一条中途 system 消息（`cap/auto-2.1.321-20261110-full/00756` 那种）。
+        if withdraw {
+            msgs.push(json!({"role": "system", "content": [{"type": "text", "text": format!(
+                "The following deferred tools are no longer available in this session. Do not search for them \u{2014} ToolSearch will return no match:\n{}",
+                builtin.join("\n")
+            )}]}));
+        }
+        let t = Telemetry::default();
+        let mut c = call(v.to_string().into_bytes(), "req_resume_p", "end_turn");
+        c.betas = betas.clone();
+        c.ua_out = "claude-cli/2.1.323 (external, sdk-cli)".into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending
+            .values()
+            .flat_map(|p| &p.events)
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let withdrawn = resumed(true);
+    assert_eq!(withdrawn["non_mcp_tools_tokens"], json!(268), "{withdrawn}");
+    assert!(
+        withdrawn.get("non_mcp_tools_tokens_excludes_unsent").is_none(),
+        "撤回的不算仍启用: {withdrawn}"
+    );
+    let still = resumed(false);
+    assert_eq!(still["non_mcp_tools_tokens"], json!(268));
+    assert_eq!(still["non_mcp_tools_tokens_excludes_unsent"], json!(true), "没撤回、仍启用却没发");
+}
+
+/// SDK 会话恢复的真实抓包（`cap/auto-2.1.323-20261113-resume`，同一会话先后三个 `-p` 进程）：
+/// - `run12/00061`：首个进程，ToolSearch 载入 WebFetch 之前的首条，官方 3197 + 遗漏；
+/// - `run4/00058`：默认工具集 `--resume`，首条带着已载入、带 schema 的延迟 WebFetch，官方 3336（多 139）+ 遗漏。
+///
+/// `run3/00057`（`--resume --tools Read`）是**已知缺口**，不在这里：见 [`sdk_restricted_resume_context_size_known_gap`] 与
+/// [`crate::config::cc_2_1_323_known_gaps`]。
+#[test]
+fn sdk_resume_context_size_matches_the_captures() {
+    for (rel, tokens) in [
+        ("auto-2.1.323-20261113-resume/run12/00061_", 3197),
+        ("auto-2.1.323-20261113-resume/run4/00058_", 3336),
+    ] {
+        let Some((body, betas)) = cap_request(rel) else {
+            eprintln!("skipped: cap/{rel} not present");
+            continue;
+        };
+        let t = Telemetry::default();
+        let mut c = call(body, "req_resume", "end_turn");
+        c.betas = betas;
+        c.ua_out = "claude-cli/2.1.323 (external, sdk-cli)".into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let m = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .find(|(_, e)| ev_name(e) == "tengu_context_size")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(m["non_mcp_tools_tokens"], json!(tokens), "{rel}: {m}");
+        assert_eq!(m["non_mcp_tools_tokens_excludes_unsent"], json!(true), "{rel}");
+    }
+}
+
+/// **已知缺口**（[`crate::config::cc_2_1_323_known_gaps`]）：`-p --resume --tools Read`（`cap/auto-2.1.323-20261113-resume/run3/00057`）
+/// 官方报 268、不带遗漏标记，请求体却与默认恢复几乎相同，本轮虽撤回了 19 个延迟内建工具，常驻工具却不在撤回通知里，还原不出启用集，现在报 26 个 / 3336（不带遗漏标记）。钉住官方值，补上之前失败；
+/// 默认不跑，免得把「已知没对齐」混进常规结果。
+#[test]
+#[ignore = "已知缺口：受限工具集恢复，出站体看不出实际启用集"]
+fn sdk_restricted_resume_context_size_known_gap() {
+    let rel = "auto-2.1.323-20261113-resume/run3/00057_";
+    let Some((body, betas)) = cap_request(rel) else {
+        eprintln!("skipped: cap/{rel} not present");
+        return;
+    };
+    let t = Telemetry::default();
+    let mut c = call(body, "req_resume_read", "end_turn");
+    c.betas = betas;
+    c.ua_out = "claude-cli/2.1.323 (external, sdk-cli)".into();
+    c.client_tools = true;
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let m = st
+        .pending
+        .values()
+        .flat_map(|p| &p.events)
+        .find(|(_, e)| ev_name(e) == "tengu_context_size")
+        .map(|(_, e)| meta_of(e))
+        .unwrap();
+    assert_eq!(m["non_mcp_tools_tokens"], json!(268), "{m}");
+    assert!(m.get("non_mcp_tools_tokens_excludes_unsent").is_none(), "{m}");
 }
 
 /// 真实 CC 经网关透传（[`ApiCall::client_tools`]）时 `context_size` 的工具计数按网关基线报：
@@ -9122,6 +9385,7 @@ fn pool_summary_matches_the_captures() {
     let cases = [
         ("auto-2.1.321-20261110-full", "00756_", "00760_"),
         ("auto-2.1.322-20261110-full", "00763_", "00767_"),
+        ("auto-2.1.323-20261113-full", "00738_", "00742_"),
         ("auto-2.1.319-20261106-confirm/2.1.319", "00162_", "00165_"),
     ];
     for (dir, req, batch) in cases {
@@ -9654,12 +9918,14 @@ fn an_unknown_declared_parent_leaves_its_identity_unknown() {
 }
 
 /// 冷启动时头一回见到的是半截的一轮（线程续轮）：不当成新输入，所接的回复认不出，本轮累计不报（不报成 1 次请求、0 个工具）。
-/// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063`、`cap/auto-2.1.322-20261110-bashfail/2.1.322/00059` 各自单独回放。
+/// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063`、`cap/auto-2.1.322-20261110-bashfail/2.1.322/00059`、
+/// `cap/auto-2.1.323-20261113-bashfail/2.1.323/00059` 各自单独回放。
 #[test]
 fn a_cold_start_on_a_thread_continuation_is_not_a_new_prompt() {
     for rel in [
         "auto-2.1.321-20261110-bashfail/2.1.321/00063_",
         "auto-2.1.322-20261110-bashfail/2.1.322/00059_",
+        "auto-2.1.323-20261113-bashfail/2.1.323/00059_",
     ] {
         cold_start_on_continuation(rel);
     }
@@ -11607,12 +11873,13 @@ fn unknown_turn_stats_are_not_written_back() {
 }
 
 /// 子代理同父分叉：Explore 原包 `-full/00103`（create）后接两条同父续轮（`00107` 原样回放两次，回复 id 各不相同）——两条
-/// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`。
+/// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`，2.1.323 那份是 `00101` → `00104`。
 #[test]
 fn subagent_sibling_continuations_share_the_parent_depth() {
     for (dir, create, cont) in [
         ("auto-2.1.321-20261110-full", "00103_", "00107_"),
         ("auto-2.1.322-20261110-full", "00104_", "00107_"),
+        ("auto-2.1.323-20261113-full", "00101_", "00104_"),
     ] {
         subagent_sibling_depths(dir, create, cont);
     }
@@ -12021,12 +12288,13 @@ fn metas_named(events: &[Value], name: &str, agent: bool) -> Vec<Value> {
 
 /// 抓包回归：子代理的工具池汇总（`callSite: attachments_subagent`、`querySource` 是子代理自己的）首轮、续轮各一条，续轮
 /// 另有 MCP 服务器说明那条：`cap/auto-2.1.321-20261110-full` 请求 `00103`（Explore create）→ `00107`（continue）→ 批次
-/// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`。
+/// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`，2.1.323 那份是 `00101` → `00104` → 批次 `00108`。
 #[test]
 fn subagent_tool_result_turn_pool_summary_matches_the_captures() {
     for (dir, reqs, batch) in [
         ("auto-2.1.321-20261110-full", ["00103_", "00107_"], "00111_"),
         ("auto-2.1.322-20261110-full", ["00104_", "00107_"], "00112_"),
+        ("auto-2.1.323-20261113-full", ["00101_", "00104_"], "00108_"),
     ] {
         subagent_pool_summary(dir, reqs, batch);
     }
@@ -12214,7 +12482,8 @@ fn departures_on_a_tool_result_turn_are_reported() {
 /// - `cap/auto-2.1.321-20261110-bashfail/2.1.321` 请求 `00059`（create）→ `00063`（continue，新宣告 25 个）→ 批次 `00065`
 ///   第二条：`addedCount: 25`、`unlistedCount: 25`、`priorAnnouncedCount: 308`、`dtdCount: 1`；
 /// - `cap/auto-2.1.321-20261110-bashfail-fable/2.1.321` 请求 `00056` → `00060` → 批次 `00062` 同理；
-/// - `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00049` → `00059` → 批次 `00062` 同理。
+/// - `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00049` → `00059` → 批次 `00062` 同理；
+/// - `cap/auto-2.1.323-20261113-bashfail/2.1.323` 请求 `00054` → `00059` → 批次 `00061` 同理。
 ///
 /// 首轮、续轮的工具池汇总与 MCP 服务器说明、续轮的 MCP 工具数刷新，键都是官方的子集、顺序相同、值逐个一致；续轮省掉的
 /// 只有复算不出的内部消息数、附件数。续轮附件的类型与估值也对官方。
@@ -12224,6 +12493,7 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         ("auto-2.1.321-20261110-bashfail/2.1.321", ["00059_", "00063_"], "00065_"),
         ("auto-2.1.321-20261110-bashfail-fable/2.1.321", ["00056_", "00060_"], "00062_"),
         ("auto-2.1.322-20261110-bashfail/2.1.322", ["00049_", "00059_"], "00062_"),
+        ("auto-2.1.323-20261113-bashfail/2.1.323", ["00054_", "00059_"], "00061_"),
     ];
     for (dir, reqs, batch) in cases {
         let official_events: Vec<Value> = {
@@ -12623,6 +12893,142 @@ fn tools_used_connector_fields_and_mcp_mark_are_reported_once() {
     })));
 }
 
+/// 2.1.323：带了 sandy-plover 头的 `tengu_api_success` 紧跟 `requestPrepareMs` 报 `wait_ms`。会话起头那一条等过一次查盘
+/// （`cap/auto-2.1.323-20261113-full`：交互式首条 11–40ms，`requestPrepareMs` 是它再加几毫秒），之后都是 0；没带头的不报，
+/// 2.1.322 不报。
+#[test]
+fn api_success_reports_the_tools_header_wait_from_2_1_323() {
+    let run = |ua: &str, header: bool| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        first.tools_used_header = header;
+        t.ingest(first);
+        let mut next = call(cc_body(false), "req_2", "end_turn");
+        next.ua_out = ua.into();
+        next.tools_used_header = header;
+        t.ingest(next);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e))
+            .collect::<Vec<_>>()
+    };
+    let ev = run("claude-cli/2.1.323 (external, cli)", true);
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    let keys: Vec<&str> = ev[0].as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "wait_ms").expect("首条带 wait_ms");
+    assert_eq!(keys[at - 1], "requestPrepareMs");
+    let wait = ev[0]["wait_ms"].as_u64().unwrap();
+    assert!((11..=40).contains(&wait), "{wait}");
+    assert_eq!(ev[0]["requestPrepareMs"].as_u64().unwrap(), wait + 1, "主线程首条：等待加 1");
+    assert_eq!(ev[1]["wait_ms"], json!(0), "之后不再等");
+    assert!(ev[1]["requestPrepareMs"].as_u64().unwrap() <= 1);
+    assert!(
+        run("claude-cli/2.1.323 (external, cli)", false).iter().all(|m| m.get("wait_ms").is_none())
+    );
+    assert!(
+        run("claude-cli/2.1.322 (external, cli)", true).iter().all(|m| m.get("wait_ms").is_none())
+    );
+}
+
+/// 2.1.323：Bash 执行 / 失败事件在 `duration_ms` 后紧跟 `stall_duration_ms`（官方 `spawnMs`，三位小数；
+/// `cap/auto-2.1.323-20261113-full` 有 `duration_ms` 的 26 条都带，`00079` 是 47.043 / 0.47，值在 0.458 ~ 1.288）。
+/// 2.1.322 不带。
+#[test]
+fn bash_events_report_the_spawn_stall_from_2_1_323() {
+    let run = |ua: &str, command: &str, result: Value, event: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":command,"description":"x"}}]});
+        body["messages"][2] = json!({"role":"user","content":[result]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == event)
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let ok = json!({"type":"tool_result","tool_use_id":"t1","content":"a\nb"});
+    let bad = json!({"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\nls: x: No such file or directory"});
+    for (cmd, result, event) in [
+        ("ls", ok, "tengu_bash_tool_command_executed"),
+        ("ls x", bad, "tengu_bash_tool_command_failed"),
+    ] {
+        let m = run("claude-cli/2.1.323 (external, cli)", cmd, result.clone(), event);
+        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        let after = |k: &str| keys[keys.iter().position(|x| *x == k).unwrap() + 1];
+        assert_eq!(after("duration_ms"), "stall_duration_ms", "{event}: {m}");
+        assert_eq!(after("stall_duration_ms"), "command_cpu_user_ms", "{event}");
+        let stall = m["stall_duration_ms"].as_f64().unwrap();
+        assert!((0.45..1.4).contains(&stall), "{stall}");
+        assert_eq!((stall * 1000.0).round() / 1000.0, stall, "三位小数");
+        let old = run("claude-cli/2.1.322 (external, cli)", cmd, result, event);
+        assert!(old.get("stall_duration_ms").is_none(), "2.1.322 {event}");
+        assert!(old.get("duration_ms").is_some());
+    }
+}
+
+/// 2.1.323 的起头等待按「第一条标题 + 首条主线程」认，不看时间窗：`cap/auto-2.1.323-20261113-full` 标题 `00352` 比主线程
+/// `00353` 早 13.871 秒发出，先被扣在 presession 里、主线程那条建好会话后才补处理（`started_at` 仍是它自己的），批次 `00359`
+/// 里两条 `api_success` 的 `wait_ms` 都是 15、`requestPrepareMs` 19 / 16。之后的请求等待为 0。
+#[test]
+fn a_parked_first_title_shares_the_startup_wait() {
+    let (Some((title, title_betas)), Some((main, main_betas))) = (
+        cap_request("auto-2.1.323-20261113-full/00352_"),
+        cap_request("auto-2.1.323-20261113-full/00353_"),
+    ) else {
+        eprintln!("skipped: cap not present");
+        return;
+    };
+    let ua = "claude-cli/2.1.323 (external, cli)";
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let mut c = call(title, "req_title", "end_turn");
+    c.betas = title_betas;
+    c.ua_out = ua.into();
+    c.client_tools = true;
+    c.tools_used_header = true;
+    c.started_at = base;
+    t.ingest(c);
+    let mut c = call(main, "req_main", "end_turn");
+    c.betas = main_betas;
+    c.ua_out = ua.into();
+    c.client_tools = true;
+    c.tools_used_header = true;
+    c.started_at = base + Duration::from_millis(13_871);
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let success: Vec<Value> = st
+        .pending
+        .values()
+        .flat_map(|p| &p.events)
+        .filter(|(_, e)| ev_name(e) == "tengu_api_success")
+        .map(|(_, e)| meta_of(e))
+        .collect();
+    let of = |src: &str| {
+        success
+            .iter()
+            .find(|m| m["querySource"] == src)
+            .unwrap_or_else(|| panic!("{src}: {success:?}"))
+    };
+    let (title, main) = (of("generate_session_title"), of("repl_main_thread"));
+    let wait = title["wait_ms"].as_u64().unwrap();
+    assert!(wait >= 11, "标题照样等过那次查盘: {title}");
+    assert_eq!(main["wait_ms"], json!(wait), "同一批同值");
+    assert!(title["requestPrepareMs"].as_u64().unwrap() >= wait, "组体耗时含等待: {title}");
+    assert_eq!(main["requestPrepareMs"].as_u64().unwrap(), wait + 1);
+}
+
 /// 2.1.319 的 `tengu_auto_mode_decision` 键序（`cap/auto-2.1.319-20261106-full` 的 Edit 快路径 `00213` 与 Bash `01167`，
 /// 2.1.318 同类见 `cap/auto-2.1.318-20261104-full` 的 `00208`、`01152`）。
 #[test]
@@ -12871,6 +13277,23 @@ fn version_2_1_321_moves_the_5xx_frame() {
         }
         assert!(seen > 0);
     }
+}
+
+/// 2.1.323（`cap/auto-2.1.323-20261113-retry`）：5xx 照旧只换块名，仍不带 `error_constructor`。
+#[test]
+fn version_2_1_323_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.323 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert!(m.get("error_constructor").is_none(), "2.1.323 {n}: {m}");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-fmjm3js0.js:5:1510")),
+            "2.1.323 {n}"
+        );
+    }
+    assert!(seen > 0);
 }
 
 /// 2.1.322（`cap/auto-2.1.322-20261110-retry`）：5xx 的栈哈希与行列照旧、顶帧换块；压缩后的类名 `zmn` 小写开头过不了校验，
@@ -14142,6 +14565,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.323 摘要、行列、块名都换了（`cap/auto-2.1.323-20261113-bashfail/2.1.323`）。
+        ("claude-cli/2.1.323 (external, cli)", "46a1ab4152b6", "chunk-2x9ma4k7.js:3673:9499"),
         // 2.1.322 只换了块名（`cap/auto-2.1.322-20261110-bashfail/2.1.322`）。
         ("claude-cli/2.1.322 (external, cli)", "0cacd2d8980f", "chunk-9r1hbf9p.js:3632:9537"),
         ("claude-cli/2.1.321 (external, cli)", "0cacd2d8980f", "chunk-ne1755n5.js:3632:9537"),
@@ -14173,8 +14598,14 @@ fn version_2_1_303_telemetry_shape() {
         // 2.1.321 的 `ShellError` 压缩后是 `Rx`，带构造名、夹在消息摘要与栈摘要之间
         // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`），2.1.322 同；2.1.293 ~ 2.1.319 不带。
         let keys: Vec<&str> = err.as_object().unwrap().keys().map(String::as_str).collect();
-        if ua.contains("2.1.322") || ua.contains("2.1.321") || ua.contains("2.1.320") {
-            assert_eq!(err["error_constructor"], json!("Rx"), "{ua}");
+        if ua.contains("2.1.323")
+            || ua.contains("2.1.322")
+            || ua.contains("2.1.321")
+            || ua.contains("2.1.320")
+        {
+            // 2.1.323 类名压缩后换成 `JR`，位置不变。
+            let want = if ua.contains("2.1.323") { "JR" } else { "Rx" };
+            assert_eq!(err["error_constructor"], json!(want), "{ua}");
             let at = keys.iter().position(|k| *k == "error_constructor").unwrap();
             assert_eq!(
                 (keys[at - 1], keys[at + 1]),

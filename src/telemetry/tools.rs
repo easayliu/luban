@@ -338,6 +338,9 @@ pub(super) struct ShellUsage {
     pub(super) wall_ms: f64,
     pub(super) user_ms: f64,
     pub(super) system_ms: f64,
+    /// 2.1.323 起报的拉起子进程那一段（官方 `spawnMs`，报成 `stall_duration_ms`，紧跟 `duration_ms`、三位小数）。
+    /// 更早的版本是 `None`，见 [`Self::with_spawn`]。
+    pub(super) spawn_ms: Option<f64>,
 }
 
 impl ShellUsage {
@@ -360,7 +363,22 @@ impl ShellUsage {
         let user = busy * (0.38 + (h % 25) as f64 / 100.0);
         let system = busy * (0.30 + ((h * 7) % 16) as f64 / 100.0);
         let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
-        Self { wall_ms: r3(wall), user_ms: r3(user), system_ms: r3(system) }
+        // 拉起子进程的那一段：`cap/auto-2.1.323-20261113-full` 26 条在 0.458 ~ 1.288ms，多在 0.46 ~ 0.81，与命令长短无关。
+        let spawn = 0.455 + ((h * 41) % 360) as f64 / 1000.0 + if h % 23 == 0 { 0.45 } else { 0.0 };
+        Self {
+            wall_ms: r3(wall),
+            user_ms: r3(user),
+            system_ms: r3(system),
+            spawn_ms: Some(r3(spawn)),
+        }
+    }
+
+    /// 只有 2.1.323 起才报 `stall_duration_ms`：`v323` 为假时去掉。
+    pub(super) fn with_spawn(mut self, v323: bool) -> Self {
+        if !v323 {
+            self.spawn_ms = None;
+        }
+        self
     }
 }
 
@@ -391,11 +409,17 @@ pub(super) fn bash_meta_v311(
         insert_before(meta, "has_pipe", kinds);
     }
     if let Some(u) = usage {
+        insert_after(meta, "interrupted", vec![("duration_ms", js_number(u.wall_ms))]);
+        // 2.1.323：官方 `x1t` 在 `duration_ms` 后接 `stall_duration_ms`（有 `spawnMs` 才报；后面的 `limit` 只在 Linux 上有）。
+        let mut after = "duration_ms";
+        if let Some(spawn) = u.spawn_ms {
+            insert_after(meta, "duration_ms", vec![("stall_duration_ms", js_number(spawn))]);
+            after = "stall_duration_ms";
+        }
         insert_after(
             meta,
-            "interrupted",
+            after,
             vec![
-                ("duration_ms", js_number(u.wall_ms)),
                 ("command_cpu_user_ms", js_number(u.user_ms)),
                 ("command_cpu_system_ms", js_number(u.system_ms)),
                 ("left_process_running", json!(run.leaves_running)),

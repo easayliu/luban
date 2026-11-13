@@ -523,7 +523,7 @@ fn latch(
 
 /// 每一项怎么写（官方 2.1.319 `Nf` / `rS`）。2.1.318 及以前一律 `{"name":"…"}`；2.1.319 起 `tengu_jolly_wren`（默认开，
 /// 按号随 eval 记在内存，[`note_eval`]）开着时 MCP 工具（名字以 `mcp__` 开头，官方 `rm`）多 `"mcp":true`
-/// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00071`）。
+/// （`cap/auto-2.1.319-20261106-confirm/2.1.319/00071`）。2.1.323 删掉了这个开关，MCP 工具一律写 `"mcp":true`。
 ///
 /// **claude.ai 连接器的字段（`url` / `directory_entry` / `unresolved`，`tengu_precious_ember`）一律不带**：官方只给注册时
 /// 来源是 claude.ai、带连接器 id 的工具挂这些字段，而 luban 发出的工具全是来访客户端带来的，从来不是池里这个号自己注册的
@@ -540,8 +540,11 @@ impl Style {
     const PLAIN: Self = Self { marks_mcp: false };
 
     fn of(cred_id: i64, version: &str) -> Self {
-        let v319 = super::parse_version(version).is_some_and(|v| v >= (2, 1, 319));
-        let jolly = JOLLY_WREN.read().get(&cred_id).copied().unwrap_or(true);
+        let v = super::parse_version(version);
+        let v319 = v.is_some_and(|v| v >= (2, 1, 319));
+        // 2.1.323 起不读 `tengu_jolly_wren`，无条件写。
+        let v323 = v.is_some_and(|v| v >= (2, 1, 323));
+        let jolly = v323 || JOLLY_WREN.read().get(&cred_id).copied().unwrap_or(true);
         Self { marks_mcp: v319 && jolly }
     }
 
@@ -734,6 +737,11 @@ mod tests {
             &features(serde_json::json!({"features": {"tengu_jolly_wren": {"value": false}}})),
         );
         assert_eq!(item(), r#"{"name":"mcp__luban__search"}"#);
+        assert_eq!(
+            Style::of(id, "2.1.323").item("mcp__luban__search"),
+            r#"{"name":"mcp__luban__search","mcp":true}"#,
+            "2.1.323 删了开关，下发关也写"
+        );
         note_eval(id, &features(serde_json::json!({"features": {}})));
         assert_eq!(item(), r#"{"name":"mcp__luban__search","mcp":true}"#, "没下发按开");
     }

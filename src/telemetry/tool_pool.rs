@@ -1319,6 +1319,12 @@ impl Default for PoolHistory {
 }
 
 impl PoolHistory {
+    /// 账本里仍宣告着的内建工具（不是 MCP 的）：叠上这一轮的变更后就是当前启用、可能还没发 schema 的那些，2.1.323 `-p` 的
+    /// `context_size` 认「有工具没算进去」看它（[`super::shape::RequestShape::unsent_builtin`]）。
+    pub(super) fn builtin_announced(&self) -> impl Iterator<Item = &str> {
+        self.announced.iter().map(String::as_str).filter(|n| !n.starts_with("mcp__"))
+    }
+
     /// 测试用：宣告过这几个名字、准的账本。
     #[cfg(test)]
     pub(super) fn of_announced(names: &[&str]) -> Self {

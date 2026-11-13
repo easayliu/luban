@@ -380,6 +380,14 @@ impl<'a> EventEnv<'a> {
                 ],
             );
         }
+        // 2.1.323：`toolResultClearingHeldStateless` 后多一项（`cap/auto-2.1.323-20261113-full` 111 条全是 false）。
+        if self.f.v323 {
+            insert_after(
+                &mut live,
+                "toolResultClearingHeldStateless",
+                vec![("refusalRetryHeldStateless", json!(false))],
+            );
+        }
         // 2.1.299：紧跟 `serverToolHistory` 多一项（`cap/auto-2.1.299-20261014-full` 108 条全是 false）。
         if v299 {
             insert_after(
@@ -431,6 +439,10 @@ impl<'a> EventEnv<'a> {
             tool_family: super::template::ToolFamily::of(&self.shape.model),
             tools_off: self.shape.tools_off,
             client_tools: self.call.client_tools,
+            sent_schema: self
+                .shape
+                .tools_known
+                .then_some((self.shape.sent_schema_tokens, self.shape.unsent_builtin)),
             bare: self.call.bare,
             lucky_cerf: f.lucky_cerf.clone(),
             lapis: f.lapis.clone(),

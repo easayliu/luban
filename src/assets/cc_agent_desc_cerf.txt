@@ -1,6 +1,6 @@
 Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.
 
-Available agent types are listed in <system-reminder> messages in the conversation.
+Available agent types are listed in messages from the system in the conversation.
 
 When using the Agent tool, specify a subagent_type to select an agent: `"fork"` forks yourself (the fork inherits your full conversation context and always runs on your model — a `model` override is ignored); any other type — or omitting it — starts a fresh agent (general-purpose by default).
 

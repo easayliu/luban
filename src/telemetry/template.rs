@@ -499,6 +499,10 @@ pub(super) struct Subst<'a> {
     /// 工具声明是来访客户端自带的（真实 CC 经网关透传），`tengu_context_size` 按网关基线报，见
     /// [`gateway_tool_tokens`]。
     pub(super) client_tools: bool,
+    /// 2.1.323 起 `-p` 的 `tengu_context_size` 要的那份工具准备状态：工具表已知（[`super::shape::RequestShape::tools_known`]，
+    /// 空数组也算）时是 `Some((实际发出 schema 的内建工具按工具记录估的 token, 有没有已启用却没发出 schema 的内建工具))`，
+    /// 未知是 `None`、照旧按全部工具报。
+    pub(super) sent_schema: Option<(u64, bool)>,
     /// billing-only 模拟，见 [`super::ApiCall::bare`]：模板里宣告注入内容的那几条不发。
     pub(super) bare: bool,
     /// 这一轮那几条 `tengu_lucky_cerf` 一系实验曝光，空即不发——按会话钉住的分组与「模型走不走
@@ -679,6 +683,9 @@ fn artifact_schema_delta(version: &str) -> u64 {
         // 交互式各族 15502→15539，`-p` 仍是 7742）。Bash 那句 `cd` 说明同样不进这个估算。
         // 2.1.317 `list` 加 `page_token` 参数 +40：同一份资产 15766→15929 字符，3942→3982（`cap/auto-2.1.317-20261103-full`
         // 交互式各族比 2.1.316 多 61，减去各族共有的 [`SHARE_GUIDE_TOKENS_2_1_317`] 那 21）。
+        // 2.1.323 `intent` 与开头那段加了电子表格一类 +4：交互式各族 15633→15637（`cap/auto-2.1.323-20261113-full`，
+        // haiku-4.5 16104→16108、haiku-5-5 15603→15607），`-p` 没有 Artifact 不受影响。
+        _ if version_at_least(version, "2.1.323") => 274 - 2 + 8 + 45 + 37 + 40 + 4,
         _ if version_at_least(version, "2.1.317") => 274 - 2 + 8 + 45 + 37 + 40,
         _ if version_at_least(version, "2.1.311") => 274 - 2 + 8 + 45 + 37,
         _ if version_at_least(version, "2.1.309") => 274 - 2 + 8 + 45,
@@ -1021,12 +1028,13 @@ where
                 }
             }
             if e.name == "tengu_mcp_instructions_pool_change" {
-                // 2.1.311 起客户端自带说明的那一侧是两项（`cap/auto-2.1.311~321-*-full`、`bashfail` 每条都是 2，2.1.310 及以前
-                // 都是 1；模板是 2.1.305 拍的）。
+                // 2.1.311 起客户端自带说明的那一侧是两项（`cap/auto-2.1.311~322-*-full`、`bashfail` 每条都是 2，2.1.310 及以前
+                // 都是 1；模板是 2.1.305 拍的）；2.1.323 又回到一项（`cap/auto-2.1.323-20261113-full` 30 条、`retry` 3 条、
+                // `bashfail` 两条都是 1）。
                 if version_at_least(subst.version, "2.1.311")
                     && let Some(slot) = meta.get_mut("clientSideCount")
                 {
-                    *slot = json!(2);
+                    *slot = json!(if version_at_least(subst.version, "2.1.323") { 1 } else { 2 });
                 }
                 super::tool_pool::fill_mcp_summary(&mut meta, subst.version, subst.pool);
             }
@@ -1141,8 +1149,26 @@ where
                         tokens,
                     );
                 }
+                // 2.1.323 起 `-p` 改按准备好的工具记录估：只算这条真正发出了 schema 的内建工具，延迟池里还没发过的不算，
+                // 有没算进去的就多报 `non_mcp_tools_tokens_excludes_unsent: true`（官方 `Z$i`：打印模式下 `gyn` 先准备了请求，
+                // 没进记录、也没建过条目的工具跳过）。`cap/auto-2.1.323-20261113-full` 六个 `-p` 会话都是 3197 + true；交互式不走
+                // 这条（没有那份准备），照旧按全部工具。工具数照旧数全部。
+                // 工具表未知（没有 `tools` 数组）时没法知道准备了哪些，照旧；已知为空（`tools: []`）就是 0。是否遗漏只看
+                // 实际启用、却没发出 schema 的内建工具（延迟池里宣告过的），与工具总数无关：`--tools Read` 这种受限工具集
+                // 都发了，不报。
+                let mut excludes_unsent = false;
+                if subst.sdk
+                    && version_at_least(subst.version, "2.1.323")
+                    && let Some((sent_tokens, unsent)) = subst.sent_schema
+                {
+                    tokens = sent_tokens;
+                    excludes_unsent = unsent;
+                }
                 o.insert("non_mcp_tools_count".into(), json!(count));
                 o.insert("non_mcp_tools_tokens".into(), json!(tokens));
+                if excludes_unsent {
+                    o.insert("non_mcp_tools_tokens_excludes_unsent".into(), json!(true));
+                }
             }
             // 2.1.293 起 haiku-4.5 当主模型时模型目录那条不带这两项（haiku 的默认档换成了 haiku-5-5，
             // `cap/auto-2.1.293-20261008-full` 的 haiku-4-5 会话只剩 `default_match`；2.1.291 时它还带着）。
@@ -1222,6 +1248,32 @@ where
                     "rendererEntryPath",
                     vec![("config_dir_kind", json!("unset"))],
                 );
+            }
+            // 2.1.323 删掉了 v1 的 MCP 客户端：SDK 代际恒为 v2，来源不再是 `growthbook` 而是 `default`；连接成功那条在
+            // `sdkGeneration` 之后多一项 `v1Compat`（`MCP_SDK_GENERATION=v1` 才为真，`cap/auto-2.1.323-20261113-full` 230 条
+            // 全是 `false`）；官方 MCP 地址表改一次 `GET /api/directory/server-urls` 取（`source: "bff"`，16 个交互式会话
+            // `url_count` 都是 1046、耗时 703–1152ms，原先分页拉 mcp-registry 是 294 / 2–4s）。
+            if version_at_least(subst.version, "2.1.323") {
+                match e.name.as_str() {
+                    "tengu_mcp_sdk_generation" => {
+                        if let Some(o) = meta.as_object_mut() {
+                            o.insert("source".into(), json!("default"));
+                        }
+                    }
+                    "tengu_mcp_server_connection_succeeded" if meta.get("v1Compat").is_none() => {
+                        insert_after(&mut meta, "sdkGeneration", vec![("v1Compat", json!(false))]);
+                    }
+                    "tengu_mcp_registry_fetch"
+                        if meta.get("source").and_then(|x| x.as_str()) == Some("legacy") =>
+                    {
+                        if let Some(o) = meta.as_object_mut() {
+                            o.insert("source".into(), json!("bff"));
+                            o.insert("url_count".into(), json!(1046));
+                            o.insert("duration_ms".into(), json!(703 + subst.seed % 450));
+                        }
+                    }
+                    _ => {}
+                }
             }
             // 2.1.312 起上下文宣告在 `updates_copy` 之后多一项 `assumed_utc`：只有日期那条、且客户端按 UTC 推当天日期
             // （远程会话、进程时区是 UTC、服务端开关 `tengu_peppy_nest` 开着）时为真，本机的交互式与 `-p` 恒为 `false`

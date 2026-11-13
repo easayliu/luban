@@ -223,7 +223,18 @@ fn touch_headers(
         "anthropic-version",
         carried("anthropic-version").or(Some(HeaderValue::from_static("2023-06-01"))),
     );
+    let ua = carried("user-agent");
     put("x-app", carried("x-app"));
+    // 2.1.323 起多一个 `x-claude-1p-request-class`：`cache_touch` 官方归 `main`（`qya` 里的 `tK` 集合），
+    // 见 [`config::cc_first_party_request_class`]。跟那条回复的客户端版本走。
+    if ua
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::proxy::body::cc_cli_version)
+        .is_some_and(|v| v >= (2, 1, 323))
+    {
+        put("x-claude-1p-request-class", Some(HeaderValue::from_static("main")));
+    }
     put("x-claude-code-request-class", Some(HeaderValue::from_static("auxiliary")));
     let rid = client_request_id
         .filter(|v| v.to_str().is_ok_and(crate::proxy::simulation::looks_like_uuid))
@@ -309,6 +320,24 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         assert_eq!(got, want);
+        // 2.1.323 起多一个 `x-claude-1p-request-class: main`，插在 `x-app` 之后。
+        let route323 = TouchRoute {
+            cred_id: 1,
+            headers: route
+                .headers
+                .iter()
+                .map(|(n, val)| match *n {
+                    "user-agent" => (*n, v("claude-cli/2.1.323 (external, cli)")),
+                    _ => (*n, val.clone()),
+                })
+                .collect(),
+        };
+        let out323 = touch_headers(&route323, "tok", Some(&rid));
+        let names: Vec<&str> = out323.keys().map(|k| k.as_str()).collect();
+        let at = names.iter().position(|n| *n == "x-app").unwrap();
+        assert_eq!(names[at + 1], "x-claude-1p-request-class");
+        assert_eq!(out323.get("x-claude-1p-request-class").unwrap(), "main");
+        assert!(out.get("x-claude-1p-request-class").is_none(), "2.1.300 不带");
         // 来访那个不是 uuid：换一个新的。
         let out = touch_headers(&route, "tok", Some(&v("sess-42")));
         let rid = out.get("x-client-request-id").unwrap().to_str().unwrap();

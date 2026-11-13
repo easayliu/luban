@@ -1,15 +1,15 @@
-//! 2.1.322 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.322 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.322 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.322 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.322 的 profile 表：2.1.322 来访的 beta 参照（[`cc_profile_at`]）。2.1.323 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.321（[`CC_PROFILES_2_1_321`]）完全相同**：两版原生层逐节相同（cch 不变），JS 层的改动全在
 /// Vertex 上的 fast mode（可用性按 provider 分 `fast_mode` / `vertex_fast_mode`、Vertex 区域限制、被拒冷却重试、
 /// 环境段那句 fast mode 在 Vertex 下改说法），官方直连这条路上没有变化。`cap/auto-2.1.322-20261110-full` 按场景逐条对
 /// `cap/auto-2.1.321-20261110-full`，system 各块（测试项目路径归一后）、头顺序、beta、body 键、工具定义都没变。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_322: &[CcProfile] = &[
     at_322(CC_PROFILES_2_1_321[0]),
     at_322(CC_PROFILES_2_1_321[1]),
     at_322(CC_PROFILES_2_1_321[2]),

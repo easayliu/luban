@@ -1513,7 +1513,26 @@ fn eval_request(
 
 /// `GET /mcp-registry/v0/servers?…`：无鉴权，UA 是 SDK 那份；官方按 `metadata.next_cursor`
 /// 翻页（抓包里翻了 4 页）。返回最后一页的状态。
+///
+/// 2.1.323 起官方 MCP 地址表改由一次 `GET /api/directory/server-urls` 取（无鉴权、不翻页，头形与原来那条逐项相同；
+/// `cap/auto-2.1.323-20261113-full` 交互式 15 条、`-p` 7 条），mcp-registry 那段代码整个删了。
 async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> KeepaliveResult {
+    if ctx.client_version().is_none_or(|v| v >= (2, 1, 323)) {
+        let url = format!("{}/api/directory/server-urls", config::UPSTREAM_BASE_URL);
+        let resp = axios(
+            client
+                .get(&url)
+                .header("User-Agent", ctx.cli_ua())
+                .header("Accept", config::AXIOS_ACCEPT),
+            "mcp_registry",
+        )
+        .send()
+        .await;
+        return match resp {
+            Ok(r) => KeepaliveResult::from_response(r, "mcp_registry").await,
+            Err(_) => KeepaliveResult::Failed,
+        };
+    }
     let base = format!(
         "{}/mcp-registry/v0/servers?version=latest&limit=100&visibility=commercial%2Cgsuite%2Centerprise%2Chealth",
         config::UPSTREAM_BASE_URL
@@ -2037,7 +2056,7 @@ impl HandshakeRunner {
         self.report("config", &[("policy_limits", policy_limits), ("settings", settings)]);
     }
 
-    /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页）/ bootstrap / code triggers（2.1.276 及以前，见
+    /// 收尾段：penguin / mcp_servers ×2 / mcp-registry（翻页；2.1.323 起换成一次 server-urls）/ bootstrap / code triggers（2.1.276 及以前，见
     /// [`handshake_code_triggers`]）/ downloads。抓包里这批与首条 messages 重叠，故 spawn 即可，不必挡着主请求。
     ///
     /// `fetch` 是这次 bootstrap 在 [`crate::proxy::client_data`] 里的进行中登记：bootstrap 那条回来（成功失败都算）就丢掉

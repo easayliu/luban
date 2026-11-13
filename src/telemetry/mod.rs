@@ -606,6 +606,11 @@ impl Telemetry {
                 if version_at_least(&identity.version, "2.1.317") {
                     meta["flags"] = json!(false);
                 }
+                // 2.1.323 末尾再多 `launcher`：那行命令是不是经启动器（`CLAUDE_CODE_RESUME_HINT_COMMAND`）给的；本机直接起的
+                // `claude` 恒 false（`cap/auto-2.1.323-20261113-full` 16 条都是）。
+                if version_at_least(&identity.version, "2.1.323") {
+                    meta["launcher"] = json!(false);
+                }
                 events.push((t0, identity.event("tengu_resume_hint_printed", t0, &ctx(t0), meta)));
             }
             // 配置缓存命中数随会话长短走：抓包里 7 秒的会话 3779、一小时的 11054。

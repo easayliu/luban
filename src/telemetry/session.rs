@@ -54,6 +54,11 @@ pub(super) struct Session {
     /// `api_per_turn_effort` / `mcp_late_tool_additions` / `api_kept_reminder_clear_at`，收尾时的
     /// `tengu_wire_shape_recorded`）。
     pub(super) first_main_done: bool,
+    /// 这个会话的第一条标题生成已经处理过：2.1.323 的 `wait_ms` 只给会话起头那一批（第一条标题与首条主线程），见
+    /// [`TurnFacts::startup_wait`]。标题多半先被扣在 [`State::presession`]、等主线程那条建好会话才补处理，补处理时
+    /// `started_at` 还是它自己的（`cap/auto-2.1.323-20261113-full` 标题 `00352` 比主线程 `00353` 早 13.871 秒），所以按
+    /// 「是不是第一条标题」认，不按时间窗认。
+    pub(super) first_title_done: bool,
     /// 主线程那份会话级 beta（[`session_betas`] 过滤出站头）。子代理那条支线上除 API 调用本身
     /// 外的事件报的都是它，见 `betas_session` 的取法。
     pub(super) main_betas: String,
@@ -1135,6 +1140,9 @@ pub(super) struct TurnFacts {
     /// 2.1.322：失败 Bash 与 5xx 的错误栈只换了打包块名（摘要、行列不变）；失败 Bash 照旧带 `error_constructor: "Rx"`，
     /// 5xx 不再带构造名（类名 `zmn`），别的事件键没变（`cap/auto-2.1.322-20261110-*`）。
     pub(super) v322: bool,
+    /// 2.1.323：失败 Bash 的栈摘要、行列、块名都换了，类名 `Rx` → `JR`；5xx 摘要与行列照旧、只换块名，仍不带构造名
+    /// （`cap/auto-2.1.323-20261113-*`）。
+    pub(super) v323: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
@@ -1182,6 +1190,10 @@ pub(super) struct TurnFacts {
     /// 见 [`Session::attachment_counts`]。
     pub(super) attachment_counts: Vec<(String, u32)>,
     pub(super) first_main: bool,
+    /// 2.1.323 起带了 sandy-plover 头的 `tengu_api_success` 报 `wait_ms`（拼头时等了多久，排在 `requestPrepareMs` 之后，
+    /// `requestPrepareMs` 也把它算进去）。会话起头那一批（第一条标题与首条主线程，[`Session::first_title_done`]）是
+    /// `Some(等待毫秒)`，同一会话同值；其余是 `None`，报 0（`cap/auto-2.1.323-20261113-full` 154 条里 144 条 0）。
+    pub(super) startup_wait: Option<u32>,
     pub(super) snapshot: Option<(&'static str, String)>,
     pub(super) sleepy: bool,
     /// 这条前面报一条 `tengu_heron_brook_applied`：服务端下发的那段文本的 `(len, fromClientData)`
@@ -1416,6 +1428,7 @@ impl Session {
             turn_retry_status: None,
             shell_snapshot_done: false,
             first_main_done: false,
+            first_title_done: false,
             main_betas: String::new(),
             main_requests: 0,
             first_prompt_tpl_done: false,

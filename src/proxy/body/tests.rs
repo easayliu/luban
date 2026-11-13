@@ -2683,12 +2683,16 @@ fn core_tool_stubs_are_profile_specific() {
     // 那几句（2.1.301 是 36629）；2.1.309 改写了 `root` 参数的说明（2.1.303 ~ 2.1.308 是 37253，+182）；
     // 2.1.311 改写了连接器那段、「artifact, not a document」那句与 `intent` 参数说明（2.1.309 ~ 2.1.310 是 37435，+367）；
     // 2.1.317 `list` 多 `page_token` 参数（2.1.311 ~ 2.1.316 是 37802，+163，`cap/auto-2.1.317-20261103-full/00066`）。
-    assert_eq!(d(opus, "Artifact").chars().count(), 37965);
+    // 2.1.323 加了电子表格那一类（「a spreadsheet for people to fill in…」、`.xlsx`、`intent` 里的 `a spreadsheet`；
+    // 2.1.317 ~ 2.1.322 是 37965，+255，`cap/auto-2.1.323-20261113-full/00064`）。
+    assert_eq!(d(opus, "Artifact").chars().count(), 38220);
     // 2.1.317 改写了 `mode` 里 `delete` 那句与 `short_code` 的说明（2.1.316 是 1326，+84）。
     assert_eq!(d(opus, "ShareOnboardingGuide").chars().count(), 1410);
     // 2.1.309 的 `# Creating pull requests` 段也加了那句 `@name` 提示（2.1.308 及以前是 11913，+283）；
     // 2.1.311 同样改写了开头那句工作目录的说明（2.1.309 ~ 2.1.310 是 12196，+161）。
-    assert_eq!(d(haiku, "Bash").chars().count(), 12357);
+    // 2.1.323 提交说明里「可能含密钥的文件」多列一项 `.claude/settings.local.json`（2.1.311 ~ 2.1.322 是 12357，+29，
+    // `cap/auto-2.1.323-20261113-full/00576`）。
+    assert_eq!(d(haiku, "Bash").chars().count(), 12386);
     // 2.1.312 的 AskUserQuestion 在「Preview feature」前多一段「The user may see only the question
     // dialog…」，四族都加（`cap/auto-2.1.312-20261028-full/00069`、haiku-4.5 `00603`；2.1.311 是 4926 / 4669，+299）。
     assert_eq!(d(opus, "AskUserQuestion").chars().count(), 5225);
@@ -2832,7 +2836,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.322."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.323."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -3883,7 +3887,8 @@ fn agent_description_follows_the_lucky_cerf_model_list() {
 /// `tengu_lucky_cerf_text`：cerf 那版里客户端内置的四段正文整段换成号下发的那段，前后（「Launch a
 /// new agent…」到「## When to use」、「When you do spawn…」之后）不动；没下发用内置的，即资产原样。
 /// `cap/auto-2.1.299-20261014-full/00246`（sonnet-5-5）的 `Agent` 说明就是资产里这段换成那个号 v4 第 1 组
-/// 的正文（`assets/cc_agent_cerf_text_v4.txt`），3141 字符。
+/// 的正文（`assets/cc_agent_cerf_text_v4.txt`），3141 字符；2.1.323 起资产开头那句「listed in <system-reminder> messages」
+/// 换成「listed in messages from the system」（[`crate::proxy::body::CC_REMINDER_WORDING`]），少 2 个字符。
 #[test]
 fn agent_cerf_text_replaces_the_builtin_paragraphs() {
     use crate::proxy::lucky_cerf::AgentDesc;
@@ -3901,7 +3906,7 @@ fn agent_cerf_text_replaces_the_builtin_paragraphs() {
     assert_eq!(agent(&AgentDesc::Cerf(None)), asset);
     let v4 = include_str!("../../assets/cc_agent_cerf_text_v4.txt").trim();
     let got = agent(&AgentDesc::Cerf(Some(v4.into())));
-    assert_eq!(got.chars().count(), 3141, "与抓包那条等长");
+    assert_eq!(got.chars().count(), 3139, "与抓包那条等长（去掉 323 的说法差）");
     assert!(got.contains("## When to use\n\nA fresh agent costs more than it looks."));
     assert!(got.contains("hand it off.\n\nA fork runs in the background"), "后面那段接得上");
     assert!(!got.contains("Several at once spend tokens in a burst"), "内置那句换掉了");
@@ -3911,6 +3916,66 @@ fn agent_cerf_text_replaces_the_builtin_paragraphs() {
         &*crate::proxy::cc_tools_core_for(opus, &AgentDesc::Cerf(Some(v4.into())), true),
         &*crate::proxy::cc_tools_core_for(opus, &AgentDesc::Cerf(Some(v4.into())), true),
     ));
+}
+
+/// 2.1.323 的 `Skill` / `Agent` / `Workflow` 说明按模型选说法（[`super::CC_REMINDER_WORDING`]）：接受中途 system 消息的
+/// opus-5-5 / sonnet-5-5 / fable / haiku-5-5 用资产里的新说法（`cap/auto-2.1.323-20261113-full` 主线程逐字节对过），
+/// `claude-sonnet-5` / `claude-opus-4-8` 退回旧说法；haiku-4.5 的资产本来就是旧说法。
+#[test]
+fn reminder_wording_follows_the_model() {
+    use config::CcProfileKind::*;
+    let wording = |kind, model: &str| {
+        let profile = config::cc_profile(kind);
+        let mut v = serde_json::json!({"model": model, "messages": [], "tools": []});
+        assert!(super::inject_cc_tools(&mut v, profile, true, false, who()), "{model}");
+        let desc = |name: &str| {
+            v["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        (desc("Skill"), desc("Workflow"), desc("Agent"))
+    };
+    for (kind, model) in [
+        (MainOpus, "claude-opus-5-5"),
+        (MainSonnet, "claude-sonnet-5-5"),
+        (MainFable, "claude-fable-5-1"),
+        (MainHaiku55, "claude-haiku-5-5"),
+    ] {
+        assert!(!super::reminder_wording_legacy(config::cc_profile(kind), model), "{model}");
+        let (skill, workflow, agent) = wording(kind, model);
+        assert!(skill.contains("Available skills appear in a listing from the system"), "{model}");
+        assert!(workflow.contains("(a message from the system confirms it)"), "{model}");
+        assert!(
+            agent.contains("listed in messages from the system in the conversation"),
+            "{model}"
+        );
+        assert!(!format!("{skill}{workflow}{agent}").contains("system-reminder"), "{model}");
+    }
+    for (kind, model) in [(MainSonnet, "claude-sonnet-5"), (MainOpus, "claude-opus-4-8")] {
+        assert!(super::reminder_wording_legacy(config::cc_profile(kind), model), "{model}");
+        let (skill, workflow, agent) = wording(kind, model);
+        assert!(skill.contains("Available skills appear in a system-reminder listing"), "{model}");
+        assert!(workflow.contains("(you'll see a system-reminder confirming it)"), "{model}");
+        assert!(workflow.contains("(a system-reminder confirms it)"), "{model}");
+        assert!(
+            agent.contains("listed in <system-reminder> messages in the conversation"),
+            "{model}"
+        );
+    }
+    // 新旧两套逐条可逆：换回旧说法后再换新，等于资产原样。
+    let core = crate::proxy::cc_tools_core(config::cc_profile(MainOpus), false);
+    let mut back = super::legacy_reminder_wording(core);
+    for t in back.iter_mut() {
+        if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
+            let mut d = d.to_owned();
+            for (new, old) in super::CC_REMINDER_WORDING {
+                d = d.replace(old, new);
+            }
+            t["description"] = serde_json::Value::from(d);
+        }
+    }
+    assert_eq!(back, core);
 }
 
 /// 客户端把 14 个全声明了，但次序不是官方的、其中一条键序不同（内容全同）：出站仍要是
@@ -5139,7 +5204,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 322)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 323)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

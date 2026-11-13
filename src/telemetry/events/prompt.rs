@@ -513,7 +513,12 @@ impl EventBuilder<'_> {
                     if v311 {
                         let h = i64::from(env.req_hash % 100);
                         let v316 = env.f.v316;
-                        let run = bash_meta_v311(&mut meta, cmd, Some(ShellUsage::typed(h)), v316);
+                        let run = bash_meta_v311(
+                            &mut meta,
+                            cmd,
+                            Some(ShellUsage::typed(h).with_spawn(env.f.v323)),
+                            v316,
+                        );
                         // 2.1.315 起同样多那几项；`!` 跑的没有 tool_use id，计量器只记一次在跑、不比重复
                         // （`cap/auto-2.1.316-20261031-full` 那条没有 `repeat` 那组）。
                         if v316 {

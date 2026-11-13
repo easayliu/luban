@@ -696,6 +696,7 @@ impl EventBuilder<'_> {
             v319,
             v321,
             v322,
+            v323,
             bash_metered,
             prompt_seq,
             ..
@@ -853,6 +854,7 @@ impl EventBuilder<'_> {
             let usage = (v311 && !backgrounded).then(|| {
                 let h = (i64::from(req_hash % 1_000) + i).rem_euclid(100);
                 ShellUsage::from_external(bash_timing.map_or(0, |t| t.external), h)
+                    .with_spawn(env.f.v323)
             });
             // meta 带着这条请求的模型（2.1.299 起）：顶层 `betas` 按这个模型取，子代理跑 haiku 时是 haiku 那份
             // （`cap/auto-2.1.308-20261022-gaps` claude-code-guide 里那条 Bash，事件与 Datadog 都是 6 项）。
@@ -1101,7 +1103,13 @@ impl EventBuilder<'_> {
             // 同 2.1.291 那次）。
             // 2.1.322（`cap/auto-2.1.322-20261110-bashfail` 与全量包里两条，同值；同一次跑的 2.1.321 对照仍是 0cacd2d8980f）
             // 摘要、行列、类名都没变，只换了块名。
-            if v322 {
+            // 2.1.323（`cap/auto-2.1.323-20261113-bashfail` 与全量包里两条，同值；同一次跑的 2.1.322 对照仍是 0cacd2d8980f）
+            // 摘要、行列、块名都换了，类名压缩后是 `JR`（照样过构造名校验）。
+            if v323 {
+                err["error_constructor"] = json!("JR");
+                err["error_stack_hash"] = json!("46a1ab4152b6");
+                err["error_top_frame"] = json!("chunk-2x9ma4k7.js:3673:9499");
+            } else if v322 {
                 err["error_constructor"] = json!("Rx");
                 err["error_stack_hash"] = json!("0cacd2d8980f");
                 err["error_top_frame"] = json!("chunk-9r1hbf9p.js:3632:9537");

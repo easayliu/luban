@@ -10,6 +10,9 @@
 //! 2.1.317 起客户端默认值变了（`ZT()`）：没设 `CLAUDE_CODE_DISABLE_MCP_TASKS` 时读
 //! `k("tengu_glowing_lark", entrypoint === "cli" && !CLAUDE_CODE_REMOTE && !diskless)`——交互式终端会话读不到也按开。
 //! 握手一律按交互式（bootstrap 带 `entrypoint=cli`）发，所以 ≥2.1.317 没下发这一项时按开，下发了照下发。
+//!
+//! 2.1.323 删掉了 v1 的 MCP 客户端（`MCP_SDK_GENERATION=v1` 也只记一笔 `v1Compat`，照样走 v2），也就不再读
+//! `tengu_brindle_causeway`：只看 `tengu_glowing_lark`。
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -36,6 +39,8 @@ pub(crate) fn tasks_extension(cred_id: i64, version: Option<(u64, u64, u64)>) ->
     }
     let default_on = version.is_none_or(|v| v >= (2, 1, 317));
     let (glowing, sdk_v2) = FLAGS.read().get(&cred_id).copied().unwrap_or((None, true));
+    // 2.1.323 起 SDK 恒为 v2，`tengu_brindle_causeway` 不再读。
+    let sdk_v2 = sdk_v2 || version.is_none_or(|v| v >= (2, 1, 323));
     glowing.unwrap_or(default_on) && sdk_v2
 }
 
@@ -68,6 +73,7 @@ mod tests {
         );
         assert!(!tasks_extension(id, Some((2, 1, 312))), "SDK 退回 v1 就不带");
         assert!(!tasks_extension(id, Some((2, 1, 317))), "2.1.317 也一样");
+        assert!(tasks_extension(id, Some((2, 1, 323))), "2.1.323 删了 v1，不再看 brindle_causeway");
         note_eval(id, &features(serde_json::json!({"features": {}})));
         assert!(
             !tasks_extension(id, Some((2, 1, 312))),

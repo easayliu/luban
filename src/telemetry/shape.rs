@@ -173,6 +173,18 @@ pub(super) struct RequestShape {
     pub(super) total_tokens_max: Option<u64>,
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
+    /// 这条实际发出了 schema 的内建工具（非延迟、非 MCP）按官方工具记录估的 token 和（[`recorded_schema_tokens`]）：
+    /// 2.1.323 起 `-p` 的 `tengu_context_size.non_mcp_tools_tokens` 只算这些。
+    pub(super) sent_schema_tokens: u64,
+    /// 工具表是已知的（体里 `tools` 是数组，空数组也算——那就是「已知为空」，计 0）：只有这时才按 [`Self::sent_schema_tokens`]
+    /// 报；没有 `tools` 键或不是数组（线程续轮的增量体、怪值）算未知，照旧。
+    pub(super) tools_known: bool,
+    /// 已启用却没发出 schema 的内建工具：这一轮或之前宣告进延迟池、但不在这条 `tools` 里的非 MCP 工具名
+    /// （[`super::tool_pool::PoolDelta::builtin_added`]）。官方 `excludes_unsent` 看的是实际启用的工具里有没有缺 schema、
+    /// 又没建过条目的，与工具总数无关：`--tools Read` 这种受限工具集全都发了，就是假。
+    pub(super) unsent_builtin: bool,
+    /// 带着 schema 发出去的内建工具名（延迟加载但已带 schema 的也算，占位不算），判 [`Self::unsent_builtin`] 用。
+    sent_tool_names: Vec<String>,
     pub(super) tools_hash: String,
     /// 工具表**内容**的摘要（各非延迟工具去掉 `cache_control` 后的紧凑 JSON，按先后；延迟占位与长度表同样不算）：
     /// tether 判工具变没变用它（官方 `v4` 比的是逐项条目，不是长度表），描述或 schema 改了而长度没变的也认得出。线程续轮的
@@ -1153,6 +1165,11 @@ pub(super) fn error_trace(
         ("2.1.322", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-hrr4cssb.js:5:1510"))
         }
+        // 2.1.323 照旧只换块名，仍不带 `error_constructor`（`cap/auto-2.1.323-20261113-retry`：两条 `tengu_api_retry` 与
+        // 收尾的 `tengu_api_error`）。
+        ("2.1.323", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-fmjm3js0.js:5:1510"))
+        }
         _ => None,
     }
 }
@@ -1203,6 +1220,34 @@ pub(super) fn tail_tokens_est(m: &Value) -> u64 {
 /// 官方那些「长度」都是 JavaScript 的 `String.length`，即 UTF-16 码元数：中文一个字算 1、
 /// emoji 算 2，而不是 UTF-8 字节数或码点数（`cap/2.1.260-2/00057`：requestBodyChars 101459，
 /// 同一份 body 的字节数是 101908）。
+/// 延迟池的占位工具：只是让 `tools` 里有一条延迟项，不是可用的工具。
+const DEFERRED_PLACEHOLDER: &str = "DeferredToolPlaceholder";
+
+/// 2.1.323 `-p` 的 `tengu_context_size` 按工具记录估一条已发工具的 schema：`round(紧凑 JSON 长度 / 4)`。官方计的是工具
+/// 原始 schema 的转换结果（`Q2(inputSchema)`），出站那份是 `LMn` 处理过的——没开 agent teams 时 `Agent` 删掉了
+/// `name` / `team_name` / `mode` 三个属性，记录里还在，这里把它们的长度补回去（526 字符：两段「Deprecated; ignored.」
+/// 说明、名字的正则与六个权限模式枚举，`cap/auto-2.1.323-20261113-full` 六个 `-p` 会话首条 12 个工具据此逐个求和正好
+/// 3197，不补是 3066）。`ExitPlanMode` 删的 `launchSwarm` / `teammateCount` 在 `-p` 里不出现，`_host` 只在开了远程机器时
+/// 才有，都不补。
+pub(super) fn recorded_schema_tokens(name: &str, schema: &Value) -> u64 {
+    const AGENT_TEAM_PROPS: &str = concat!(
+        r#","name":{"description":"Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running.","#,
+        r#""type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}"#,
+        r#","team_name":{"description":"Deprecated; ignored. The session has a single implicit team.","type":"string"}"#,
+        r#","mode":{"description":"Deprecated; ignored. Subagents inherit the parent session's permission mode; "#,
+        r#"agent-definition frontmatter may override it.","type":"string","#,
+        r#""enum":["acceptEdits","auto","bypassPermissions","default","dontAsk","plan"]}"#,
+    );
+    let mut len = js_len(&schema.to_string());
+    if name == "Agent"
+        && let Some(props) = schema.get("properties").and_then(|p| p.as_object())
+        && !["name", "team_name", "mode"].iter().any(|k| props.contains_key(*k))
+    {
+        len += js_len(AGENT_TEAM_PROPS);
+    }
+    (len as f64 / 4.0).round() as u64
+}
+
 pub(super) fn js_len(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -1702,6 +1747,7 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     // 官方报 `44136fa355b3`，正是 sha256("{}") 的前缀（`cap/2.1.260-2` 标题生成那条）。
     let mut lens = Map::new();
     shape.tools_declared = v.get("tools").is_some();
+    shape.tools_known = v.get("tools").is_some_and(|t| t.is_array());
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         shape.tools_count = tools.len();
         let n = serde_json::to_string(tools).map_or(0, |j| js_len(&j));
@@ -1709,6 +1755,17 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         shape.omitted_tools_bytes += n;
         shape.tools_bytes += n;
         for t in tools {
+            // 2.1.323 `-p` 的 `context_size` 计的是带着 schema 发出去的内建工具，与长度表的延迟过滤是两回事：延迟加载的工具
+            // 也可能已经带着完整 schema（`cap/auto-2.1.323-20261113-full/00217` 里的 ExitPlanMode / WebFetch / WebSearch，合计
+            // 473），照算；只有真正的占位（`DeferredToolPlaceholder`）不算，它不是一个可用的工具。
+            if let Some(name) = t.get("name").and_then(|n| n.as_str())
+                && !name.starts_with("mcp__")
+                && name != DEFERRED_PLACEHOLDER
+                && let Some(schema) = t.get("input_schema")
+            {
+                shape.sent_schema_tokens += recorded_schema_tokens(name, schema);
+                shape.sent_tool_names.push(name.to_owned());
+            }
             // 延迟加载的占位工具计入 `toolsCount` / `deferredToolsCount`，但不进长度表：官方
             // 16 个工具的表只有 15 项，`toolsCharLength` 也不含它（差的 204 正是占位那条）。
             if t.get("defer_loading").and_then(|d| d.as_bool()) == Some(true) {
@@ -1771,6 +1828,16 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         shape.pool_delta = scan.delta.map(Arc::new);
         shape.pool_mcp = scan.mcp.map(Arc::new);
         shape.pool_total_tokens = scan.total_tokens;
+        // 先把这一轮的工具池变更叠到账本上（宣告的加进来、撤回的扣掉），再看**仍然启用**的内建工具里有没有没带 schema
+        // 发出去的：恢复会话把工具集收紧成 Read 时，历史宣告过的 WebSearch 这一轮明确撤回了，不算遗漏。
+        shape.unsent_builtin = {
+            let mut current = shape.pool_history.as_deref().cloned().unwrap_or_default();
+            if let Some(d) = shape.pool_delta.as_deref() {
+                current.apply(d);
+            }
+            let sent = &shape.sent_tool_names;
+            current.builtin_announced().any(|n| !sent.iter().any(|s| s == n))
+        };
         shape.settle_pool();
         let last_assistant =
             msgs.iter().rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));

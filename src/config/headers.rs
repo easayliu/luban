@@ -141,6 +141,9 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     "anthropic-usage-limit",
     "anthropic-version",
     "x-app",
+    // 2.1.323 起（`cap/auto-2.1.323-20261113-full`），与 `request-class` 同闸、每条 `/v1/messages` 与 `count_tokens`
+    // 都带，落在 `x-app` 与 `x-claude-code-agent-id` 之间，见 [`cc_first_party_request_class`]。
+    "x-claude-1p-request-class",
     // 2.1.277 起的四个 `x-claude-code-*` 头（`cap/2.1.277`）：子代理带 `agent-id` / `agent-type`
     // （`00049`），工具续轮带 `prev-tool-durations`（`00026`），每条都带 `request-class`；四个都
     // 落在 `x-app` 与 `x-client-request-id` 之间、按这个先后。模拟路径只写 `request-class`

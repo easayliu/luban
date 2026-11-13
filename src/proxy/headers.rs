@@ -701,6 +701,14 @@ pub(crate) fn official_headers(sim: &Simulation) -> HeaderMap {
     // （[`config::CcProfile::request_class`]）；线上位置由 [`config::CC_HEADER_ORDER`] 归到
     // `x-app` 之后。
     out.insert("x-claude-code-request-class", HeaderValue::from_static(sim.profile.request_class));
+    // 2.1.323 起同一道闸下多一个 `x-claude-1p-request-class`（[`config::cc_first_party_request_class`]），
+    // 线上位置由 [`config::CC_HEADER_ORDER`] 归到 `x-app` 之后。
+    if super::parse_version(sim.profile.version).is_some_and(|v| v >= (2, 1, 323)) {
+        out.insert(
+            "x-claude-1p-request-class",
+            HeaderValue::from_static(config::cc_first_party_request_class(sim.profile.kind)),
+        );
+    }
     // 2.1.285 起每条 messages 都带（[`config::CC_DISPATCH_ID`]），额度探测那条不带
     // （`cap/2.1.285/00017`）。线上位置由 [`config::CC_HEADER_ORDER`] 归到
     // `anthropic-dangerous-direct-browser-access` 之后。

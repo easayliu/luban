@@ -490,6 +490,14 @@ impl EventBuilder<'_> {
                     vec![("creditRetryStateless", json!(false))],
                 );
             }
+            // 2.1.323：`creditRetryStateless` 后多一项（`cap/auto-2.1.323-20261113-full` 111 条全是 false）。
+            if env.f.v323 {
+                insert_after(
+                    &mut decision,
+                    "creditRetryStateless",
+                    vec![("refusalRetryHeldStateless", json!(false))],
+                );
+            }
             // 2.1.319：`changedExtraBody` 后多 `toolsHashKept`——这个来源上一份状态在、工具逐项没变（官方 `v4` 复用旧哈希，
             // `tether_decide` 单独记）。`cap/auto-2.1.319-20261106-full`：`first_request` 那条 false，续轮、`config_changed` 都是
             // true；`/clear` 之后那条（`cap/auto-2.1.319-20261106-confirm/2.1.319/00092`）上一份状态已清，false。

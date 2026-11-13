@@ -752,6 +752,8 @@ impl Telemetry {
         let v321 = version_at_least(&version, "2.1.320");
         // 2.1.322：错误栈换块，见 [`TurnFacts::v322`]。
         let v322 = version_at_least(&version, "2.1.322");
+        // 2.1.323：错误栈换了摘要、行列、块名与类名，见 [`TurnFacts::v323`]。
+        let v323 = version_at_least(&version, "2.1.323");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -814,6 +816,15 @@ impl Telemetry {
         let ide_detect = sess.take_ide_detect(&version, shape.sdk, call.started_at);
         let attachment_counts = sess.attachment_counts.clone();
         let first_main = v280 && is_main && !failed && !sess.first_main_done;
+        // 2.1.323：拼 sandy-plover 头时要等这个会话头一回查盘（官方 `kf` 里的 `lDs`），会话起头并发出去的那一批
+        // （第一条标题与首条主线程）共用这一次等待，报同一个 `wait_ms`；之后的都是 0（见 [`TurnFacts::startup_wait`]）。
+        // 标题常被扣在 presession 里、主线程那条建好会话才补处理，所以按「第一条标题」认，不看时间。
+        let first_title = kind == super::kind::Kind::Title && !sess.first_title_done;
+        if kind == super::kind::Kind::Title {
+            sess.first_title_done = true;
+        }
+        let startup_wait = (v323 && call.chain_tools_used_header() && (first_title || first_main))
+            .then(|| startup_wait_ms(&session_id, shape.sdk));
         if first_main {
             sess.first_main_done = true;
         }
@@ -1246,6 +1257,7 @@ impl Telemetry {
             v319,
             v321,
             v322,
+            v323,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,
@@ -1270,6 +1282,7 @@ impl Telemetry {
             ide_detect,
             attachment_counts,
             first_main,
+            startup_wait,
             snapshot,
             sleepy,
             heron,
@@ -2481,4 +2494,17 @@ fn cold_continuation(shape: &RequestShape) -> bool {
         && (shape.thread_type.as_deref() == Some("continue")
             || (shape.diag_prev_message_id.is_some()
                 && (!shape.tool_uses.is_empty() || !shape.orphan_results.is_empty())))
+}
+
+/// 2.1.323 会话起头那一批的 `wait_ms`（[`TurnFacts::startup_wait`]）：按会话 id 取一个稳定值，同一批的几条同值。
+/// `cap/auto-2.1.323-20261113-full` 交互式 16 个会话 11–40ms（多在 15–24），`-p` 六个会话 1–7ms（多为 1–2）。
+fn startup_wait_ms(session_id: &str, sdk: bool) -> u32 {
+    let h = session_id.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+    if sdk {
+        // 1、1、1、1、2、7：多数 1–2。
+        [1, 1, 1, 2, 2, 7][(h % 6) as usize]
+    } else {
+        // 15–24 占多，偶有 11 / 33 / 40。
+        [11, 15, 15, 16, 16, 17, 17, 18, 18, 20, 22, 24, 33, 40][(h % 14) as usize]
+    }
 }

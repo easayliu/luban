@@ -308,6 +308,65 @@ pub(crate) fn cc_tools_core_for(
     }
 }
 
+/// 2.1.323 起 `Skill` / `Agent` / `Workflow` 说明里提到 `system-reminder` 的四处，按模型换成「from the system」的说法
+/// （官方 `O_t` → `A1t(model)`：模型接受中途 system 消息、且不是 `claude-sonnet-5` / `claude-opus-4-8`）。左边是新说法
+/// （资产里存的，`cap/auto-2.1.323-20261113-full` opus / sonnet / fable / haiku-5-5 主线程），右边是旧说法（haiku-4.5 那份，
+/// 以及 2.1.322 及以前）。haiku-4.5 有自己的资产（[`CC_TOOLS_CORE_HAIKU`]），本来就是旧说法。
+pub(in crate::proxy) const CC_REMINDER_WORDING: &[(&str, &str)] = &[
+    (
+        "Available skills appear in a listing from the system",
+        "Available skills appear in a system-reminder listing",
+    ),
+    (
+        "(you'll see a message from the system confirming it)",
+        "(you'll see a system-reminder confirming it)",
+    ),
+    ("(a message from the system confirms it)", "(a system-reminder confirms it)"),
+    (
+        "listed in messages from the system in the conversation",
+        "listed in <system-reminder> messages in the conversation",
+    ),
+];
+
+/// 这条模拟请求的工具说明该用旧说法（[`CC_REMINDER_WORDING`] 右边）：版本早于 2.1.323，或这个模型不接受中途 system
+/// 消息（出站 beta 里没有 `mid-conversation-system` / 它的 `clear-at` 子项——与官方 `SE(model)` 同源，抓包里两者逐条
+/// 对应），或是官方点名排除的 `claude-sonnet-5` / `claude-opus-4-8`。haiku-4.5 的资产不受影响（没有新说法可换）。
+pub(in crate::proxy) fn reminder_wording_legacy(profile: &config::CcProfile, model: &str) -> bool {
+    if parse_version(profile.version).is_none_or(|v| v < (2, 1, 323)) {
+        return true;
+    }
+    let beta = config::cc_model_beta(profile, model);
+    let mid = beta.split(',').map(str::trim).any(|b| {
+        b == config::CC_BETA_MID_CONVERSATION_SYSTEM
+            || b == config::CC_BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT
+    });
+    let canon = crate::proxy::curious_tower::canonical_model(model);
+    let canon = canon.trim_end_matches("[1m]");
+    !mid || canon == "claude-sonnet-5" || canon == "claude-opus-4-8"
+}
+
+/// 把工具说明里的新说法换回旧说法（[`CC_REMINDER_WORDING`]），只动 `Agent` / `Skill` / `Workflow` 的 `description`。
+pub(in crate::proxy) fn legacy_reminder_wording(
+    tools: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            if matches!(t["name"].as_str(), Some("Agent" | "Skill" | "Workflow"))
+                && let Some(desc) = t.get("description").and_then(|d| d.as_str())
+            {
+                let mut d = desc.to_owned();
+                for (new, old) in CC_REMINDER_WORDING {
+                    d = d.replace(new, old);
+                }
+                t["description"] = serde_json::Value::from(d);
+            }
+            t
+        })
+        .collect()
+}
+
 /// [`inject_cc_tools`] 会往这条请求里**补**哪几个工具名（客户端没声明的那些）；**不改体**。
 ///
 /// 只给注入那一步用（[`inject_cc_tools`]）。流水**不**拿它预判：
@@ -504,6 +563,11 @@ pub(super) fn inject_cc_tools(
     let desc =
         crate::proxy::lucky_cerf::agent_desc(who.cred_id, who.session, &model, profile.version);
     let stubs = cc_tools_core_for(profile, &desc, trim);
+    let stubs = if reminder_wording_legacy(profile, &model) {
+        CcTools::Shared(legacy_reminder_wording(&stubs).into())
+    } else {
+        stubs
+    };
     let official_names: Vec<&str> =
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
     let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);
