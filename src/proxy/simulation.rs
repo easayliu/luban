@@ -99,6 +99,12 @@ pub(crate) struct Simulation {
     /// 来访带了 `context-1m`、但模拟版本的官方客户端对这个模型不发它（原生 1M，见 [`context_1m_beta_wanted`]）：
     /// 出站把来访那一项去掉。原生 1M 的模型窗口本来就是 1M，去掉它不改语义，留着则是官方不产生的形态。
     pub(super) strip_context_1m: bool,
+    /// 出站头 `x-claude-1p-request-class` 的取值（2.1.323 起，[`config::cc_first_party_request_class`]）。按 profile 取，
+    /// 只有「猜下一句」（[`super::CcRequestKind::Suggestion`]）例外：它的体与主线程同形（同一份 system 与工具），旧头
+    /// `x-claude-code-request-class` 也是 `main`，但官方这个头报 `followup-generation`
+    /// （`cap/auto-2.1.323-20261113-full` 38 条）。标题、无工具这几类不跟着改：模拟路径把它们整条重建成主线程形态，
+    /// 头也得是主线程的。
+    pub(super) first_party_class: &'static str,
     /// 来访**整个没带 `tools` 键**时也按主线程补齐官方工具（开关 `fill_absent_tools`，见
     /// [`crate::store::ForwardFlags::fill_absent_tools`]）。关着时这类请求一个工具都不注——
     /// 带了 `tools`（哪怕是空数组）的照旧补缺，与这项无关。
@@ -411,8 +417,9 @@ impl Simulation {
         let inbound_beta = inbound_beta_list(headers);
         // `<total_tokens>` 那一档按会话钉住，只让主线程那条来钉（官方按启动时的主模型读 `client_data`）：同一会话里
         // 抢先到的标题、无工具侧查询多半是别的模型，只看不钉，见 [`super::lapis_anchor::session_mode`]。
+        let cc_kind = super::CcRequestKind::of(v, &inbound_beta);
         let main_thread = matches!(
-            super::CcRequestKind::of(v, &inbound_beta),
+            cc_kind,
             super::CcRequestKind::Main
                 | super::CcRequestKind::Fork
                 | super::CcRequestKind::Suggestion
@@ -461,6 +468,11 @@ impl Simulation {
             env,
             context_1m,
             strip_context_1m: inbound_1m && !wants_1m,
+            first_party_class: if cc_kind == super::CcRequestKind::Suggestion {
+                "followup-generation"
+            } else {
+                config::cc_first_party_request_class(profile.kind)
+            },
             lapis,
             fill_absent_tools: flags.fill_absent_tools,
             trim_tools: flags.sim_trim_tools,

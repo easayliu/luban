@@ -1096,6 +1096,29 @@ fn simulates_cc_agrees_with_detect() {
     assert!(!agrees(&plain, &cc_ua, sim_off), "开关关着一律不模拟");
 }
 
+/// 2.1.323 的 `x-claude-1p-request-class`：被接管的「猜下一句」报 `followup-generation`（官方 38 条都是），旧头照旧
+/// `main`；普通对话与不带工具的请求整条按主线程重建，两个头都是 `main`。
+#[test]
+fn simulated_suggestion_reports_followup_generation() {
+    let class = |body: &str| {
+        let body = Bytes::from(body.to_string());
+        let sim = detect_for(&body, all_on()).unwrap();
+        let h = crate::proxy::official_headers(&sim);
+        let get = |n: &str| h.get(n).unwrap().to_str().unwrap().to_owned();
+        (get("x-claude-1p-request-class"), get("x-claude-code-request-class"))
+    };
+    let tools = r#""tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}]"#;
+    let suggestion = format!(
+        r#"{{"model":"claude-opus-5-5","max_tokens":8,{tools},"messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":"hello"}},{{"role":"user","content":"[SUGGESTION MODE: Suggest what the user might naturally type next.]"}}]}}"#
+    );
+    assert_eq!(class(&suggestion), ("followup-generation".into(), "main".into()));
+    let plain = format!(
+        r#"{{"model":"claude-opus-5-5","max_tokens":8,{tools},"messages":[{{"role":"user","content":"hi"}}]}}"#
+    );
+    assert_eq!(class(&plain), ("main".into(), "main".into()));
+    assert_eq!(class(PLAIN_BODY), ("main".into(), "main".into()), "无工具的照主线程重建");
+}
+
 /// auto 模式的安全分类：带不带 billing header 都是官方请求，不进模拟（线上 2.1.284/285/294/296
 /// 关掉 attribution header 的客户端 system 只有「提示词 + Session Context」两块，曾被当第三方
 /// 重建成主线程体）。少任何一项（beta、块内容、body 形态）照旧模拟。

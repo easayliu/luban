@@ -1511,6 +1511,9 @@ fn eval_request(
 
 // ---------- 会话启动握手（每个新会话一次） ----------
 
+/// `server-urls` 回包最多读这么多：2026-11 解压后约 60KB（一千来条地址），留足余量。
+const SERVER_URLS_READ_CAP: usize = 4 * 1024 * 1024;
+
 /// `GET /mcp-registry/v0/servers?…`：无鉴权，UA 是 SDK 那份；官方按 `metadata.next_cursor`
 /// 翻页（抓包里翻了 4 页）。返回最后一页的状态。
 ///
@@ -1528,10 +1531,21 @@ async fn handshake_mcp_registry(client: &wreq::Client, ctx: &KeepaliveCtx) -> Ke
         )
         .send()
         .await;
-        return match resp {
-            Ok(r) => KeepaliveResult::from_response(r, "mcp_registry").await,
-            Err(_) => KeepaliveResult::Failed,
+        // 结果记给遥测那条 `tengu_mcp_registry_fetch`（[`crate::proxy::server_urls`]）：取到了报去重后的条数，没取到报失败。
+        use crate::proxy::server_urls::{self, Fetch};
+        let note = |f: Fetch| server_urls::note(ctx.cred_id, &ctx.session_id, f);
+        let Ok(r) = resp else {
+            note(Fetch::Failed);
+            return KeepaliveResult::Failed;
         };
+        let status = r.status().as_u16();
+        if !r.status().is_success() {
+            note(Fetch::Failed);
+            return KeepaliveResult::from_response(r, "mcp_registry").await;
+        }
+        let body = read_body_capped(r, SERVER_URLS_READ_CAP).await;
+        note(server_urls::count(&body).map_or(Fetch::Failed, Fetch::Ok));
+        return KeepaliveResult::from_status(status);
     }
     let base = format!(
         "{}/mcp-registry/v0/servers?version=latest&limit=100&visibility=commercial%2Cgsuite%2Centerprise%2Chealth",

@@ -503,6 +503,9 @@ pub(super) struct Subst<'a> {
     /// 空数组也算）时是 `Some((实际发出 schema 的内建工具按工具记录估的 token, 有没有已启用却没发出 schema 的内建工具))`，
     /// 未知是 `None`、照旧按全部工具报。
     pub(super) sent_schema: Option<(u64, bool)>,
+    /// 2.1.323 起 `tengu_mcp_registry_fetch` 报的那次取官方 MCP 地址表的结果：这个会话握手那条实际拿到的
+    /// （[`crate::proxy::server_urls::reported`]）。
+    pub(super) server_urls: crate::proxy::server_urls::Fetch,
     /// billing-only 模拟，见 [`super::ApiCall::bare`]：模板里宣告注入内容的那几条不发。
     pub(super) bare: bool,
     /// 这一轮那几条 `tengu_lucky_cerf` 一系实验曝光，空即不发——按会话钉住的分组与「模型走不走
@@ -1252,7 +1255,8 @@ where
             // 2.1.323 删掉了 v1 的 MCP 客户端：SDK 代际恒为 v2，来源不再是 `growthbook` 而是 `default`；连接成功那条在
             // `sdkGeneration` 之后多一项 `v1Compat`（`MCP_SDK_GENERATION=v1` 才为真，`cap/auto-2.1.323-20261113-full` 230 条
             // 全是 `false`）；官方 MCP 地址表改一次 `GET /api/directory/server-urls` 取（`source: "bff"`，16 个交互式会话
-            // `url_count` 都是 1046、耗时 703–1152ms，原先分页拉 mcp-registry 是 294 / 2–4s）。
+            // `url_count` 都是 1046、耗时 703–1152ms，原先分页拉 mcp-registry 是 294 / 2–4s）。条数与成败照这个会话握手那条实际
+            // 拿到的报（[`crate::proxy::server_urls`]），耗时照旧按官方客户端那头的范围取——luban 机房到上游的耗时不是它。
             if version_at_least(subst.version, "2.1.323") {
                 match e.name.as_str() {
                     "tengu_mcp_sdk_generation" => {
@@ -1267,8 +1271,13 @@ where
                         if meta.get("source").and_then(|x| x.as_str()) == Some("legacy") =>
                     {
                         if let Some(o) = meta.as_object_mut() {
+                            let (ok, n) = match subst.server_urls {
+                                crate::proxy::server_urls::Fetch::Ok(n) => (true, n),
+                                crate::proxy::server_urls::Fetch::Failed => (false, 0),
+                            };
                             o.insert("source".into(), json!("bff"));
-                            o.insert("url_count".into(), json!(1046));
+                            o.insert("success".into(), json!(ok));
+                            o.insert("url_count".into(), json!(n));
                             o.insert("duration_ms".into(), json!(703 + subst.seed % 450));
                         }
                     }
@@ -1302,6 +1311,23 @@ where
                 names.dedup();
                 o.insert("set_env_var_count".into(), json!(names.len()));
                 o.insert("set_env_vars".into(), json!(names.join(",")));
+            }
+            // 2.1.323：地址表没取到时，那条 `feature_ok{mcp_registry_fetch}` 换成 `feature_sad`（同一毫秒，在
+            // `tengu_mcp_registry_fetch` 之前；`cap/auto-2.1.323-20261113-full` 批次 `00286`），进 Datadog。
+            if e.name == "tengu_feature_ok"
+                && e.meta.get("feature_name").and_then(|f| f.as_str()) == Some("mcp_registry_fetch")
+                && version_at_least(subst.version, "2.1.323")
+                && subst.server_urls == crate::proxy::server_urls::Fetch::Failed
+            {
+                let sad = json!({
+                    "feature_name": "mcp_registry_fetch",
+                    "error_code": "fetch_failed",
+                    "tengu_quizzical_giraffe": "unset"
+                });
+                let c = ctx(t);
+                dd.push(id.dd_entry_at(e.stage, "tengu_feature_sad", &c, resp_model, sad.clone()));
+                events.push((t, id.event_at(e.stage, "tengu_feature_sad", t, &c, sad)));
+                continue;
             }
             if !sample_event(&e.name, subst.version, &mut meta) {
                 continue;

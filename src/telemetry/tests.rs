@@ -12934,6 +12934,53 @@ fn api_success_reports_the_tools_header_wait_from_2_1_323() {
     );
 }
 
+/// 2.1.323：`tengu_mcp_registry_fetch` 照这个会话握手那条 `server-urls` 实际拿到的报（[`crate::proxy::server_urls`]）。
+/// 取到了报去重后的条数；没取到报 `success: false` / 0，前面那条 `feature_ok` 换成 `feature_sad{fetch_failed}`
+/// （`cap/auto-2.1.323-20261113-full` 批次 `00286`）；握手没记过的按取到了报。
+#[test]
+fn registry_fetch_reports_what_the_handshake_got() {
+    use crate::proxy::server_urls::{Fetch, remember};
+    let run = |cred_id: i64, fetch: Option<Fetch>| {
+        if let Some(f) = fetch {
+            remember(cred_id, SESSION, f);
+        }
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        first.ua_out = "claude-cli/2.1.323 (external, cli)".into();
+        first.cred_id = cred_id;
+        t.ingest(first);
+        let st = t.0.state.lock();
+        let events = &st.pending[&(cred_id, SESSION.to_string())].events;
+        let at = events
+            .iter()
+            .position(|(_, e)| ev_name(e) == "tengu_mcp_registry_fetch")
+            .expect("启动段有这条");
+        let before = &events[at - 1].1;
+        (ev_name(before).to_owned(), meta_of(before), meta_of(&events[at].1))
+    };
+    let (name, before, fetch) = run(-7_323_101, Some(Fetch::Ok(1050)));
+    assert_eq!(name, "tengu_feature_ok");
+    assert_eq!(before["feature_name"], json!("mcp_registry_fetch"));
+    assert_eq!(
+        (&fetch["source"], &fetch["success"], &fetch["url_count"]),
+        (&json!("bff"), &json!(true), &json!(1050))
+    );
+    let (name, before, fetch) = run(-7_323_102, Some(Fetch::Failed));
+    assert_eq!(name, "tengu_feature_sad");
+    assert_eq!(
+        (&before["feature_name"], &before["error_code"]),
+        (&json!("mcp_registry_fetch"), &json!("fetch_failed"))
+    );
+    assert_eq!(
+        (&fetch["source"], &fetch["success"], &fetch["url_count"]),
+        (&json!("bff"), &json!(false), &json!(0))
+    );
+    let (name, _, fetch) = run(-7_323_103, None);
+    assert_eq!(name, "tengu_feature_ok");
+    assert_eq!(fetch["success"], json!(true));
+    assert!(fetch["url_count"].as_u64().unwrap() > 1000, "{fetch}");
+}
+
 /// 2.1.323：Bash 执行 / 失败事件在 `duration_ms` 后紧跟 `stall_duration_ms`（官方 `spawnMs`，三位小数；
 /// `cap/auto-2.1.323-20261113-full` 有 `duration_ms` 的 26 条都带，`00079` 是 47.043 / 0.47，值在 0.458 ~ 1.288）。
 /// 2.1.322 不带。

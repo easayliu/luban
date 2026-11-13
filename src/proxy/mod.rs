@@ -108,6 +108,7 @@ mod lucky_cerf;
 pub(crate) mod org_config_gate;
 pub(crate) mod original_games;
 pub(crate) mod sandy_plover;
+pub(crate) mod server_urls;
 pub(crate) mod snoopy_creek;
 pub(crate) mod vivid_peach;
 pub(crate) use lucky_cerf::{

@@ -795,6 +795,7 @@ pub(crate) async fn send_quota_probe(
         env: None,
         context_1m: false,
         strip_context_1m: false,
+        first_party_class: config::cc_first_party_request_class(profile.kind),
         // 探测不带 system 第四块、环境说明与线程，这一档用不上。
         lapis: super::lapis_anchor::SessionMode::DEFAULT,
         fill_absent_tools: false,
@@ -956,6 +957,7 @@ fn header_simulation(
         env: None,
         context_1m: false,
         strip_context_1m: false,
+        first_party_class: config::cc_first_party_request_class(profile.kind),
         // 探测不带 system 第四块、环境说明与线程，这一档用不上。
         lapis: super::lapis_anchor::SessionMode::DEFAULT,
         // 两种官方形态都不带工具。

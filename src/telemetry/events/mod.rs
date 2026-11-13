@@ -443,6 +443,7 @@ impl<'a> EventEnv<'a> {
                 .shape
                 .tools_known
                 .then_some((self.shape.sent_schema_tokens, self.shape.unsent_builtin)),
+            server_urls: crate::proxy::server_urls::reported(self.call.cred_id, &f.session_id),
             bare: self.call.bare,
             lucky_cerf: f.lucky_cerf.clone(),
             lapis: f.lapis.clone(),
