@@ -100,6 +100,10 @@ impl EventBuilder<'_> {
                     "deniedBy": "other",
                     "decisionReasonType": "other"
                 });
+                // 2.1.325 起多 `hasFeedback`（官方 `fPr`）：分叉的拒绝不带说明，恒 `false`。
+                if env.f.v325 {
+                    can_use["hasFeedback"] = json!(false);
+                }
                 if v296 {
                     can_use["preToolHookDurationMs"] = json!(1);
                     can_use["permissionDurationMs"] = json!(1);

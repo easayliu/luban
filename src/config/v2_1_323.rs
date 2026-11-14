@@ -1,15 +1,15 @@
-//! 2.1.323 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.323 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.323 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.323 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.323 的 profile 表：2.1.323 / 2.1.324 来访的 beta 参照（[`cc_profile_at`]）。2.1.325 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.322（[`CC_PROFILES_2_1_322`]）完全相同**：两版的 beta 名字清单逐个相同，
 /// `cap/auto-2.1.323-20261113-full` 按场景逐条对 `cap/auto-2.1.322-20261110-full`，system 各块（测试项目路径归一后）、
 /// beta、body 键、工具集合都没变。这一版请求面的改动是一个新头（[`cc_first_party_request_class`]）与几个工具的描述
 /// （Skill / Agent / Workflow 里 `system-reminder` 的说法按模型改写、Artifact 多电子表格、Bash 提交说明多一项）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_323: &[CcProfile] = &[
     at_323(CC_PROFILES_2_1_322[0]),
     at_323(CC_PROFILES_2_1_322[1]),
     at_323(CC_PROFILES_2_1_322[2]),

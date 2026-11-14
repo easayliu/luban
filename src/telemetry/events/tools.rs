@@ -539,6 +539,10 @@ impl EventBuilder<'_> {
                 "toolName": &tu.name,
                 "isMcp": false
             });
+            // 2.1.325 起在 `messageID` 后多 `toolUseID`（`cap/auto-2.1.325-20261114-full` 各条弹框）。
+            if env.f.v325 {
+                insert_after(&mut show, "messageID", vec![("toolUseID", json!(&tu.id))]);
+            }
             // 复合命令逐条判过（`subcommandResults`），子代理里的弹框另标来源
             // （`07:58:16.980`、`08:02:04.556`）。
             if profile.as_ref().is_some_and(|p| p.simple_commands > 1) {
@@ -697,6 +701,7 @@ impl EventBuilder<'_> {
             v321,
             v322,
             v323,
+            v325,
             bash_metered,
             prompt_seq,
             ..
@@ -1105,7 +1110,13 @@ impl EventBuilder<'_> {
             // 摘要、行列、类名都没变，只换了块名。
             // 2.1.323（`cap/auto-2.1.323-20261113-bashfail` 与全量包里两条，同值；同一次跑的 2.1.322 对照仍是 0cacd2d8980f）
             // 摘要、行列、块名都换了，类名压缩后是 `JR`（照样过构造名校验）。
-            if v323 {
+            // 2.1.325（`cap/auto-2.1.325-20261114-bashfail` 与全量包里那条，同值；同一次跑的 2.1.323 对照仍是 46a1ab4152b6）
+            // 摘要、行列、块名都换了，类名压缩后是 `Sx`。2.1.324 没有发布。
+            if v325 {
+                err["error_constructor"] = json!("Sx");
+                err["error_stack_hash"] = json!("5ae540068e38");
+                err["error_top_frame"] = json!("chunk-wqb2b4v0.js:3690:9609");
+            } else if v323 {
                 err["error_constructor"] = json!("JR");
                 err["error_stack_hash"] = json!("46a1ab4152b6");
                 err["error_top_frame"] = json!("chunk-2x9ma4k7.js:3673:9499");

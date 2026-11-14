@@ -441,6 +441,21 @@ impl Files {
     pub(super) fn has_plan_file(&self) -> bool {
         self.map.keys().any(|p| p.contains("/.claude/plans/"))
     }
+
+    /// 账本记下的文件大小（字节）。
+    pub(super) fn size_of(&self, path: &str) -> Option<usize> {
+        self.map.get(path).and_then(|r| r.size)
+    }
+
+    /// 压缩后恢复的那份计划文件：最近碰过的那份的路径与全文（官方 `lJr` 从磁盘读回整份；账本里只有一段或还原不出
+    /// 内容时全文为 `None`）。
+    pub(super) fn plan_file(&self) -> Option<(String, Option<String>)> {
+        self.map
+            .iter()
+            .filter(|(p, _)| p.contains("/.claude/plans/"))
+            .max_by_key(|(_, r)| r.touched)
+            .map(|(p, r)| (p.clone(), r.content.clone().filter(|_| r.complete)))
+    }
 }
 
 /// 官方压缩后恢复文件时跳过的工具产物（2.1.321 `Wkr`）：文件名以 `artifact-` 开头、且直接放在名为 `tool-results` 的

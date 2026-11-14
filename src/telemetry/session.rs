@@ -1143,6 +1143,11 @@ pub(super) struct TurnFacts {
     /// 2.1.323：失败 Bash 的栈摘要、行列、块名都换了，类名 `Rx` → `JR`；5xx 摘要与行列照旧、只换块名，仍不带构造名
     /// （`cap/auto-2.1.323-20261113-*`）。
     pub(super) v323: bool,
+    /// 2.1.325：失败 Bash 的栈摘要、行列、块名都换了，类名 `JR` → `Sx`；5xx 摘要与行列照旧、只换块名，**又带上
+    /// `error_constructor: "Fkn"`**。`tengu_tool_use_show_permission_request` 在 `messageID` 后多 `toolUseID`，
+    /// `tengu_tool_use_can_use_tool_rejected` 在 `decisionReasonType` 后多 `hasFeedback`，`tengu_reactive_compact_succeeded`
+    /// 在 `postCompactTokens` 后多一组 `postCompact*Tokens` 分项（`cap/auto-2.1.325-20261114-*`；2.1.324 没有发布）。
+    pub(super) v325: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见

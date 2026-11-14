@@ -482,7 +482,8 @@ impl EventBuilder<'_> {
     pub(super) fn emit_compact_succeeded(&mut self, t3: DateTime<Utc>, restored_files: usize) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
-        let TurnFacts { message_tokens, ref attachment_counts, v305, v314, v318, .. } = *env.f;
+        let TurnFacts { message_tokens, ref attachment_counts, v305, v314, v318, v325, .. } =
+            *env.f;
         if !env.f.v285 {
             return;
         }
@@ -526,11 +527,30 @@ impl EventBuilder<'_> {
         .collect();
         let mut fixed = json!({ "attachment_types": restored_kinds });
         fill_attachment_estimates(&mut fixed, "unknown", shape.sdk, &env.f.display_model);
-        let fixed: u64 = fixed["attachment_token_estimates"]
+        // 各种固定附件分开的估值（与 `attachment_types` 一一对应），2.1.325 的分项要按类型归。
+        let fixed_by_kind: Vec<(&str, u64)> = fixed["attachment_token_estimates"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str()?.parse::<u64>().ok()).sum())
-            .unwrap_or(0);
-        let post = summary + st.kept + restored + fixed;
+            .map(|a| {
+                restored_kinds
+                    .iter()
+                    .zip(a)
+                    .map(|(k, x)| (*k, x.as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fixed: u64 = fixed_by_kind.iter().map(|(_, n)| n).sum();
+        // 计划文件引用（官方 `lJr` → `plan_file_reference`）：正文照官方模板拼、套一层 `<system-reminder>`，按 `qc` 估
+        // （`cap/auto-2.1.325-20261114-full` A18：模板正文 1493 字符 + 包裹 37 → 383，与官方 `postCompactPlanTokens` 相同）。
+        // 账本里没有全文时按记下的大小估正文。官方这一项一直算进 `postCompactTokens`，各版一样加上。
+        let plan: u64 = self.files.plan_file().map_or(0, |(path, content)| {
+            let body = content.unwrap_or_else(|| "x".repeat(self.files.size_of(&path).unwrap_or(0)));
+            qc(&format!(
+                "<system-reminder>\nA plan file exists from plan mode at: {path}\n\nPlan contents:\n\n{body}\n\n\
+                 If this plan is relevant to the current work and not already complete, continue working on it.\n\
+                 </system-reminder>"
+            ))
+        });
+        let post = summary + st.kept + restored + fixed + plan;
         let restored_count =
             restored_files + usize::from(self.files.has_plan_file()) + restored_kinds.len();
         // 压完之后消息表里还在的附件（下一次压缩照这个数）：保留那组带的 `<total_tokens>` 提醒，加上这次放回去
@@ -582,6 +602,35 @@ impl EventBuilder<'_> {
         put("trigger", json!("manual"));
         put("preCompactTokens", json!(pre));
         put("postCompactTokens", json!(post));
+        // 2.1.325 起紧跟一组分项（官方 `YIn`）：摘要、保留那段、按附件类型归的几类，加起来就是 `postCompactTokens`
+        // （`cap/auto-2.1.325-20261114-full` A18：1622 + 194 + 6964 + 0 + 4977 + 3559 + 685 + 924 + 383 + 0 + 472 = 19780）。
+        // 类型归属照官方 `sJr`：技能清单 / 已调技能 / MCP 说明 / 延迟工具 / 子代理清单各一项，恢复的文件进 `Files`，
+        // 计划文件引用进 `Plan`，钩子结果单算，其余（环境、模型……）进 `Rest`。钩子与已调技能代理看不到，报 0；分项之和
+        // 与上面那项保持相等。
+        if v325 {
+            let kind = |k: &str| {
+                fixed_by_kind.iter().filter(|(n, _)| *n == k).map(|(_, v)| v).sum::<u64>()
+            };
+            let named = [
+                "skill_listing",
+                "mcp_instructions_delta",
+                "deferred_tools_delta",
+                "agent_listing_delta",
+            ];
+            let rest: u64 =
+                fixed_by_kind.iter().filter(|(n, _)| !named.contains(n)).map(|(_, v)| v).sum();
+            put("postCompactSummaryTokens", json!(summary));
+            put("postCompactKeptTokens", json!(st.kept));
+            put("postCompactSkillListTokens", json!(kind("skill_listing")));
+            put("postCompactSkillTextTokens", json!(0));
+            put("postCompactMcpInstructionsTokens", json!(kind("mcp_instructions_delta")));
+            put("postCompactDeferredToolsTokens", json!(kind("deferred_tools_delta")));
+            put("postCompactAgentListTokens", json!(kind("agent_listing_delta")));
+            put("postCompactFilesTokens", json!(restored));
+            put("postCompactPlanTokens", json!(plan));
+            put("postCompactHooksTokens", json!(0));
+            put("postCompactRestTokens", json!(rest));
+        }
         put("restoredAttachmentCount", json!(restored_count));
         let duration = env.total + if v305 { 40 } else { 31 };
         put("durationMs", json!(duration));

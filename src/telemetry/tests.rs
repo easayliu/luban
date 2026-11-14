@@ -5045,37 +5045,11 @@ fn call_body_facts_match_every_captured_body() {
     assert!(n > 0);
 }
 
-/// **对照工具，默认不跑**：把 `LUBAN_REPLAY_CALLS`（抓包提出来的一串调用，见 scratchpad 里
-/// 的 `calls.py`）按原时刻喂进遥测，把生成的 event_logging 事件与 Datadog 条目写到
-/// `LUBAN_REPLAY_OUT`，给脚本逐段与官方批次比。
-/// `cargo test dump_telemetry_replay -- --ignored --nocapture`。
-#[test]
-#[ignore]
-fn dump_telemetry_replay() {
-    let (Ok(inp), Ok(out)) =
-        (std::env::var("LUBAN_REPLAY_CALLS"), std::env::var("LUBAN_REPLAY_OUT"))
-    else {
-        eprintln!("set LUBAN_REPLAY_CALLS / LUBAN_REPLAY_OUT");
-        return;
-    };
-    let calls: Vec<Value> = serde_json::from_slice(&std::fs::read(inp).unwrap()).unwrap();
-    // 抓包那个号 2.1.305 起开着会话活动心跳（`tengu_dapper_dawn` 是 force 的 true）。
-    let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
-    crate::proxy::dapper_dawn::note_eval(7, eval.as_object().unwrap());
-    // 抓包那天各模型 bootstrap 的 `client_data`（`{模型: client_data}`，`LUBAN_REPLAY_CLIENT_DATA` 指向的 JSON），按号 7 记下。
-    if let Ok(p) = std::env::var("LUBAN_REPLAY_CLIENT_DATA") {
-        let per_model: serde_json::Map<String, Value> =
-            serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
-        for (model, data) in &per_model {
-            let boot = json!({ "client_data": data }).to_string();
-            crate::proxy::client_data::note_bootstrap(7, model, boot.as_bytes());
-        }
-    }
-    // 回放真实 CC 经网关的抓包（`*-api`）时置 1，按透传路径报（[`ApiCall::client_tools`]）。
-    let client_tools = std::env::var("LUBAN_REPLAY_CLIENT_TOOLS").is_ok_and(|v| v == "1");
+/// 把 `calls.py` 抽出来的调用清单（`dump_telemetry_replay` 的输入）依次喂进一个新的 [`Telemetry`]。
+fn replay_calls(calls: &[Value], client_tools: bool) -> Telemetry {
     let t = Telemetry::default();
     let s = |c: &Value, k: &str| c[k].as_str().map(str::to_string);
-    for c in &calls {
+    for c in calls {
         let mut a = call(c["body"].as_str().unwrap().as_bytes().to_vec(), "x", "end_turn");
         a.client_tools = client_tools;
         // 模拟 billing-only：体里的 `cc_prompt_id` 被挪到这里（会话链那份），见 [`ApiCall::link_prompt_id`]。
@@ -5138,6 +5112,38 @@ fn dump_telemetry_replay() {
             .unwrap_or_default();
         t.ingest(a);
     }
+    t
+}
+
+/// **对照工具，默认不跑**：把 `LUBAN_REPLAY_CALLS`（抓包提出来的一串调用，见 scratchpad 里
+/// 的 `calls.py`）按原时刻喂进遥测，把生成的 event_logging 事件与 Datadog 条目写到
+/// `LUBAN_REPLAY_OUT`，给脚本逐段与官方批次比。
+/// `cargo test dump_telemetry_replay -- --ignored --nocapture`。
+#[test]
+#[ignore]
+fn dump_telemetry_replay() {
+    let (Ok(inp), Ok(out)) =
+        (std::env::var("LUBAN_REPLAY_CALLS"), std::env::var("LUBAN_REPLAY_OUT"))
+    else {
+        eprintln!("set LUBAN_REPLAY_CALLS / LUBAN_REPLAY_OUT");
+        return;
+    };
+    let calls: Vec<Value> = serde_json::from_slice(&std::fs::read(inp).unwrap()).unwrap();
+    // 抓包那个号 2.1.305 起开着会话活动心跳（`tengu_dapper_dawn` 是 force 的 true）。
+    let eval = json!({"tengu_dapper_dawn": {"value": true, "source": "force"}});
+    crate::proxy::dapper_dawn::note_eval(7, eval.as_object().unwrap());
+    // 抓包那天各模型 bootstrap 的 `client_data`（`{模型: client_data}`，`LUBAN_REPLAY_CLIENT_DATA` 指向的 JSON），按号 7 记下。
+    if let Ok(p) = std::env::var("LUBAN_REPLAY_CLIENT_DATA") {
+        let per_model: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        for (model, data) in &per_model {
+            let boot = json!({ "client_data": data }).to_string();
+            crate::proxy::client_data::note_bootstrap(7, model, boot.as_bytes());
+        }
+    }
+    // 回放真实 CC 经网关的抓包（`*-api`）时置 1，按透传路径报（[`ApiCall::client_tools`]）。
+    let client_tools = std::env::var("LUBAN_REPLAY_CLIENT_TOOLS").is_ok_and(|v| v == "1");
+    let t = replay_calls(&calls, client_tools);
     let st = t.0.state.lock();
     let mut events = Vec::new();
     let mut dd = Vec::new();
@@ -9386,6 +9392,9 @@ fn pool_summary_matches_the_captures() {
         ("auto-2.1.321-20261110-full", "00756_", "00760_"),
         ("auto-2.1.322-20261110-full", "00763_", "00767_"),
         ("auto-2.1.323-20261113-full", "00738_", "00742_"),
+        // 2.1.325 全量包那次 `--continue`（`-full/00758`）退出时没刷出这一轮的遥测批次，另起一个会话再 `--continue` 补抓
+        // （`cap/auto-2.1.325-20261114-continue`，退出前多等 20 秒）。
+        ("auto-2.1.325-20261114-continue", "00141_", "00144_"),
         ("auto-2.1.319-20261106-confirm/2.1.319", "00162_", "00165_"),
     ];
     for (dir, req, batch) in cases {
@@ -9919,13 +9928,14 @@ fn an_unknown_declared_parent_leaves_its_identity_unknown() {
 
 /// 冷启动时头一回见到的是半截的一轮（线程续轮）：不当成新输入，所接的回复认不出，本轮累计不报（不报成 1 次请求、0 个工具）。
 /// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063`、`cap/auto-2.1.322-20261110-bashfail/2.1.322/00059`、
-/// `cap/auto-2.1.323-20261113-bashfail/2.1.323/00059` 各自单独回放。
+/// `cap/auto-2.1.323-20261113-bashfail/2.1.323/00059`、`cap/auto-2.1.325-20261114-bashfail/2.1.325/00059` 各自单独回放。
 #[test]
 fn a_cold_start_on_a_thread_continuation_is_not_a_new_prompt() {
     for rel in [
         "auto-2.1.321-20261110-bashfail/2.1.321/00063_",
         "auto-2.1.322-20261110-bashfail/2.1.322/00059_",
         "auto-2.1.323-20261113-bashfail/2.1.323/00059_",
+        "auto-2.1.325-20261114-bashfail/2.1.325/00059_",
     ] {
         cold_start_on_continuation(rel);
     }
@@ -11873,13 +11883,15 @@ fn unknown_turn_stats_are_not_written_back() {
 }
 
 /// 子代理同父分叉：Explore 原包 `-full/00103`（create）后接两条同父续轮（`00107` 原样回放两次，回复 id 各不相同）——两条
-/// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`，2.1.323 那份是 `00101` → `00104`。
+/// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`，2.1.323 那份是 `00101` → `00104`，
+/// 2.1.325 那份是 `00104` → `00107`。
 #[test]
 fn subagent_sibling_continuations_share_the_parent_depth() {
     for (dir, create, cont) in [
         ("auto-2.1.321-20261110-full", "00103_", "00107_"),
         ("auto-2.1.322-20261110-full", "00104_", "00107_"),
         ("auto-2.1.323-20261113-full", "00101_", "00104_"),
+        ("auto-2.1.325-20261114-full", "00104_", "00107_"),
     ] {
         subagent_sibling_depths(dir, create, cont);
     }
@@ -12288,13 +12300,15 @@ fn metas_named(events: &[Value], name: &str, agent: bool) -> Vec<Value> {
 
 /// 抓包回归：子代理的工具池汇总（`callSite: attachments_subagent`、`querySource` 是子代理自己的）首轮、续轮各一条，续轮
 /// 另有 MCP 服务器说明那条：`cap/auto-2.1.321-20261110-full` 请求 `00103`（Explore create）→ `00107`（continue）→ 批次
-/// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`，2.1.323 那份是 `00101` → `00104` → 批次 `00108`。
+/// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`，2.1.323 那份是 `00101` → `00104` → 批次 `00108`，
+/// 2.1.325 那份是 `00104` → `00107` → 批次 `00108`。
 #[test]
 fn subagent_tool_result_turn_pool_summary_matches_the_captures() {
     for (dir, reqs, batch) in [
         ("auto-2.1.321-20261110-full", ["00103_", "00107_"], "00111_"),
         ("auto-2.1.322-20261110-full", ["00104_", "00107_"], "00112_"),
         ("auto-2.1.323-20261113-full", ["00101_", "00104_"], "00108_"),
+        ("auto-2.1.325-20261114-full", ["00104_", "00107_"], "00108_"),
     ] {
         subagent_pool_summary(dir, reqs, batch);
     }
@@ -12483,7 +12497,8 @@ fn departures_on_a_tool_result_turn_are_reported() {
 ///   第二条：`addedCount: 25`、`unlistedCount: 25`、`priorAnnouncedCount: 308`、`dtdCount: 1`；
 /// - `cap/auto-2.1.321-20261110-bashfail-fable/2.1.321` 请求 `00056` → `00060` → 批次 `00062` 同理；
 /// - `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00049` → `00059` → 批次 `00062` 同理；
-/// - `cap/auto-2.1.323-20261113-bashfail/2.1.323` 请求 `00054` → `00059` → 批次 `00061` 同理。
+/// - `cap/auto-2.1.323-20261113-bashfail/2.1.323` 请求 `00054` → `00059` → 批次 `00061` 同理；
+/// - `cap/auto-2.1.325-20261114-bashfail/2.1.325` 请求 `00051` → `00059` → 批次 `00061` 同理。
 ///
 /// 首轮、续轮的工具池汇总与 MCP 服务器说明、续轮的 MCP 工具数刷新，键都是官方的子集、顺序相同、值逐个一致；续轮省掉的
 /// 只有复算不出的内部消息数、附件数。续轮附件的类型与估值也对官方。
@@ -12494,6 +12509,7 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         ("auto-2.1.321-20261110-bashfail-fable/2.1.321", ["00056_", "00060_"], "00062_"),
         ("auto-2.1.322-20261110-bashfail/2.1.322", ["00049_", "00059_"], "00062_"),
         ("auto-2.1.323-20261113-bashfail/2.1.323", ["00054_", "00059_"], "00061_"),
+        ("auto-2.1.325-20261114-bashfail/2.1.325", ["00051_", "00059_"], "00061_"),
     ];
     for (dir, reqs, batch) in cases {
         let official_events: Vec<Value> = {
@@ -12579,7 +12595,8 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         assert_eq!((a.len(), b.len()), (2, 2), "{dir}");
         // fable 那组首轮有一台只给了说明、一个工具都没宣告的服务器（`luban-47-…`）：认不准，服务器数留为未知（不报
         // `addedCount`），之后的账本也就不准（续轮不报 `priorAnnouncedCount`）。另一组每台都认得出，全报。
-        let instruction_only = dir.contains("fable");
+        // 2.1.325 那份同理：那次 `luban-beehears-01` 只给了说明、没宣告工具（`cap/auto-2.1.325-20261114-bashfail/2.1.325/00051`）。
+        let instruction_only = dir.contains("fable") || dir.contains("2.1.325");
         let (first_missing, next_missing): (&[&str], &[&str]) = if instruction_only {
             (&["addedCount"], &["priorAnnouncedCount", "messagesLength", "attachmentCount"])
         } else {
@@ -13324,6 +13341,31 @@ fn version_2_1_321_moves_the_5xx_frame() {
         }
         assert!(seen > 0);
     }
+}
+
+/// 2.1.325（`cap/auto-2.1.325-20261114-retry`）：5xx 栈哈希与行列照旧、顶帧换块；压缩后的类名 `Fkn` 过得了校验，
+/// **又带上 `error_constructor`**（夹在消息摘要与栈摘要之间）。
+#[test]
+fn version_2_1_325_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.325 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert_eq!(m["error_constructor"], json!("Fkn"), "2.1.325 {n}: {m}");
+        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = keys.iter().position(|k| *k == "error_constructor").unwrap();
+        assert_eq!(
+            (keys[at - 1], keys[at + 1]),
+            ("error_message_hash", "error_stack_hash"),
+            "2.1.325 {n}"
+        );
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-wryttfdq.js:5:1510")),
+            "2.1.325 {n}"
+        );
+    }
+    assert!(seen > 0);
 }
 
 /// 2.1.323（`cap/auto-2.1.323-20261113-retry`）：5xx 照旧只换块名，仍不带 `error_constructor`。
@@ -14612,6 +14654,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.325 摘要、行列、块名都换了（`cap/auto-2.1.325-20261114-bashfail/2.1.325`）。
+        ("claude-cli/2.1.325 (external, cli)", "5ae540068e38", "chunk-wqb2b4v0.js:3690:9609"),
         // 2.1.323 摘要、行列、块名都换了（`cap/auto-2.1.323-20261113-bashfail/2.1.323`）。
         ("claude-cli/2.1.323 (external, cli)", "46a1ab4152b6", "chunk-2x9ma4k7.js:3673:9499"),
         // 2.1.322 只换了块名（`cap/auto-2.1.322-20261110-bashfail/2.1.322`）。
@@ -14645,13 +14689,20 @@ fn version_2_1_303_telemetry_shape() {
         // 2.1.321 的 `ShellError` 压缩后是 `Rx`，带构造名、夹在消息摘要与栈摘要之间
         // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`），2.1.322 同；2.1.293 ~ 2.1.319 不带。
         let keys: Vec<&str> = err.as_object().unwrap().keys().map(String::as_str).collect();
-        if ua.contains("2.1.323")
+        if ua.contains("2.1.325")
+            || ua.contains("2.1.323")
             || ua.contains("2.1.322")
             || ua.contains("2.1.321")
             || ua.contains("2.1.320")
         {
-            // 2.1.323 类名压缩后换成 `JR`，位置不变。
-            let want = if ua.contains("2.1.323") { "JR" } else { "Rx" };
+            // 2.1.323 类名压缩后换成 `JR`、2.1.325 换成 `Sx`，位置不变。
+            let want = if ua.contains("2.1.325") {
+                "Sx"
+            } else if ua.contains("2.1.323") {
+                "JR"
+            } else {
+                "Rx"
+            };
             assert_eq!(err["error_constructor"], json!(want), "{ua}");
             let at = keys.iter().position(|k| *k == "error_constructor").unwrap();
             assert_eq!(
@@ -16964,4 +17015,165 @@ fn a_literal_reminder_inside_a_read_line_is_content() {
         crate::telemetry::files::read_content(strip_trailing_reminder(&appended)).as_deref(),
         Some("# doc\n<system-reminder>example</system-reminder>")
     );
+}
+
+/// 2.1.325（`cap/auto-2.1.325-20261114-full`）：弹框那条 `show_permission_request` 在 `messageID` 后多 `toolUseID`
+/// （放行与被拒两条路都是），被拒那条 `can_use_tool_rejected` 在 `decisionReasonType` 后多 `hasFeedback: false`
+/// （B2 按 Esc 拒，没附说明）；2.1.323 都不带。
+#[test]
+fn version_2_1_325_adds_tool_use_id_and_feedback_to_permission_events() {
+    let keys_of = |m: &Value| -> Vec<String> { m.as_object().unwrap().keys().cloned().collect() };
+    let after = |m: &Value, k: &str| {
+        let keys = keys_of(m);
+        let at = keys.iter().position(|x| x == k).unwrap();
+        keys.get(at + 1).cloned()
+    };
+    // 被拒那条路。
+    for (ua, cred, new) in [
+        ("claude-cli/2.1.325 (external, cli)", 93_325, true),
+        ("claude-cli/2.1.323 (external, cli)", 93_323, false),
+    ] {
+        let ev = user_rejected_events(ua, cred);
+        let find = |n: &str| ev.iter().find(|(x, _)| x == n).map(|(_, m)| m.clone()).unwrap();
+        let show = find("tengu_tool_use_show_permission_request");
+        let rej = find("tengu_tool_use_can_use_tool_rejected");
+        if new {
+            assert_eq!(after(&show, "messageID").as_deref(), Some("toolUseID"), "{show}");
+            assert_eq!(show["toolUseID"], "t1");
+            assert_eq!(after(&rej, "decisionReasonType").as_deref(), Some("hasFeedback"), "{rej}");
+            assert_eq!(rej["hasFeedback"], false);
+        } else {
+            assert!(show.get("toolUseID").is_none(), "{show}");
+            assert!(rej.get("hasFeedback").is_none(), "{rej}");
+        }
+    }
+    // 放行那条路：default 模式下非只读的 Bash 弹框点头。
+    let shown = |ua: &str| {
+        let t = Telemetry::default();
+        let start = frozen_now() - Duration::from_secs(30);
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.text_chars = 0;
+        first.started_at = start;
+        first.ua_out = ua.into();
+        let end = start + Duration::from_millis(first.total_ms);
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["system"][3]["text"] = json!("base rules");
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_325","name":"Bash","input":{"command":"make test","description":"build"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_325","content":"ok"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.started_at = end + Duration::from_millis(3_000);
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_tool_use_show_permission_request")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let m = shown("claude-cli/2.1.325 (external, cli)");
+    assert_eq!(after(&m, "messageID").as_deref(), Some("toolUseID"), "{m}");
+    assert_eq!(m["toolUseID"], "toolu_325");
+    let old = shown("claude-cli/2.1.323 (external, cli)");
+    assert!(old.get("toolUseID").is_none(), "{old}");
+}
+
+/// 2.1.325（`cap/auto-2.1.325-20261114-full` A18）：`/compact` 那条 `reactive_compact_succeeded` 在 `postCompactTokens`
+/// 后紧跟官方 `YIn` 那组分项，顺序照官方，加起来等于 `postCompactTokens`；2.1.323 不带。
+#[test]
+fn version_2_1_325_breaks_down_post_compact_tokens() {
+    let run = |ua: &str| {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(120);
+        let mut first = call(cc_body(true), "req_1", "end_turn");
+        first.ua_out = ua.into();
+        first.started_at = base;
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"] = json!([
+            {"role":"user","content":[{"type":"text","text":"hello there"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/p/a.md"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"r1","content":"1\t# a\n2\t"},{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."}]}
+        ]);
+        let mut c = call(body.to_string().into_bytes(), "req_c", "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30);
+        c.text_chars = 1_600;
+        c.agent = AgentHeaders {
+            agent_id: None,
+            agent_type: None,
+            request_class: Some("compaction".into()),
+        };
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let m = run("claude-cli/2.1.325 (external, cli)");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "postCompactTokens").unwrap();
+    let parts = [
+        "postCompactSummaryTokens",
+        "postCompactKeptTokens",
+        "postCompactSkillListTokens",
+        "postCompactSkillTextTokens",
+        "postCompactMcpInstructionsTokens",
+        "postCompactDeferredToolsTokens",
+        "postCompactAgentListTokens",
+        "postCompactFilesTokens",
+        "postCompactPlanTokens",
+        "postCompactHooksTokens",
+        "postCompactRestTokens",
+    ];
+    assert_eq!(keys[at + 1..at + 1 + parts.len()], parts, "{m}");
+    assert_eq!(keys[at + 1 + parts.len()], "restoredAttachmentCount");
+    let sum: u64 = parts.iter().map(|k| m[*k].as_u64().unwrap()).sum();
+    assert_eq!(sum, m["postCompactTokens"].as_u64().unwrap(), "{m}");
+    assert!(m["postCompactSummaryTokens"].as_u64().unwrap() > 0);
+    assert!(m["postCompactSkillListTokens"].as_u64().unwrap() > 0, "技能清单放回去了");
+    assert!(m["postCompactRestTokens"].as_u64().unwrap() > 0, "环境与模型归 Rest");
+    let old = run("claude-cli/2.1.323 (external, cli)");
+    assert!(old.get("postCompactSummaryTokens").is_none(), "{old}");
+}
+
+/// 抓包回归：`cap/auto-2.1.325-20261114-full` 会话 A 整段回放（`_driver/a0.calls.json`，`calls.py` 按 `A0 startup` 那段抽的
+/// 72 条调用），A18 `/compact` 那条 `reactive_compact_succeeded` 的计划文件分项按账本里 A17 写下的计划正文估，与官方批次
+/// `00204` 的 `postCompactPlanTokens` 383 相同，分项加总等于 `postCompactTokens`。
+#[test]
+fn post_compact_plan_tokens_match_the_2_1_325_capture() {
+    let path = format!(
+        "{}/cap/auto-2.1.325-20261114-full/_driver/a0.calls.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let Ok(raw) = std::fs::read(&path) else {
+        eprintln!("skipped: {path} not present");
+        return;
+    };
+    let calls: Vec<Value> = serde_json::from_slice(&raw).unwrap();
+    let t = replay_calls(&calls, false);
+    let st = t.0.state.lock();
+    let m = st
+        .pending
+        .values()
+        .flat_map(|p| &p.events)
+        .find(|(_, e)| ev_name(e) == "tengu_reactive_compact_succeeded")
+        .map(|(_, e)| meta_of(e))
+        .expect("压缩收尾");
+    assert_eq!(m["postCompactPlanTokens"], 383, "{m}");
+    let parts: u64 = m
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| {
+            k.starts_with("postCompact") && k.ends_with("Tokens") && *k != "postCompactTokens"
+        })
+        .map(|(_, v)| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(parts, m["postCompactTokens"].as_u64().unwrap(), "{m}");
 }

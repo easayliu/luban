@@ -754,6 +754,8 @@ impl Telemetry {
         let v322 = version_at_least(&version, "2.1.322");
         // 2.1.323：错误栈换了摘要、行列、块名与类名，见 [`TurnFacts::v323`]。
         let v323 = version_at_least(&version, "2.1.323");
+        // 2.1.325：错误栈换块、5xx 带回构造名，几个事件多键，见 [`TurnFacts::v325`]。
+        let v325 = version_at_least(&version, "2.1.325");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -1258,6 +1260,7 @@ impl Telemetry {
             v321,
             v322,
             v323,
+            v325,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,

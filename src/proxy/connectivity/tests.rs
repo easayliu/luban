@@ -322,15 +322,15 @@ fn prewarm_probe_matches_the_capture() {
     use crate::proxy::body::{CcClient, apply_cch};
     use crate::proxy::session_link::CcRequestKind;
 
-    // `cap/auto-2.1.323-20261113-model/00064` 原文（与 2.1.322 的 `00067`、2.1.321 的 `00065` 只差版本、cch 与会话）。cch 算法在这个形态上同样成立：
-    // 几条体只差模型名，cch 却都是同一个值，一并钉住（同场各模型那几条同为 `8beca`）。
+    // `cap/auto-2.1.325-20261114-model/00066` 原文（与 2.1.323 的 `00064`、2.1.322 的 `00067` 只差版本、cch 与会话）。cch 算法在这个形态上同样成立：
+    // 几条体只差模型名，cch 却都是同一个值，一并钉住（同场各模型那几条同为 `d622b`）。
     const CAPTURED: &str = concat!(
         r#"{"model":"claude-opus-5-5","max_tokens":1,"system":[{"type":"text","text":"#,
-        r#""x-anthropic-billing-header: cc_version=2.1.323.1a2; cc_entrypoint=cli; cch=8beca;"},"#,
+        r#""x-anthropic-billing-header: cc_version=2.1.325.ff3; cc_entrypoint=cli; cch=d622b;"},"#,
         r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
         r#""messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}],"#,
         r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\","#,
-        r#"\"account_uuid\":\"92d1865c-9cd0-4cb9-8dc5-e881c25d2990\",\"session_id\":\"b38d6bc7-34af-4ef0-9cc6-213d482cc222\"}"}}"#,
+        r#"\"account_uuid\":\"92d1865c-9cd0-4cb9-8dc5-e881c25d2990\",\"session_id\":\"e227d115-422b-4ea8-aae7-c6d9785ddfc0\"}"}}"#,
     );
     for model in [
         "claude-opus-5-5",
@@ -342,7 +342,7 @@ fn prewarm_probe_matches_the_capture() {
         let captured = CAPTURED.replace("claude-opus-5-5", model);
         assert_eq!(
             apply_cch(&mut captured.clone().into_bytes()).as_deref(),
-            Some("8beca"),
+            Some("d622b"),
             "{model}"
         );
     }
@@ -413,7 +413,7 @@ fn prewarm_probe_matches_the_capture() {
         // 抓包那条换上本凭证的身份与这份体自己的 cch，其余逐字节相同。
         let want = CAPTURED
             .replace("claude-opus-5-5", model)
-            .replace("cch=8beca", &format!("cch={cch}"))
+            .replace("cch=d622b", &format!("cch={cch}"))
             .replace(
                 &CAPTURED[CAPTURED.find(r#""metadata""#).unwrap()..],
                 &format!(r#""metadata":{{"user_id":{}}}}}"#, serde_json::json!(user_id)),

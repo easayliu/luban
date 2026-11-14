@@ -1170,6 +1170,11 @@ pub(super) fn error_trace(
         ("2.1.323", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-fmjm3js0.js:5:1510"))
         }
+        // 2.1.325 摘要与行列照旧、顶帧换了块；5xx 类压缩后是 `Fkn`，过得了构造名校验，**又带上了 `error_constructor`**
+        // （`cap/auto-2.1.325-20261114-retry`：两条 `tengu_api_retry` 与收尾的 `tengu_api_error` 都带）。2.1.324 没有发布。
+        ("2.1.325", Some(s)) if s >= 500 => {
+            Some((Some("Fkn"), "5b32b751db51", "chunk-wryttfdq.js:5:1510"))
+        }
         _ => None,
     }
 }

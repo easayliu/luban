@@ -221,18 +221,19 @@ impl EventBuilder<'_> {
             let prev_main_depth = env.f.parent_reply_depth.unwrap_or(prev_main_depth);
             for (c, _) in rejected_calls {
                 let bash = c.name == "Bash";
-                self.push(
-                    shown,
-                    "tengu_tool_use_show_permission_request",
-                    json!({
-                        "messageID": &prev_msg,
-                        "toolName": &c.name,
-                        "isMcp": false,
-                        "sandboxEnabled": false,
-                        "permissionMode": shape.permission_mode,
-                        "originAgentType": "main"
-                    }),
-                );
+                let mut show = json!({
+                    "messageID": &prev_msg,
+                    "toolName": &c.name,
+                    "isMcp": false,
+                    "sandboxEnabled": false,
+                    "permissionMode": shape.permission_mode,
+                    "originAgentType": "main"
+                });
+                // 2.1.325 起在 `messageID` 后多 `toolUseID`（`cap/auto-2.1.325-20261114-full` B2 那条 Bash）。
+                if env.f.v325 {
+                    insert_after(&mut show, "messageID", vec![("toolUseID", json!(&c.id))]);
+                }
+                self.push(shown, "tengu_tool_use_show_permission_request", show);
                 // 弹框与被拒的 `unary_event`（`cap/auto-2.1.305-20261021-full` B1 的 Bash：.484 / .360），编辑类
                 // 工具另记一次拒绝。
                 let tool = (c.name.as_str(), &c.input);
@@ -248,6 +249,11 @@ impl EventBuilder<'_> {
                     "deniedBy": "user_reject",
                     "decisionReasonType": "unknown"
                 });
+                // 2.1.325 起在 `decisionReasonType` 后多 `hasFeedback`（官方 `fPr`：拒绝时附了说明才为真；按 Esc 拒的
+                // 没有说明，`cap/auto-2.1.325-20261114-full` B2 那条 `false`，同 `rejected_in_prompt` 那项）。
+                if env.f.v325 {
+                    can_use["hasFeedback"] = json!(false);
+                }
                 // 2.1.296 起在 `decisionReasonType` 之后多 PreToolUse 钩子与权限判定两段耗时（`cap/
                 // auto-2.1.296-20261013-full` B1：`preToolHookDurationMs: 1`、`permissionDurationMs: 3178`，
                 // 后者就是弹框挂着的那段，与下面 `waiting_for_user_permission_ms` 同一个量）。
