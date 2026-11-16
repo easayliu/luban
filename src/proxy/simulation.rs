@@ -84,6 +84,10 @@ pub(crate) struct Simulation {
     pub(super) lapis_peek: bool,
     /// 拼 [`Self::rest`] 时的下发版本（[`super::client_data::generation`]）：发出前变了就重拼。
     pub(super) rest_gen: u64,
+    /// 整形时读到的 ultrareview 开关（[`super::bughunter::applies`]）。它同时管第四块那条说明与首轮技能清单
+    /// （[`crate::proxy::body::insert_env_note`]）；后者不在第四块里，所以 [`Self::refresh_system_rest`] 单独比它，变了也要重新
+    /// 整形——第四块没有（`simulate_full_system` 关着）时同样。
+    pub(super) ultra: bool,
     /// 那台「机器」（[`SimEnv`]）：第四块的记忆目录与首轮环境说明
     /// （[`crate::proxy::body::insert_env_note`]）都照它写。环境说明落在 `messages` 里，不跟第四块的
     /// 开关 `simulate_full_system`；只有官方不发 `system` 的 profile（额度探测）为 `None`。
@@ -124,6 +128,10 @@ pub(crate) struct Simulation {
     /// （[`Self::take_thread`]）。放在这里而不是改写的返回值里，是因为改写那个函数有十几处调用点，
     /// 只有转发主路径用得上它。同一条请求重新改写（签名降级重试之类）会覆盖成最后发出的那份。
     pub(super) thread: parking_lot::Mutex<Option<ThreadPending>>,
+    /// 最近一次整形真的补进了首轮环境说明时，那份说明钉在哪段对话上（首条消息指纹 `env_root`）；没补是 `None`。
+    /// 这条请求发出去时只定死这一份（[`crate::proxy::body::settle_env_pin`]）：原样透传、不带环境说明的请求（比如被认作
+    /// 主线程的第三方 `count_tokens`）不能替正在等握手的主请求把暂定值定掉。同 [`Self::thread`]，由改写那一步写。
+    pub(super) env_pin: parking_lot::Mutex<Option<u64>>,
 }
 
 /// 模拟路径 system 第四块：模板按这台「机器」渲染，末尾按号的下发排原创游戏那段与 `heron_brook`
@@ -144,8 +152,13 @@ fn system_rest(
     // 2.1.321 的 `# Finishing work` / `# Memory, notes and feedback` 两节跟这个号这个模型的下发走。先排它们、再拼原创游戏那段
     // 与 `heron_brook` 的正文（官方段序 `…、original_games、heron_brook、finishing_work、notes_and_feedback、willow_tern、…`）：
     // 这样按标题认节时下发的正文还不在里面。
-    let rest = super::finishing_notes::fit_system_rest(
+    // ultrareview 那条在 `# Session-specific guidance` 里，跟这个号的 `tengu_review_bughunter_config` 走。
+    let rendered = super::bughunter::fit_system_rest(
         render_system_rest(template, env),
+        super::bughunter::applies(cred_id, profile.version),
+    );
+    let rest = super::finishing_notes::fit_system_rest(
+        rendered,
         super::finishing_notes::SECTIONS
             .map(|s| super::finishing_notes::applies(cred_id, model, profile.version, s)),
     );
@@ -176,8 +189,11 @@ impl Simulation {
                 self.profile.version,
             )
         };
-        let lapis_changed = lapis != self.lapis;
+        // 技能清单那行跟 ultrareview 开关走（握手常在首次整形之后才把 eval 拉回来），与第四块变没变无关。
+        let ultra = super::bughunter::applies(cred_id, self.profile.version);
+        let lapis_changed = lapis != self.lapis || ultra != self.ultra;
         self.lapis = lapis;
+        self.ultra = ultra;
         let (Some(old), Some(env)) = (self.rest.as_ref(), self.env.as_ref()) else {
             return lapis_changed;
         };
@@ -465,6 +481,7 @@ impl Simulation {
             rest_model: model.to_string(),
             lapis_peek: !main_thread,
             rest_gen,
+            ultra: super::bughunter::applies(cred.id, profile.version),
             env,
             context_1m,
             strip_context_1m: inbound_1m && !wants_1m,
@@ -479,6 +496,7 @@ impl Simulation {
             billing_only: flags.sim_billing_only,
             usage_limit: super::usage_limit_wanted(v, profile, cred.id),
             thread: Default::default(),
+            env_pin: Default::default(),
         })
     }
 }

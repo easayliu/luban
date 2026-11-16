@@ -778,7 +778,7 @@ pub struct KeepaliveCtx {
     prompt_id: String,
     /// account_uuid（直传）。
     account_uuid: String,
-    /// subscription_type（team / individual）。
+    /// subscription_type（`max` / `pro` / `team` / `enterprise`，认不出的 `individual`）。
     subscription_type: String,
     /// 组织 id：该凭证最近一次 `/v1/messages` 响应头里的 `anthropic-organization-id`
     /// 优先（见 [`crate::telemetry::Telemetry::org_uuid`]），没有就用凭证上从 profile 存的
@@ -829,6 +829,11 @@ static PROCESS_SEED: std::sync::LazyLock<[u8; 16]> = std::sync::LazyLock::new(||
 });
 
 impl KeepaliveCtx {
+    /// 个人订阅号（Max / Pro），见 [`crate::telemetry::is_prosumer`]。
+    pub fn prosumer(&self) -> bool {
+        crate::telemetry::is_prosumer(&self.subscription_type)
+    }
+
     /// `session` 有值时，空闲事件挂到这个真实会话上：session_id / device_id / prompt_id /
     /// 版本 / 模型 / beta 全取它的，`uptime` 从该会话起点算——真实 CC 进程开着没人说话时，
     /// 版本检查事件就是从同一个会话发出的。没有近期会话才退回按账号派生的那套身份。
@@ -1285,7 +1290,8 @@ pub async fn keepalive_event_logging(
     }
 }
 
-/// 每小时发一次 `GET /api/claude_code/policy_limits`；会话启动时也发一次。
+/// 每小时发一次 `GET /api/claude_code/policy_limits`；会话启动时也发一次。个人订阅号（Max / Pro）官方不发
+/// （`prosumer_oauth`，见 [`crate::telemetry::is_prosumer`]），直接当成功。
 ///
 /// 带 `If-None-Match`（见 [`etag_of`]）：官方每次都带，缺了它就是「一个从不缓存的客户端
 /// 每小时把同一份策略重拉一遍」。
@@ -1294,6 +1300,9 @@ pub async fn keepalive_policy_limits(
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
+    if ctx.prosumer() {
+        return KeepaliveResult::Ok;
+    }
     let req = policy_limits_request(client, config::UPSTREAM_BASE_URL, access_token, ctx);
     conditional_get(req, ctx.cred_id, "policy_limits").await
 }
@@ -1323,12 +1332,15 @@ fn policy_limits_request(
     axios_at(req, "policy_limits", ctx.client_version())
 }
 
-/// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。
+/// 每小时发一次 `GET /api/claude_code/settings`；会话启动时也发一次。个人订阅号同 [`keepalive_policy_limits`]，不发。
 pub async fn keepalive_settings(
     client: &wreq::Client,
     access_token: &str,
     ctx: &KeepaliveCtx,
 ) -> KeepaliveResult {
+    if ctx.prosumer() {
+        return KeepaliveResult::Ok;
+    }
     let url = format!("{}{}", config::UPSTREAM_BASE_URL, config::KEEPALIVE_SETTINGS);
     let mut req = client
         .get(&url)

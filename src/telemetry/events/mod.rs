@@ -456,6 +456,7 @@ impl<'a> EventEnv<'a> {
             },
             org_gate: f.org_gate.clone(),
             capability_events: f.capability_events.clone(),
+            prosumer: f.identity.prosumer(),
             git: f.identity.vcs.is_some(),
             seed: self.req_hash,
             tracked_files: 0,

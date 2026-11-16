@@ -8200,3 +8200,38 @@ fn thread_fingerprint_ignores_key_order() {
     assert_eq!(fp(&resorted), fp(&in_history), "去掉断点进历史");
     assert_ne!(fp(&in_history), fp(&changed), "内容变了");
 }
+
+/// 整形补进了首轮环境说明才记下那一份（[`crate::proxy::Simulation::env_pin`]，发出时只定死它）；没补的那次（billing-only、
+/// 没有那台「机器」）记空——同一条请求重新整形会覆盖成最后发出的那份。
+#[test]
+fn env_pin_records_only_an_inserted_note() {
+    let raw = r#"{"model":"claude-opus-5-5","max_tokens":16,"messages":[{"role":"user","content":"环境说明·钉"}]}"#;
+    let body = Bytes::from(raw);
+    let mut sim = sim_for(raw);
+    sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/sam", "/Users/sam/src/api"));
+    let run = |sim: &crate::proxy::Simulation, flags: crate::store::ForwardFlags| {
+        crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            flags,
+            Some(sim),
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            None,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        );
+    };
+    run(&sim, all_on());
+    let root = super::env_note::env_root_of(&serde_json::from_str(raw).unwrap());
+    assert_eq!(*sim.env_pin.lock(), Some(root), "补了就记这一份");
+    sim.billing_only = true;
+    run(&sim, all_on());
+    assert_eq!(*sim.env_pin.lock(), None, "billing-only 不补环境说明，重新整形覆盖成空");
+}

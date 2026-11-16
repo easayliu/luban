@@ -90,6 +90,7 @@ pub(in crate::proxy) fn insert_env_note(
             model_line,
             haiku: sim.profile.kind == config::CcProfileKind::MainHaiku,
             trim: sim.trim_tools,
+            ultra: crate::proxy::bughunter::applies(cred_id, sim.profile.version),
         },
         PinTurn {
             len: msgs.len(),
@@ -108,7 +109,7 @@ pub(in crate::proxy) fn insert_env_note(
         env_head(env, &sim.session_id, first.trim),
         first.model_line,
         (if first.haiku { config::CC_ENV_AGENTS_HAIKU } else { config::CC_ENV_AGENTS }).to_string(),
-        env_skills(first.trim).to_string(),
+        crate::proxy::bughunter::fit_skills(env_skills(first.trim), first.ultra).into_owned(),
     ];
     // 这个会话不发 `<total_tokens>`（服务端下发 `off`，见 [`crate::proxy::lapis_anchor`]）时这一段整个没有，日期
     // 紧跟技能清单（`cap/auto-2.1.311-20261027-full/00070`）；写的数是这个会话的预算（官方 `vnn` 取 `RJ()`）。
@@ -458,6 +459,9 @@ struct PinFirst {
     model_line: String,
     haiku: bool,
     trim: bool,
+    /// 技能清单里 `code-review` 那行用带 `ultra` 的长版（[`crate::proxy::bughunter`]）：会话还没有请求发出去时跟着最新下发，
+    /// 之后钉住（[`EnvPin::settled`]）。
+    ultra: bool,
 }
 
 /// [`pin_env`] 交出的：首轮那几样、日期、这一轮要不要补模型说明、更早几轮换过模型时需要在
@@ -488,6 +492,9 @@ struct EnvPin {
     /// 先不做。
     switch: Option<Switch>,
     seen: std::time::Instant,
+    /// 这个会话已经有请求带着这份环境说明发出去了（[`settle_env_pins`]）。之前 `first.ultra` 只是暂定，每次整形按当时的
+    /// 下发取（首次整形常在启动握手拉回 eval 之前）；之后钉住，不改写已发出的历史。
+    settled: bool,
 }
 
 /// 环境说明按**对话**钉住：官方在会话开头取一次日期与模型，此后作为历史原样带着。逐轮现取会让
@@ -505,10 +512,19 @@ struct EnvPin {
 ///
 /// 表的上限是 [`PIN_CAP`]：满了先清一天没见的，仍超过一半就按最近见到的时间只留一半。清一次
 /// 腾出一半的空，下次满之前不必再扫。
+type PinMap = std::collections::HashMap<(i64, String, u64), EnvPin>;
+static PINS: std::sync::LazyLock<parking_lot::Mutex<PinMap>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// 一条带着环境说明的请求要发出去了：它用的那一份（凭证、会话、首条消息指纹）的暂定值（技能清单那行）定死，见
+/// [`EnvPin::settled`]。只定这一份：同一会话 id 下别的对话、以及不带环境说明的请求都不碰。
+pub(crate) fn settle_env_pin(cred_id: i64, session_id: &str, root: u64) {
+    if let Some(pin) = PINS.lock().get_mut(&(cred_id, session_id.to_string(), root)) {
+        pin.settled = true;
+    }
+}
+
 fn pin_env(key: PinKey<'_>, now: PinFirst, turn: PinTurn) -> Pinned {
-    type Key = (i64, String, u64);
-    static PINS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<Key, EnvPin>>> =
-        std::sync::LazyLock::new(Default::default);
     const IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
     let at = std::time::Instant::now();
     let fresh = |now: PinFirst| EnvPin {
@@ -517,6 +533,7 @@ fn pin_env(key: PinKey<'_>, now: PinFirst, turn: PinTurn) -> Pinned {
         first: now,
         switch: None,
         seen: at,
+        settled: false,
     };
     let mut map = PINS.lock();
     if map.len() >= PIN_CAP {
@@ -530,7 +547,12 @@ fn pin_env(key: PinKey<'_>, now: PinFirst, turn: PinTurn) -> Pinned {
     let fresh_conversation = turn.opening && pin.first.model_line != now.model_line;
     if stale || fresh_conversation {
         *pin = fresh(now.clone());
-    } else if pin.current != now.model_line {
+    } else if !pin.settled {
+        // 技能清单那行跟号的下发走（[`crate::proxy::bughunter`]），而头一回整形常在启动握手拉到 eval 之前：还没有请求带着它
+        // 发出去就按现在的下发取（进程重启后首条就带着多轮历史的也一样），发出去之后钉住。
+        pin.first.ultra = now.ultra;
+    }
+    if !(stale || fresh_conversation) && pin.current != now.model_line {
         pin.current = now.model_line.clone();
         pin.switch = Some(Switch { turn: turn.len, fp: turn.last_fp, line: now.model_line });
     }
@@ -681,7 +703,8 @@ mod tests {
     #[test]
     fn pin_table_evicts_down_to_half_when_full() {
         let base = std::time::Instant::now();
-        let first = super::PinFirst { model_line: "m".into(), haiku: false, trim: false };
+        let first =
+            super::PinFirst { model_line: "m".into(), haiku: false, trim: false, ultra: false };
         let mut map: std::collections::HashMap<usize, super::EnvPin> = (0..super::PIN_CAP)
             .map(|i| {
                 let pin = super::EnvPin {
@@ -690,6 +713,7 @@ mod tests {
                     current: "m".into(),
                     switch: None,
                     seen: base + std::time::Duration::from_millis(i as u64),
+                    settled: false,
                 };
                 (i, pin)
             })
@@ -697,5 +721,33 @@ mod tests {
         super::evict_oldest(&mut map, super::PIN_CAP / 2);
         assert_eq!(map.len(), super::PIN_CAP / 2);
         assert!(map.contains_key(&(super::PIN_CAP - 1)) && !map.contains_key(&0), "留最近的");
+    }
+
+    /// 技能清单 `code-review` 那行（`ultra`）：首次整形常在启动握手拉到 eval 之前，暂定成短版；会话还没有请求发出去时，
+    /// 握手后重新整形就换成长版——进程重启后首条就带着多轮历史（不是开场那一轮）的也一样。主线程请求发出去
+    /// （[`super::settle_env_pin`]）之后钉住，不再跟下发改。
+    #[test]
+    fn provisional_ultra_follows_the_served_flag_until_sent() {
+        let key = || super::PinKey { cred_id: -95_001, session_id: "s-ultra", root: 7 };
+        let now =
+            |ultra| super::PinFirst { model_line: "m".into(), haiku: false, trim: false, ultra };
+        let turn = |len, opening| super::PinTurn { len, opening, last_fp: 1 };
+        assert!(
+            !super::pin_env(key(), now(false), turn(5, false)).first.ultra,
+            "握手前，带历史的首条"
+        );
+        assert!(super::pin_env(key(), now(true), turn(5, false)).first.ultra, "握手后重新整形");
+        super::settle_env_pin(-95_001, "s-ultra", 8);
+        assert!(
+            !super::pin_env(key(), now(false), turn(6, false)).first.ultra,
+            "别的对话定死不碰这份"
+        );
+        assert!(super::pin_env(key(), now(true), turn(6, false)).first.ultra);
+        super::settle_env_pin(-95_001, "s-ultra", 7);
+        assert!(super::pin_env(key(), now(false), turn(7, false)).first.ultra, "发出去之后钉住");
+        // 别的会话不受这次定死影响。
+        let other = || super::PinKey { cred_id: -95_001, session_id: "s-other", root: 7 };
+        assert!(!super::pin_env(other(), now(false), turn(1, true)).first.ultra);
+        assert!(super::pin_env(other(), now(true), turn(1, true)).first.ultra);
     }
 }

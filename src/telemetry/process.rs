@@ -1415,34 +1415,37 @@ impl Telemetry {
         }
         pending.started_wall = Some(started_wall);
         pending.push_batch((events, dd), now);
-        pending.metrics_since.get_or_insert(now);
-        pending.metrics.push(CallMetric {
-            session_id,
-            device_id,
-            account_uuid,
-            loc_model: loc_reply_model
-                .unwrap_or_else(|| display_model.trim_end_matches("[1m]").to_string()),
-            loc,
-            decisions,
-            model: display_model,
-            category: kind.category(),
-            effort: shape.effort.clone(),
-            agent_name: (v285 && kind == Kind::Subagent)
-                .then(|| call.agent.agent_type.clone())
-                .flatten()
-                .filter(|t| !t.is_empty()),
-            cost: call.cost_usd.unwrap_or(0.0),
-            input: call.input_tokens,
-            output: call.output_tokens,
-            cache_read: call.cache_read_tokens,
-            cache_creation: call.cache_creation_tokens,
-            cli_secs: if is_main && turn_over { call.total_ms as f64 / 1000.0 } else { 0.0 },
-            user_secs,
-            new_session: is_new_session && !counted,
-            resumed: resumed || continued,
-            continued,
-            usage: !failed && !aborted,
-        });
+        // OTel 指标只有 team / enterprise 号导出（官方 `st()`）；个人号不攒，也就没有那条 `internal_metrics_export`。
+        if !is_prosumer(&pending.subscription_type) {
+            pending.metrics_since.get_or_insert(now);
+            pending.metrics.push(CallMetric {
+                session_id,
+                device_id,
+                account_uuid,
+                loc_model: loc_reply_model
+                    .unwrap_or_else(|| display_model.trim_end_matches("[1m]").to_string()),
+                loc,
+                decisions,
+                model: display_model,
+                category: kind.category(),
+                effort: shape.effort.clone(),
+                agent_name: (v285 && kind == Kind::Subagent)
+                    .then(|| call.agent.agent_type.clone())
+                    .flatten()
+                    .filter(|t| !t.is_empty()),
+                cost: call.cost_usd.unwrap_or(0.0),
+                input: call.input_tokens,
+                output: call.output_tokens,
+                cache_read: call.cache_read_tokens,
+                cache_creation: call.cache_creation_tokens,
+                cli_secs: if is_main && turn_over { call.total_ms as f64 / 1000.0 } else { 0.0 },
+                user_secs,
+                new_session: is_new_session && !counted,
+                resumed: resumed || continued,
+                continued,
+                usage: !failed && !aborted,
+            });
+        }
 
         // 主线程请求到了：新一轮的 prompt id 已经写进会话，把扣住的侧查询补发出去（会话建起来
         // 之前就扣住的标题已经并进这个队列）。

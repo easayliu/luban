@@ -2,13 +2,26 @@
 
 use super::*;
 
-/// `org_type` → 遥测里的 `subscription_type`。
+/// `org_type` → 遥测里的 `subscription_type`：`claude_max` / `claude_pro` / `claude_team` / `claude_enterprise`
+/// 照官方报 `max` / `pro` / `team` / `enterprise`（`cap/auto-max-2.1.325-20261116-full` 个人 Max 号全是 `max`），
+/// 认不出的沿用旧口径。
 pub fn subscription_type(org_type: Option<&str>) -> &'static str {
+    if let Some(t) = crate::proxy::org_config_gate::tier_of(org_type) {
+        return t;
+    }
     match org_type {
         Some(t) if t.contains("team") => "team",
         Some(t) if t.contains("enterprise") => "enterprise",
         _ => "individual",
     }
+}
+
+/// 个人订阅号（Max / Pro）：官方 `sD()` 判为 `prosumer_oauth`——不拉组织策略（`policy_limits`）与托管配置
+/// （`settings`），不导出 OTel 指标（`/api/claude_code/metrics` 只给 team / enterprise），启动段那几条组织配置
+/// 事件换成个人号的形态（`cap/auto-max-2.1.325-20261116-full` 对照 `cap/auto-2.1.325-20261114-full`）。
+/// 订阅类型取不到时官方照团队号走，这里同样不算。
+pub fn is_prosumer(subscription_type: &str) -> bool {
+    matches!(subscription_type, "max" | "pro")
 }
 
 /// 一份遥测身份：发事件时所有 `env`/`auth`/`device_id` 之类的公共字段都从这里取。
@@ -60,6 +73,11 @@ pub struct EventCtx<'a> {
 }
 
 impl Identity {
+    /// 个人订阅号，见 [`is_prosumer`]。
+    pub fn prosumer(&self) -> bool {
+        is_prosumer(&self.subscription_type)
+    }
+
     /// `build_time`，按版本查表。
     pub fn build_time(&self) -> &'static str {
         config::cc_build_time(&self.version)

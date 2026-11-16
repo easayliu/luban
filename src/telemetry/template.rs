@@ -535,6 +535,9 @@ pub(super) struct Subst<'a> {
     /// 模型能力被 bootstrap 的 `client_data` 改了默认时官方报的那几条（`tengu_model_capability_from_client_data` /
     /// `…_off_from_client_data`，事件名与 `{capability, model}`），与 [`Self::lapis`] 同一处、跟在它后面。
     pub(super) capability_events: Vec<(&'static str, Value)>,
+    /// 个人订阅号（[`super::is_prosumer`]）：模板是团队号抓的，组织配置那几条按 [`prosumer_drops`] /
+    /// [`prosumer_managed_config`] 改成个人号的样子。
+    pub(super) prosumer: bool,
 }
 
 /// 组织配置那道闸的输入，见 [`Subst::org_gate`]。
@@ -622,6 +625,177 @@ impl OrgGate {
         });
         Some([("tengu_org_config_gate", gate), ("tengu_feature_sad", sad)])
     }
+}
+
+/// 个人订阅号（Max / Pro）不报的那几条模板事件（`cap/auto-max-2.1.325-20261116-full` 对照同版团队号
+/// `cap/auto-2.1.325-20261114-full`）：官方判 `prosumer_oauth` 后不拉组织策略与托管配置，签名缓存、两次拉取与
+/// 它们的 `feature_ok`、组织配置闸的真判定都没有；`managed_config_ready` 与闸的影子判定不在启动段，挪到首次输入
+/// （`-p` 是退出时）由 [`prosumer_managed_config`] 补。
+pub(super) fn prosumer_drops(name: &str, meta: &Value) -> bool {
+    match name {
+        "tengu_signed_cache_shadow"
+        | "tengu_signed_cache_identity"
+        | "tengu_remote_settings_fetch"
+        | "tengu_policy_limits_fetch"
+        | "tengu_managed_config_ready"
+        | "tengu_org_config_gate_shadow"
+        | "tengu_org_config_gate" => true,
+        "tengu_feature_ok" | "tengu_feature_sad" | "tengu_feature_bad" => matches!(
+            meta.get("feature_name").and_then(|f| f.as_str()),
+            Some("policy_limits_load" | "remote_managed_settings_pull" | "org_config_gate")
+        ),
+        _ => false,
+    }
+}
+
+/// 个人号首次输入那条 `policy_limits_cache_state_at_first_prompt`：没资格（`prosumer_oauth`）、没缓存、没开始拉
+/// （`cap/auto-max-2.1.325-20261116-full` 交互式 16 条都是这样）。在模板那条上改，键随版本走。
+pub(super) fn prosumer_cache_state(meta: &mut Value) {
+    let Some(o) = meta.as_object_mut() else { return };
+    o.shift_remove("cache_age_ms");
+    for (k, v) in [
+        ("eligible", json!(false)),
+        ("eligible_if_base_url_gate_removed", json!(false)),
+        ("has_cache", json!(false)),
+        ("live_verdict", json!(false)),
+        ("load_state", json!("not_started")),
+        ("outcome_reason", json!("not_attempted_consumer_plan")),
+        ("error_reporting_gate", json!("allowed_untaintable")),
+    ] {
+        if o.contains_key(k) {
+            o.insert(k.into(), v);
+        }
+    }
+    if !o.contains_key("ineligible_reason") {
+        insert_after(meta, "eligible", vec![("ineligible_reason", json!("prosumer_oauth"))]);
+    }
+}
+
+/// 个人号补的 `managed_config_ready` 与 `org_config_gate_shadow`：交互式在首次输入那条 `policy_limits_cache_state…`
+/// 同一毫秒（影子判定晚 4ms，`trigger: first_prompt` / `shadow_trigger: settled`），`-p` 在退出那条
+/// `config_cache_stats` 同一毫秒（两条都是 `exit`；失败、中止那两支不走收尾模板，由 `emit_sdk_result` 补）。键照这一版团队号模板启动段那两条改（[`template_for`]），没有就
+/// 不补。`emitted_ms` 按进程已运行的时长，两侧落定的耗时按官方的范围散列取。
+pub(super) fn prosumer_managed_config(
+    subst: &Subst<'_>,
+    tier: &str,
+    uptime_ms: u64,
+) -> Vec<(i64, &'static str, Value)> {
+    let tpl = template_for(subst.version, subst.sdk);
+    let find = |n: &str| tpl.startup.iter().find(|e| e.name == n).map(|e| e.meta.clone());
+    let mut out = Vec::new();
+    if let Some(mut m) = find("tengu_managed_config_ready")
+        && let Some(o) = m.as_object_mut()
+    {
+        let seed = u64::from(subst.seed);
+        let (settled, crossed) = if subst.sdk {
+            let s = 195 + seed % 45;
+            (s, s + 25 + seed % 10)
+        } else {
+            let s = 590 + seed % 60;
+            (s, s + 130 + seed % 20)
+        };
+        o.insert("trigger".into(), json!(if subst.sdk { "exit" } else { "first_prompt" }));
+        o.insert("emitted_ms".into(), json!(uptime_ms));
+        o.insert("settled_ms".into(), json!(settled));
+        o.insert("barrier_crossed_ms".into(), json!(crossed));
+        o.insert("settings_source".into(), json!("ineligible"));
+        o.insert("settings_had_cache".into(), json!(false));
+        o.insert("settings_settled_ms".into(), json!(settled));
+        o.insert("policy_source".into(), json!("ineligible"));
+        o.insert("policy_had_cache".into(), json!(false));
+        o.insert("policy_settled_ms".into(), json!(settled - 1 - seed % 27));
+        o.shift_remove("policy_cache_age_ms");
+        for (k, v) in [
+            ("policy_eligible_if_base_url_gate_removed", json!(false)),
+            ("policy_live_verdict", json!(false)),
+            ("policy_load_state", json!("not_started")),
+        ] {
+            if o.contains_key(k) {
+                o.insert(k.into(), v);
+            }
+        }
+        insert_after(
+            &mut m,
+            "settings_barrier_wait_ms",
+            vec![
+                ("settings_outcome_reason", json!("not_attempted_consumer_plan")),
+                ("settings_ineligible_reason", json!("unsupported_subscription")),
+            ],
+        );
+        insert_after(
+            &mut m,
+            "policy_barrier_wait_ms",
+            vec![("policy_ineligible_reason", json!("prosumer_oauth"))],
+        );
+        insert_after(
+            &mut m,
+            "policy_load_state",
+            vec![("policy_outcome_reason", json!("not_attempted_consumer_plan"))],
+        );
+        out.push((0, "tengu_managed_config_ready", m));
+    }
+    if let Some(mut m) = find("tengu_org_config_gate_shadow") {
+        // 2.1.310 起多的那五项（团队号由 [`emit_template`] 补，这里先按个人号的取值补上）。
+        if version_at_least(subst.version, "2.1.310") && m.get("settings_stored_copy").is_none() {
+            insert_after(
+                &mut m,
+                "settings_cache_age_ms",
+                vec![
+                    ("settings_stored_copy", json!("not_read")),
+                    ("policy_stored_copy", json!("not_read")),
+                    ("settings_live_signed", json!("no_answer")),
+                    ("policy_live_signed", json!("no_answer")),
+                    ("decision_if_strict", json!("pass")),
+                ],
+            );
+        }
+        let Some(o) = m.as_object_mut() else { return out };
+        o.insert("tier".into(), json!(tier));
+        // 2.1.293 ~ 2.1.303 那几份模板的影子判定是 `blocked`，带着阻塞的原因与哪一侧；改成放行就一并去掉。
+        o.shift_remove("decision_reason");
+        o.shift_remove("decision_resource");
+        o.shift_remove("policy_cache_age_ms");
+        o.shift_remove("settings_cache_age_ms");
+        for (k, v) in [
+            ("flag_source", json!("payload")),
+            ("policy_reason", json!("not_attempted")),
+            ("policy_has_cache", json!(false)),
+            ("settings_reason", json!("not_attempted")),
+            ("settings_has_cache", json!(false)),
+            ("settings_stored_copy", json!("not_read")),
+            ("policy_stored_copy", json!("not_read")),
+            ("settings_live_signed", json!("no_answer")),
+            ("policy_live_signed", json!("no_answer")),
+            ("decision", json!("pass")),
+            ("decision_if_strict", json!("pass")),
+            ("shadow_trigger", json!(if subst.sdk { "exit" } else { "settled" })),
+        ] {
+            if o.contains_key(k) {
+                o.insert(k.into(), v);
+            }
+        }
+        match &subst.org_gate {
+            Some(g) => g.apply_shadow(&mut m),
+            None => {
+                if let Some(o) = m.as_object_mut() {
+                    o.insert("candidate_if_armed".into(), json!(false));
+                    o.insert("candidate_now".into(), json!(false));
+                }
+                insert_after(
+                    &mut m,
+                    "candidate_if_armed",
+                    vec![("exclusion_if_armed", json!("tier_unknown"))],
+                );
+                insert_after(
+                    &mut m,
+                    "candidate_now",
+                    vec![("exclusion_now", json!("tier_unknown"))],
+                );
+            }
+        }
+        out.push((if subst.sdk { 0 } else { 4 }, "tengu_org_config_gate_shadow", m));
+    }
+    out
 }
 
 /// 模型用的是哪一套内建工具声明：haiku-4.5 那套长描述（2.1.291 起），haiku-5-5 那套（与 opus 相同，
@@ -989,6 +1163,10 @@ where
             if e.name == "tengu_frontmatter_shadow_unknown_key" {
                 continue;
             }
+            // 个人订阅号没有组织配置那几条（[`prosumer_drops`]）。
+            if subst.prosumer && prosumer_drops(&e.name, &e.meta) {
+                continue;
+            }
             // 启动时的文件建议：git 仓库里官方一律走 `git ls-files`（`cap/auto-2.1.285-20260930` 起每份全量抓包
             // 26 ~ 30 条，没有一条 ripgrep），否则与同一会话的 `vcs: git` 自相矛盾。代理不知道仓库里有几个文件，
             // 个数沿用模板那条、全算已跟踪；耗时官方 48 ~ 89ms，按调用散列取。
@@ -1009,6 +1187,9 @@ where
                 continue;
             }
             let mut meta = substitute(&e.meta, subst);
+            if subst.prosumer && e.name == "tengu_policy_limits_cache_state_at_first_prompt" {
+                prosumer_cache_state(&mut meta);
+            }
             if e.name == "tengu_deferred_tools_pool_change" {
                 deferred_pool_v317(&mut meta, subst.version);
                 super::tool_pool::fill_summary(&mut meta, subst.version, subst.pool);
@@ -1383,6 +1564,22 @@ where
                 events.push((t, id.event_at(e.stage, "tengu_inline_tools_announced", t, &c, m)));
             }
             events.push((t, id.event_at(e.stage, &e.name, t, &c, meta.clone())));
+            // 个人号的 `managed_config_ready` 与组织配置闸影子判定：交互式跟在首次输入那条缓存状态后、`-p` 跟在退出那条
+            // 配置缓存统计后（[`prosumer_managed_config`]）。
+            let managed_here = if subst.sdk {
+                e.name == "tengu_config_cache_stats"
+            } else {
+                e.name == "tengu_policy_limits_cache_state_at_first_prompt"
+            };
+            if subst.prosumer && managed_here {
+                let uptime_ms = (c.uptime_secs * 1000.0).round().max(0.0) as u64;
+                for (dt, name, m) in
+                    prosumer_managed_config(subst, &id.subscription_type, uptime_ms)
+                {
+                    let tm = t + chrono::Duration::milliseconds(dt);
+                    events.push((tm, id.event_at(MetaStage::Prompt, name, tm, &ctx(tm), m)));
+                }
+            }
             if !subst.sdk && !subst.pool_inline && e.name == "tengu_mcp_instructions_pool_change" {
                 events.extend(lapis(&c));
                 events.extend(capabilities(&c));

@@ -465,6 +465,14 @@ pub(super) async fn prepare<'a>(
     if let Some(s) = upstream.sim.as_ref().filter(|s| !s.lapis_peek) {
         crate::proxy::lapis_anchor::settle(cred.id, &s.session_id);
     }
+    // 首轮环境说明里随下发暂定的那几样（技能清单的 `code-review` 那行）也在发出时定死：只认这条出站真的补进去的那一份
+    // （[`Simulation::env_pin`]）。标题之类侧查询、原样透传的 `count_tokens` 不带环境说明，不能替等着握手的主请求定。
+    if billable
+        && let Some(s) = upstream.sim.as_ref()
+        && let Some(root) = *s.env_pin.lock()
+    {
+        crate::proxy::body::settle_env_pin(cred.id, &s.session_id, root);
+    }
     // 模拟路径（含 billing-only）的 `/v1/messages`：这个会话用过的工具名（2.1.311 起，号的 `tengu_snug_mitten` 开着时），
     // 按出站改名之后的名字记，见 [`crate::proxy::sandy_plover`]；`count_tokens` 官方不带。**放在启动握手之后**：新号首条
     // 请求建头时还没见过 eval，握手刚把开关拉回来（打开或关掉），以它为准；遥测的首次使用也跟着这份出站头报。

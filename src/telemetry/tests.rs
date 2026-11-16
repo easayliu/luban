@@ -8171,6 +8171,231 @@ fn org_config_gate_follows_the_accounts_eval_and_the_machine_bucket() {
     assert!(gate_at(&ev).is_none());
 }
 
+/// 个人订阅号（Max / Pro）的遥测照 `cap/auto-max-2.1.325-20261116-full` 改（同版团队号 `cap/auto-2.1.325-20261114-full` 对照）：
+/// - `subscription_type` 报 `max`；不报签名缓存、两次拉取与它们的 `feature_ok`、消息展示钩子；不攒 OTel 指标；
+/// - 交互式首次输入：缓存状态那条没资格（`prosumer_oauth`）、紧跟 `managed_config_ready{trigger: first_prompt}`，4ms 后报组织
+///   配置闸影子判定（`tier_unknown`），三条键序与抓包 A0 会话逐项相同；
+/// - `-p`：两条挪到退出那条 `config_cache_stats` 之后（`exit`、`noninteractive`）；
+/// - 团队号不变：启动段照旧有拉取与 `managed_config_ready{both_resolved}`。
+#[test]
+fn prosumer_accounts_skip_org_config_and_metrics() {
+    let run = |cred: i64, org: &str, sdk: bool| {
+        let t = Telemetry::default();
+        let mut body =
+            String::from_utf8(body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        if sdk {
+            body = body.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+        }
+        let mut c = call(body.into_bytes(), "req_prosumer", "end_turn");
+        c.cred_id = cred;
+        c.org_type = Some(org.into());
+        c.ua_out =
+            format!("claude-cli/2.1.325 (external, {})", if sdk { "sdk-cli" } else { "cli" });
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = &st.pending[&(cred, SESSION.to_string())];
+        let ev: Vec<(String, Value)> =
+            p.events.iter().map(|(_, e)| (ev_name(e).to_string(), e.clone())).collect();
+        (ev, p.metrics.len())
+    };
+    let keys = |m: &Value| -> Vec<String> { m.as_object().unwrap().keys().cloned().collect() };
+    let find = |ev: &[(String, Value)], n: &str| ev.iter().position(|(x, _)| x == n);
+    let feature = |ev: &[(String, Value)], f: &str| {
+        ev.iter().any(|(n, e)| n == "tengu_feature_ok" && meta_of(e)["feature_name"] == json!(f))
+    };
+    let gone = [
+        "tengu_signed_cache_shadow",
+        "tengu_remote_settings_fetch",
+        "tengu_policy_limits_fetch",
+        "tengu_org_config_gate",
+        "tengu_message_display_hooks",
+    ];
+
+    // 交互式。
+    let (ev, metrics) = run(-94_001, "claude_max", false);
+    assert_eq!(metrics, 0, "个人号不攒指标");
+    for n in gone {
+        assert!(find(&ev, n).is_none(), "{n}");
+    }
+    assert!(!feature(&ev, "policy_limits_load") && !feature(&ev, "remote_managed_settings_pull"));
+    assert!(ev.iter().all(|(_, e)| meta_of(e)["subscription_type"] == json!("max")));
+    let at = find(&ev, "tengu_policy_limits_cache_state_at_first_prompt").unwrap();
+    assert_eq!(ev[at + 1].0, "tengu_managed_config_ready");
+    assert_eq!(
+        ev.iter().filter(|(n, _)| n == "tengu_managed_config_ready").count(),
+        1,
+        "启动段那条不报"
+    );
+    let cache = meta_of(&ev[at].1);
+    assert_eq!(
+        keys(&cache),
+        [
+            "renderer_mode",
+            "subscription_type",
+            "cc_prompt_id",
+            "eligible",
+            "ineligible_reason",
+            "eligible_if_base_url_gate_removed",
+            "has_cache",
+            "would_fail_closed",
+            "live_verdict",
+            "token_source",
+            "credential_road",
+            "has_custom_base_url",
+            "via_unix_socket",
+            "has_unix_socket",
+            "has_auth_token",
+            "has_api_key_helper",
+            "api_key_prefix",
+            "ms_since_startup",
+            "load_state",
+            "outcome_reason",
+            "startup_await_result",
+            "error_reporting_gate",
+        ]
+    );
+    assert_eq!(
+        (&cache["eligible"], &cache["ineligible_reason"], &cache["load_state"]),
+        (&json!(false), &json!("prosumer_oauth"), &json!("not_started"))
+    );
+    let ready = meta_of(&ev[at + 1].1);
+    assert_eq!(
+        keys(&ready),
+        [
+            "renderer_mode",
+            "subscription_type",
+            "cc_prompt_id",
+            "trigger",
+            "emitted_ms",
+            "is_default_command",
+            "settled_ms",
+            "barrier_crossed_ms",
+            "settings_source",
+            "settings_had_cache",
+            "settings_awaited",
+            "settings_settled_ms",
+            "settings_barrier",
+            "settings_barrier_wait_ms",
+            "settings_outcome_reason",
+            "settings_ineligible_reason",
+            "policy_source",
+            "policy_had_cache",
+            "policy_awaited",
+            "policy_settled_ms",
+            "policy_barrier",
+            "policy_barrier_wait_ms",
+            "policy_ineligible_reason",
+            "policy_eligible_if_base_url_gate_removed",
+            "policy_would_fail_closed",
+            "policy_live_verdict",
+            "policy_load_state",
+            "policy_outcome_reason",
+            "policy_has_auth_token",
+            "policy_has_api_key_helper",
+            "policy_has_custom_base_url",
+            "policy_api_provider",
+        ]
+    );
+    assert_eq!(
+        (&ready["trigger"], &ready["settings_source"], &ready["policy_ineligible_reason"]),
+        (&json!("first_prompt"), &json!("ineligible"), &json!("prosumer_oauth"))
+    );
+    let s = find(&ev, "tengu_org_config_gate_shadow").unwrap();
+    assert!(s > at, "影子判定挪到首次输入之后");
+    let shadow = meta_of(&ev[s].1);
+    assert_eq!(
+        keys(&shadow),
+        [
+            "renderer_mode",
+            "subscription_type",
+            "cc_prompt_id",
+            "decision",
+            "surface",
+            "blocked_ms",
+            "candidate_if_armed",
+            "exclusion_if_armed",
+            "candidate_now",
+            "exclusion_now",
+            "flag_enabled",
+            "flag_source",
+            "flag_percent",
+            "grace_ttl_hours",
+            "tier",
+            "credential_shape",
+            "policy_reason",
+            "policy_has_cache",
+            "settings_reason",
+            "settings_has_cache",
+            "settings_stored_copy",
+            "policy_stored_copy",
+            "settings_live_signed",
+            "policy_live_signed",
+            "decision_if_strict",
+            "shadow_trigger",
+        ]
+    );
+    assert_eq!(
+        (
+            &shadow["tier"],
+            &shadow["exclusion_now"],
+            &shadow["policy_stored_copy"],
+            &shadow["shadow_trigger"]
+        ),
+        (&json!("max"), &json!("tier_unknown"), &json!("not_read"), &json!("settled"))
+    );
+
+    // `-p`：退出那条配置缓存统计之后。
+    let (ev, _) = run(-94_002, "claude_pro", true);
+    for n in gone {
+        assert!(find(&ev, n).is_none(), "-p {n}");
+    }
+    let at = find(&ev, "tengu_config_cache_stats").unwrap();
+    assert_eq!(ev[at + 1].0, "tengu_managed_config_ready");
+    assert_eq!(ev[at + 2].0, "tengu_org_config_gate_shadow");
+    let ready = meta_of(&ev[at + 1].1);
+    assert!(ready.get("renderer_mode").is_none());
+    assert_eq!((&ready["trigger"], &ready["subscription_type"]), (&json!("exit"), &json!("pro")));
+    let shadow = meta_of(&ev[at + 2].1);
+    assert_eq!(
+        (&shadow["surface"], &shadow["shadow_trigger"], &shadow["tier"]),
+        (&json!("noninteractive"), &json!("exit"), &json!("pro"))
+    );
+
+    // 2.1.293 ~ 2.1.303 的模板影子判定是 `blocked`：改成放行就不带阻塞原因与哪一侧。
+    let old = {
+        let t = Telemetry::default();
+        let body = String::from_utf8(body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        let mut c = call(body.into_bytes(), "req_prosumer_old", "end_turn");
+        c.cred_id = -94_004;
+        c.org_type = Some("claude_max".into());
+        c.ua_out = "claude-cli/2.1.303 (external, cli)".into();
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let p = &st.pending[&(-94_004, SESSION.to_string())];
+        p.events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_org_config_gate_shadow")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    assert_eq!(old["decision"], json!("pass"));
+    assert!(
+        old.get("decision_reason").is_none() && old.get("decision_resource").is_none(),
+        "{old}"
+    );
+
+    // 团队号照旧。
+    let (ev, metrics) = run(-94_003, "claude_team", false);
+    assert!(metrics > 0);
+    for n in
+        ["tengu_signed_cache_shadow", "tengu_remote_settings_fetch", "tengu_policy_limits_fetch"]
+    {
+        assert!(find(&ev, n).is_some(), "团队号 {n}");
+    }
+    let ready = ev.iter().find(|(n, _)| n == "tengu_managed_config_ready").unwrap();
+    assert_eq!(meta_of(&ready.1)["trigger"], json!("both_resolved"));
+}
+
 /// `tengu_lapis_anchor_from_client_data` 只在请求体真按那一档发的时候报（号的 bootstrap 都下发了 off）：完整模拟
 /// 按钉住的那一档报；billing-only 与真实 CC 透传发的是客户端自己的 system 与 messages，看出站体里（system 那段，
 /// 或换了 system 的客户端只在 messages 里跟的那条）有没有 `<total_tokens>`，与 off 对得上（没有）才报。
@@ -15861,6 +16086,61 @@ fn sdk_result_reports_failures_and_aborts() {
     for absent in ["tengu_sdk_ttft", "tengu_cancel", "tengu_conversation_rewind"] {
         assert!(!ev.iter().any(|(n, _)| n == absent), "{absent}");
     }
+}
+
+/// 个人号 `-p` 的 `managed_config_ready` 与组织配置闸影子判定挪到退出时：成功那支跟在收尾模板的 `config_cache_stats`
+/// 之后，失败、中止那两支不走收尾模板，跟在 `sdk_result` 之后补——三支都各报一次，不丢也不重复。
+#[test]
+fn prosumer_sdk_exit_reports_managed_config_on_every_outcome() {
+    let max = |mut c: ApiCall| {
+        c.org_type = Some("claude_max".into());
+        c
+    };
+    let check = |t: &Telemetry, label: &str| {
+        let ev = sdk_events(t);
+        let count = |n: &str| ev.iter().filter(|(x, _)| x == n).count();
+        assert_eq!(count("tengu_managed_config_ready"), 1, "{label}");
+        assert_eq!(count("tengu_org_config_gate_shadow"), 1, "{label}");
+        let pos = |n: &str| ev.iter().position(|(x, _)| x == n).unwrap();
+        assert!(pos("tengu_managed_config_ready") > pos("tengu_sdk_result"), "{label}");
+        let ready = &ev[pos("tengu_managed_config_ready")].1;
+        assert_eq!(
+            (&ready["trigger"], &ready["subscription_type"]),
+            (&json!("exit"), &json!("max")),
+            "{label}"
+        );
+        assert_eq!(
+            ev[pos("tengu_org_config_gate_shadow")].1["shadow_trigger"],
+            json!("exit"),
+            "{label}"
+        );
+    };
+
+    let ok = Telemetry::default();
+    sdk_turn_with(&ok, |_, c| max(c), max);
+    check(&ok, "success");
+
+    let failed_t = Telemetry::default();
+    sdk_turn_with(
+        &failed_t,
+        |_, c| max(c),
+        |c| failed(max(c), Some(529), "overloaded_error", "Overloaded"),
+    );
+    give_up_retries(&failed_t);
+    check(&failed_t, "failed");
+
+    let aborted_t = Telemetry::default();
+    sdk_turn_with(
+        &aborted_t,
+        |_, c| max(c),
+        |c| {
+            let mut c = max(c);
+            c.aborted = true;
+            c.stop_reason = None;
+            c
+        },
+    );
+    check(&aborted_t, "aborted");
 }
 
 /// 图片的字节数扣掉 base64 填充、像素数按文件头读出宽高（`cap/auto-2.1.306-20261021-full` A0：

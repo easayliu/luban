@@ -539,6 +539,35 @@ async fn eval_attributes_carry_the_raw_rate_limit_tier(pool: sqlx::PgPool) {
     assert!(bare["attributes"].get("rateLimitTier").is_none());
 }
 
+/// 个人订阅号（Max / Pro）官方判 `prosumer_oauth`，不拉 `policy_limits` / `settings`（`cap/auto-max-2.1.325-20261116-full`
+/// 一条都没有，同版团队号各 24 条）：两条保活直接当成功、不发请求（这里的客户端连不上任何地方，发了就是 `Failed`）。
+/// 遥测与 eval 里的 `subscriptionType` 报 `max`。
+#[sqlx::test]
+async fn prosumer_accounts_skip_policy_limits_and_settings(pool: sqlx::PgPool) {
+    let store = crate::store::CredentialStore::for_test(pool.clone()).await;
+    let cred = store.insert("m", None, "a", "r", 0, None, Some("claude_max"), 1).await.unwrap();
+    let ctx = KeepaliveCtx::new(&cred, 1.0, None, None);
+    assert!(ctx.prosumer());
+    assert_eq!(ctx.eval_body()["attributes"]["subscriptionType"], "max");
+    let client = wreq::Client::builder()
+        .proxy(wreq::Proxy::all("http://127.0.0.1:1").unwrap())
+        .build()
+        .unwrap();
+    assert!(matches!(
+        super::keepalive_policy_limits(&client, "tok", &ctx).await,
+        KeepaliveResult::Ok
+    ));
+    assert!(matches!(super::keepalive_settings(&client, "tok", &ctx).await, KeepaliveResult::Ok));
+
+    let team = store.insert("t", None, "b", "r2", 0, None, Some("claude_team"), 1).await.unwrap();
+    let ctx = KeepaliveCtx::new(&team, 1.0, None, None);
+    assert!(!ctx.prosumer());
+    assert!(matches!(
+        super::keepalive_policy_limits(&client, "tok", &ctx).await,
+        KeepaliveResult::Failed
+    ));
+}
+
 /// 团队号的档位只能从 `rate_limit_tier` 读——实测 `cred_id=9`（`claude_team`）的
 /// `account.has_claude_max`/`has_claude_pro` **都是 false**，而
 /// `organization.rate_limit_tier` 是 `default_claude_max_5x`。

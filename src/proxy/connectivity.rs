@@ -792,6 +792,7 @@ pub(crate) async fn send_quota_probe(
         rest_model: String::new(),
         lapis_peek: false,
         rest_gen: 0,
+        ultra: false,
         env: None,
         context_1m: false,
         strip_context_1m: false,
@@ -803,6 +804,7 @@ pub(crate) async fn send_quota_probe(
         billing_only: false,
         usage_limit: false,
         thread: Default::default(),
+        env_pin: Default::default(),
     };
     let mut headers = build_forward_headers_for(
         &HeaderMap::new(),
@@ -954,6 +956,7 @@ fn header_simulation(
         rest_model: String::new(),
         lapis_peek: false,
         rest_gen: 0,
+        ultra: false,
         env: None,
         context_1m: false,
         strip_context_1m: false,
@@ -967,6 +970,7 @@ fn header_simulation(
         billing_only: false,
         usage_limit: false,
         thread: Default::default(),
+        env_pin: Default::default(),
     }
 }
 

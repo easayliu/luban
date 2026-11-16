@@ -292,6 +292,10 @@ pub(crate) fn rewrite_body_out_parsed(
         Some(s) if simulated && !billing_only => insert_env_note(&mut v, s, cred.id, env_root),
         _ => EnvNoted::default(),
     };
+    // 这一次整形带没带环境说明、带的是哪一份：发出时只定死它（同一条请求重新整形会覆盖成最后发出的那份）。
+    if let Some(s) = sim {
+        *s.env_pin.lock() = env_note.inserted.then_some(env_root);
+    }
     // 换模型那一轮的模型说明：开着 message thread 时交给 [`apply_sim_thread`] 与 `<total_tokens>`
     // 并成一条，关着时没有那条提醒，就在这里单独补；落位按首轮钉住的那份而非这一轮 sim 的 beta，
     // 换了模型族（opus→haiku）才不会把历史从 role:system 消息改成用户正文里的提醒块。

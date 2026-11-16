@@ -773,7 +773,9 @@ impl EventBuilder<'_> {
             // 2.1.291：每轮收尾、猜下一句那条之前多一条消息展示钩子的统计（交互式才有，`-p` 没有；
             // `cap/auto-2.1.291-20261006-full` 46 条，flushCount 绝大多数是 1，耗时 1 ~ 8ms、
             // 只刷一次时 total 与 max 相同）。
-            if v291 && !shape.sdk {
+            // 个人号（Max / Pro）不报：样本里这些钩子来自团队组织下发的插件，个人号没有组织插件
+            // （`cap/auto-max-2.1.325-20261116-full` 一条都没有，团队号同场景 51 条）。
+            if v291 && !shape.sdk && !identity.prosumer() {
                 let d = 2 + i64::from(env.req_hash % 6);
                 self.push(
                     t1,
@@ -1008,6 +1010,19 @@ impl EventBuilder<'_> {
             result["debug_file_dropped_total"] = json!(0);
         }
         self.push(t4, "tengu_sdk_result", result);
+        // 个人号的那两条配置事件挪到了退出时（[`crate::telemetry::template::prosumer_managed_config`]）。成功那支由收尾模板在
+        // `config_cache_stats` 之后补；失败、中止不走收尾模板，在这里补，与 `sdk_result` 隔开退出那一段的几十毫秒。
+        if outcome != SdkOutcome::Success && self.subst.prosumer {
+            let t = ms(t_end, 64);
+            let uptime_ms = (env.ctx(t).uptime_secs * 1000.0).round().max(0.0) as u64;
+            for (dt, name, meta) in crate::telemetry::template::prosumer_managed_config(
+                &self.subst,
+                &env.f.identity.subscription_type,
+                uptime_ms,
+            ) {
+                self.push(ms(t, dt), name, meta);
+            }
+        }
         // 逐出提示报的是最后一条**成功**的主请求（官方 `dV()`）：失败或被中止的那条都不算，之前也没成功过就整条
         // 不报，心跳的 `session_end` 一样报不出来（R2）。
         let last_ok = match outcome {

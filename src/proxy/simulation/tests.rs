@@ -3459,6 +3459,28 @@ fn system_rest_follows_client_data_fetched_by_the_handshake() {
     assert!(!sim.refresh_system_rest(cred.id), "重拼过的再调不动");
 }
 
+/// ultrareview 开关（[`crate::proxy::bughunter`]）也管首轮技能清单，不只第四块：握手拉回 eval 后
+/// [`super::Simulation::refresh_system_rest`] 照样返回 `true` 让出站体重新整形——第四块关着（`simulate_full_system`）、
+/// `<total_tokens>` 那一档也没变时同样。
+#[test]
+fn ultra_flag_reshapes_even_without_the_fourth_block() {
+    let cred = crate::credentials::Credential { id: 933_401, ..test_cred() };
+    let body = Bytes::from(
+        r#"{"model":"claude-opus-5-5","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    );
+    let mut flags = all_on();
+    flags.simulate_full_system = false;
+    let mut sim = detect_as(&body, flags, &cred).unwrap();
+    assert!(sim.rest.is_none() && !sim.ultra);
+    assert!(!sim.refresh_system_rest(cred.id), "下发没变不动");
+    let eval = serde_json::json!({"features": {"tengu_review_bughunter_config":
+        {"value": {"enabled": true}}}});
+    crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
+    assert!(sim.refresh_system_rest(cred.id), "只有技能清单那行变了也要重新整形");
+    assert!(sim.ultra);
+    assert!(!sim.refresh_system_rest(cred.id), "跟上了再调不动");
+}
+
 /// fable-5-2 的 `# Finishing work` / `# Memory, notes and feedback` 两节跟这个号这个模型的下发走（官方 2.1.321 `kT`）：默认
 /// 都有（`cap/auto-2.1.321-20261110-fable52/00068`），bootstrap 显式下发 `false` 的那一节重拼时去掉，另一节与别的段落不动。
 #[test]

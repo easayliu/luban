@@ -96,6 +96,7 @@ pub(crate) use rate_limit::{
 };
 pub(crate) use usage_grace::note_eval_features;
 pub(crate) mod agent_summary_config;
+pub(crate) mod bughunter;
 pub(crate) mod cache_keepalive;
 pub(crate) mod client_data;
 pub(crate) mod curious_tower;
