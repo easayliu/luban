@@ -93,11 +93,24 @@ pub(super) fn bash_profile(cmd: &str) -> BashProfile {
                 }
                 '>' => {
                     // `2>&1` / `>&2`：fd 复制；`> /dev/null`：丢弃。都不算重定向。
-                    let rest: String = chars[i + 1..].iter().collect();
-                    let rest = rest.trim_start_matches('>');
-                    let target = rest.trim_start();
-                    if !rest.starts_with('&') && !target.starts_with("/dev/null") {
-                        has_redirect = true;
+                    //
+                    // 只往后看到目标为止，不把余下整段命令抄一遍：命令长度没有上限，每个 `>` 抄一遍
+                    // 是平方级，几十万个 `>` 能把持着遥测状态锁的线程占住几十秒。一串连着的 `>`
+                    // 结论相同（都是看这一串后面跟着什么），只在串首看一次；已经判成重定向的也不必再看。
+                    let run_head = i == 0 || chars[i - 1] != '>';
+                    if !has_redirect && run_head {
+                        let mut j = i + 1;
+                        while chars.get(j) == Some(&'>') {
+                            j += 1;
+                        }
+                        let fd_dup = chars.get(j) == Some(&'&');
+                        while chars.get(j).is_some_and(|c| c.is_whitespace()) {
+                            j += 1;
+                        }
+                        let dev_null = chars[j..].iter().take(9).copied().eq("/dev/null".chars());
+                        if !fd_dup && !dev_null {
+                            has_redirect = true;
+                        }
                     }
                     cur.push(c);
                 }

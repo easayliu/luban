@@ -112,8 +112,10 @@ async fn credential_view_carries_the_exact_proxy_id(pool: sqlx::PgPool) {
     store.set_proxy(c.id, Some("http://u:other@h:9")).await.unwrap();
     let state = AppState::for_test(store);
     let admin = state.store.admin_user().await.unwrap();
-    let views =
-        list_credentials(State(state.clone()), Extension(Actor::from(admin))).await.unwrap().0;
+    let views = list_credentials(State(state.clone()), Extension(Actor::from(admin)), None)
+        .await
+        .unwrap()
+        .0;
     let id_of = |id: i64| views.iter().find(|v| v["id"] == id).unwrap()["proxy_id"].as_i64();
     assert_eq!(id_of(a.id), Some(pa.id));
     assert_eq!(id_of(b.id), Some(pb.id));
@@ -1057,7 +1059,7 @@ async fn agents_list_their_team_read_only(pool: sqlx::PgPool) {
     let proxy_of = |who: &Actor| {
         let (state, who) = (state.clone(), who.clone());
         async move {
-            let rows = list_credentials(State(state), Extension(who)).await.unwrap().0;
+            let rows = list_credentials(State(state), Extension(who), None).await.unwrap().0;
             rows.into_iter().find(|v| v["id"] == sub_cred).unwrap()["proxy"]
                 .as_str()
                 .unwrap()
@@ -1069,7 +1071,7 @@ async fn agents_list_their_team_read_only(pool: sqlx::PgPool) {
     let list = |who: &Actor| {
         let (state, who) = (state.clone(), who.clone());
         async move {
-            list_credentials(State(state), Extension(who))
+            list_credentials(State(state), Extension(who), None)
                 .await
                 .unwrap()
                 .0
@@ -1362,4 +1364,26 @@ async fn instance_name_is_trimmed_bounded_and_clearable(pool: sqlx::PgPool) {
     assert_eq!(store.instance_name().as_deref(), Some(max.as_str()), "被拒的不落库");
     assert!(set("  ").await.is_ok());
     assert_eq!(store.instance_name(), None);
+}
+
+/// 分享链接的账号列表不带主人用户名（控制台登录名）；访客密码登录的照旧带。
+#[sqlx::test]
+async fn share_links_do_not_see_owner_usernames(pool: sqlx::PgPool) {
+    let store = Arc::new(CredentialStore::for_test(pool.clone()).await);
+    let admin = store.admin_user().await.unwrap();
+    let member = store.create_user("m1", "x", UserRole::User, admin.id).await.unwrap().unwrap();
+    store.insert("r1", None, "at", "r1", u64::MAX, None, None, member.id).await.unwrap();
+    let state = AppState::for_test(store);
+    let viewer = || Actor { id: 0, username: "share".into(), role: UserRole::Viewer };
+    let owners = |rows: Vec<serde_json::Value>| -> Vec<(Option<String>, Option<i64>)> {
+        rows.iter()
+            .map(|v| (v["owner"].as_str().map(str::to_owned), v["owner_id"].as_i64()))
+            .collect()
+    };
+    let via = Extension(auth::ViaShareLink { expires_at: u64::MAX });
+    let shared =
+        list_credentials(State(state.clone()), Extension(viewer()), Some(via)).await.unwrap().0;
+    assert_eq!(owners(shared), [(None, Some(member.id))]);
+    let visitor = list_credentials(State(state), Extension(viewer()), None).await.unwrap().0;
+    assert_eq!(owners(visitor), [(Some("m1".to_owned()), Some(member.id))]);
 }

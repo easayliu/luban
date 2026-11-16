@@ -58,6 +58,37 @@ const NOT_ACCOUNT_PHRASES: &[&str] = &[
 /// 恢复（[`park_org_oauth_disallowed`]），而不是像普通 `permission_error` 那样原样透传了事。
 const ORG_OAUTH_DISALLOWED: &str = "oauth authentication is currently not allowed for this";
 
+/// 400 上「文案带着回显的请求内容」这一条豁免在日志里的名字，见 [`echoes_request`]。
+const ECHOED_REQUEST: &str = "(400 message echoes request content)";
+
+/// 400 的文案是不是带着**回显的请求内容**：是的话，里面的特征词可能是来访自己写进去的，不作数。
+///
+/// 上游的参数校验报错会把请求里的东西抄回来：未知键名抄在句首（`fallbacks: Extra inputs are not
+/// permitted`，键路径后面固定跟一个冒号），取值抄在引号里（`Input tag 'x' found using 'type'`、
+/// `` Unexpected value(s) `x` for the `anthropic-beta` header ``）。持接入 Key 的人在请求体顶层
+/// 加一个 `"oauth": 1`，回来的就是 `oauth: Extra inputs are not permitted`——400 上按裸特征词
+/// 判封号的话，一条请求停用一个号，重复即清空号池。键名、取值都由来访定，逐词排除排不干净，
+/// 所以按**形态**认：真正的账号级文案是一句平铺的话（`This organization has been disabled.`），
+/// 回显必带冒号或成对的引号。带了就整条不作数，宁可漏判——漏判的号下一条不带回显的 400
+/// （或 401/403）照样会被认出来，误判却是终态停用。
+///
+/// - 冒号：`https://` 这种链接里的不算（先去掉），其余一律算。
+/// - 引号：`"` 与 `` ` `` 一律算；`'` 夹在两个字母数字之间的是撇号（`organization's`）不算——
+///   上游包取值的那对引号，开头那个前面是空格，躲不过去。
+fn echoes_request(message: &str) -> bool {
+    let text = message.replace("https://", "").replace("http://", "");
+    if text.contains([':', '"', '`']) {
+        return true;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        c == '\''
+            && !(i > 0
+                && chars[i - 1].is_alphanumeric()
+                && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric()))
+    })
+}
+
 /// 暂停落库失败时退回的进程内账号级冷却时长：至少本进程这一小时里不再选它。
 const ORG_OAUTH_FALLBACK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -107,7 +138,8 @@ pub(crate) enum AccountRejection {
 /// - 401：`authentication_error` 才停用。裸 401（CDN/网关拦截，无 `error.type`）不停用。
 /// - 403：**仅**命中特征词时停用。普通 `permission_error`（如 Pro 账号请求
 ///   Opus、beta 未开通、区域限制）是能力/权限问题而非封号，原样透传即可。
-/// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。
+/// - 400：同 403，仅命中特征词时停用；普通 `invalid_request_error` 是客户端请求错误。文案带着
+///   回显的请求内容（冒号、引号）时特征词不作数：那些词可能是来访自己写的，见 [`echoes_request`]。
 ///
 /// 「命中特征词」= [`BAN_KEYWORDS`] 之一，或 [`BAN_SUBJECTS`] 与 [`BAN_STATES`] 各中一项。
 ///
@@ -174,6 +206,15 @@ pub(super) fn ban_verdict(status: StatusCode, etype: Option<&str>, message: &str
         }
         _ => false,
     };
+    // 400 是参数校验报错，文案里会回显请求内容：带回显形态的，上面两条判据都可能是来访自己
+    // 写进去的词，整条不作数（见 [`echoes_request`]）。排在「主语 + 状态词」之前——那一条压得过
+    // 普通豁免，压不过这一条。
+    if status == StatusCode::BAD_REQUEST
+        && (subject_and_state || weak_signal)
+        && echoes_request(message)
+    {
+        return BanVerdict::Exempt { phrase: ECHOED_REQUEST, overrode_signal: true };
+    }
     if subject_and_state
         && matches!(
             status,

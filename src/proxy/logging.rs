@@ -1083,6 +1083,51 @@ pub(crate) struct ShapeBits {
 /// 转发主路径走这个，`Value` 由改写那一步顺手交出来（见 [`rewrite_body_out`](crate::proxy::rewrite_body_out)）——同一份几 MB
 /// 的 JSON 一条请求里只解析一次。只拿得到字节的那几条路（重试改写、早退兜底、连通性测试）
 /// 走上面那个包装。
+/// [`shape_summary_of`] 里一个不认识的顶层字段最多原样留多少字节（按紧凑 JSON 估），超了记占位。
+/// 正常的 `thinking` / `output_config` / `tool_choice` / `context_management` 都是几十到几百字节。
+const SHAPE_FIELD_MAX: usize = 8 * 1024;
+
+/// `v` 序列化出来是否不超过 `budget` 字节（估算，只少不多）。边走边扣，超了立刻停——
+/// 不为了量大小把整棵树走完，更不先序列化一遍。
+fn within_budget(v: &serde_json::Value, budget: usize) -> bool {
+    fn walk(v: &serde_json::Value, left: &mut usize) -> bool {
+        let cost = match v {
+            serde_json::Value::String(s) => s.len() + 2,
+            serde_json::Value::Array(a) => {
+                return take(left, 2 + a.len()) && a.iter().all(|x| walk(x, left));
+            }
+            serde_json::Value::Object(o) => {
+                return take(left, 2 + o.len())
+                    && o.iter().all(|(k, x)| take(left, k.len() + 3) && walk(x, left));
+            }
+            _ => 1,
+        };
+        take(left, cost)
+    }
+    fn take(left: &mut usize, n: usize) -> bool {
+        match left.checked_sub(n) {
+            Some(rest) => {
+                *left = rest;
+                true
+            }
+            None => false,
+        }
+    }
+    let mut left = budget;
+    walk(v, &mut left)
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 pub(crate) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
     use sha2::{Digest, Sha256};
     let Some(obj) = v.as_object() else { return ShapeBits::default() };
@@ -1152,7 +1197,16 @@ pub(crate) fn shape_summary_of(v: &serde_json::Value) -> ShapeBits {
                 let uid = val.get("user_id").and_then(|u| u.as_str());
                 serde_json::json!({ "user_id": uid.is_some(), "user_id_len": uid.map(str::len) })
             }
-            _ => val.clone(),
+            // 不认识的字段原样留着，但有上限：字段是来访定的，顶层塞一个几十 MB 的值，整段拷进摘要、
+            // 进写入队列、进库，翻流水时再整段读出来。超了只记它是什么、有多大。
+            _ => match within_budget(val, SHAPE_FIELD_MAX) {
+                true => val.clone(),
+                false => serde_json::json!({
+                    "truncated": true,
+                    "kind": json_kind(val),
+                    "over_bytes": SHAPE_FIELD_MAX,
+                }),
+            },
         };
         out.insert(k.clone(), digest);
     }

@@ -851,3 +851,43 @@ fn named_block_fingerprint_follows_upstream_coordinates() {
     assert_eq!(thinking_block_fingerprint_at(sent, 9, 0), None, "越界");
     assert_eq!(thinking_block_fingerprint_at(b"not json", 0, 0), None);
 }
+
+/// 几万个思考块也得一趟还原完：配对与拼接曾是平方级（逐块回头扫整张表、每处还原重拷整份体）。
+/// 结果逐字节等于原文——原文除了思考块里的 `<` 转义，其余与 serde 的紧凑输出相同。
+#[test]
+fn many_thinking_blocks_are_restored_in_one_pass() {
+    let n = 20_000;
+    let blocks: Vec<serde_json::Value> = (0..n)
+        .map(|i| serde_json::json!({"type": "thinking", "thinking": format!("a<b {i}"), "signature": format!("sig{i}")}))
+        .collect();
+    let body = serde_json::json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": blocks},
+            {"role": "user", "content": "more < text"},
+        ],
+    });
+    let rewritten = serde_json::to_vec(&body).unwrap();
+    // 只把思考块里的 `<` 写成转义；末条 user 里的那个不动。
+    let original = String::from_utf8(rewritten.clone()).unwrap().replace("a<b", "a\\u003cb");
+    assert_ne!(original.as_bytes(), &rewritten[..]);
+    let started = std::time::Instant::now();
+    let fixed = crate::proxy::preserve_thinking_encoding(original.as_bytes(), rewritten);
+    assert!(fixed == original.as_bytes(), "restored bytes differ from the original");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+/// 同一个签名贴了两遍的块退回按位置配，照样各回各位。
+#[test]
+fn duplicated_signatures_still_fall_back_to_position() {
+    let body = serde_json::json!({"messages": [{"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "x<1", "signature": "same"},
+        {"type": "thinking", "thinking": "x<2", "signature": "same"},
+        {"type": "thinking", "thinking": "x<3"},
+    ]}]});
+    let rewritten = serde_json::to_vec(&body).unwrap();
+    let original = String::from_utf8(rewritten.clone()).unwrap().replace("x<", "x\\u003c");
+    let fixed = crate::proxy::preserve_thinking_encoding(original.as_bytes(), rewritten);
+    assert_eq!(String::from_utf8(fixed).unwrap(), original);
+}

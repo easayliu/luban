@@ -74,11 +74,30 @@ const CONDITIONAL_MARKS: &[&str] = &[" when ", " unless ", " without ", " while 
 /// 这个取值不行；该拦的那部分由入口的 [`super::body::misplaced_system_role`] 按原话精确判。
 const POSITIONAL_MARKS: &[&str] = &[" must precede ", " must follow ", " at any position"];
 
-/// 这句 400 是不是「有前提」的（条件句或位置约束），是则不能学成「这个取值一律拒」。
+/// 「回显请求内容」的句式。同 [`CONDITIONAL_MARKS`]，命中即**不学**。
+///
+/// 这几句会把请求里**任意一段文字**原样抄进报错：未知键名（`<键>: Extra inputs are not
+/// permitted`）、对不上的类型标签（`Input tag '<值>' found using 'type' does not match any of the
+/// expected tags`）、认不得的头值（`` Unexpected value(s) `<值>` for the `anthropic-beta` header ``）、
+/// 点了名却找不到的东西（`Tool '<名>' not found …`）。学习的判据只是「字段关键词 + 被点名的取值」
+/// 两个子串，持接入 Key 的人带一个合法的 `effort: "high"` 再加一个顶层键 `effort 'high'`，回来的
+/// `effort 'high': Extra inputs are not permitted` 就会被学成「这个模型不收 effort=high」——规则
+/// 不分 Key、留 7 天，同模型的正常请求全被本地拒掉，回给别人的报错正文还是他写的。
+/// 真正点名取值的那几句（`output_config.effort 'max' is not supported …`、
+/// `` `temperature` is deprecated for this model. ``）不带这些句式。
+const ECHO_MARKS: &[&str] = &[
+    "extra inputs are not permitted",
+    "does not match any of the expected tags",
+    "unexpected value(s)",
+    " not found",
+];
+
+/// 这句 400 是不是「有前提」的（条件句或位置约束）、或带着回显的请求内容（[`ECHO_MARKS`]），
+/// 是则不能学成「这个取值一律拒」。
 /// 学的时候（[`remember_shape_rejection`]）与从库里回填时（[`seed_tables`]）共用。
 fn is_qualified_rejection(message: &str) -> bool {
     let hay = message.to_lowercase();
-    CONDITIONAL_MARKS.iter().chain(POSITIONAL_MARKS).any(|m| hay.contains(m))
+    CONDITIONAL_MARKS.iter().chain(POSITIONAL_MARKS).chain(ECHO_MARKS).any(|m| hay.contains(m))
 }
 
 /// 目前挂着的探针。新增一项只要写清「字段名怎么念、取值从哪儿取、怎么算被点名」，学习与
@@ -585,15 +604,27 @@ pub type EmptyReplyMemory = std::sync::Arc<parking_lot::RwLock<EmptyReplyRejecti
 /// 不同就是不同的请求。
 pub(crate) fn prompt_digest(body: &serde_json::Value) -> Option<String> {
     use sha2::{Digest, Sha256};
+    /// 把序列化器吐出来的字节直接喂给哈希，不先攒成一个与请求体一般大的 `String`。
+    /// 字节与 `Value::to_string()` 逐字相同（同一个紧凑序列化器），摘要不变。
+    struct Feed<'a>(&'a mut Sha256);
+    impl std::io::Write for Feed<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let messages = body.get("messages")?;
     let mut h = Sha256::new();
     for field in ["system", "tools", "tool_choice"] {
         if let Some(v) = body.get(field) {
-            h.update(v.to_string().as_bytes());
+            serde_json::to_writer(Feed(&mut h), v).ok()?;
         }
         h.update(b"\0");
     }
-    h.update(messages.to_string().as_bytes());
+    serde_json::to_writer(Feed(&mut h), messages).ok()?;
     Some(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
 }
 
@@ -751,12 +782,14 @@ pub(crate) fn known_refused_prompt(
     body: Option<&serde_json::Value>,
 ) -> Option<RefusedPrompt> {
     let model = model?;
-    let table = mem.read();
-    if table.prompts.is_empty() {
+    // 摘要要把整份体序列化一遍再哈希（几 MB 的体是毫秒级，几十 MB 是上百毫秒），**不在锁里算**：
+    // 读锁拿着的时候学规则、定时重建的写者进不来，写者一排队，后面的读者也跟着停。
+    // 锁里只判空（O(1)）：表不设上限，按模型筛一遍就是每条请求拿着读锁走全表。
+    if mem.read().prompts.is_empty() {
         return None;
     }
     let digest = prompt_digest(body?)?;
-    table.prompts.get(&(model.to_string(), digest)).cloned()
+    mem.read().prompts.get(&(model.to_string(), digest)).cloned()
 }
 
 /// 上游拒答了这条提示词 → 连同上游那次的原样响应体记进 [`EmptyReplyMemory`]。返回**这次

@@ -11,9 +11,14 @@ use super::*;
 ///
 /// 代理看到的下属的号整行过一遍 [`auth::redact_url_credentials`]：出口代理串（还有顺着报错
 /// 流进 `ban_reason` 的）带着下属的代理密码，代理不该看到。本人的号照旧原样给。
+///
+/// 分享链接不带主人用户名：那是控制台的登录名，拿到名单就能定向猜密码、或刷满限流把人锁在
+/// 登录页外。口径同账单接口（[`super::billing`] 里分享链接不许按成员拆）。`owner_id` 照给，
+/// 页面按它分组，本身不是登录凭据。
 pub(super) async fn list_credentials(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    share: Option<Extension<auth::ViaShareLink>>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let store = &state.store;
     // 额度快照那条最重（逐号加 7 天窗口内的流水），和其余各项并发跑；其余的都是小表或走索引的
@@ -22,6 +27,7 @@ pub(super) async fn list_credentials(
         Ok::<_, anyhow::Error>((
             visible_credentials(store, &actor).await?,
             match (actor.scope(), actor.team_lead()) {
+                _ if share.is_some() => None,
                 (Scope::All, _) | (_, Some(_)) => Some(store.owner_names().await?),
                 (Scope::Owner(_), None) => None,
             },
@@ -524,7 +530,7 @@ pub(super) async fn set_priorities(
         }
         _ => return Err(bad_request("provide exactly one of priority or delta")),
     }
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 /// 批量操作的公共入参：待处理的账号 id 列表。
@@ -560,7 +566,7 @@ pub(super) async fn set_device_limits(
     check_member_limit(&state, &actor, Knob::DeviceLimit, limit, None)?;
     let n = state.store.set_device_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, device_limit = limit, "device limit set in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 #[derive(Deserialize)]
@@ -581,7 +587,7 @@ pub(super) async fn set_session_limits(
     check_member_limit(&state, &actor, Knob::SessionLimit, limit, None)?;
     let n = state.store.set_session_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, session_limit = limit, "session limit set in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 #[derive(Deserialize)]
@@ -602,7 +608,7 @@ pub(super) async fn set_rpm_limits(
     check_member_limit(&state, &actor, Knob::RpmLimit, limit, None)?;
     let n = state.store.set_rpm_limits(&req.ids, limit).await.map_err(internal)?;
     tracing::info!(count = n, rpm_limit = limit, "rpm limit set in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 #[derive(Deserialize)]
@@ -633,7 +639,7 @@ pub(super) async fn set_quota_pause_pcts_many(
         quota_pause_pct_7d = ?long,
         "per-account quota-threshold pause set in bulk"
     );
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 #[derive(Deserialize)]
@@ -651,7 +657,7 @@ pub(super) async fn set_disabled_many(
     check_ids(&req.ids)?;
     let n = state.store.set_disabled_many(&req.ids, req.disabled).await.map_err(internal)?;
     tracing::info!(count = n, disabled = req.disabled, "enabled/disabled in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 /// 批量删除（连带清设备绑定；用量流水不删，随保留期自然裁掉），返回删除后的整份列表。
@@ -666,7 +672,7 @@ pub(super) async fn delete_credentials(
     let store = state.store.clone();
     let n = store.remove(&req.ids).await.map_err(internal)?;
     tracing::info!(count = n, "credentials deleted in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }
 
 #[derive(Deserialize)]
@@ -943,5 +949,5 @@ pub(super) async fn set_credentials_groups(
         .map_err(internal)?
         .map_err(group_error)?;
     tracing::info!(count = req.ids.len(), groups = ?req.group_ids, by = %actor.username, "credential groups updated in bulk");
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }

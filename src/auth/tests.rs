@@ -945,3 +945,40 @@ fn proxy_fields_are_hidden_from_viewers() {
     );
     assert!(!super::hide_viewer_fields(&mut v), "已经置空的不算改动");
 }
+
+/// 限流键按库里的用户名算：库里 `lower()` 把 `İ` 认成 `i` 时，换着大小写变体写用户名找到的是
+/// 同一个账号，计数也得记在同一个键上——不能每个变体各有一份名额。
+#[sqlx::test]
+async fn login_attempts_are_keyed_by_the_stored_username(pool: sqlx::PgPool) {
+    use axum::{
+        Json,
+        extract::{ConnectInfo, State},
+    };
+    let state = test_state(pool.clone()).await;
+    let admin_id = set_admin_password(&state, "pw1234").await;
+    create(&state, "vix-variant", UserRole::User, admin_id).await;
+    let attempt = |name: &'static str| {
+        let state = state.clone();
+        async move {
+            super::login(
+                State(state),
+                ConnectInfo("127.0.0.1:5000".parse().unwrap()),
+                with_host("127.0.0.1:4600"),
+                Json(super::LoginReq { username: name.into(), password: "bad".into() }),
+            )
+            .await
+            .err()
+            .map(|e| e.0)
+        }
+    };
+    for _ in 0..super::LOGIN_FAIL_MAX {
+        assert_eq!(attempt("vix-variant").await, Some(StatusCode::UNAUTHORIZED));
+    }
+    assert_eq!(attempt("VIX-Variant").await, Some(StatusCode::TOO_MANY_REQUESTS));
+    // 库的排序规则把 `İ` 小写成 `i` 的（libc 的 UTF-8 locale），这个变体找到的是同一个账号，
+    // 也得被锁；不这么映射的库里它只是个不存在的用户名。
+    let variant = "V\u{130}X-VARIANT";
+    let same_account = state.store.user_by_username(variant).await.unwrap().is_some();
+    let want = if same_account { StatusCode::TOO_MANY_REQUESTS } else { StatusCode::UNAUTHORIZED };
+    assert_eq!(attempt(variant).await, Some(want), "same_account={same_account}");
+}

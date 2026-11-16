@@ -595,5 +595,5 @@ pub(super) async fn set_proxies(
         proxy = %proxy.as_deref().unwrap_or("<direct>"),
         "proxy set in bulk"
     );
-    list_credentials(State(state), Extension(actor)).await
+    list_credentials(State(state), Extension(actor), None).await
 }

@@ -17177,3 +17177,110 @@ fn post_compact_plan_tokens_match_the_2_1_325_capture() {
         .sum();
     assert_eq!(parts, m["postCompactTokens"].as_u64().unwrap(), "{m}");
 }
+
+// ---- 来访可控的大输入：这几处曾是平方级，且前两处持着遥测状态锁 ----
+
+/// `bash_profile` 判重定向改成只往后看到目标为止，结论要和原先「把余下整段抄出来再看」逐条一致。
+#[test]
+fn bash_profile_redirect_matches_reference() {
+    // 原先的写法，原样留作对照。
+    fn reference(cmd: &str) -> bool {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (mut quote, mut depth, mut prev_dollar, mut hit) = (None::<char>, 0i32, false, false);
+        for (i, &c) in chars.iter().enumerate() {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => match c {
+                    '\'' | '"' | '`' => quote = Some(c),
+                    '(' if prev_dollar => depth += 1,
+                    ')' if depth > 0 => depth -= 1,
+                    _ if depth > 0 => {}
+                    '>' => {
+                        let rest: String = chars[i + 1..].iter().collect();
+                        let rest = rest.trim_start_matches('>');
+                        if !rest.starts_with('&') && !rest.trim_start().starts_with("/dev/null") {
+                            hit = true;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            prev_dollar = c == '$';
+        }
+        hit
+    }
+    let cases = [
+        "echo a > b",
+        "echo a >> b",
+        "echo a >>> b",
+        "ls 2>&1",
+        "ls >&2",
+        "ls >>&2",
+        "ls > /dev/null",
+        "ls >/dev/null",
+        "ls >>   /dev/null",
+        "ls >\t\u{3000}/dev/null",
+        "ls > /dev/nul",
+        "ls > /dev/nullx",
+        "ls >",
+        ">",
+        ">>",
+        ">>&",
+        "> &1",
+        "ls 2>&1 > out",
+        "ls > /dev/null 2>&1",
+        "ls > /dev/null > out",
+        "echo '>' x",
+        "echo \">\" > /dev/null",
+        "echo $(a > b)",
+        "a >&1 >> /dev/null >b",
+        "a >> >& b",
+    ];
+    for cmd in cases {
+        assert_eq!(bash_profile(cmd).has_redirect, reference(cmd), "{cmd:?}");
+    }
+}
+
+/// 几十万个 `>` / 扩展名 / 工具块都得是线性的：原先这三处分别要几十秒到几分钟（debug 构建更久），
+/// 这里跑得完就是守住了。
+#[test]
+fn attacker_sized_inputs_stay_linear() {
+    let started = std::time::Instant::now();
+    // 每个 `>` 后面跟 `&`（判成 fd 复制，`has_redirect` 一直为假，躲不开每次都看）。
+    assert!(!bash_profile(&">&".repeat(300_000)).has_redirect);
+    // 一长串连着的 `>`，最后才是 `&`。
+    assert!(!bash_profile(&format!("{}&1", ">".repeat(600_000))).has_redirect);
+    // 每个 `>` 后面一长段空白。
+    assert!(bash_profile(&format!("a >{}b", " ".repeat(600_000))).has_redirect);
+
+    // 十万种不同的扩展名：按出现先后、去重。
+    let files: String = (0..100_000).map(|i| format!(" f.e{i}")).collect();
+    let ext = files::bash_command_file_ext(&format!("cat a.md b.md{files} c.md")).unwrap();
+    assert!(ext.starts_with("md,e0,e1,"));
+    assert_eq!(ext.split(',').count(), 100_001);
+
+    // 五万对 tool_use / tool_result，id 逆序配对；重复 id 认第一条结果。
+    let n = 50_000;
+    let uses: Vec<Value> = (0..n)
+        .map(|i| json!({"type": "tool_use", "id": format!("toolu_{i}"), "name": "X", "input": {}}))
+        .collect();
+    let mut results: Vec<Value> = (0..n)
+        .rev()
+        .map(|i| json!({"type": "tool_result", "tool_use_id": format!("toolu_{i}"), "content": "ok"}))
+        .collect();
+    results.push(json!({"type": "tool_result", "tool_use_id": "toolu_0", "content": "second!", "is_error": true}));
+    let messages = vec![
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": uses}),
+        json!({"role": "user", "content": results}),
+    ];
+    let got = tool_uses_of(&messages);
+    assert_eq!(got.len(), n);
+    assert_eq!((got[0].id.as_str(), got[0].result_len, got[0].is_error), ("toolu_0", 2, false));
+
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}

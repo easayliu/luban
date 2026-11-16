@@ -57,15 +57,30 @@ pub struct KeyAccess {
 /// [`CredentialStore::api_key_access`] 的进程内缓存：每条转发请求都要认一次 Key，Key 表又
 /// 极少变动，逐条查库就是每请求一到两次往返。
 ///
-/// 只缓存认得出的 Key（键是 [`key_hash`]）：认不出的不进缓存，乱发 Key 撑不大它，条数以
-/// `api_keys` 的行数为上限。改动 Key 或分组绑定的写路径用
+/// 认得出的 Key（键是 [`key_hash`]）条数以 `api_keys` 的行数为上限。认不出的另记在 `misses` 里、
+/// 只留 [`KEY_MISS_TTL`]、最多 [`KEY_MISS_MAX`] 条：配错 Key 的客户端会拿同一把 Key 不停重试，
+/// 每条都查一次库没有意义；乱编 Key 的每把都不同，这张表挡不住也撑不大（满了不再记）。改动 Key 或分组绑定的写路径用
 /// [`CredentialStore::commit_invalidating_keys`] 提交，提交结束后整体作废；`generation` 挡住
 /// 「提交之前读到的旧值在作废之后才放进缓存」。[`KEY_CACHE_TTL`] 兜底：直接改库（运维手工 SQL）最多这么久后生效。
 #[derive(Default)]
 pub(super) struct KeyAccessCache {
     generation: u64,
     hits: HashMap<String, (std::time::Instant, KeyAccess)>,
+    misses: HashMap<String, std::time::Instant>,
+    /// `misses` 上次清扫的时刻：满了之后最多每 [`KEY_MISS_SWEEP_EVERY`] 扫一遍，见该常量。
+    misses_swept: Option<std::time::Instant>,
 }
+
+/// 认不出的 Key 记多久：新建 Key 走写路径会整体作废缓存，这个时长只管「手工改库加 Key」多久生效。
+const KEY_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `misses` 最多几条。
+const KEY_MISS_MAX: usize = 4096;
+
+/// `misses` 满了之后隔多久才清扫一次过期条目。乱编 Key 的洪泛几千条就把表填满，而最早那条到期
+/// 之前扫多少遍也腾不出位置——逐请求扫的话，每条无效 Key 都拿着缓存锁走一遍全表，合法 Key 的
+/// 查询也在等这把锁。两次清扫之间新来的无效 Key 不记，照常查库。
+const KEY_MISS_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// [`KeyAccessCache`] 里一条的有效期。
 const KEY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -595,15 +610,36 @@ impl CredentialStore {
             {
                 return Ok(Some(access.clone()));
             }
+            if cache.misses.get(&hash).is_some_and(|at| at.elapsed() < KEY_MISS_TTL) {
+                return Ok(None);
+            }
             cache.generation
         };
         let access = self.api_key_access_uncached(&hash).await?;
-        if let Some(access) = &access {
-            let mut cache = self.key_cache.lock();
-            if cache.generation == generation {
-                cache.hits.insert(hash, (std::time::Instant::now(), access.clone()));
+        let mut cache = self.key_cache.lock();
+        if cache.generation == generation {
+            let now = std::time::Instant::now();
+            match &access {
+                Some(access) => {
+                    cache.misses.remove(&hash);
+                    cache.hits.insert(hash, (now, access.clone()));
+                }
+                None => {
+                    if cache.misses.len() >= KEY_MISS_MAX
+                        && cache
+                            .misses_swept
+                            .is_none_or(|at| now.duration_since(at) >= KEY_MISS_SWEEP_EVERY)
+                    {
+                        cache.misses_swept = Some(now);
+                        cache.misses.retain(|_, at| now.duration_since(*at) < KEY_MISS_TTL);
+                    }
+                    if cache.misses.len() < KEY_MISS_MAX {
+                        cache.misses.insert(hash, now);
+                    }
+                }
             }
         }
+        drop(cache);
         Ok(access)
     }
 
@@ -639,6 +675,7 @@ impl CredentialStore {
             let mut cache = cache.lock();
             cache.generation += 1;
             cache.hits.clear();
+            cache.misses.clear();
             committed
         })
         .await

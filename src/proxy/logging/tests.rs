@@ -963,3 +963,22 @@ fn forensics_keep_only_the_rebuilt_tools_used_header() {
     let s = crate::proxy::logging::inbound_headers_summary(&h).unwrap();
     assert!(s.contains("<5 bytes>") && !s.contains("url"), "{s}");
 }
+
+/// 不认识的顶层字段有上限：小的原样留，大的只记占位，不把来访塞的几十 MB 抄进流水。
+#[test]
+fn shape_summary_bounds_unknown_fields() {
+    let big = "x".repeat(1 << 20);
+    let body = serde_json::json!({
+        "model": "m",
+        "thinking": {"type": "adaptive"},
+        "junk": big,
+        "deep": vec![serde_json::json!({"k": "v".repeat(100)}); 200],
+    });
+    let ShapeBits { shape, .. } = crate::proxy::shape_summary_of(&body);
+    let shape: serde_json::Value = serde_json::from_str(&shape.unwrap()).unwrap();
+    assert_eq!(shape["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(shape["junk"]["truncated"], true);
+    assert_eq!(shape["junk"]["kind"], "string");
+    assert_eq!(shape["deep"]["kind"], "array");
+    assert!(shape.to_string().len() < 2048);
+}

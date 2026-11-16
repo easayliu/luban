@@ -539,7 +539,10 @@ pub(super) fn bash_command_file_ext(command: &str) -> Option<String> {
     if !command.contains('.') {
         return None;
     }
+    // 按出现先后报，所以留着 `seen` 这个有序表；判重另用一张集合——命令长度没有上限，拿 `Vec::contains`
+    // 判重是平方级（几万种扩展名就是秒级，还持着遥测状态锁）。
     let mut seen: Vec<String> = Vec::new();
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
     for seg in split_shell_ops(command) {
         if seg.is_empty() {
             continue;
@@ -557,7 +560,7 @@ pub(super) fn bash_command_file_ext(command: &str) -> Option<String> {
                 continue;
             }
             if let Some(ext) = js_ext(w)
-                && !seen.contains(&ext)
+                && known.insert(ext.clone())
             {
                 seen.push(ext);
             }

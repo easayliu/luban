@@ -959,8 +959,15 @@ pub async fn login(
     if username.len() > MAX_LOGIN_USERNAME_LEN {
         return Err((StatusCode::UNAUTHORIZED, "wrong username or password".into()));
     }
-    let key = username.to_lowercase();
     let user = state.store.user_by_username(username).await.map_err(internal)?;
+    // 限流键：确有账号的按**库里那个用户名**算，不按来访写的那串。库里找人用的是 PG 的 `lower()`，
+    // 和 Rust 的 `to_lowercase()` 对个别字符映射不同（`İ` 在 PG 里小写成 `i`，Rust 小写成 `i` 加
+    // 组合点）：按来访原串算的话，`admİn` 找到的是 admin 这个账号，计数却记在另一个键上，
+    // 用户名里每有一个 `i`，可猜的次数翻一倍。
+    let key = match &user {
+        Some(u) => u.username.to_lowercase(),
+        None => username.to_lowercase(),
+    };
     if !reserve_login_attempt(&key, user.is_some()) {
         tracing::warn!(%ip, username, "console login rejected: too many failed attempts");
         return Err((

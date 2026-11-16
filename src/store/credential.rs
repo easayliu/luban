@@ -458,6 +458,9 @@ impl CredentialStore {
         .rows_affected() as usize)
     }
 
+    /// 删号前锁外预删思考块登记，一批删几行，见 [`Self::remove`]。
+    const THINKING_PREDELETE_BATCH: i64 = 5000;
+
     /// 批量删除：口径同 [`Self::remove`]，返回实际删除的条数（仅测试用）。
     #[cfg(test)]
     pub async fn delete_many(&self, ids: &[i64]) -> Result<usize> {
@@ -473,6 +476,27 @@ impl CredentialStore {
     pub async fn remove(&self, ids: &[i64]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
+        }
+        // 思考块登记先在**锁外**分批删掉：一个用了几个月的号有几十万行（保留 90 天、三个索引），
+        // 放在下面那个事务里一次删，全局写锁要拿几秒到几十秒，期间所有转发请求卡在选号上。
+        // 这里删完，事务里那条 DELETE（与外键级联）只剩其间新登记的零星几行。
+        // 提前删掉的代价：到事务提交之前，这个号签发的旧思考块查不到签发者——号反正要删了。
+        loop {
+            let n = sqlx::query(
+                // `= ANY(ARRAY(子查询))`：子查询先算成一个数组，外层按主键逐个点查这一批。写成
+                // `fp IN (SELECT … LIMIT n)` 的话规划器可能对外层走全表扫描再做半连接，每批都把
+                // 别的号的行扫一遍。
+                "DELETE FROM thinking_blocks WHERE fp = ANY(ARRAY(\
+                 SELECT fp FROM thinking_blocks WHERE cred_id = ANY($1) LIMIT $2))",
+            )
+            .bind(ids)
+            .bind(Self::THINKING_PREDELETE_BATCH)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            if n < Self::THINKING_PREDELETE_BATCH as u64 {
+                break;
+            }
         }
         // 串行化：与选号互斥，选号不会把设备绑回一个刚删掉的号。
         let mut tx = self.begin_write().await?;
@@ -1689,6 +1713,30 @@ mod tests {
         assert_eq!(q.requests_5h, Some(1));
         assert_eq!(q.cost_7d, None, "无 7d reset 时不应给出 0");
         assert_eq!(q.requests_7d, None, "无 7d reset 时请求数也应未知");
+    }
+
+    /// 删号前锁外分批预删思考块登记：超过一批的量也删得干净，别的号与外来登记不动。
+    #[sqlx::test]
+    async fn removing_a_credential_clears_its_thinking_blocks_in_batches(pool: PgPool) {
+        let (store, ids) = store_with(pool, &["a", "b"]).await;
+        let (a, b) = (ids[0], ids[1]);
+        sqlx::query(
+            "INSERT INTO thinking_blocks (fp, cred_id, ts) \
+             SELECT 'a' || g, $1, 1 FROM generate_series(1, 12000) g",
+        )
+        .bind(a)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO thinking_blocks (fp, cred_id, ts) VALUES ('b1', $1, 1), ('x1', NULL, 1)",
+        )
+        .bind(b)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.remove(&[a]).await.unwrap(), 1);
+        assert_eq!(scalar(&store, "SELECT COUNT(*) FROM thinking_blocks").await, 2);
     }
 
     /// 删号时正好有一条流水在写：两边都得成功，不能死锁。

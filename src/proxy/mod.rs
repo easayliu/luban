@@ -238,6 +238,7 @@ pub async fn handle(
     let local_replay = log_state.local_replay.lock().take();
     if (is_error || local_replay.is_some())
         && !log_state.logged.load(std::sync::atomic::Ordering::Relaxed)
+        && !log_state.skip_local_log.load(std::sync::atomic::Ordering::Relaxed)
     {
         let parsed = log_state.parsed.lock().take();
         let mut rec =
@@ -400,6 +401,9 @@ pub(crate) struct RequestLogState {
     refresh_failed: parking_lot::Mutex<Option<store::RefreshFailed>>,
     /// 来访用的哪把接入 Key（认身份那一步放下），流水与费用汇总按它记账。
     key_id: parking_lot::Mutex<Option<i64>>,
+    /// 这条本地拒绝**不写流水**：无效 Key 的拒绝超了每分钟的记录额度（见
+    /// `handler::admit::invalid_key_log_slot`），只在日志里计数。
+    skip_local_log: std::sync::atomic::AtomicBool,
 }
 
 /// 流水 `rewrites` 里标「本地拒绝、未转发」；带原因分类时是 `rejected_locally:<kind>`，

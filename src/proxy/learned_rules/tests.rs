@@ -1522,3 +1522,62 @@ fn lazy_prompt_digest_matches_the_eager_one() {
     let broken = crate::proxy::LazyPromptDigest::FromBody(axum::body::Bytes::from_static(b"{"));
     assert_eq!(broken.resolve(), None);
 }
+
+/// 回显请求内容的 400 不学：键名、标签值、头值都是来访定的，凑得出「字段关键词 + 被点名的取值」。
+#[test]
+fn echoed_request_content_is_never_learned() {
+    let mem = crate::proxy::ShapeMemory::default();
+    let req = json_body(
+        r#"{"model":"claude-opus-5","output_config":{"effort":"high"},"temperature":1,
+            "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"x"}]}"#,
+    );
+    for msg in [
+        "effort 'high': Extra inputs are not permitted",
+        "`temperature` deprecated: Extra inputs are not permitted",
+        "messages.0.content.0: Input tag 'effort 'high'' found using 'type' does not match any of the expected tags",
+        "Unexpected value(s) `effort 'high'` for the `anthropic-beta` header",
+        "tool_choice: Tool 'effort 'high'' not found in provided tools",
+        "x does not support assistant message prefill: Extra inputs are not permitted",
+    ] {
+        let err = serde_json::json!({"type": "error", "error": {"type": "invalid_request_error", "message": msg}})
+            .to_string();
+        let learned = crate::proxy::remember_shape_rejection(
+            &mem,
+            Some("claude-opus-5"),
+            req.as_ref(),
+            req.as_ref(),
+            err.as_bytes(),
+        );
+        assert!(learned.is_empty(), "{msg}");
+    }
+    assert!(mem.read().is_empty());
+}
+
+/// 摘要改成边序列化边哈希之后，值要和原先「先 `to_string` 再哈希」逐位相同：库里存着的旧摘要靠它认。
+#[test]
+fn prompt_digest_matches_the_to_string_form() {
+    use sha2::{Digest, Sha256};
+    let reference = |body: &serde_json::Value| -> String {
+        let mut h = Sha256::new();
+        for field in ["system", "tools", "tool_choice"] {
+            if let Some(v) = body.get(field) {
+                h.update(v.to_string().as_bytes());
+            }
+            h.update(b"\0");
+        }
+        h.update(body["messages"].to_string().as_bytes());
+        h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    };
+    for body in [
+        serde_json::json!({"messages": [{"role": "user", "content": "hi \"q\" \u{4e2d}\u{6587} \n\t <>&"}]}),
+        serde_json::json!({
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "t", "input_schema": {"type": "object", "z": 1.5, "a": null}}],
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
+        }),
+        serde_json::json!({"system": "", "messages": []}),
+    ] {
+        assert_eq!(crate::proxy::prompt_digest(&body), Some(reference(&body)));
+    }
+}

@@ -31,10 +31,11 @@ pub(super) async fn touch(
 ) -> Response {
     let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path()).to_string();
     let client_ua = ua_of(&headers);
-    let key_access = match admit::client_gates(state, &method, &path, &client_ua, &headers).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
+    let key_access =
+        match admit::client_gates(state, &method, &path, &client_ua, &headers, log_state).await {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
     *log_state.key_id.lock() = key_access.key_id;
     let Some(body) = read_touch_body(body).await else {
         return error_response(

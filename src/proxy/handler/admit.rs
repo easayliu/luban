@@ -136,7 +136,8 @@ pub(super) async fn admit(
     // 在途计数：入口就 +1，随后 move 进 ReqLog 活到响应流结束，见 [`InFlightGuard`]。
     let in_flight = InFlightGuard::new(state.in_flight.clone());
 
-    let key_access = client_gates(state, &method, &path_and_query, &client_ua, &headers).await?;
+    let key_access =
+        client_gates(state, &method, &path_and_query, &client_ua, &headers, log_state).await?;
     *log_state.key_id.lock() = key_access.key_id;
     let (session_from_header, concurrency_limit, mut session_concurrency_guard) =
         header_session_gates(state, &method, &path_and_query, &client_ua, &headers, log_state)?;
@@ -354,12 +355,22 @@ pub(super) async fn client_gates(
     path_and_query: &str,
     client_ua: &str,
     headers: &HeaderMap,
+    log_state: &RequestLogState,
 ) -> Result<store::KeyAccess, Response> {
     // 1) 校验来访 API Key（一把都没配则全部拒绝），见 [`client_access`]。
     let access = match client_access(state, headers).await {
         Ok(Some(access)) => access,
         Ok(None) => {
-            tracing::warn!(%method, path = %path_and_query, ua = %client_ua, "rejected: invalid inbound API key");
+            // 不带 Key / 带错 Key 的请求谁都能发、读体之前就被拒，成本极低：每条都打日志、写流水的话，
+            // 日志被刷屏，流水写入队列（与真实请求的计费流水共用、满了丢新的）被灌满。所以限量记，
+            // 见 [`invalid_key_log_slot`]。
+            match invalid_key_log_slot() {
+                Some(suppressed) => {
+                    let path: String = path_and_query.chars().take(200).collect();
+                    tracing::warn!(%method, %path, ua = %client_ua, suppressed, "rejected: invalid inbound API key");
+                }
+                None => log_state.skip_local_log.store(true, std::sync::atomic::Ordering::Relaxed),
+            }
             return Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "authentication_error",
@@ -392,7 +403,64 @@ pub(super) async fn client_gates(
             ),
         ));
     }
+    // 1.6) 路径白名单，见 [`forwardable_path`]。排在认 Key 之后：没 Key 的人探不出这张表。
+    if !forwardable_path(path_and_query) {
+        let path: String = path_and_query.chars().take(200).collect();
+        tracing::warn!(%method, %path, ua = %client_ua, "rejected: path is not forwarded");
+        *log_state.local_reject.lock() = Some("path-not-forwarded");
+        return Err(error_response(StatusCode::NOT_FOUND, "not_found_error", "Not Found"));
+    }
     Ok(access)
+}
+
+/// 无效 Key 的拒绝每分钟最多记几条（日志一行 + 流水一行）。配错 Key 的人照样查得到自己那条，
+/// 洪泛时多出来的只计数。
+const INVALID_KEY_LOGS_PER_MINUTE: u32 = 30;
+
+/// 这条无效 Key 的拒绝要不要记：要记返回 `Some(此前憋掉的条数)`，超了本分钟额度返回 `None`。
+/// 憋掉的条数挂在下一个窗口的第一行日志上。
+fn invalid_key_log_slot() -> Option<u64> {
+    // (窗口起点, 本窗口已记条数, 憋掉的条数)
+    static SLOT: parking_lot::Mutex<Option<(std::time::Instant, u32, u64)>> =
+        parking_lot::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut slot = SLOT.lock();
+    let (start, used, suppressed) = slot.get_or_insert((now, 0, 0));
+    if now.duration_since(*start) >= std::time::Duration::from_secs(60) {
+        (*start, *used) = (now, 0);
+    }
+    if *used < INVALID_KEY_LOGS_PER_MINUTE {
+        *used += 1;
+        Some(std::mem::take(suppressed))
+    } else {
+        *suppressed += 1;
+        None
+    }
+}
+
+/// 这条路径转不转发。只放行对外的推理接口：`/v1/messages`（含 `count_tokens`、`batches`、
+/// 缓存保活）、`/v1/files`、`/v1/models`。
+///
+/// 转发带的是号池里那个号的 OAuth token，而同一个 token 在 `/v1/` 下还能打一批**账号级**端点
+/// （Claude Code 自己用的 `/v1/mcp_servers`、`/v1/code/triggers`、`/v1/sessions` 之类）。不设这张表，
+/// 持接入 Key 的人就能以号主的身份读写这些东西，不占名额、也不经任何形态检查。
+///
+/// 带 `.` / `..` 段、转义的点或斜杠、反斜杠、连续斜杠的一律不放：出站客户端不规整路径，
+/// `/v1/messages/../../api/oauth/profile` 会原样发出去，上游怎么解释它不由我们定。
+pub(super) fn forwardable_path(path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    if path.contains('\\')
+        || path.contains("//")
+        || ["%2e", "%2f", "%5c"].iter().any(|esc| lower.contains(esc))
+        || path.split('/').any(|seg| seg == "." || seg == "..")
+    {
+        return false;
+    }
+    let path = path.trim_end_matches('/');
+    ["/v1/messages", "/v1/files", "/v1/models"].iter().any(|root| {
+        path.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// 1.6～1.7：头上带会话 id 的，先按会话限 RPM 与并发。返回头上的会话 id、并发上限与

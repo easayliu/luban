@@ -3036,3 +3036,44 @@ async fn simulated_messages_carry_the_tools_used_header(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sandy(&mock.seen()[3]).as_deref(), Some(first.as_str()), "2.1.319 没有开关可关");
 }
+
+/// 只转发对外的推理接口；账号级端点与带点段、转义的路径一律不放。
+#[test]
+fn only_inference_paths_are_forwarded() {
+    use super::admit::forwardable_path;
+    for ok in [
+        "/v1/messages",
+        "/v1/messages?beta=true",
+        "/v1/messages/",
+        "/v1/messages/count_tokens?beta=true",
+        "/v1/messages/batches",
+        "/v1/messages/batches/msgbatch_01/results",
+        crate::config::CC_CACHE_TOUCH_PATH,
+        "/v1/files",
+        "/v1/files/file_01/content",
+        "/v1/models",
+        "/v1/models/claude-opus-5-5",
+        // query 里的点与斜杠不算路径。
+        "/v1/models?after_id=../x&b=%2e",
+    ] {
+        assert!(forwardable_path(ok), "{ok}");
+    }
+    for no in [
+        "/v1/mcp_servers",
+        "/v1/code/triggers",
+        "/v1/sessions",
+        "/v1/complete",
+        "/v1/",
+        "/v1/messagesx",
+        "/v1/modelsfoo",
+        "/v1/messages/../../api/oauth/profile",
+        "/v1/messages/./count_tokens",
+        "/v1/messages/%2e%2e/sessions",
+        "/v1/messages/%2E%2E%2Fsessions",
+        "/v1/messages//batches",
+        "/v1/files/..",
+        "/v1/messages\\..\\sessions",
+    ] {
+        assert!(!forwardable_path(no), "{no}");
+    }
+}

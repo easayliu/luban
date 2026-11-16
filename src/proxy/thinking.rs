@@ -384,19 +384,43 @@ pub(crate) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
     // 能按位置配回去。
     let aligned = orig_blocks.len() == rw_blocks.len()
         && orig_blocks.iter().zip(&rw_blocks).all(|(o, r)| o.turn == r.turn && o.blk == r.blk);
-    let unique = |list: &[ThinkingBlockRef], key: &str| {
-        list.iter().filter(|b| b.key.as_deref() == Some(key)).count() == 1
+    // 配对全走查表：块数是来访定的，没有上限，逐块回头扫整张表（数 key 出现几次、按 key / 按位置
+    // 找对家）是平方级，十万个小块就能把一个工作线程占住几十秒。
+    //
+    // key → (出现次数, 首次出现的下标)。
+    use std::collections::HashMap;
+    fn by_key(list: &[ThinkingBlockRef]) -> HashMap<&str, (usize, usize)> {
+        let mut map: HashMap<&str, (usize, usize)> = HashMap::with_capacity(list.len());
+        for (i, b) in list.iter().enumerate() {
+            if let Some(key) = b.key.as_deref() {
+                map.entry(key).or_insert((0, i)).0 += 1;
+            }
+        }
+        map
+    }
+    let (orig_keys, rw_keys) = (by_key(&orig_blocks), by_key(&rw_blocks));
+    let unique =
+        |map: &HashMap<&str, (usize, usize)>, key: &str| map.get(key).is_some_and(|&(n, _)| n == 1);
+    // (assistant 序号, 块下标) → 改写后那一侧首次出现的下标；只在完全对齐时用得到。
+    let rw_by_pos: HashMap<(usize, usize), usize> = if aligned {
+        let mut map = HashMap::with_capacity(rw_blocks.len());
+        for (i, r) in rw_blocks.iter().enumerate() {
+            map.entry((r.turn, r.blk)).or_insert(i);
+        }
+        map
+    } else {
+        HashMap::new()
     };
     let mut subs: Vec<(std::ops::Range<usize>, &[u8])> = Vec::new();
     for ob in &orig_blocks {
         let rb = match ob.key.as_deref() {
             // 两侧各只出现一次才算认得出是同一个块；重复的（客户端把同一块贴了两遍）退回位置。
-            Some(key) if unique(&orig_blocks, key) && unique(&rw_blocks, key) => {
-                rw_blocks.iter().find(|r| r.key.as_deref() == Some(key))
+            Some(key) if unique(&orig_keys, key) && unique(&rw_keys, key) => {
+                rw_keys.get(key).map(|&(_, i)| &rw_blocks[i])
             }
             // 没有签名的块只在完全对齐时按位置配。错位时宁可不还原：它没有签名，上游无从
             // 按字节校验，重新编码一遍无害，而配错了就是把历史改乱。
-            _ if aligned => rw_blocks.iter().find(|r| r.turn == ob.turn && r.blk == ob.blk),
+            _ if aligned => rw_by_pos.get(&(ob.turn, ob.blk)).map(|&i| &rw_blocks[i]),
             _ => None,
         };
         if let Some(rb) = rb {
@@ -410,9 +434,23 @@ pub(crate) fn preserve_thinking_encoding(original: &[u8], rewritten: Vec<u8>) ->
     if subs.is_empty() {
         return rewritten;
     }
-    subs.sort_by_key(|a| std::cmp::Reverse(a.0.start));
+    subs.sort_by_key(|a| a.0.start);
+    // 正常情形各段互不相交：一趟拼完（原文段与还原段交替），不为每处还原把整份体重拷一遍。
+    if subs.windows(2).all(|w| w[0].0.end <= w[1].0.start) {
+        let grow: usize = subs.iter().map(|(_, orig)| orig.len()).sum();
+        let mut out = Vec::with_capacity(rewritten.len() + grow);
+        let mut at = 0;
+        for (range, orig) in &subs {
+            out.extend_from_slice(&rewritten[at..range.start]);
+            out.extend_from_slice(orig);
+            at = range.end;
+        }
+        out.extend_from_slice(&rewritten[at..]);
+        return out;
+    }
+    // 两个原始块配到了同一个改写块（按 key 配的与按位置配的撞在一起）：极少见，照旧从后往前逐处换。
     let mut out = rewritten;
-    for (range, orig) in subs {
+    for (range, orig) in subs.into_iter().rev() {
         let mut v = Vec::with_capacity(out.len() - range.len() + orig.len());
         v.extend_from_slice(&out[..range.start]);
         v.extend_from_slice(orig);

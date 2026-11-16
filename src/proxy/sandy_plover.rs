@@ -397,8 +397,10 @@ fn inferred_capped(value: &str, items: &[serde_json::Value], item_max: usize) ->
 /// 官方锁存跨压缩一直在、子代理执行那一刻就记，luban 只能从清单里认回来，按清单的先后（官方写的是排过序的）并进去。
 fn tools_used_in(body: &serde_json::Value, tool_names: Option<&ToolNameMap>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let add = |used: String, out: &mut Vec<String>| {
-        if !out.contains(&used) {
+    // 顺序按首次出现；判重另用集合——工具块的个数是来访定的，`Vec::contains` 判重是平方级。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut add = |used: String, out: &mut Vec<String>| {
+        if seen.insert(used.clone()) {
             out.push(used);
         }
     };
@@ -935,6 +937,25 @@ mod tests {
 
     /// 压缩过的对话里没有调用块，用过的工具在摘要开头那份清单里（`cap/auto-2.1.312-20261028-full/00206`）：头一回见到这个
     /// 会话也认得回来；裸标签那种同样认，不在消息开头的、不是摘要那段开头的不认。
+    /// 几万个不同名的工具块：按首次出现的先后去重，判重不能是平方级。
+    #[test]
+    fn many_distinct_tools_dedupe_in_order() {
+        let n = 50_000;
+        let blocks: Vec<serde_json::Value> = (0..n)
+            .chain(0..n)
+            .map(|i| serde_json::json!({"type": "tool_use", "id": "x", "name": format!("T{i}"), "input": {}}))
+            .collect();
+        let body = serde_json::json!({"messages": [{"role": "assistant", "content": blocks}]});
+        let started = std::time::Instant::now();
+        let names = tools_used_in(&body, None);
+        assert_eq!(names.len(), n);
+        assert_eq!(
+            (names[0].as_str(), names[n - 1].as_str()),
+            ("T0", format!("T{}", n - 1).as_str())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
     #[test]
     fn a_compacted_conversation_brings_its_tools_back_from_the_summary() {
         let summary = "This session is being continued from a previous conversation that ran out of context. \

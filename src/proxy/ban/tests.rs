@@ -306,3 +306,65 @@ fn header_text_falls_back_to_a_dash() {
     );
     assert_eq!(crate::proxy::header_text(&h, "x-weird"), "-", "非 UTF-8 头值不猜");
 }
+
+/// 400 的文案回显请求内容时，里面的特征词是来访自己写的，不能据此停用：持 Key 的人在体里加一个
+/// 顶层键 `"oauth": 1` 就能让上游回 `oauth: Extra inputs are not permitted`，一条请求扣一个号。
+#[test]
+fn echoed_request_content_on_400_is_not_a_ban() {
+    let echoes = [
+        // 未知键名抄在句首，后面跟冒号。
+        "oauth: Extra inputs are not permitted",
+        "invalid_grant: Extra inputs are not permitted",
+        "account_disabled: Extra inputs are not permitted",
+        "messages.0.content.0.organization suspended: Extra inputs are not permitted",
+        // 键名里自带冒号，想把词挪到第一个冒号后面。
+        "x: this organization has been disabled.: Extra inputs are not permitted",
+        // 取值抄在引号 / 反引号里。
+        "messages.0.content.0: Input tag 'oauth' found using 'type' does not match any of the expected tags",
+        "Unexpected value(s) `account-banned` for the `anthropic-beta` header",
+        "Tool \"credential disabled\" not found in provided tools",
+        // 取值里自带引号想闭合出来：上游包的那对引号还在。
+        "Input tag 'x' organization disabled '' found",
+    ];
+    for msg in echoes {
+        let body = err_body("invalid_request_error", msg);
+        assert_eq!(detect_account_ban(StatusCode::BAD_REQUEST, &body), None, "{msg}");
+    }
+    // 判成「豁免改写了结论」，会记一条日志：新出现的真封号文案带冒号时能看见。
+    use crate::proxy::ban::{BanVerdict, ban_verdict};
+    assert!(matches!(
+        ban_verdict(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_request_error"),
+            "oauth: Extra inputs are not permitted"
+        ),
+        BanVerdict::Exempt { overrode_signal: true, .. }
+    ));
+    // 没有特征词的普通回显不进这一臂（不刷日志）。
+    assert_eq!(
+        ban_verdict(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_request_error"),
+            "fallbacks: Extra inputs are not permitted"
+        ),
+        BanVerdict::Clear
+    );
+}
+
+/// 平铺的一句账号级文案在 400 上照旧停用：撇号、链接里的冒号不算回显。
+#[test]
+fn plain_account_sentences_on_400_still_ban() {
+    let real = [
+        "This organization has been disabled.",
+        "Your organization's access has been suspended",
+        "Your account has been disabled. See https://support.anthropic.com for details",
+        "invalid_grant",
+    ];
+    for msg in real {
+        let body = err_body("invalid_request_error", msg);
+        assert!(detect_account_ban(StatusCode::BAD_REQUEST, &body).is_some(), "{msg}");
+    }
+    // 只收紧 400：401/403 不是参数校验报错，带冒号的照旧。
+    let body = err_body("permission_error", "Account suspended: contact support");
+    assert!(detect_account_ban(StatusCode::FORBIDDEN, &body).is_some());
+}

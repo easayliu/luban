@@ -542,7 +542,13 @@ pub(super) async fn client_for(
                 },
             );
             let _ = state.store.detached(|s| async move { s.record_ban(id, &ctx).await }).await;
-            Err(error_response(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")))
+            // 错误链里带着代理 URL 原文（含口令，`invalid proxy URL: …`），只进日志与停用记录，
+            // 不回给客户端。
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "the upstream proxy for this account is unusable",
+            ))
         }
     }
 }

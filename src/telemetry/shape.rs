@@ -749,6 +749,13 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
     if results.is_empty() {
         return vec![];
     }
+    // 按 id 建表再配对：块数没有上限，每个 `tool_use` 线性扫一遍全部结果是平方级。同一个 id 有多条
+    // 结果时认第一条（与原先的 `find` 一致）。
+    let mut by_id: std::collections::HashMap<&str, &ToolResultInfo> =
+        std::collections::HashMap::with_capacity(results.len());
+    for r in &results {
+        by_id.entry(r.id.as_str()).or_insert(r);
+    }
     prev.get("content")
         .and_then(|c| c.as_array())
         .map(|blocks| {
@@ -761,7 +768,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                     let input = b.get("input").cloned().unwrap_or(Value::Null);
                     let command_len =
                         input.get("command").and_then(|c| c.as_str()).map_or(0, js_len);
-                    let hit = results.iter().find(|r| r.id == id);
+                    let hit = by_id.get(id.as_str()).copied();
                     let read_content = hit
                         .filter(|r| {
                             name == "Read"

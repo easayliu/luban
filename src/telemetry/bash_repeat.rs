@@ -330,15 +330,27 @@ pub(super) fn pieces(command: &str, cwd: &str, read_only: impl Fn(&str) -> bool)
 }
 
 /// `_p`：把 `program` / `list`（含套在重定向里的 `list`）摊平成语句与连接符，注释丢掉。
+///
+/// 用显式栈而不是递归：`a && a && …` 的 `list` 是一层套一层的，1 万码元的命令能套三千多层，
+/// 递归下去吃掉一兆多的栈（线程栈 2 MiB），溢出就是整个进程 abort。
 fn flatten(t: &bash_ast::Tree, id: bash_ast::Id) -> Vec<bash_ast::Id> {
-    match t.kind(id) {
-        "program" | "list" => t.children(id).iter().flat_map(|&c| flatten(t, c)).collect(),
-        "comment" => Vec::new(),
-        "redirected_statement" if t.children(id).first().is_some_and(|&c| t.kind(c) == "list") => {
-            t.children(id).iter().flat_map(|&c| flatten(t, c)).collect()
+    let mut out = Vec::new();
+    let mut stack = vec![id];
+    while let Some(id) = stack.pop() {
+        let expand = match t.kind(id) {
+            "program" | "list" => true,
+            "comment" => continue,
+            "redirected_statement" => t.children(id).first().is_some_and(|&c| t.kind(c) == "list"),
+            _ => false,
+        };
+        if expand {
+            // 倒着压栈，弹出来就是原来的先后。
+            stack.extend(t.children(id).iter().rev().copied());
+        } else {
+            out.push(id);
         }
-        _ => vec![id],
     }
+    out
 }
 
 /// `wp`：写文件的重定向。
@@ -1160,6 +1172,21 @@ fn secs_since(now: SystemTime, e: &Entry) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上限以内最深的 `&&` 链（三千多层 `list`）在 2 MiB 的线程栈上摊得平：`flatten` 曾是递归，
+    /// 栈溢出会带崩整个进程。
+    #[test]
+    fn deep_chains_flatten_without_recursion() {
+        let cmd = vec!["a"; 3333].join("&&");
+        assert!(cmd.encode_utf16().count() <= MAX_PARSE_LEN);
+        let got = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || pieces(&cmd, "/w", |_| false).len())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(got >= 1);
+    }
 
     fn stems(cmd: &str) -> Vec<(String, String, bool)> {
         pieces(cmd, "/w", |c| {

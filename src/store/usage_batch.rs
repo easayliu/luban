@@ -67,6 +67,12 @@ const RETRY_MAX: Duration = Duration::from_millis(4);
 /// 摘要会把它原样带上（见 `proxy::logging::inbound_shape_summary`），超了只记原长。
 const INBOUND_FIELD_MAX: usize = 16 * 1024;
 
+/// 出站摘要 `shape` 的总长上限，超了记占位。正常的几 KB（工具名最多列 64 个）。
+const SHAPE_MAX: usize = 64 * 1024;
+
+/// `path`（含 query）落库的字符数上限。
+const PATH_MAX: usize = 1024;
+
 /// 待写表里的 thinking 登记多久不落库就当作没了（写入任务丢了那批、或一直写不进去）。
 const PENDING_THINKING_TTL: Duration = Duration::from_secs(30);
 
@@ -129,6 +135,16 @@ fn trim_for_queue(rec: &mut UsageRecord) {
         {
             *s = serde_json::json!({ "truncated_bytes": s.len() }).to_string();
         }
+    }
+    // 出站摘要：逐字段已经在 `shape_summary_of` 里封过顶，这里按总长兜底（顶层键的个数是来访定的）。
+    if let Some(s) = &mut rec.forensics.shape
+        && s.len() > SHAPE_MAX
+    {
+        *s = serde_json::json!({ "truncated_bytes": s.len() }).to_string();
+    }
+    // 路径带着来访的 query 原样，长度只受请求头缓冲限制。
+    if rec.path.len() > PATH_MAX {
+        rec.path = head_chars(&rec.path, PATH_MAX);
     }
 }
 
