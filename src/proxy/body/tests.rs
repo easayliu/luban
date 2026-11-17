@@ -119,6 +119,7 @@ fn strip_extra_fields_spares_only_real_cc() {
             None,
             true,
             true,
+            true,
             client,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -151,6 +152,7 @@ fn skips_thinking_display_without_the_beta() {
         None,
         false,
         None,
+        false,
         false,
         false,
         None,
@@ -191,6 +193,7 @@ fn classifier_prefix_gets_billing_header_without_identity() {
             None,
             false,
             None,
+            false,
             false,
             false,
             None,
@@ -268,6 +271,7 @@ fn run_eager(
         None,
         true,
         adv_beta,
+        true,
         version.map(|version| crate::proxy::CcClient { version, entrypoint: "cli" }),
         None,
         kind,
@@ -675,6 +679,7 @@ fn cache_ttl_follows_request_kind_not_shaping() {
             None,
             true,
             true,
+            true,
             None,
             None,
             kind,
@@ -722,6 +727,7 @@ fn split_keeps_client_ttl_when_kind_skips_1h() {
             None,
             false,
             None,
+            true,
             true,
             true,
             None,
@@ -911,6 +917,7 @@ fn the_returned_value_summarizes_the_same_as_the_bytes_it_sent() {
             None,
             false,
             None,
+            true,
             true,
             true,
             None,
@@ -1767,6 +1774,7 @@ fn strip_extra_fields_is_wired_and_switchable() {
         None,
         true,
         false,
+        true,
         Some(crate::proxy::CcClient { version: "2.1.306", entrypoint: "cli" }),
         None,
         crate::proxy::CcRequestKind::Auxiliary,
@@ -2099,6 +2107,7 @@ fn official_side_query_gets_no_breakpoint_or_1h() {
             Some(sid),
             false,
             None,
+            true,
             true,
             true,
             None,
@@ -2519,6 +2528,7 @@ fn rewrite_body_fast_path_still_writes_fallbacks() {
             None,
             false,
             false,
+            false,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -2586,6 +2596,7 @@ fn ensure_fallbacks_inserts_at_the_official_position_and_keeps_client_arrays() {
         None,
         false,
         None,
+        true,
         true,
         true,
         None,
@@ -4199,6 +4210,7 @@ fn simulated_request_reorders_existing_top_level_keys() {
         Some(&map),
         true,
         true,
+        true,
         None,
         None,
         crate::proxy::CcRequestKind::Main,
@@ -5364,6 +5376,7 @@ fn forces_stream_true_and_keeps_key_order() {
             None,
             true,
             true,
+            true,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -5395,6 +5408,7 @@ fn forces_stream_true_and_keeps_key_order() {
         None,
         false,
         None,
+        true,
         true,
         true,
         None,
@@ -6410,6 +6424,7 @@ fn rewrite_recomputes_stale_real_cch() {
             None,
             false,
             false,
+            false,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -7201,6 +7216,7 @@ fn sim_threads_continue_through_obfuscated_tool_names() {
             Some(&map),
             true,
             true,
+            true,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -7766,6 +7782,7 @@ fn sim_threads_continue_after_a_server_tool_search_reply() {
             Some(&map),
             true,
             true,
+            true,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -7858,6 +7875,7 @@ fn rewriting_from_parsed_matches_reparsing() {
                 None,
                 false,
                 None,
+                true,
                 true,
                 true,
                 None,
@@ -8222,6 +8240,7 @@ fn env_pin_records_only_an_inserted_note() {
             None,
             true,
             true,
+            true,
             None,
             None,
             crate::proxy::CcRequestKind::Main,
@@ -8234,4 +8253,273 @@ fn env_pin_records_only_an_inserted_note() {
     sim.billing_only = true;
     run(&sim, all_on());
     assert_eq!(*sim.env_pin.lock(), None, "billing-only 不补环境说明，重新整形覆盖成空");
+}
+
+/// fable-5-2 首轮没带 `thinking`（`inject_thinking` 关着，或 `max_tokens` 不足 1024 没注入），次轮
+/// 重放思考块时 [`bind_thinking_like_api_key`](crate::proxy::bind_thinking_like_api_key) 补成
+/// `{"type":"adaptive","block_binding":…}`。思考恒开的模型上这与缺省等价，线程照样 `continue`，
+/// 不退回 `create` 重发整段历史。
+#[test]
+fn sim_threads_continue_when_binding_adds_thinking_on_turn_two() {
+    use crate::proxy::session_link::CcSessionLink;
+    let mut no_inject = all_on();
+    no_inject.inject_thinking = false;
+    for (tag, flags, max_tokens) in
+        [("inject-off", no_inject, 32000), ("small-max-tokens", all_on(), 512)]
+    {
+        let body = |messages: serde_json::Value| serde_json::json!({ "model": "claude-fable-5-2", "messages": messages, "max_tokens": max_tokens });
+        let user1 =
+            serde_json::json!({ "role": "user", "content": format!("线程测试·绑定 {tag}") });
+        let (v1, p1) = thread_turn(&body(serde_json::json!([user1])), flags);
+        assert_eq!(v1["thread"], serde_json::json!({ "type": "create" }), "{tag}: {v1}");
+        assert!(v1.get("thinking").is_none(), "{tag}: 首轮没有 thinking: {v1}");
+        let reply = serde_json::json!([
+            { "type": "thinking", "thinking": "", "signature": "sig_1" },
+            bash_use("toolu_b1", "ls"),
+        ]);
+        CcSessionLink::record_thread(
+            &p1.expect("create 要等回程提交"),
+            "msg_b1",
+            vec!["toolu_b1".into()],
+            reply_of(reply.clone()),
+            1000,
+        );
+        let msgs2 = serde_json::json!([
+            user1,
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_b1", "content": "a.txt" },
+            ] },
+        ]);
+        let (v2, _) = thread_turn(&body(msgs2), flags);
+        assert_eq!(
+            v2["thinking"]["block_binding"],
+            serde_json::json!({ "prefix_mismatch_behavior": "error" }),
+            "{tag}: 次轮按直连补了绑定: {v2}"
+        );
+        assert_eq!(
+            v2["thread"],
+            serde_json::json!({ "type": "continue", "previous_message_id": "msg_b1" }),
+            "{tag}: 补的 adaptive 与缺省等价，不该退回 create: {v2}"
+        );
+    }
+}
+
+/// 线程续接也比思考块签名：fable 族 `display` 缺省时正文是空串，客户端只把签名换成另一段对话
+/// 签发的那份，不能再判成 `continue`（那样这条 assistant 被裁掉，换过的签名到不了上游）。
+/// 签名变了退回 `create`，整段历史连同绑定策略交给上游校验。
+#[test]
+fn sim_threads_create_when_a_thinking_signature_is_swapped() {
+    use crate::proxy::session_link::CcSessionLink;
+    for (tag, sig, want_continue) in
+        [("same", "sig_orig", true), ("swapped", "sig_from_another_conversation", false)]
+    {
+        let user1 =
+            serde_json::json!({ "role": "user", "content": format!("线程测试·换签名 {tag}") });
+        let body = |messages: serde_json::Value| serde_json::json!({ "model": "claude-fable-5-2", "messages": messages, "max_tokens": 32000 });
+        let (_, p1) = thread_turn(&body(serde_json::json!([user1])), all_on());
+        let reply = |sig: &str| {
+            serde_json::json!([
+                { "type": "thinking", "thinking": "", "signature": sig },
+                bash_use("toolu_s1", "ls"),
+            ])
+        };
+        CcSessionLink::record_thread(
+            &p1.expect("create 要等回程提交"),
+            "msg_s1",
+            vec!["toolu_s1".into()],
+            reply_of(reply("sig_orig")),
+            1000,
+        );
+        let msgs2 = serde_json::json!([
+            user1,
+            { "role": "assistant", "content": reply(sig) },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_s1", "content": "a.txt" },
+            ] },
+        ]);
+        let (v2, _) = thread_turn(&body(msgs2), all_on());
+        if want_continue {
+            assert_eq!(v2["thread"]["type"], "continue", "{tag}: {v2}");
+        } else {
+            assert_eq!(v2["thread"], serde_json::json!({ "type": "create" }), "{tag}: {v2}");
+            let sent = v2["messages"].as_array().unwrap().iter().any(|m| {
+                m["content"].as_array().is_some_and(|c| c.iter().any(|b| b["signature"] == sig))
+            });
+            assert!(sent, "{tag}: 换过的签名要原样发给上游校验: {v2}");
+            assert_eq!(
+                v2["thinking"]["block_binding"],
+                serde_json::json!({ "prefix_mismatch_behavior": "error" }),
+                "{tag}: {v2}"
+            );
+        }
+    }
+}
+
+/// 关掉模拟（`sim` 为 `None`）时绑定策略照样按直连补：判据是实际出站 beta 与真实客户端身份，
+/// 不看走没走模拟。自报了 CC 身份的当真实 CC 不补；出站头没那项 beta 也不补（写了就是 400）。
+#[test]
+fn binding_follows_outbound_beta_and_client_identity_without_simulation() {
+    let raw = serde_json::json!({
+        "model": "claude-fable-5-2", "max_tokens": 64,
+        "thinking": { "type": "adaptive" },
+        "messages": [
+            { "role": "user", "content": "q" },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "", "signature": "sig" },
+                { "type": "text", "text": "a" },
+            ] },
+            { "role": "user", "content": "q2" },
+        ],
+    })
+    .to_string();
+    let body = Bytes::from(raw);
+    let mut flags = all_on();
+    flags.simulate_cc = false;
+    let run = |binding_beta: bool, client: Option<crate::proxy::CcClient<'_>>| {
+        let out = crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            flags,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            binding_beta,
+            client,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0;
+        serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+    };
+    let error = serde_json::json!({ "prefix_mismatch_behavior": "error" });
+    assert_eq!(run(true, None)["thinking"]["block_binding"], error, "第三方客户端、出站带 beta");
+    assert!(run(false, None)["thinking"].get("block_binding").is_none(), "出站没那项 beta");
+    let real = Some(crate::proxy::CcClient { version: "2.1.325", entrypoint: "cli" });
+    assert!(run(true, real)["thinking"].get("block_binding").is_none(), "真实 CC 不补");
+}
+
+/// 绑定与否按解析后的体判，不拿原始字节预筛：历史只有 `redacted_thinking`、顶层没写 `thinking`
+/// 时体里没有 `"thinking"` 字面量；键名与类型写成合法的 `\u0074hinking` 转义也一样。两种都要补。
+#[test]
+fn binding_is_judged_on_the_parsed_body_not_raw_bytes() {
+    let redacted_only = r#"{"model":"claude-fable-5-2","max_tokens":64,"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"ENC"},{"type":"text","text":"a"}]},{"role":"user","content":"q2"}]}"#;
+    let escaped = r#"{"model":"claude-fable-5-2","max_tokens":64,"\u0074hinking":{"type":"adaptive"},"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"\u0074hinking","\u0074hinking":"","signature":"sig"},{"type":"text","text":"a"}]},{"role":"user","content":"q2"}]}"#;
+    assert!(!redacted_only.contains("\"thinking\"") && !escaped.contains("\"thinking\""));
+    let mut flags = all_on();
+    flags.simulate_cc = false;
+    let error = serde_json::json!({ "prefix_mismatch_behavior": "error" });
+    for (tag, raw) in [("redacted-only", redacted_only), ("unicode-escaped", escaped)] {
+        let body = Bytes::from(raw.to_string());
+        let out = crate::proxy::rewrite_body_out(
+            &body,
+            &test_cred(),
+            "fp",
+            flags,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+            true,
+            true,
+            None,
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        )
+        .0;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["thinking"]["type"], "adaptive", "{tag}: {v}");
+        assert_eq!(v["thinking"]["block_binding"], error, "{tag}: {v}");
+    }
+}
+
+/// 线程指纹只归一自动补的默认绑定（`error`）：客户端显式把策略从 `drop_block` 改成 `error`，
+/// 上一轮可能已按宽松策略丢过块，必须 `create` 重发完整历史；策略不变照常 `continue`。
+#[test]
+fn sim_threads_create_when_the_client_tightens_the_binding_policy() {
+    use crate::proxy::session_link::CcSessionLink;
+    let thinking = |behavior: &str| serde_json::json!({ "type": "adaptive", "block_binding": { "prefix_mismatch_behavior": behavior } });
+    for (tag, second, want) in
+        [("unchanged", "drop_block", "continue"), ("tightened", "error", "create")]
+    {
+        let user1 =
+            serde_json::json!({ "role": "user", "content": format!("线程测试·绑定策略 {tag}") });
+        let body = |messages: serde_json::Value, behavior: &str| {
+            serde_json::json!({
+                "model": "claude-fable-5-2", "max_tokens": 32000,
+                "thinking": thinking(behavior), "messages": messages,
+            })
+        };
+        let (_, p1) = thread_turn(&body(serde_json::json!([user1]), "drop_block"), all_on());
+        let reply = serde_json::json!([
+            { "type": "thinking", "thinking": "", "signature": "sig_p" },
+            bash_use("toolu_p1", "ls"),
+        ]);
+        CcSessionLink::record_thread(
+            &p1.expect("create 要等回程提交"),
+            "msg_p1",
+            vec!["toolu_p1".into()],
+            reply_of(reply.clone()),
+            1000,
+        );
+        let msgs2 = serde_json::json!([
+            user1,
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_p1", "content": "a.txt" },
+            ] },
+        ]);
+        let (v2, _) = thread_turn(&body(msgs2, second), all_on());
+        assert_eq!(v2["thread"]["type"], want, "{tag}: {v2}");
+        assert_eq!(v2["thinking"]["block_binding"]["prefix_mismatch_behavior"], second, "{tag}");
+    }
+}
+
+/// 线程建立时 `api_key_parity` 关着（订阅默认丢块），同一会话中途打开：自动补的 `error` 比原先
+/// 宽松，线程指纹要对不上、退回 `create` 重发完整历史；一直开着照常 `continue`。
+#[test]
+fn sim_threads_create_when_binding_parity_is_turned_on_mid_session() {
+    use crate::proxy::session_link::CcSessionLink;
+    let mut off = all_on();
+    off.api_key_parity = false;
+    for (tag, first, want) in [("stays-on", all_on(), "continue"), ("turned-on", off, "create")] {
+        let user1 =
+            serde_json::json!({ "role": "user", "content": format!("线程测试·开校验 {tag}") });
+        let body = |messages: serde_json::Value| serde_json::json!({ "model": "claude-fable-5-2", "max_tokens": 32000, "messages": messages });
+        let (_, p1) = thread_turn(&body(serde_json::json!([user1])), first);
+        let reply = serde_json::json!([
+            { "type": "thinking", "thinking": "", "signature": "sig_on" },
+            bash_use("toolu_on1", "ls"),
+        ]);
+        CcSessionLink::record_thread(
+            &p1.expect("create 要等回程提交"),
+            "msg_on1",
+            vec!["toolu_on1".into()],
+            reply_of(reply.clone()),
+            1000,
+        );
+        let msgs2 = serde_json::json!([
+            user1,
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_on1", "content": "a.txt" },
+            ] },
+        ]);
+        let (v2, _) = thread_turn(&body(msgs2), all_on());
+        assert_eq!(v2["thread"]["type"], want, "{tag}: {v2}");
+        assert_eq!(
+            v2["thinking"]["block_binding"],
+            serde_json::json!({ "prefix_mismatch_behavior": "error" }),
+            "{tag}"
+        );
+    }
 }

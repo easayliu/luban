@@ -19,7 +19,10 @@ use super::simulation::{
     relocate_billing_only_client_system, relocate_long_client_system, simulate_system,
 };
 use super::thinking::preserve_thinking_encoding;
-use super::{CacheSlot, cache_slots, count_cache_control, ensure_cc_metadata, insert_top_level};
+use super::{
+    CacheSlot, bind_thinking_like_api_key, cache_slots, count_cache_control, ensure_cc_metadata,
+    insert_top_level,
+};
 
 mod billing;
 mod cache;
@@ -107,6 +110,9 @@ pub(crate) fn rewrite_body_out(
     // 出站头里已经带了 `advanced-tool-use` beta（同样由调用方从实际发出的头上判定）。
     // 真 CC 路径只有它为真才给工具补 `eager_input_streaming`，见 [`eager_tools_wanted`]。
     adv_beta: bool,
+    // 出站头里已经带了 `thinking-binding-controls` beta（同样由调用方从实际发出的头上判定）。
+    // 只有它为真才能写 `thinking.block_binding`，见 [`bind_thinking_like_api_key`]。
+    binding_beta: bool,
     // 来访**自报**的客户端身份（`claude-cli/x.y.z (external, <entrypoint>)`，版本解不出为
     // `None`）。给真实 CC 补 billing header（[`ensure_cc_system_prefix`]）与按版本取舍字段时用。
     client: Option<CcClient<'_>>,
@@ -132,6 +138,7 @@ pub(crate) fn rewrite_body_out(
         tool_names,
         display_beta,
         adv_beta,
+        binding_beta,
         client,
         client_link,
         cc_kind,
@@ -164,6 +171,9 @@ pub(crate) fn rewrite_body_out_parsed(
     // 出站头里已经带了 `advanced-tool-use` beta（同样由调用方从实际发出的头上判定）。
     // 真 CC 路径只有它为真才给工具补 `eager_input_streaming`，见 [`eager_tools_wanted`]。
     adv_beta: bool,
+    // 出站头里已经带了 `thinking-binding-controls` beta（同样由调用方从实际发出的头上判定）。
+    // 只有它为真才能写 `thinking.block_binding`，见 [`bind_thinking_like_api_key`]。
+    binding_beta: bool,
     // 来访**自报**的客户端身份（`claude-cli/x.y.z (external, <entrypoint>)`，版本解不出为
     // `None`）。给真实 CC 补 billing header（[`ensure_cc_system_prefix`]）与按版本取舍字段时用。
     client: Option<CcClient<'_>>,
@@ -214,6 +224,15 @@ pub(crate) fn rewrite_body_out_parsed(
     // 字符串 `fallbacks` 要归一、`user_id` 可能要剥，都得解析了才知道。
     let may_fill_eager =
         flags.eager_tool_streaming && adv_beta && body_contains(body, b"\"tools\"");
+    // 思考块前缀绑定（[`bind_thinking_like_api_key`]）：看实际出站头有没有那项 beta、来访是不是
+    // 真实 CC，不看走没走模拟——关掉模拟时第三方客户端自带 CC 形态体与这项 beta 照样出站。
+    // 模拟路径一定不是真实 CC；不模拟时按自报身份（[`CcClient`]）判，自报了的当真实 CC 不补。
+    // 要不要真补按**解析后**的体判（模型、历史里有没有思考块，见 [`bind_thinking_like_api_key`]），
+    // 不拿原始字节预筛：只有 `redacted_thinking` 的历史不含 `"thinking"` 字面量，键名或类型也可以
+    // 合法地写成 `\u0074hinking` 这类转义，字节判据会把它们漏掉。代价是这种配置下快速通道不再
+    // 跳过解析。
+    let binding_wanted =
+        flags.api_key_parity && binding_beta && (sim.is_some() || client.is_none());
     // 补 1h 不跟着 `system_shape` 走（见下方 `ttl_wanted`），没有 `cache_control` 字面量的体
     // 一个断点都没有，不必为它解析。
     let may_fill_ttl = cache.ttl_1h && body_contains(body, b"\"cache_control\"");
@@ -228,6 +247,7 @@ pub(crate) fn rewrite_body_out_parsed(
         && tool_names.is_none()
         && fallbacks.is_none()
         && !billing_only
+        && !binding_wanted
         && !real_cch_stale(body, sim, flags)
     {
         return (body.clone(), None);
@@ -343,6 +363,10 @@ pub(crate) fn rewrite_body_out_parsed(
             None => cc_inbound && flags.merge_beta && display_beta,
         }
         && fill_thinking_display(&mut v);
+    // 思考块前缀绑定：出站按官方 CC 带着 `thinking-binding-controls` beta、体里不写字段时，订阅通道
+    // 对改过前缀的重放默认丢块回 200，直连却是 400。非真实 CC 的来访按直连补 `"error"`，见
+    // [`bind_thinking_like_api_key`]。真实 CC 不补：官方从不写这个字段，它自己也不改历史。
+    let binding_filled = binding_wanted && bind_thinking_like_api_key(&mut v);
     let ctx_mgmt = sim.is_some() && !billing_only && ensure_context_management(&mut v);
     // `output_config.effort`：2.1.277 起 opus / fable / sonnet 主线程恒带，按模型的官方默认档补
     // （[`ensure_output_config`]）；haiku 与辅助 profile 官方不带，`effort` 为 `None`。
@@ -572,7 +596,7 @@ pub(crate) fn rewrite_body_out_parsed(
     let threaded = flags.sim_message_threads
         && !billing_only
         && sim.is_some_and(|s| {
-            apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps, raw_sys_shape)
+            apply_sim_thread(&mut v, s, cred.id, &env_note, &raw_fps, raw_sys_shape, binding_wanted)
         });
     tracing::debug!(
         billing_only,
@@ -590,6 +614,7 @@ pub(crate) fn rewrite_body_out_parsed(
         link_added,
         thinking_filled,
         display_filled,
+        binding_filled,
         ctx_mgmt,
         diag,
         fallbacks_shaped,
@@ -622,6 +647,7 @@ pub(crate) fn rewrite_body_out_parsed(
         && !session_synced
         && !thinking_filled
         && !display_filled
+        && !binding_filled
         && !ctx_mgmt
         && !effort_filled
         && !diag

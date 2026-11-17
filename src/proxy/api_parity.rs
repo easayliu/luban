@@ -199,5 +199,72 @@ fn remap_system_paths(msg: &str, map: &[usize]) -> Option<String> {
     changed.then_some(out)
 }
 
+/// 直连对**所有账号**强制执行思考块前缀绑定检查的模型：Fable 5.2 / Mythos 5.2，以及 Mythos 5.1
+/// （Claude API 上不看账号年龄一律强制）。Opus 5.5 / Sonnet 5.5 / Haiku 5.5 / Fable 5.1 只对
+/// 2026-08-31 之后建的账号强制，直连结果随客户的号而变，不在此列。
+pub(crate) fn prefix_binding_enforced_model(model: &str) -> bool {
+    let model = model.trim_end_matches("[1m]");
+    ["claude-fable-5-2", "claude-mythos-5-2", "claude-mythos-5-1"]
+        .iter()
+        .any(|m| model.strip_prefix(m).is_some_and(|rest| rest.is_empty() || rest.starts_with('-')))
+}
+
+/// 历史里有没有 assistant 轮带回的思考块（`thinking` / `redacted_thinking`）。没有就没有可绑定的块，
+/// 补字段只会白添一个官方不发的形态。
+fn replays_thinking_blocks(v: &serde_json::Value) -> bool {
+    v.get("messages").and_then(|m| m.as_array()).is_some_and(|msgs| {
+        msgs.iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .any(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+    })
+}
+
+/// 客户端没写 `thinking.block_binding` 时补 `prefix_mismatch_behavior: "error"`，返回是否改动过。
+///
+/// 直连（不带 `thinking-binding-controls` beta，或带了但不写字段）对上面那几个模型默认 `error`：
+/// 改过 system / tools / 先前消息再重放签名思考块，回 400 `The block is bound to a different
+/// conversation`。luban 出站按官方 CC 带着这项 beta、体里不写字段，订阅通道这时的默认是丢块
+/// （`input_transformations` 里记一条 `thinking_dropped`）照常生成、回 200——渠道测试工具拿
+/// 「直连 400、中转 200」识别中转（2026-11-16 本地实测复现，显式写 `"error"` 即回直连那句）。
+///
+/// 只在出站头带那项 beta 时补（调用方判）：没有 beta 时写 `block_binding` 是一发「Extra inputs」400。
+/// `thinking` 缺省时补成 `{"type":"adaptive", …}`——这几个模型思考恒开，与不写等价；
+/// 写的是别的类型（`disabled` / `enabled`）不动，让上游回它自己那句。
+pub(crate) fn bind_thinking_like_api_key(v: &mut serde_json::Value) -> bool {
+    if !v.get("model").and_then(|m| m.as_str()).is_some_and(prefix_binding_enforced_model)
+        || !replays_thinking_blocks(v)
+    {
+        return false;
+    }
+    let Some(obj) = v.as_object_mut() else { return false };
+    let binding = || serde_json::json!({"prefix_mismatch_behavior": "error"});
+    match obj.get_mut("thinking") {
+        None => {
+            obj.insert(
+                "thinking".into(),
+                serde_json::json!({"type": "adaptive", "block_binding": binding()}),
+            );
+            true
+        }
+        Some(th) => {
+            let Some(th) = th.as_object_mut() else { return false };
+            if th.get("type").and_then(|t| t.as_str()) != Some("adaptive")
+                || th.contains_key("block_binding")
+            {
+                return false;
+            }
+            th.insert("block_binding".into(), binding());
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

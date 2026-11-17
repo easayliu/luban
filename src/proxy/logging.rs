@@ -1497,6 +1497,9 @@ struct ReplyBlock {
     empty: bool,
     /// `text` 块的引用：非流式在块里，流式由 `citations_delta` 一条条来。
     citations: Vec<serde_json::Value>,
+    /// `thinking` 块的签名：非流式在块里，流式由 `signature_delta` 拼（可能分片）。进回复指纹，
+    /// 见 [`ReplyFp::thinking`]。
+    signature: String,
     /// [`ReplyBlockKind::Other`] 的整块（`content_block_start` 那份；工具类块的 `input` 在
     /// [`UsageSniffer::reply_fp`] 里换成拼好的入参）。
     raw: Option<serde_json::Value>,
@@ -1750,6 +1753,20 @@ impl UsageSniffer {
                 {
                     self.pending_signatures.entry(index).or_default().push_str(sig);
                 }
+                // 签名也进回复指纹（[`ReplyFp::thinking`]），按块下标拼到对应的 thinking 块上。
+                if delta.and_then(|d| d.get("type")).and_then(|t| t.as_str())
+                    == Some("signature_delta")
+                    && let Some(sig) =
+                        delta.and_then(|d| d.get("signature")).and_then(|s| s.as_str())
+                {
+                    match self.reply_blocks.iter_mut().rev().find(|b| b.index == index) {
+                        // 防御：签名异常长时不再拼，这条回复记成拼不出原貌。
+                        Some(b) if b.signature.len() + sig.len() <= 1 << 20 => {
+                            b.signature.push_str(sig)
+                        }
+                        _ => self.reply_unverifiable = true,
+                    }
+                }
                 // 认得的增量才拼得出原貌；别的一律记成拼不出，那条回复不给 `continue` 接。
                 match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                     Some(
@@ -1920,6 +1937,14 @@ impl UsageSniffer {
                     fp: reply_text_fp(REPLY_TEXT_FP_INIT, body),
                     empty: body.is_empty() && citations.is_empty(),
                     citations,
+                    signature: match kind {
+                        ReplyBlockKind::Thinking => cb
+                            .get("signature")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        _ => String::new(),
+                    },
                     raw: (kind == ReplyBlockKind::Other).then(|| cb.clone()),
                 });
             }
@@ -2062,8 +2087,8 @@ impl UsageSniffer {
                 Item::Block(b) => match b.kind {
                     ReplyBlockKind::Text if !b.empty => fp.text(b.fp, &b.citations),
                     ReplyBlockKind::Text => {}
-                    ReplyBlockKind::Thinking => fp.thinking(false, b.fp),
-                    ReplyBlockKind::RedactedThinking => fp.thinking(true, b.fp),
+                    ReplyBlockKind::Thinking => fp.thinking(false, b.fp, &b.signature),
+                    ReplyBlockKind::RedactedThinking => fp.thinking(true, b.fp, ""),
                     ReplyBlockKind::Other => {
                         let Some(mut raw) = b.raw.clone() else { continue };
                         // 服务端工具的入参与客户端的一样是 `input_json_delta` 拼的。

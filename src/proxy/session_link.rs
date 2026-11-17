@@ -681,10 +681,18 @@ impl ReplyFp {
 
     /// 一个 `thinking`（`redacted == false`，`block_fp` 是正文的 [`reply_text_fp`]）或
     /// `redacted_thinking`（`block_fp` 是 `data` 的）块。
-    pub(crate) fn thinking(&mut self, redacted: bool, block_fp: u64) {
+    ///
+    /// `signature` 是 `thinking` 块的签名（`redacted_thinking` 传空：密文本身就在 `block_fp` 里）。
+    /// 签名要进指纹：fable 族 `display` 缺省时正文恒为空串，只比正文的话，客户端把签名换成
+    /// 另一段对话签发的那份照样判成 `continue`，线程裁掉这条 assistant，换过的签名根本到不了
+    /// 上游，前缀绑定检查（[`bind_thinking_like_api_key`](crate::proxy::bind_thinking_like_api_key)）
+    /// 也就查不到它。签名变了就对不上、退回 `create`，整段历史交给上游校验。
+    pub(crate) fn thinking(&mut self, redacted: bool, block_fp: u64, signature: &str) {
         let h = self.thinking.unwrap_or(REPLY_TEXT_FP_INIT);
         let h = fnv_bytes(h, if redacted { b"R" } else { b"K" });
-        self.thinking = Some(fnv_bytes(h, &block_fp.to_le_bytes()));
+        let h = fnv_bytes(h, &block_fp.to_le_bytes());
+        let h = fnv_bytes(h, &(signature.len() as u64).to_le_bytes());
+        self.thinking = Some(fnv_bytes(h, signature.as_bytes()));
     }
 
     /// 测试里拿来访那条的算法冒充回程那份：thinking 一侧补成回程的样子（没带即初值）。

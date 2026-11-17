@@ -90,6 +90,10 @@ pub const CC_BETA_FALLBACK_CREDIT: &str = "fallback-credit-2026-06-01";
 /// [`CC_BETA_FALLBACK_CREDIT`] 之后。
 pub const CC_BETA_THINKING_DISPLAY_UPDATES: &str = "thinking-display-updates-2026-08-18";
 
+/// `thinking-binding-controls-2026-08-01`：允许体里写 `thinking.block_binding`，并让回包带
+/// `input_transformations`。官方主线程四族都发，但体里从不写字段。
+pub const CC_BETA_THINKING_BINDING_CONTROLS: &str = "thinking-binding-controls-2026-08-01";
+
 /// `redact-thinking-2026-02-12`：订阅端 fable 族**不发**（opus / sonnet / haiku 发），而
 /// API-key 端的 fable 发。故 [`crate::proxy::merge_beta_for`] 对 fable 族把它剥掉——fable 上原始
 /// 思维链本来就不返回，这项对它没有语义。

@@ -208,3 +208,71 @@ fn unshift_rewrites_only_system_indices_in_the_message() {
     assert_eq!(remap_system_paths("system.5.text", &[0]), None, "超出表的不动");
     assert!(unshift_system_index(&Bytes::from_static(b"not json"), &map).is_none());
 }
+
+/// 历史里带思考块的 fable-5-2 / mythos 请求：客户端没写 `block_binding` 就补 `"error"`，与直连默认一致。
+#[test]
+fn binding_is_filled_for_enforced_models_replaying_thinking() {
+    let body = |model: &str, thinking: Option<serde_json::Value>| {
+        let mut v = json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig"},
+                    {"type": "text", "text": "a"}
+                ]},
+                {"role": "user", "content": "q2"}
+            ]
+        });
+        if let Some(t) = thinking {
+            v["thinking"] = t;
+        }
+        v
+    };
+    let error = json!({"prefix_mismatch_behavior": "error"});
+    for model in
+        ["claude-fable-5-2", "claude-fable-5-2[1m]", "claude-mythos-5-2", "claude-mythos-5-1"]
+    {
+        let mut v = body(model, Some(json!({"type": "adaptive", "display": "updates"})));
+        assert!(bind_thinking_like_api_key(&mut v), "{model}");
+        assert_eq!(v["thinking"]["block_binding"], error);
+        assert_eq!(v["thinking"]["display"], "updates");
+        // 再补一次不改。
+        assert!(!bind_thinking_like_api_key(&mut v));
+    }
+    // 缺省 thinking：补成 adaptive。
+    let mut v = body("claude-fable-5-2", None);
+    assert!(bind_thinking_like_api_key(&mut v));
+    assert_eq!(v["thinking"], json!({"type": "adaptive", "block_binding": error}));
+}
+
+#[test]
+fn binding_is_left_alone_otherwise() {
+    let with = |model: &str, thinking: serde_json::Value, assistant: serde_json::Value| {
+        json!({"model": model, "thinking": thinking, "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": assistant},
+            {"role": "user", "content": "q2"}
+        ]})
+    };
+    let blocks = json!([{"type": "thinking", "thinking": "", "signature": "s"}]);
+    let adaptive = json!({"type": "adaptive"});
+    // 只对账号年龄不论一律强制的模型补。
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-20"] {
+        let mut v = with(model, adaptive.clone(), blocks.clone());
+        assert!(!bind_thinking_like_api_key(&mut v), "{model}");
+    }
+    // 历史里没有思考块。
+    let mut v = with("claude-fable-5-2", adaptive.clone(), json!("plain"));
+    assert!(!bind_thinking_like_api_key(&mut v));
+    // 客户端自己写了（含旧别名）、或 thinking 不是 adaptive：原样交给上游。
+    for th in [
+        json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}),
+        json!({"type": "adaptive", "block_binding": {"mismatch_behavior": "drop_block"}}),
+        json!({"type": "disabled"}),
+    ] {
+        let mut v = with("claude-fable-5-2", th.clone(), blocks.clone());
+        assert!(!bind_thinking_like_api_key(&mut v));
+        assert_eq!(v["thinking"], th);
+    }
+}

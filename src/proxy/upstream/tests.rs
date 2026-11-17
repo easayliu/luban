@@ -1405,3 +1405,18 @@ fn aggregates_a_compaction_stream() {
         assert_eq!(v["usage"]["input_tokens"], 6, "顶层是最后一轮");
     }
 }
+
+/// `anthropic-beta` 有多条同名头时逐条看：绑定 beta 在第二条里也认得出（只读第一条会漏补
+/// `thinking.block_binding`）；逗号列表、空白照常拆。
+#[test]
+fn outbound_beta_check_reads_every_anthropic_beta_header() {
+    let mut h = crate::proxy::HeaderMap::new();
+    h.append("anthropic-beta", HeaderValue::from_static("oauth-2025-04-20"));
+    h.append(
+        "anthropic-beta",
+        HeaderValue::from_static("claude-code-20250219, thinking-binding-controls-2026-08-01"),
+    );
+    assert!(super::outbound_has_beta(&h, config::CC_BETA_THINKING_BINDING_CONTROLS));
+    assert!(super::outbound_has_beta(&h, "oauth-2025-04-20"));
+    assert!(!super::outbound_has_beta(&h, config::CC_BETA_THINKING_DISPLAY_UPDATES));
+}

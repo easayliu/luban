@@ -307,6 +307,9 @@ fn the_sniffer_fingerprints_the_reply_like_the_client_copy() {
     assert_ne!(s.reply_fp(), client(blocks("先看目录", "我改过了", "ls")), "改了正文");
     assert_ne!(s.reply_fp(), client(blocks("先看目录", "我看一下", "rm -rf x")), "改了入参");
     assert_ne!(s.reply_fp(), client(blocks("改过的推理", "我看一下", "ls")), "改了 thinking");
+    let mut swapped = blocks("先看目录", "我看一下", "ls");
+    swapped[0]["signature"] = "sig_from_another_conversation".into();
+    assert_ne!(s.reply_fp(), client(swapped), "换了签名（正文不变）");
 
     let body = r#"{"id":"msg_y","type":"message","content":[{"type":"thinking","thinking":"先看目录","signature":"sig"},{"type":"text","text":"我看一下"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls","timeout":5}},{"type":"text","text":"。"}]}"#;
     let mut n = crate::proxy::UsageSniffer::new(false, false);

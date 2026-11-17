@@ -149,16 +149,13 @@ impl Upstream<'_> {
             // （[`merge_beta_for`] 只给 2.1.251+ 世代的 fable 补；agent-sdk / VSCode 扩展那类客户端
             // 的串没有 `advisor-tool`，头上不补，体里就也不能写，否则上游 400：
             // `thinking.adaptive.display: Input should be 'summarized', 'omitted'`）。
-            let has_beta = |name: &str| {
-                self.headers
-                    .get("anthropic-beta")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|s| s.split(',').any(|b| b.trim() == name))
-            };
+            let has_beta = |name: &str| outbound_has_beta(&self.headers, name);
             let display_beta = has_beta(config::CC_BETA_THINKING_DISPLAY_UPDATES);
             // 同理，工具声明上的 `eager_input_streaming` 只在出站头带了 `advanced-tool-use`
             // 时才补：带 eager 的官方请求头上都有它，见 [`config::CcEagerTools`]。
             let adv_beta = has_beta(config::CC_BETA_ADVANCED_TOOL_USE);
+            // 体里的 `thinking.block_binding` 同样要出站头带着 `thinking-binding-controls`。
+            let binding_beta = has_beta(config::CC_BETA_THINKING_BINDING_CONTROLS);
             // 给真实 CC 补 billing header 时写的是**它自报的**版本与 entrypoint，不是 luban
             // 自己那份：见 [`billing_header_text`]。模拟路径不看这个值（那条路的版本在 profile 里）。
             let ua = self.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
@@ -184,6 +181,7 @@ impl Upstream<'_> {
                 self.tool_names.as_deref(),
                 display_beta,
                 adv_beta,
+                binding_beta,
                 client,
                 self.client_link.as_ref().map(|(_, l)| l),
                 self.cc_kind,
@@ -1069,6 +1067,13 @@ pub(crate) fn upstream_load_snapshot(
         table.sent.remove(&cred_id);
     }
     UpstreamLoadSnapshot { route_in_flight, cred_in_flight, sent, max_tokens }
+}
+
+/// 出站头里有没有 `name` 这项 beta。`anthropic-beta` 可能有好几条同名头（`merge_beta` 关着时来访的
+/// 多条原样保留），要逐条按逗号拆开看——只读第一条会把第二条里的 beta 当成没发，体里该配套补的
+/// 字段（`thinking.display`、`eager_input_streaming`、`thinking.block_binding`）就漏了。
+pub(super) fn outbound_has_beta(headers: &HeaderMap, name: &str) -> bool {
+    crate::proxy::inbound_beta_list(headers).iter().any(|b| b == name)
 }
 
 #[cfg(test)]

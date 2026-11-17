@@ -70,8 +70,8 @@ pub(crate) use probe_detect::{
 mod api_parity;
 pub(crate) use api_parity::{
     BUDGET_EXCEEDS_MAX_TOKENS_MESSAGE, SystemRewrite, VERSION_REQUIRED_MESSAGE,
-    billing_system_index_map, client_budget_rejection, client_display_rejection,
-    unshift_system_index,
+    billing_system_index_map, bind_thinking_like_api_key, client_budget_rejection,
+    client_display_rejection, prefix_binding_enforced_model, unshift_system_index,
 };
 
 mod thinking;

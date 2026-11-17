@@ -395,6 +395,7 @@ fn prewarm_probe_matches_the_capture() {
             None,
             false,
             false,
+            false,
             Some(CcClient { version: config::CC_VERSION_BASE, entrypoint: "cli" }),
             None,
             CcRequestKind::Prewarm,

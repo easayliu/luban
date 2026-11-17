@@ -42,6 +42,9 @@ pub(super) fn apply_sim_thread(
     env_note: &EnvNoted,
     raw_fps: &[ThreadMsg],
     raw_sys_shape: u64,
+    // 这一轮按直连补不补思考块绑定策略（`rewrite_body_out` 的 `binding_wanted`），进形态指纹，
+    // 见 [`thread_shape_of`]。
+    strict_binding: bool,
 ) -> bool {
     if !crate::proxy::simulation::sim_is_main_thread(sim) {
         return false;
@@ -58,7 +61,7 @@ pub(super) fn apply_sim_thread(
     let fps = raw_fps;
     let regular_prompt = crate::telemetry::last_is_new_prompt_body(v);
     let key = CcSessionKey { cred_id, session_id: &sim.session_id };
-    let shape = thread_shape_of(v, raw_sys_shape);
+    let shape = thread_shape_of(v, raw_sys_shape, strict_binding);
     let seq = sim.link.turn.as_ref().map_or(0, |t| t.seq);
     // 倒数只在「用户输入之后也跟提醒」时于新输入处重新锚定，预算按这个会话那一档（[`crate::proxy::lapis_anchor`]）。
     let reanchor = regular_prompt && sim.lapis.user_turn;
@@ -564,11 +567,16 @@ pub(in crate::proxy) fn thread_msg_of(m: &serde_json::Value) -> ThreadMsg {
                             field("name"),
                             b.get("input").unwrap_or(&serde_json::Value::Null),
                         ),
-                        Some("thinking") => reply
-                            .thinking(false, reply_text_fp(REPLY_TEXT_FP_INIT, field("thinking"))),
-                        Some("redacted_thinking") => {
-                            reply.thinking(true, reply_text_fp(REPLY_TEXT_FP_INIT, field("data")))
-                        }
+                        Some("thinking") => reply.thinking(
+                            false,
+                            reply_text_fp(REPLY_TEXT_FP_INIT, field("thinking")),
+                            field("signature"),
+                        ),
+                        Some("redacted_thinking") => reply.thinking(
+                            true,
+                            reply_text_fp(REPLY_TEXT_FP_INIT, field("data")),
+                            "",
+                        ),
                         Some("fallback") => {}
                         _ => reply.block(b),
                     }
@@ -624,18 +632,59 @@ pub(super) fn thread_shape_with_relocation(shape: u64, relocated: bool) -> u64 {
 /// 线程形态指纹：模型、system 正文（`sys_shape`，由 [`thread_system_shape`] 在挪客户端 system
 /// 之前算好）、`tools`、`thinking`、`output_config`。后三样按传入的（最终出站）体算，全部去掉
 /// `cache_control`，见 [`crate::proxy::session_link::ThreadPending`] 的 `shape`。
-fn thread_shape_of(v: &serde_json::Value, sys_shape: u64) -> u64 {
+///
+/// 前缀绑定检查强制的那几个模型（[`prefix_binding_enforced_model`](crate::proxy::prefix_binding_enforced_model)）
+/// 上，`thinking.block_binding` 不按字面进指纹，按**实际生效的策略**进：客户端写了就是它写的值；
+/// 没写时 `strict_binding`（这一轮按直连补，[`bind_thinking_like_api_key`](crate::proxy::bind_thinking_like_api_key)）
+/// 为真即 `error`，否则是订阅通道的默认（丢块）。这样：
+/// - 校验开着，首轮（历史里还没有思考块、没补字段）与次轮（自动补了 `error`）同一策略，照常 `continue`；
+/// - 中途开了校验，或客户端从 `drop_block` 改成 `error`，策略变严，上一轮可能已丢过块，续接会把
+///   这条历史裁掉、严格策略查不到它，必须 `create` 重发完整历史。
+///
+/// 这几个模型思考恒开，裸 `{"type":"adaptive"}` 与缺省等价，按缺省算（别的模型缺省是不思考，
+/// 两者不等价，`thinking` 整个按字面进指纹）。
+fn thread_shape_of(v: &serde_json::Value, sys_shape: u64, strict_binding: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    v.get("model").and_then(|m| m.as_str()).unwrap_or_default().hash(&mut h);
+    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or_default();
+    model.hash(&mut h);
     sys_shape.hash(&mut h);
+    let enforced = crate::proxy::prefix_binding_enforced_model(model);
     for key in ["tools", "thinking", "output_config"] {
         key.hash(&mut h);
-        if let Some(x) = v.get(key) {
-            hash_without_cache_control(x, &mut h);
+        match v.get(key) {
+            Some(serde_json::Value::Object(th)) if key == "thinking" && enforced => {
+                let mut th = th.clone();
+                th.remove("block_binding");
+                let bare_adaptive =
+                    th.len() == 1 && th.get("type").and_then(|t| t.as_str()) == Some("adaptive");
+                if !bare_adaptive {
+                    hash_without_cache_control(&serde_json::Value::Object(th), &mut h);
+                }
+            }
+            Some(x) => hash_without_cache_control(x, &mut h),
+            None => {}
         }
     }
+    if enforced {
+        effective_binding(v, strict_binding).hash(&mut h);
+    }
     h.finish()
+}
+
+/// 出站体实际生效的思考块绑定策略，见 [`thread_shape_of`]。客户端写的取值原样（含旧别名
+/// `mismatch_behavior`）；写了认不出的形态整段按字面算，没写按 `strict_binding` 取 `error` 或
+/// 订阅通道默认。
+fn effective_binding(v: &serde_json::Value, strict_binding: bool) -> String {
+    match v.get("thinking").and_then(|t| t.get("block_binding")) {
+        Some(b) => ["prefix_mismatch_behavior", "mismatch_behavior"]
+            .iter()
+            .find_map(|k| b.get(*k).and_then(|x| x.as_str()))
+            .filter(|_| b.as_object().is_some_and(|o| o.len() == 1))
+            .map_or_else(|| format!("raw:{b}"), str::to_string),
+        None if strict_binding => "error".to_string(),
+        None => "default".to_string(),
+    }
 }
 
 /// 线程形态指纹里 system 正文那一份：billing header 那块除外（`cch` 与会话链字段每条都变），
