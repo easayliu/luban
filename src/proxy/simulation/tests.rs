@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.325."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.326."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.325."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.326."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1652,8 +1652,9 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-2.1.325-20261114-full` 逐项核**
-/// （下面列的是历次抓包用过的编号，2.1.325 用 `00683`、`00359`、`00443`、`00589`、`00898`（测试项目 `cal15`，同一份 calc 项目从
+/// **对着 `cap/auto-team-2.1.326-20261117-full` 逐项核**
+/// （下面列的是历次抓包用过的编号，2.1.326 用 `00714`、`00365`、`00456`、`00615`、`00949`（团队号，配置目录 `~/.claude2`，记忆路径
+/// 归一后比；测试项目 `cal15` 同一份 calc 项目；同样没补抓 Fable 5.2 交互式）；2.1.325 用 `00683`、`00359`、`00443`、`00589`、`00898`（测试项目 `cal15`，同一份 calc 项目从
 /// 323 抓包还原；同样没补抓 Fable 5.2 交互式）；2.1.323 用 `00667`、`00353`、`00436`、`00576`、`00873`——这一版没补抓 Fable 5.2 交互式，
 /// fable-5-2 那条不比；2.1.322 用 `00687`、`00366`、`00451`、`00598`、`00906` 与 `fable52/00074`；2.1.321 用
 /// `00681`、`00363`、`00447`、`00593`、`00899`）：六个主线程模型各造一条第三方请求（只有一句
@@ -1678,8 +1679,8 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_325_captures() {
-    let sub = "auto-2.1.325-20261114-full";
+fn simulated_main_threads_match_the_2_1_326_captures() {
+    let sub = "auto-team-2.1.326-20261117-full";
     let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("skipped: cap/{sub} not present");
@@ -1719,11 +1720,11 @@ fn simulated_main_threads_match_the_2_1_325_captures() {
         cred
     };
     for (i, (sub, n, auto_mode)) in [
-        ("-full", "00683", false),
-        ("-full", "00359", false),
-        ("-full", "00443", false),
-        ("-full", "00589", false),
-        ("-full", "00898", true),
+        ("-full", "00714", false),
+        ("-full", "00365", false),
+        ("-full", "00456", false),
+        ("-full", "00615", false),
+        ("-full", "00949", true),
     ]
     .into_iter()
     .enumerate()
@@ -1741,7 +1742,11 @@ fn simulated_main_threads_match_the_2_1_325_captures() {
         let raw = std::fs::read(path).unwrap();
         let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let head = std::str::from_utf8(&raw[..sep]).unwrap();
-        let official: serde_json::Value = serde_json::from_slice(&raw[sep + 4..]).unwrap();
+        // 团队号那次用的是另一个配置目录（`CLAUDE_CONFIG_DIR=~/.claude2`），记忆路径里是 `.claude2/projects`；归一成默认的
+        // `~/.claude`，别的字节不动。
+        let body_text =
+            std::str::from_utf8(&raw[sep + 4..]).unwrap().replace("/.claude2/", "/.claude/");
+        let official: serde_json::Value = serde_json::from_str(&body_text).unwrap();
         let model = official["model"].as_str().unwrap();
         let header = |name: &str| {
             head.lines().find_map(|l| l.strip_prefix(&format!("{name}: ")[..])).unwrap()
@@ -1831,7 +1836,7 @@ fn simulated_main_threads_match_the_2_1_325_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.325."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.326."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1840,7 +1845,7 @@ fn simulated_main_threads_match_the_2_1_325_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/2a181118-d1af-4b9c-810c-f0c52421eb63/scratchpad/cal15",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/59e1c116-4e7d-444f-84cf-dd523e7f31cb/scratchpad/cal15",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -2148,13 +2153,14 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.325 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
-/// 2.1.325 是当前模拟的版本，`-model`、`-retry`、`-bashfail` 一并过，2.1.323 同样四份都过；2.1.322 另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍（这一版官方直连路径没改）；2.1.321 同样把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
+/// **2.1.309 ~ 2.1.326 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
+/// 2.1.326 是当前模拟的版本，团队号与个人 Max 号（多 `Yield` 工具、ultrareview 那句、`anthropic-usage-limit`）两套的 `-full`、`-model`、
+/// `-retry`、`-bashfail` 一并过，2.1.325、2.1.323 同样四份都过；2.1.322 另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍（这一版官方直连路径没改）；2.1.321 同样把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
 /// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。2.1.319 那份 WebFetch 页面处理与 kebab-case 命名多带
 /// `claude-code-side-query`，merge_beta 同样一项不多。
 #[test]
-fn every_auto_2_1_309_to_325_official_request_passes_through() {
+fn every_auto_2_1_309_to_326_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2179,12 +2185,23 @@ fn every_auto_2_1_309_to_325_official_request_passes_through() {
         ("auto-2.1.323-20261113-model", (2, 1, 323)),
         ("auto-2.1.323-20261113-retry", (2, 1, 323)),
         ("auto-2.1.323-20261113-bashfail/2.1.323", (2, 1, 323)),
-        // 当前模拟的版本：全量、`/model` 预热、重试、失败 Bash 都过一遍；失败 Bash 那份另有同一次跑的 2.1.323 对照。
         ("auto-2.1.325-20261114-full", (2, 1, 325)),
         ("auto-2.1.325-20261114-model", (2, 1, 325)),
         ("auto-2.1.325-20261114-retry", (2, 1, 325)),
         ("auto-2.1.325-20261114-bashfail/2.1.325", (2, 1, 325)),
         ("auto-2.1.325-20261114-bashfail/2.1.323", (2, 1, 323)),
+        // 当前模拟的版本：团队号与个人 Max 号各一套，全量、`/model` 预热、重试、失败 Bash 都过一遍；失败 Bash 那份另有同一次跑的
+        // 2.1.325 对照。
+        ("auto-team-2.1.326-20261117-full", (2, 1, 326)),
+        ("auto-team-2.1.326-20261117-model", (2, 1, 326)),
+        ("auto-team-2.1.326-20261117-retry", (2, 1, 326)),
+        ("auto-team-2.1.326-20261117-bashfail/2.1.326", (2, 1, 326)),
+        ("auto-team-2.1.326-20261117-bashfail/2.1.325", (2, 1, 325)),
+        ("auto-max-2.1.326-20261117-full", (2, 1, 326)),
+        ("auto-max-2.1.326-20261117-model", (2, 1, 326)),
+        ("auto-max-2.1.326-20261117-retry", (2, 1, 326)),
+        ("auto-max-2.1.326-20261117-bashfail/2.1.326", (2, 1, 326)),
+        ("auto-max-2.1.326-20261117-bashfail/2.1.325", (2, 1, 325)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");
@@ -3979,5 +3996,80 @@ fn other_official_side_queries_pass_through() {
         "x-anthropic-billing-header: cc_version=2.1.319.abc; cc_entrypoint=sdk-cli; cch=0a1b2; cc_is_subagent=true; cc_prev_req=req_011CgAbc; cc_prompt_id=1f2e;",
     ] {
         assert!(crate::proxy::simulation::is_official_billing_block(b), "{b}");
+    }
+}
+
+/// 模拟路径同样按这一轮的内容认来源（[`crate::proxy::session_link::injected_origin`]）：同一会话「用户输入 → 后台任务通知 →
+/// 同伴消息 → 用户输入」，出站 billing header 的 `cc_turn_origin` 依次是 human / task_notification / peer / human，
+/// `cc_prompt_index` 只在用户输入时加（1、1、1、2），`cc_turn_index` 每轮加（1、2、3、4）。同真实客户端那条路
+/// （`api_key_cc_billing_carries_the_reply_before_compaction`）。
+#[test]
+fn simulated_turn_origin_follows_injected_turns() {
+    use crate::proxy::session_link::{CcSessionKey, CcSessionLink};
+    let cred = crate::credentials::Credential { id: 93_401, ..test_cred() };
+    let notice = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b1</task-id>\n\
+                  </task-notification>\n</system-reminder>";
+    let peer = "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport\n</agent-message>";
+    let mut seen = Vec::new();
+    for (i, last) in ["first question", notice, peer, "second question"].into_iter().enumerate() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "claude-opus-5-5", "max_tokens": 32000, "system": "你是助手",
+                "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "y"},
+                    {"role": "user", "content": last}],
+            })
+            .to_string(),
+        );
+        let sim = detect_as(&body, all_on(), &cred).unwrap();
+        let out = rewrite_body(&body, &cred, "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let billing = v["system"][0]["text"].as_str().unwrap().to_string();
+        let tail = billing.split_once("cc_turn_origin=").map(|(_, t)| t.to_string()).unwrap();
+        seen.push(tail);
+        let key = CcSessionKey { cred_id: cred.id, session_id: &sim.session_id };
+        CcSessionLink::record_main(
+            key,
+            sim.link.turn.as_ref().unwrap(),
+            Some("req"),
+            Some(&format!("msg_{i}")),
+        );
+    }
+    for (got, want) in seen.iter().zip([
+        "human; cc_prompt_index=1; cc_turn_index=1;",
+        "task_notification; cc_prompt_index=1; cc_turn_index=2;",
+        "peer; cc_prompt_index=1; cc_turn_index=3;",
+        "human; cc_prompt_index=2; cc_turn_index=4;",
+    ]) {
+        assert!(got.starts_with(want), "{seen:?}");
+    }
+}
+
+/// 会话头一轮就是后台任务通知（或同伴消息）：`cc_prompt_index` 是 0、`cc_turn_index` 是 1，照写，不因为 0 漏掉两项。
+#[test]
+fn simulated_first_turn_from_a_notification_writes_zero_prompt_index() {
+    let notice = "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b1</task-id>\n\
+                  </task-notification>\n</system-reminder>";
+    let peer = "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport\n</agent-message>";
+    for (i, (first, origin)) in
+        [(notice, "task_notification"), (peer, "peer")].into_iter().enumerate()
+    {
+        let cred = crate::credentials::Credential { id: 93_411 + i as i64, ..test_cred() };
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "claude-opus-5-5", "max_tokens": 32000, "system": "你是助手",
+                "messages": [{"role": "user", "content": first}],
+            })
+            .to_string(),
+        );
+        let sim = detect_as(&body, all_on(), &cred).unwrap();
+        let out = rewrite_body(&body, &cred, "fp", all_on(), Some(&sim), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let billing = v["system"][0]["text"].as_str().unwrap();
+        assert!(
+            billing.ends_with(&format!(
+                "cc_turn_origin={origin}; cc_prompt_index=0; cc_turn_index=1;"
+            )),
+            "{billing}"
+        );
     }
 }

@@ -267,6 +267,9 @@ impl EventBuilder<'_> {
                 if env.f.v312 {
                     can_use_tool_v312(&mut can_use, &c.id);
                 }
+                if env.f.v326 {
+                    can_use_tool_v326(&mut can_use);
+                }
                 self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
                 // 2.1.307 紧跟着一条 `tengu_safety_event`（`cap/auto-2.1.307-20261022-full` B1，同一毫秒）。
                 if safety_events {
@@ -524,6 +527,7 @@ impl EventBuilder<'_> {
                             cmd,
                             Some(ShellUsage::typed(h).with_spawn(env.f.v323)),
                             v316,
+                            env.f.v326,
                         );
                         // 2.1.315 起同样多那几项；`!` 跑的没有 tool_use id，计量器只记一次在跑、不比重复
                         // （`cap/auto-2.1.316-20261031-full` 那条没有 `repeat` 那组）。

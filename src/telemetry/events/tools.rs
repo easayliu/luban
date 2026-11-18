@@ -28,7 +28,12 @@ impl EventBuilder<'_> {
         // 子代理每一步之间也是这一串（`cap/2.1.280` Explore：Bash 的权限判定、执行、成功，
         // 再攒附件），深度与消息 id 取它自己那条支线的上一条。
         let is_sub = kind == Kind::Subagent;
-        if (is_main || is_sub) && !new_prompt && !shape.tool_uses.is_empty() {
+        // fork 的首条请求末尾带着继承来的占位工具结果（「Fork started — that fork is you.」，官方 `SNs`）：那不是它自己跑过的
+        // 工具，官方这一步什么工具事件都不报（`cap/auto-max-2.1.326-20261117-fork` 两份 fork 首步）。
+        let fork_first = is_sub
+            && call.agent.agent_type.as_deref() == Some("fork")
+            && env.f.agent.as_ref().is_some_and(|a| a.steps == 0);
+        if (is_main || is_sub) && !new_prompt && !shape.tool_uses.is_empty() && !fork_first {
             // 所接的回复认不出（[`TurnFacts::parent_unknown`]）：这一串不报它的 requestId 与深度。
             self.unknown_parent_scope = env.f.parent_unknown;
             // 这一批工具结果算一批（文件账本的修改先后，[`super::super::files::Files::begin_batch`]）。
@@ -702,6 +707,7 @@ impl EventBuilder<'_> {
             v322,
             v323,
             v325,
+            v326,
             bash_metered,
             prompt_seq,
             ..
@@ -873,7 +879,7 @@ impl EventBuilder<'_> {
                     o.insert("exit_code".into(), json!(exit_code_of(&tu.result_head)));
                 }
                 if v311 {
-                    let run = bash_meta_v311(&mut bash, command, usage, v316);
+                    let run = bash_meta_v311(&mut bash, command, usage, v316, env.f.v326);
                     if let Some(b) = &begun {
                         let code = exit_code_of(&tu.result_head);
                         bash_meta_v316(
@@ -906,7 +912,7 @@ impl EventBuilder<'_> {
                 self.push_dd(t_done, "tengu_feature_sad", sad);
             } else {
                 if v311 {
-                    let run = bash_meta_v311(&mut bash, command, usage, v316);
+                    let run = bash_meta_v311(&mut bash, command, usage, v316, env.f.v326);
                     if let Some(b) = &begun {
                         bash_meta_v316(
                             &mut bash,
@@ -1034,10 +1040,25 @@ impl EventBuilder<'_> {
                 ],
             );
         }
+        // 2.1.326：`claude_ai` 那台 MCP 服务器（官方 `R$`，工具名 `mcp__claude_ai__*`）的工具不报结果那四项（官方
+        // `yf ? {toolResultSizeBytes, ...} : {}`）；别的 MCP 工具、`claude.ai` 连接器（`mcp__claude_ai_<名>__*`）与 2.1.325 照报。
+        if v326
+            && tu.name.starts_with("mcp__claude_ai__")
+            && let Some(o) = rest.as_object_mut()
+        {
+            for k in [
+                "toolResultSizeBytes",
+                "toolResultTokensEst",
+                "toolResultMediaBlocks",
+                "toolResultWillPersist",
+            ] {
+                o.shift_remove(k);
+            }
+        }
         if let (Some(obj), Some(rest)) = (success.as_object_mut(), rest.as_object()) {
             obj.extend(rest.clone());
         }
-        tool_success_extras(&mut success, tu, self.file_sizes, v277, v285);
+        tool_success_extras(&mut success, tu, self.file_sizes, v277, v285, v326);
         success["queryChainId"] = json!(&chain_id);
         success["queryDepth"] = json!(prev_depth);
         success["requestId"] = json!(&prev_req);
@@ -1112,7 +1133,13 @@ impl EventBuilder<'_> {
             // 摘要、行列、块名都换了，类名压缩后是 `JR`（照样过构造名校验）。
             // 2.1.325（`cap/auto-2.1.325-20261114-bashfail` 与全量包里那条，同值；同一次跑的 2.1.323 对照仍是 46a1ab4152b6）
             // 摘要、行列、块名都换了，类名压缩后是 `Sx`。2.1.324 没有发布。
-            if v325 {
+            // 2.1.326（`cap/auto-max-2.1.326-20261117-bashfail` 与团队号同名目录，两号同值；同一次跑的 2.1.325 对照仍是
+            // 5ae540068e38）摘要、行列、块名都换了，类名压缩后是 `UT`。
+            if v326 {
+                err["error_constructor"] = json!("UT");
+                err["error_stack_hash"] = json!("96e266587f52");
+                err["error_top_frame"] = json!("chunk-4h798pp0.js:3710:10163");
+            } else if v325 {
                 err["error_constructor"] = json!("Sx");
                 err["error_stack_hash"] = json!("5ae540068e38");
                 err["error_top_frame"] = json!("chunk-wqb2b4v0.js:3690:9609");
@@ -1188,6 +1215,12 @@ impl EventBuilder<'_> {
             err["rssDeltaBytes"] = json!(1_081_344);
             err["heapUsedDeltaBytes"] = json!(0);
             err["externalDeltaBytes"] = json!(2_856);
+            // 2.1.326 末尾多命令词与位置类别（官方 `...ws&&{bash_argv0,...Ko}`；`cap/auto-team-2.1.326-20261117-bashfail`
+            // 那条 `ls` 报 `ls` / `none`，全量包里 `python …` 那条报 `home,other_absolute_path`）。
+            if v326 && !command.is_empty() {
+                err["bash_argv0"] = json!(&bash_profile(command).argv0);
+                err["bash_places"] = json!(super::super::bash_places::bash_places(command));
+            }
             self.push_dd_snake(t_done, "tengu_tool_use_error", err);
         } else if call_failed {
             // 执行抛错（官方 `o4r` 的 catch）：同一份调用字段，`error` / `errorCode` 是异常类名，再带
@@ -1238,6 +1271,8 @@ impl EventBuilder<'_> {
                 self.push(t_done, "tengu_tool_empty_result", json!({ "toolName": name }));
             }
         }
+        // 工具结果作为一条消息回到前台子代理这边：派它的那次 `Agent` 调用报一条进度（抓包里紧跟工具成功那条 1–2ms）。
+        self.agent_progress(ms(t_done, 2));
     }
 }
 

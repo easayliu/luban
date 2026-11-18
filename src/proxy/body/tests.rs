@@ -1104,6 +1104,137 @@ fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
     assert!(build_tool_name_map(Some(&legacy_only)).is_none());
 }
 
+/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 / 2.1.326 各份抓包（团队号、个人 Max 号、Ultra）的每条
+/// `/v1/messages`，按白名单建映射应当为空，整条出站改写（真实 CC 透传那条路、工具名混淆开着）之后 `tools` 的名字与
+/// 先后逐个不变。Max 号延迟池里的 `SendToProject` / `SendToProjectContext` 与按号下发的 `Yield` 此前漏在白名单外，
+/// 会被改成 `mcp__luban__*`。抓包不在就跳过。
+#[test]
+fn official_tool_names_survive_the_outbound_rewrite() {
+    use crate::proxy::test_support::{all_on, test_cred};
+    let root = format!("{}/cap", env!("CARGO_MANIFEST_DIR"));
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        eprintln!("skipped: cap/ not present");
+        return;
+    };
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for d in dirs.flatten() {
+        let name = d.file_name().to_string_lossy().to_string();
+        if !(name.contains("2.1.325-") || name.contains("2.1.326-")) {
+            continue;
+        }
+        let mut stack = vec![d.path()];
+        while let Some(p) = stack.pop() {
+            if p.file_name().is_some_and(|f| f.to_string_lossy().starts_with('_')) {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&p) else { continue };
+            for e in rd.flatten() {
+                let q = e.path();
+                if q.is_dir() {
+                    stack.push(q);
+                } else if q.to_string_lossy().ends_with(".req.raw") {
+                    files.push(q);
+                }
+            }
+        }
+    }
+    let cred = test_cred();
+    let mut checked = 0;
+    for f in files {
+        let raw = std::fs::read(&f).unwrap();
+        let Some(sep) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+        let head = String::from_utf8_lossy(&raw[..sep]);
+        let first = head.lines().next().unwrap_or("");
+        if !first.contains("/v1/messages") || first.contains("count_tokens") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw[sep + 4..]) else { continue };
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v["tools"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
+        let before = names(&v);
+        if before.is_empty() {
+            continue;
+        }
+        let map = build_tool_name_map(Some(&v));
+        assert!(
+            map.as_ref().is_none_or(|m| m.forward.is_empty()),
+            "{}: {:?}",
+            f.display(),
+            map.map(|m| m.forward)
+        );
+        let ua = head
+            .lines()
+            .find_map(|l| l.strip_prefix("User-Agent: "))
+            .and_then(crate::proxy::cc_cli_version)
+            .map(|(a, b, c)| format!("{a}.{b}.{c}"))
+            .unwrap_or_else(|| config::CC_VERSION_BASE.to_string());
+        let (out, _) = crate::proxy::rewrite_body_out(
+            &Bytes::from(raw[sep + 4..].to_vec()),
+            &cred,
+            "fp",
+            all_on(),
+            None,
+            None,
+            None,
+            false,
+            map.as_ref(),
+            true,
+            true,
+            true,
+            Some(crate::proxy::body::CcClient { version: &ua, entrypoint: "cli" }),
+            None,
+            crate::proxy::CcRequestKind::Main,
+            None,
+        );
+        let after: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(names(&after), before, "{}", f.display());
+        checked += 1;
+    }
+    if checked > 0 {
+        assert!(checked >= 100, "{checked}");
+    }
+}
+
+/// 只在消息里按值补了定义（`tool_addition` / `tool_definition`）、顶层 `tools` 里没有的自定义工具照样进映射：定义与引用都改
+/// 成假名；造出来的别名撞上内联声明的工具时让位加后缀。两种映射都看内联声明。
+#[test]
+fn inline_only_tool_definitions_are_mapped() {
+    use super::build_billing_only_tool_name_map;
+    let inline = |name: &str| {
+        serde_json::json!({"type": "tool_addition", "tool": {"type": "tool_definition",
+            "definition": {"name": name, "description": "d", "input_schema": {"type": "object"}}}})
+    };
+    let body = serde_json::json!({
+        "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [inline("mcp_call_tool"), {"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "mcp_call_tool", "input": {}}]},
+        ],
+    });
+    for map in [build_tool_name_map(Some(&body)), build_billing_only_tool_name_map(Some(&body))] {
+        let map = map.expect("内联独占的工具该有映射");
+        let fake = map.forward["mcp_call_tool"].clone();
+        assert!(fake.starts_with(FAKE_TOOL_NS), "{fake}");
+        assert!(!map.forward.contains_key("Bash"));
+        let mut v = body.clone();
+        assert!(apply_tool_names(&mut v, &map));
+        assert_eq!(v["messages"][0]["content"][0]["tool"]["definition"]["name"], fake.as_str());
+        assert_eq!(v["messages"][1]["content"][0]["name"], fake.as_str());
+    }
+
+    // billing-only 的别名是 `mcp__luban__<原名>`：内联已经声明了同名工具，别名让位成 `…_1`，两个工具不会撞在一起。
+    let taken = format!("{FAKE_TOOL_NS}mcp_call_tool");
+    let mut clash = body.clone();
+    clash["messages"][0]["content"].as_array_mut().unwrap().push(inline(&taken));
+    let map = build_billing_only_tool_name_map(Some(&clash)).unwrap();
+    assert_eq!(map.forward["mcp_call_tool"], format!("{taken}_1"));
+    assert!(!map.forward.contains_key(&taken), "官方 MCP 命名空间的不改");
+}
+
 /// 上游那条「`mcp_` 单下划线开头」的判据边界：2026-10-16 本地对拍，命中的全 400、其余全 200。
 #[test]
 fn mcp_underscore_rule_matches_exactly_the_probed_boundary() {
@@ -2847,7 +2978,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.325."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.326."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -5216,7 +5347,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 325)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 326)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -8522,4 +8653,152 @@ fn sim_threads_create_when_binding_parity_is_turned_on_mid_session() {
             "{tag}"
         );
     }
+}
+
+/// 原生线程续轮沿用线程上的工具别名：首轮 `lookup_user` 改了名、按回复 id 登记；接着它的续轮只内联新增 `lookup_order`，
+/// 新别名避开旧的、旧工具的别名不变；再下一轮什么都没声明，映射仍在，回复里调旧工具照样还原得了。两种映射都一样；
+/// 不接线程、接的回复没登记过的不沿用。
+#[test]
+fn thread_continuations_inherit_tool_aliases() {
+    use crate::proxy::body::{
+        build_billing_only_tool_name_map_on, build_tool_name_map_on, note_thread_tool_names,
+        thread_tool_names,
+    };
+    type Build = fn(
+        Option<&serde_json::Value>,
+        Option<&crate::proxy::ToolNameMap>,
+    ) -> Option<crate::proxy::ToolNameMap>;
+    let cases: [(&str, &str, &str, Build); 2] = [
+        ("full", "lookup_user", "lookup_order", build_tool_name_map_on),
+        ("narrow", "mcp_lookup_user", "mcp_lookup_order", build_billing_only_tool_name_map_on),
+    ];
+    for (tag, first, second, build) in cases {
+        let (m1, m2) = (format!("msg_alias_{tag}_1"), format!("msg_alias_{tag}_2"));
+        let create = serde_json::json!({
+            "thread": {"type": "create"},
+            "tools": [{"name": "Bash"}, {"name": first}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(thread_tool_names(Some(&create)).is_none(), "{tag}: create 不沿用");
+        let map1 = std::sync::Arc::new(build(Some(&create), None).unwrap());
+        let alias1 = map1.forward[first].clone();
+        note_thread_tool_names(&m1, map1.clone());
+
+        // 续轮只内联新增一件：单看这一条，造出来的别名会与旧工具的相同。
+        let cont = serde_json::json!({
+            "thread": {"type": "continue", "previous_message_id": m1},
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_addition", "tool": {"type": "tool_definition",
+                    "definition": {"name": second, "input_schema": {"type": "object"}}}},
+                {"type": "text", "text": "next"}
+            ]}]
+        });
+        let inherited = thread_tool_names(Some(&cont)).expect("接着登记过的回复");
+        let map2 = std::sync::Arc::new(build(Some(&cont), Some(&inherited)).unwrap());
+        assert_eq!(map2.forward[first], alias1, "{tag}: 旧工具别名不变");
+        let alias2 = map2.forward[second].clone();
+        assert_ne!(alias2, alias1, "{tag}: 新别名避开线程上已有的");
+        let mut out = cont.clone();
+        assert!(apply_tool_names(&mut out, &map2));
+        assert_eq!(out["messages"][0]["content"][0]["tool"]["definition"]["name"], alias2.as_str());
+        note_thread_tool_names(&m2, map2.clone());
+
+        // 普通续轮：一个要改的都没声明，映射沿用线程上的，回复里调旧工具能还原。
+        let plain = serde_json::json!({
+            "thread": {"type": "continue", "previous_message_id": m2},
+            "messages": [{"role": "user", "content": "again"}]
+        });
+        let inherited = thread_tool_names(Some(&plain)).unwrap();
+        let map3 = build(Some(&plain), Some(&inherited)).expect("沿用线程上的映射");
+        for (alias, name) in [(&alias1, first), (&alias2, second)] {
+            assert!(map3.reverse.iter().any(|(f, n)| f == alias && n == name), "{tag}: {name}");
+        }
+        // 接的回复没登记过：不沿用，也就没有映射。
+        let unknown = serde_json::json!({
+            "thread": {"type": "continue", "previous_message_id": format!("msg_alias_{tag}_x")},
+            "messages": [{"role": "user", "content": "again"}]
+        });
+        assert!(thread_tool_names(Some(&unknown)).is_none());
+        assert!(build(Some(&unknown), None).is_none());
+    }
+}
+
+/// 续轮新声明的工具原名恰好等于线程上的旧别名（`mcp__` 开头、本来保留原名）：也给它造别名，出站不与旧工具撞名，回程里
+/// 新别名还原成新工具、旧别名仍还原成旧工具。
+#[test]
+fn a_new_tool_named_like_an_inherited_alias_gets_its_own_alias() {
+    use crate::proxy::body::{build_billing_only_tool_name_map_on, build_tool_name_map_on};
+    type Build = fn(
+        Option<&serde_json::Value>,
+        Option<&crate::proxy::ToolNameMap>,
+    ) -> Option<crate::proxy::ToolNameMap>;
+    let cases: [(&str, Build); 2] = [
+        ("lookup_user", build_tool_name_map_on),
+        ("mcp_lookup_user", build_billing_only_tool_name_map_on),
+    ];
+    for (first, build) in cases {
+        let create = serde_json::json!({
+            "thread": {"type": "create"},
+            "tools": [{"name": first}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let map1 = build(Some(&create), None).unwrap();
+        let old_alias = map1.forward[first].clone();
+        assert!(old_alias.starts_with("mcp__"));
+        let cont = serde_json::json!({
+            "thread": {"type": "continue", "previous_message_id": "msg_x"},
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_addition", "tool": {"type": "tool_definition",
+                    "definition": {"name": old_alias, "input_schema": {"type": "object"}}}},
+                {"type": "text", "text": "next"}
+            ]}]
+        });
+        let map2 = build(Some(&cont), Some(&map1)).unwrap();
+        let new_alias = map2.forward[&old_alias].clone();
+        assert_ne!(new_alias, old_alias, "{first}");
+        assert_eq!(map2.forward[first], old_alias, "{first}: 旧工具别名不变");
+        let mut out = cont.clone();
+        assert!(apply_tool_names(&mut out, &map2));
+        assert_eq!(
+            out["messages"][0]["content"][0]["tool"]["definition"]["name"],
+            new_alias.as_str()
+        );
+        let back =
+            |fake: &str| map2.reverse.iter().find(|(f, _)| f == fake).map(|(_, n)| n.as_str());
+        assert_eq!(back(&new_alias), Some(old_alias.as_str()), "{first}: 新别名还原成新工具");
+        assert_eq!(back(&old_alias), Some(first), "{first}: 旧别名还原成旧工具");
+    }
+}
+
+/// 续轮重发顶层 `tools`，其中新 MCP 工具的原名恰好等于线程上的旧别名：顶层声明也按映射改成新别名，不留下两个同名声明，
+/// 与 `tool_choice`、内联引用一致。服务端工具（带类型的）不动。
+#[test]
+fn rescue_aliases_reach_top_level_tool_declarations() {
+    use crate::proxy::body::build_tool_name_map_on;
+    let create = serde_json::json!({
+        "thread": {"type": "create"},
+        "tools": [{"name": "Bash"}, {"name": "lookup_user"}],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let map1 = build_tool_name_map(Some(&create)).unwrap();
+    let old_alias = map1.forward["lookup_user"].clone();
+    let cont = serde_json::json!({
+        "thread": {"type": "continue", "previous_message_id": "msg_x"},
+        "tools": [
+            {"name": "Bash"},
+            {"name": "lookup_user"},
+            {"name": old_alias},
+            {"type": "web_search_20250305", "name": "web_search"}
+        ],
+        "tool_choice": {"type": "tool", "name": old_alias},
+        "messages": [{"role": "user", "content": "next"}]
+    });
+    let map2 = build_tool_name_map_on(Some(&cont), Some(&map1)).unwrap();
+    let new_alias = map2.forward[&old_alias].clone();
+    let mut out = cont.clone();
+    assert!(apply_tool_names(&mut out, &map2));
+    let names: Vec<&str> =
+        out["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Bash", old_alias.as_str(), new_alias.as_str(), "web_search"]);
+    assert_eq!(out["tool_choice"]["name"], new_alias.as_str());
 }

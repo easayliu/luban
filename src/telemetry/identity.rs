@@ -42,6 +42,10 @@ pub struct Identity {
     /// 事件才带：event_logging 在顶层 `device_id` 之后追 `agent_id` + `agent_type: "subagent"`，
     /// Datadog 在 `swe_bench_task_id` 之后（`cap/2.1.280` 子代理 a51764… 那一串）。
     pub agent_id: Option<String>,
+    /// 孙代理（子代理再派出去的）的父代理号（出站头 `x-claude-code-parent-agent-id`）：它名下每条事件的 meta 在
+    /// `subscription_type` 之后带 `parent_agent_id`，Datadog 在 `agent_type` 之后
+    /// （`cap/auto-max-2.1.326-20261117-fork/p-nested-fork`：孙代理 41 条事件全带）。
+    pub parent_agent_id: Option<String>,
     /// 工作目录的版本控制（`git`；不是仓库或不知道为 `None`）。有值时 `env` 在
     /// `is_local_agent_mode` 之后、Datadog 在 `deployment_environment` 之后多一项 `vcs`
     /// （`cap/auto-2.1.285-20260930` 全部事件都带，工作目录是 git 仓库）。
@@ -149,6 +153,9 @@ impl Identity {
             m.insert("renderer_mode".into(), "default".into());
         }
         m.insert("subscription_type".into(), self.subscription_type.clone().into());
+        if let Some(parent) = &self.parent_agent_id {
+            m.insert("parent_agent_id".into(), parent.clone().into());
+        }
         if stage == MetaStage::Prompt {
             m.insert("cc_prompt_id".into(), prompt_id.into());
         }
@@ -334,6 +341,9 @@ impl Identity {
             m.insert("agent_id".into(), s(agent));
             m.insert("agent_type".into(), s("subagent"));
         }
+        if let Some(parent) = &self.parent_agent_id {
+            m.insert("parent_agent_id".into(), s(parent));
+        }
         m.insert("subscription_type".into(), s(&self.subscription_type));
         // 分阶段，见 [`MetaStage`]：启动早期两项都没有，界面起来后只有 `renderer_mode`，
         // 用户提交后才多 `prompt_id`。`-p` 没有界面，不写 `renderer_mode`（同 [`Self::metadata_b64_at`]）。
@@ -503,6 +513,20 @@ pub(super) fn snake_flat(meta: &Value) -> Value {
     if let Some(obj) = meta.as_object() {
         for (k, v) in obj {
             if matches!(k.as_str(), "renderer_mode" | "subscription_type" | "cc_prompt_id") {
+                continue;
+            }
+            // 官方发 Datadog 前按一张名单删键（326 `X`），2.1.326 起名单里多了 `bash_places`：event_logging 里有，Datadog 里没有
+            // （`cap/auto-{max,team}-2.1.326-20261117-*` 两号 46 条 Bash 的 Datadog 日志都没有，`bash_argv0` 照留）。
+            if k == "bash_places" {
+                continue;
+            }
+            // 同一处还把 `bash_command_kinds` 里 2.1.326 起的 `searches_whole_disk` 那一项剔掉（官方 `ee`），其余照留。
+            if k == "bash_command_kinds"
+                && let Some(kinds) = v.as_str().filter(|s| s.contains("searches_whole_disk"))
+            {
+                let kept: Vec<&str> =
+                    kinds.split(',').filter(|x| *x != "searches_whole_disk").collect();
+                out.insert(camel_to_snake(k), json!(kept.join(",")));
                 continue;
             }
             out.insert(camel_to_snake(k), v.clone());

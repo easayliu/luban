@@ -33,6 +33,7 @@ impl EventBuilder<'_> {
             v285,
             v291,
             v305,
+            v326,
             first_main,
             ref snapshot,
             ref dd_model,
@@ -158,8 +159,19 @@ impl EventBuilder<'_> {
             put("durationMsIncludingRetries", json!(env.duration_including_retries()));
             put("attempt", json!(env.retry.attempt()));
             put("ttftMs", json!(ttft));
+            // 流式失败、回退成非流式重发成功的那一条（官方 `FO`）：没有响应头耗时、首个内容块、流事件数，也不报
+            // `clientRequestId`，`didFallBackToNonStreaming` 报真（官方 `headersMs: FO ? void 0 : …`、`firstContentMs: FO ? null : …`、
+            // `streamEventCount: FO ? void 0 : …`、`clientRequestId: FO ? void 0 : …`）。
+            let fell_back = non_stream_fallback(call, shape) && call.stream_events.is_none();
+            // 2.1.326：收到响应头的耗时（官方取那次 fetch 的 `latencyMs`），比首字节早一点：两个号 323 条里差 0ms 83 条、
+            // 1ms 170 条、2ms 47 条、3ms 21 条，更大的零星几条（`cap/auto-{max,team}-2.1.326-20261117-*`）。按 request-id
+            // 取个稳定值，同 `retry_pad`；不小于 0。
+            if v326 && !fell_back {
+                const LEAD: [i64; 16] = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3];
+                put("headersMs", json!((ttft - LEAD[(req_hash % 16) as usize]).max(0)));
+            }
             // 首个内容块到达：比首字节晚 0–1ms（`cap/2.1.280` 九条里七条 +1、两条 +0）。
-            if v270 {
+            if v270 && !fell_back {
                 put("firstContentMs", json!(ttft + i64::from(retry_pad % 2)));
             }
             if v305 && let Some(n) = call.stream_events {
@@ -173,7 +185,9 @@ impl EventBuilder<'_> {
             put("buildAgeMins", json!(build_age_mins));
             put("provider", json!("firstParty"));
             put("requestId", json!(call.request_id.as_deref().unwrap_or("")));
-            if v270 && let Some(crid) = call.client_request_id.as_deref().filter(|c| !c.is_empty())
+            if v270
+                && !fell_back
+                && let Some(crid) = call.client_request_id.as_deref().filter(|c| !c.is_empty())
             {
                 put("clientRequestId", json!(crid));
             }
@@ -209,7 +223,7 @@ impl EventBuilder<'_> {
                 }
             }
             put("costUSD", json!(call.cost_usd.unwrap_or(0.0)));
-            put("didFallBackToNonStreaming", json!(false));
+            put("didFallBackToNonStreaming", json!(fell_back));
             // `-p` 打印模式（`00441` 等十条）：非交互、print、没有 TTY。
             put("isNonInteractiveSession", json!(shape.sdk));
             put("print", json!(shape.sdk));
@@ -279,6 +293,12 @@ impl EventBuilder<'_> {
             }
             put("requestBodyEncoding", json!("identity"));
             put("requestBodyChars", json!(body_chars));
+            // 2.1.323 起不压缩的原因紧跟体长、排在组体耗时之前（官方把 `gzipSkipReason` 并进请求体那份字段；
+            // `cap/auto-2.1.323-20261113-full` 168 条、`cap/auto-team-2.1.326-20261117-full` 165 条都是这个顺序，2.1.322 及以前在
+            // `requestPrepareMs` 之后）。
+            if env.f.v323 {
+                put("gzipSkipReason", json!(gzip_skip));
+            }
             // 2.1.285：组请求体的耗时，每条都报，0 或 1ms。
             // 2.1.323 起组体耗时里还含拼 sandy-plover 头的等待（`wait_ms`，紧跟其后）：会话起头那一批等过查盘，
             // `requestPrepareMs` 是等待再加几毫秒（标题 0–5、主线程 1、`-p` 1–2，`cap/auto-2.1.323-20261113-full`），别的
@@ -297,7 +317,9 @@ impl EventBuilder<'_> {
             if let Some(w) = wait {
                 put("wait_ms", json!(w));
             }
-            put("gzipSkipReason", json!(gzip_skip));
+            if !env.f.v323 {
+                put("gzipSkipReason", json!(gzip_skip));
+            }
             put("fastMode", json!(shape.fast_mode));
             if let Some(prev) = &previous_request_id {
                 put("previousRequestId", json!(prev));
@@ -374,7 +396,10 @@ impl EventBuilder<'_> {
             ));
 
             // 工具集变了才报一次（无工具的侧查询也算一种：`{}` 那份）。
-            if tools_changed {
+            // fork 用的就是派它那一方的工具集，那份已经报过，不再报（两份 fork 抓包里 fork 名下都没有这条）。
+            if tools_changed
+                && !(kind == Kind::Subagent && call.agent.agent_type.as_deref() == Some("fork"))
+            {
                 self.push(
                     t_end,
                     "tengu_tool_schema_sizes",
@@ -600,7 +625,8 @@ impl EventBuilder<'_> {
             if let Some(crid) = call.client_request_id.as_deref().filter(|c| !c.is_empty()) {
                 put("clientRequestId", json!(crid));
             }
-            put("didFallBackToNonStreaming", json!(false));
+            // 回退成非流式之后最后那次仍失败的，同样报回退了（判据见 [`non_stream_fallback`]）。
+            put("didFallBackToNonStreaming", json!(non_stream_fallback(call, shape)));
             put("requestBodyEncoding", json!("identity"));
             put("requestBodyChars", json!(body_chars));
             put("gzipSkipReason", json!(gzip_skip));
@@ -1042,4 +1068,15 @@ impl EventBuilder<'_> {
         // 心跳的 `session_end` 与它同一毫秒、排在它后面（`cap/auto-2.1.305-20261021-full` D1）。
         self.beat(ms(t_end, 748), heartbeat::Trigger::Reset("session_end"));
     }
+}
+
+/// 这条是不是客户端流式失败后回退成非流式重发的（官方 `didFallBackToNonStreaming`）：出站体没要流式（[`RequestShape::non_stream`]），
+/// 又不是官方原生就非流式的那两类——安全分类（带 `auto-mode-classifier` beta，一次 JSON 请求）与额度探测。只认真实客户端透传的
+/// （[`crate::telemetry::ApiCall::client_tools`]）：模拟路径非流式出站是第三方来访自己要的非流式，官方那边是一条正常的流式请求，
+/// 报成回退反倒成了少见的形态。成功那条另要求回复不是 SSE。
+fn non_stream_fallback(call: &crate::telemetry::ApiCall, shape: &RequestShape) -> bool {
+    let classifier = call.betas.as_deref().is_some_and(|b| {
+        b.split(',').any(|x| x.trim() == crate::config::CC_BETA_AUTO_MODE_CLASSIFIER)
+    });
+    call.client_tools && shape.non_stream && !shape.quota_probe && !classifier
 }

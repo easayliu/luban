@@ -16,6 +16,9 @@
 //!   其中一段改成 `ERROR` 节点；在对拍语料上开与关得出的 kind 逐条相同。
 
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
+
+use regex::Regex;
 use std::time::{Duration, Instant};
 
 use super::bash_ast;
@@ -96,6 +99,11 @@ pub(super) struct ShellRun {
 /// 一条 shell 命令的 [`ShellRun`]（`Cfe(e)` / 2.1.311 `yte(e)` 里语法树那几项）。`v316` 是会话版本 ≥2.1.315：
 /// 按 2.1.316 的表与规则认，另算 `bash_programs` 与 `bash_test_scope`；否则照 2.1.311（直到 2.1.314 都没变）。
 pub(super) fn shell_run(cmd: &str, v316: bool) -> ShellRun {
+    shell_run_at(cmd, v316, false)
+}
+
+/// 同 [`shell_run`]，`v326` 是会话版本 ≥2.1.326：另认全盘搜索（`searches_whole_disk`，[`whole_disk_search`]）。
+pub(super) fn shell_run_at(cmd: &str, v316: bool, v326: bool) -> ShellRun {
     let Some(parsed) = scan(cmd) else {
         return ShellRun {
             kinds: "unparsed".into(),
@@ -106,6 +114,7 @@ pub(super) fn shell_run(cmd: &str, v316: bool) -> ShellRun {
     };
     let mut st = State {
         v316,
+        v326,
         kinds: BTreeSet::new(),
         programs: BTreeSet::new(),
         test_scopes: BTreeSet::new(),
@@ -215,11 +224,68 @@ fn unquote(y: &[u16]) -> String {
     String::from_utf16_lossy(&body)
 }
 
+/// 认全盘搜索的一种命令（官方 `ss` 的一项）：（命令, 要有才算往下找的标志, 有了就不算全盘的标志, 头一个非标志参数是模式而不是
+/// 路径——除非出现这个标志）。
+type WholeDiskRule = (&'static str, Option<Regex>, Option<Regex>, Option<Regex>);
+
+/// 2.1.326 认全盘搜索的那几种命令（官方 `ss`，[`WholeDiskRule`]）。`du` 三项都没有。
+static WHOLE_DISK_RULES: LazyLock<Vec<WholeDiskRule>> = LazyLock::new(|| {
+    let re = |s: &str| Some(Regex::new(s).expect("全盘搜索正则"));
+    let grep = (re(r"^-[A-Za-z]*[rR]|^--(dereference-)?recursive$"), re(r"^-e.|^--(regexp|file)="));
+    vec![
+        ("find", None, re(r"^-maxdepth$"), None),
+        ("du", None, None, None),
+        ("tree", None, re(r"^-[A-Za-z]*L"), None),
+        ("ls", re(r"^-[A-Za-z]*R|^--recursive$"), None, None),
+        ("grep", grep.0.clone(), None, grep.1.clone()),
+        ("egrep", grep.0.clone(), None, grep.1.clone()),
+        ("fgrep", grep.0, None, grep.1),
+        ("rg", None, re(r"^-d|^--max-?depth(=|$)"), re(r"^-e.|^--(regexp|file)=|^--files$")),
+        ("fd", None, re(r"^-d|^--(max|exact)-depth(=|$)"), re(r"^--search-path$")),
+    ]
+});
+
+/// 官方 `ns`：根目录那一类路径（`/`、`//`、`/.`、`/*`）。
+static WHOLE_DISK_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/[/.]*\*?$").expect("全盘路径正则"));
+
+/// 2.1.326 `te` 里那段：这条简单命令（`y` 是去掉 `sudo` 一类前缀后的词，`b` 是命令名）在不限深度地搜整个磁盘。
+/// `find` 的路径参数只看第一个表达式（`-name`、`(`、`!` 之类，`-H` / `-L` / `-P` 不算）之前那几个。
+fn whole_disk_search(b: &str, y: &[String]) -> bool {
+    let Some((_, descends, stops, pattern_first)) =
+        WHOLE_DISK_RULES.iter().find(|(name, ..)| *name == b)
+    else {
+        return false;
+    };
+    let end = if b == "find" {
+        y.iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, k)| {
+                k.starts_with(['-', '(', '!']) && !matches!(k.as_str(), "-H" | "-L" | "-P")
+            })
+            .map_or(y.len(), |(i, _)| i)
+    } else {
+        y.len()
+    };
+    let skip_pattern = pattern_first.as_ref().is_some_and(|x| !y.iter().any(|k| x.is_match(k)));
+    descends.as_ref().is_none_or(|d| y.iter().any(|k| d.is_match(k)))
+        && !stops.as_ref().is_some_and(|d| y.iter().any(|k| d.is_match(k)))
+        && y.get(1..end)
+            .unwrap_or_default()
+            .iter()
+            .filter(|k| !k.starts_with('-'))
+            .skip(usize::from(skip_pattern))
+            .any(|k| WHOLE_DISK_PATH.is_match(k))
+}
+
 /// 原文 `Cfe` / `yte` 里那个 `d` / `y`：收集中的 kind、程序与测试范围，与内嵌脚本的预算。最后两项是
 /// [`ShellRun::leaves_running`] 的材料，原文没有。
 struct State {
     /// 按 2.1.316 的表与规则认（[`shell_run`]）。
     v316: bool,
+    /// 2.1.326 起另认全盘搜索（[`shell_run_at`]）。
+    v326: bool,
     kinds: BTreeSet<&'static str>,
     /// `programs`（只在 `v316` 时收集）。
     programs: BTreeSet<&'static str>,
@@ -351,6 +417,9 @@ impl State {
                 }
                 te += 1;
             }
+        }
+        if self.v326 && whole_disk_search(&b, y) {
+            self.kinds.insert("searches_whole_disk");
         }
         let Some(w) = w else {
             let class = command_class(&normalize_argv0(&b));
@@ -1961,6 +2030,39 @@ const PY_TOOL_MODULES: &[&str] = &["markitdown", "weasyprint", "ocrmypdf", "whis
 
 #[cfg(test)]
 mod tests {
+
+    /// 2.1.326 的全盘搜索（官方 `te` 里 `ss` / `ns` 那段）：不限深度地搜 `/` 这类路径才算，限了深度、相对路径、不递归的
+    /// `ls` / `grep` 不算；2.1.325 及以前不认。
+    #[test]
+    fn whole_disk_searches_are_flagged_from_2_1_326() {
+        let kinds = |cmd: &str, v326: bool| shell_run_at(cmd, true, v326).kinds;
+        for (cmd, hit) in [
+            ("find / -name abc", true),
+            ("find -L / -name abc", true),
+            ("find / -maxdepth 2 -name abc", false),
+            ("find . -name abc", false),
+            ("find /usr -name abc", false),
+            ("du -sh /", true),
+            ("tree /", true),
+            ("tree -L 2 /", false),
+            ("ls /", false),
+            ("ls -R /", true),
+            ("grep foo /", false),
+            ("grep -r foo /", true),
+            ("grep -r -e foo /", true),
+            ("rg foo /", true),
+            ("rg --max-depth 2 foo /", false),
+            ("rg --files /", true),
+            ("fd abc /", true),
+            ("sudo find / -name abc", true),
+            ("cd /tmp && find / -name abc 2>/dev/null", true),
+        ] {
+            let k = kinds(cmd, true);
+            assert_eq!(k.split(',').any(|x| x == "searches_whole_disk"), hit, "{cmd}: {k}");
+            assert!(!kinds(cmd, false).contains("searches_whole_disk"), "{cmd}: 2.1.325 不认");
+        }
+        assert_eq!(kinds("find / -name abc", true), "file_search,searches_whole_disk");
+    }
     use super::*;
 
     /// 对拍：逐条比官方 2.1.311 `yte` 的结果（node 跑官方原函数产出的 JSONL，每行

@@ -205,6 +205,7 @@ async fn relay_ok(
     let sys_relocated = sent_bits.sys_relocated;
     fill_shape_forensics(&mut forensics, sent_bits);
     let mut rl = ReqLog {
+        thread_tool_names: prepared.threaded.then(|| tool_names.clone()).flatten(),
         started: started.at,
         ttft_ms: None,
         method: method.to_string(),

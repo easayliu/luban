@@ -12,7 +12,7 @@
 /// [`CC_PROFILES`](super::CC_PROFILES) 里那几串 beta 与 [`CC_SYSTEM_BASE`] / [`CC_SYSTEM_REST`] 等提示词 / 工具资产：
 /// 同一个客户端不会一边自称 2.1.308、一边报另一个版本的 cc_version、构建时间、上一版的
 /// beta 集合或上一版的提示词。几处对不上是官方从不产生的组合。
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.325 (external, cli)";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.326 (external, cli)";
 
 /// `Accept-Encoding`：与官方客户端逐字节一致。
 ///
@@ -127,7 +127,7 @@ pub const CC_SDK_AGENT_IDENTITY: &str =
 /// **这只是模拟路径的版本。** 真实 CC 来访自己带着版本（UA 里那串），给它补 billing
 /// header 时用的是**它自报的那个**（见 [`crate::proxy::billing_header_text`]）——给一个
 /// 2.1.258 的来访写 2.1.260 的 cc_version，就是把两个版本混进了同一条请求。
-pub const CC_VERSION_BASE: &str = "2.1.325";
+pub const CC_VERSION_BASE: &str = "2.1.326";
 
 /// 已**抓包证实存在**的官方 Claude Code 最新版本，形如 `2.1.270`。它是「来访自报的版本说不
 /// 说得通」那道闸（[`crate::proxy::known_latest_release`]）的写死下限：网上学来的
@@ -140,10 +140,10 @@ pub const CC_VERSION_BASE: &str = "2.1.325";
 /// 最新版」——读不出版本，落进 2.1.258 那张表，完整的订阅端请求被塞回上一版才有的
 /// `server-side-fallback` / `fallback-credit`。
 ///
-/// 依据：`cap/auto-2.1.325-20261114-full`（四族主线程含 haiku-5-5、子代理、标题生成、额度探测、`-p`，
-/// UA `claude-cli/2.1.325`；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 发布了但没抓）。
+/// 依据：`cap/auto-team-2.1.326-20261117-full`、`cap/auto-max-2.1.326-20261117-full`（四族主线程含 haiku-5-5、子代理、
+/// 标题生成、额度探测、`-p`，UA `claude-cli/2.1.326`；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 发布了但没抓）。
 /// 不能低于任何一张 profile 表的版本（否则那张表永远选不中），有测试钉着。
-pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.325";
+pub const CC_LATEST_KNOWN_RELEASE: &str = "2.1.326";
 
 /// 模拟模式注入的 `# Reporting outcomes` 块（911 字节），2.1.251 起出现。
 ///
@@ -434,6 +434,9 @@ pub const CC_TOOL_NAMES: &[&str] = &[
     "ScheduleWakeup",
     "SendFeedback",
     "SendMessage",
+    // 个人订阅号（Max）延迟池里的两件（`cap/auto-max-2.1.325-20261116-full`、`cap/auto-max-2.1.326-20261117-full`）。
+    "SendToProject",
+    "SendToProjectContext",
     "ShareOnboardingGuide",
     "Skill",
     // 子代理的交接工具（`cap/auto-2.1.306-20261021-full/00077`）。
@@ -450,6 +453,8 @@ pub const CC_TOOL_NAMES: &[&str] = &[
     "WebSearch",
     "Workflow",
     "Write",
+    // 等后台任务回报的工具，服务端开关 `tengu_dazzling_acorn` 按号下发（`cap/auto-max-2.1.326-20261117-full/00041`）。
+    "Yield",
     // ---- 2. 老版本旧名（2.1.276 二进制的改名表 / aliases / SDK BUILTIN_TOOL_NAMES） ----
     "AgentOutput",
     "AgentOutputTool",
@@ -576,6 +581,9 @@ pub const CC_BUILD_TIMES: &[(&str, &str)] = &[
     // `cap/auto-2.1.325-20261114-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
     // `BUILD_TIME` 常量一致（2.1.324 没有发布）。
     ("2.1.325", "2026-11-13T18:52:23Z"),
+    // `cap/auto-team-2.1.326-20261117-full` 的 event_logging 批次（`env.build_time`），与可执行文件里的
+    // `BUILD_TIME` 常量一致。
+    ("2.1.326", "2026-11-16T17:02:27Z"),
 ];
 
 /// 按版本取 `build_time`，见 [`CC_BUILD_TIMES`]。

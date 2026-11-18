@@ -165,9 +165,7 @@ pub(crate) fn injected_turn(v: &serde_json::Value) -> Option<InjectedTurn> {
     let is_notice = |t: &str| {
         t.contains("[SYSTEM NOTIFICATION - NOT USER INPUT]") && t.contains("<task-notification>")
     };
-    let is_peer = |t: &str| {
-        t.trim_start().starts_with("Another Claude session sent a message:\n<agent-message")
-    };
+    let is_peer = |t: &str| only_peer_message(t);
     let texts: Vec<&str> = match last.get("content") {
         Some(serde_json::Value::String(t)) => vec![t.as_str()],
         Some(serde_json::Value::Array(blocks)) => {
@@ -183,6 +181,26 @@ pub(crate) fn injected_turn(v: &serde_json::Value) -> Option<InjectedTurn> {
     }
     (texts.iter().any(|t| is_peer(t)) && texts.iter().all(|t| is_peer(t) || only_reminders(t)))
         .then_some(InjectedTurn::Peer)
+}
+
+/// 一段**纯**同伴消息：开头那句 `Another Claude session sent a message:`，接一到多段闭合的 `<agent-message …>…</agent-message>`，
+/// 之后只剩空白或 `<system-reminder>` 区段（[`only_reminders`]）。只看开头不够：同一个文本块（或 content 字符串）里闭合标签
+/// 之后还可能跟着用户的新输入，那是一次用户输入；没闭合的不算数。
+fn only_peer_message(text: &str) -> bool {
+    const HEAD: &str = "Another Claude session sent a message:";
+    const OPEN: &str = "<agent-message";
+    const CLOSE: &str = "</agent-message>";
+    let Some(mut rest) = text.trim_start().strip_prefix(HEAD) else { return false };
+    let mut seen = false;
+    loop {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with(OPEN) {
+            return seen && only_reminders(trimmed);
+        }
+        let Some(end) = trimmed.find(CLOSE) else { return false };
+        rest = &trimmed[end + CLOSE.len()..];
+        seen = true;
+    }
 }
 
 /// 去掉所有 `<system-reminder>…</system-reminder>` 区段之后只剩空白。只看开头不够：同一个文本块
@@ -210,6 +228,34 @@ fn reset_for_test(cred_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同伴消息只认整段：纯 peer（含一段或多段、后跟提醒）算 peer；闭合标签之后跟了用户自己敲的字、或没闭合的，算用户输入。
+    /// content 字符串与单个 text 块一样认。
+    #[test]
+    fn peer_turns_need_the_whole_message() {
+        let msg = "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport\n</agent-message>";
+        let body = |content: serde_json::Value| {
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "y"}, {"role": "user", "content": content}]})
+        };
+        let as_text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+        for t in [
+            msg.to_string(),
+            format!("{msg}\n<agent-message from=\"a2\">\nmore\n</agent-message>"),
+            format!("{msg}\n<system-reminder>\nnote\n</system-reminder>"),
+        ] {
+            assert_eq!(injected_turn(&body(serde_json::json!(t))), Some(InjectedTurn::Peer), "{t}");
+            assert_eq!(injected_turn(&body(as_text(&t))), Some(InjectedTurn::Peer), "{t}");
+        }
+        for t in [
+            format!("{msg}\n\nplease also fix the tests"),
+            "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport"
+                .to_string(),
+        ] {
+            assert_eq!(injected_turn(&body(serde_json::json!(t))), None, "{t}");
+            assert_eq!(injected_turn(&body(as_text(&t))), None, "{t}");
+        }
+    }
 
     fn eval(on: bool) -> Vec<u8> {
         format!(r#"{{"features":{{"tengu_lantern_spool":{{"value":{on},"on":{on},"source":"experiment"}}}}}}"#)

@@ -13,6 +13,8 @@ pub(super) struct Prepared {
     pub(super) beta_ctx: BetaCtx,
     pub(super) upgrade_stream: bool,
     pub(super) tool_names: Option<std::sync::Arc<crate::proxy::body::ToolNameMap>>,
+    /// 这条请求走原生线程（带 `thread` 字段）：完整成功后把别名记到回复名下，见 [`crate::proxy::body::note_thread_tool_names`]。
+    pub(super) threaded: bool,
 }
 
 impl Prepared {
@@ -76,20 +78,31 @@ impl Prepared {
         // 第三方（实测见 [`crate::proxy::is_mcp_underscore_name`]），改进 `mcp__luban__<原名>`，其余不动，
         // 窄映射见 [`build_billing_only_tool_name_map`]。没有命中就不建映射，请求侧与所有回程/重试（它们都
         // 读这一份）因此一致为空。对所有来访生效，见 [`store::ForwardFlags::billing_only`]。
+        //
+        // 原生线程的续轮（`thread: continue`）只发增量：接着它那条回复上登记的别名建（[`thread_tool_names`]），之前声明的工具
+        // 沿用原别名、新工具避开它们，这一条没声明要改的也照样能还原回复里对旧工具的调用。
         let tool_names = (billable && flags.tool_name_mimic)
             .then(|| {
+                let inherited = crate::proxy::body::thread_tool_names(body_json.as_ref());
                 if flags.billing_only() && !flags.sim_billing_mimic_all {
-                    build_billing_only_tool_name_map(body_json.as_ref())
+                    crate::proxy::body::build_billing_only_tool_name_map_on(
+                        body_json.as_ref(),
+                        inherited.as_deref(),
+                    )
                 } else {
-                    build_tool_name_map(body_json.as_ref())
+                    crate::proxy::body::build_tool_name_map_on(
+                        body_json.as_ref(),
+                        inherited.as_deref(),
+                    )
                 }
                 .map(std::sync::Arc::new)
             })
             .flatten();
+        let threaded = crate::proxy::body::is_threaded(body_json.as_ref());
         if let Some(map) = &tool_names {
             tracing::debug!(count = map.forward.len(), "obfuscating tool names");
         }
-        Self { url, req_speed, req_fallback_speeds, beta_ctx, upgrade_stream, tool_names }
+        Self { url, req_speed, req_fallback_speeds, beta_ctx, upgrade_stream, tool_names, threaded }
     }
 }
 

@@ -30,6 +30,9 @@ pub(super) struct BodyFacts {
     prompt_sent: bool,
     /// 首条用户消息的各个文本块（字符串内容算一块），认领派遣（`claim_delegation`）用。
     pub(super) first_user_texts: Vec<String>,
+    /// fork 子代理请求末尾的指令（[`ForkDirective`]）：fork 继承父会话的历史，首条用户消息不是派它的那段 `prompt`，认领派遣
+    /// 靠这里。不是 fork 布局的请求为 `None`。
+    pub(super) fork_directive: Option<ForkDirective>,
     /// 体的 JS 字符串长度（UTF-16 码元数；不是合法 UTF-8 时退回字节数），`requestBodyChars` 用。
     pub(super) chars: usize,
 }
@@ -74,6 +77,7 @@ impl BodyFacts {
             }),
             prompt_sent,
             first_user_texts: v.as_ref().map(first_user_texts).unwrap_or_default(),
+            fork_directive: v.as_ref().and_then(fork_directive),
             chars: std::str::from_utf8(body).map(js_len).unwrap_or(body.len()),
         }
     }
@@ -134,6 +138,56 @@ fn system_texts(v: &Value) -> Vec<&str> {
 /// 顶层 `model`：是字符串才算。
 fn model_of(v: &Value) -> Option<String> {
     v.get("model")?.as_str().map(str::to_string)
+}
+
+/// fork 子代理请求的尾部（官方 `SNs`）：继承来的父历史之后是父那条调了 `Agent` 的回复，再接一条用户消息——父回复里每个
+/// 工具调用各一个占位 `tool_result`（fork 自己那次写「这次调用起了个 fork，就是你」，别的写「这是父的调用，不是你的」），
+/// 最后一个文本块是 `<fork-boilerplate>…</fork-boilerplate>\n\nYour directive: <prompt>`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ForkDirective {
+    /// 指令正文，即派它那次 `Agent` 调用的 `prompt`（去掉首尾空白，认领派遣用）。
+    pub(super) prompt: String,
+    /// 指令正文原样的长度（UTF-16 码元，首尾空白照算）：官方 `prompt_char_count` 量的是没裁过的那段。
+    pub(super) prompt_chars: usize,
+    /// 派它那次 `Agent` 调用的 `tool_use_id`：占位结果只有一个时就是它，有几个时取不是「父的调用」的那个；认不出为 `None`。
+    pub(super) tool_use_id: Option<String>,
+}
+
+/// 指令正文前那一截（官方 `Ssa` 同样按它切）。
+const FORK_DIRECTIVE_LEAD: &str = "</fork-boilerplate>\n\nYour directive: ";
+/// 占位结果里「这是父的调用」那句（官方 `dls`）的开头。
+const FORK_PARENTS_CALL: &str = "This is the parent's call, not yours.";
+
+fn fork_directive(v: &Value) -> Option<ForkDirective> {
+    let last = v["messages"].as_array()?.iter().rev().find(|m| m["role"] == "user")?;
+    let blocks = last["content"].as_array()?;
+    let raw = blocks.iter().rev().find_map(|b| {
+        let t = b.get("text")?.as_str()?;
+        if !t.starts_with("<fork-boilerplate>") {
+            return None;
+        }
+        let at = t.find(FORK_DIRECTIVE_LEAD)?;
+        Some(&t[at + FORK_DIRECTIVE_LEAD.len()..])
+    })?;
+    let (prompt, prompt_chars) = (raw.trim().to_string(), js_len(raw));
+    let result_text = |b: &Value| match &b["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => {
+            items.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect()
+        }
+        _ => String::new(),
+    };
+    let results: Vec<&Value> = blocks.iter().filter(|b| b["type"] == "tool_result").collect();
+    let own: Vec<&&Value> = if results.len() == 1 {
+        results.iter().collect()
+    } else {
+        results.iter().filter(|b| !result_text(b).starts_with(FORK_PARENTS_CALL)).collect()
+    };
+    let tool_use_id = match own.as_slice() {
+        [b] => b["tool_use_id"].as_str().map(str::to_string),
+        _ => None,
+    };
+    Some(ForkDirective { prompt, prompt_chars, tool_use_id })
 }
 
 /// 请求体里首条用户消息的各个文本块（字符串内容算一块）。

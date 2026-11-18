@@ -38,13 +38,26 @@ const fn at_323(p: CcProfile) -> CcProfile {
 /// `cap/auto-2.1.323-20261113-full`：主线程 97 条 `main`、Explore / Plan / general-purpose 子代理 14 条
 /// `background-task`、猜下一句 38 条 `followup-generation`、标题 17 条与额度探测 16 条 `summary-extraction`；
 /// `-model` 那份 `/model` 预热 7 条 `summary-extraction`。
-pub const fn cc_first_party_request_class(kind: CcProfileKind) -> &'static str {
+///
+/// **2.1.326 换了分法**（官方 `BWa`）：
+/// - 子代理（`agent:*`）一律 `blocking-subagent`，只有 workflow 子代理与定时任务（cron 工作负载）才是 `background-task`；
+/// - 预热那类跑在同一个标记里的调用（官方 `ino()`）归 `main`；`feedback` / `insights` / `issue_enhancement` 也归 `main`；
+/// - `summary-extraction` 只给一张白名单（标题生成、额度探测、`agent_summary`、`extract_memories` 等），白名单外的
+///   辅助调用（`count_tokens` 之类）**不带这个头**。
+///
+/// `cap/auto-team-2.1.326-20261117-full`：Explore / Plan / general-purpose 子代理 `blocking-subagent`，标题 17 条与额度
+/// 探测 16 条仍是 `summary-extraction`，`count_tokens` 37 条不带；`-model` 那份 `/model` 预热改成 `main`（个人 Max 号
+/// `cap/auto-max-2.1.326-20261117-model` 同）。
+pub fn cc_first_party_request_class(kind: CcProfileKind, version: &str) -> &'static str {
     use CcProfileKind::*;
+    let v326 = crate::proxy::parse_version(version).is_some_and(|v| v >= (2, 1, 326));
     match kind {
         MainOpus | MainFable | MainSonnet | MainHaiku | MainHaiku55 | SecurityClassifierSonnet => {
             "main"
         }
+        SdkSubagentHaiku if v326 => "blocking-subagent",
         SdkSubagentHaiku => "background-task",
+        Prewarm if v326 => "main",
         HelperSubagentHaiku | SessionTitleHaiku | QuotaProbe | Prewarm => "summary-extraction",
     }
 }

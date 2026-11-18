@@ -99,10 +99,19 @@ pub(crate) fn is_mcp_underscore_name(name: &str) -> bool {
 /// （原名长到装不下 128 字符上限的，见 [`billing_only_alias`]，截头加哈希尾巴，仍对原名恒定）。
 /// 还原走同一个 [`ToolNameMap::restore`]：前缀同为 [`FAKE_TOOL_NS`]。
 /// 没有命中的工具返回 `None`，两侧零开销。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_billing_only_tool_name_map(
     body: Option<&serde_json::Value>,
 ) -> Option<ToolNameMap> {
-    let tools = body?.get("tools")?.as_array()?;
+    build_billing_only_tool_name_map_on(body, None)
+}
+
+/// 同 [`build_billing_only_tool_name_map`]，接着线程里已有的别名（[`thread_tool_names`]）建，见 [`finish_map`]。
+pub(crate) fn build_billing_only_tool_name_map_on(
+    body: Option<&serde_json::Value>,
+    inherited: Option<&ToolNameMap>,
+) -> Option<ToolNameMap> {
+    let tools = declared_tools(body?);
     let declared: std::collections::HashSet<&str> =
         tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
     let real: Vec<&str> = tools
@@ -111,7 +120,83 @@ pub(crate) fn build_billing_only_tool_name_map(
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|name| is_mcp_underscore_name(name))
         .collect();
-    finish_map(&declared, &real, |name, _| billing_only_alias(name))
+    finish_map(&declared, &real, inherited, |name, _| billing_only_alias(name))
+}
+
+/// 原生线程（`thread: {type: continue, previous_message_id}`）上已经发出去的别名，按回复的 `message.id` 留着：续轮只发增量，
+/// 之前声明过的工具不再出现在请求里，单看这一条既不知道哪些别名占用了（新声明的工具会造出同一个别名，与上游线程里缓存的
+/// 旧工具撞名），也还原不了回复里对旧工具的调用。一条线程请求完整成功后按它的回复 id 登记（[`note_thread_tool_names`]），
+/// 接着它的那条取回来接着建（[`finish_map`] 的 `inherited`）。
+///
+/// 进程内的表：上游线程约几分钟到几小时过期，这里留 [`THREAD_NAMES_TTL`]，超过 [`THREAD_NAMES_MAX`] 条先清过期的、再清最旧的。
+static THREAD_TOOL_NAMES: std::sync::LazyLock<parking_lot::Mutex<ThreadNames>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+/// 回复 `message.id` → 那条请求用的别名与登记时刻。
+type ThreadNames =
+    std::collections::HashMap<String, (std::sync::Arc<ToolNameMap>, std::time::Instant)>;
+const THREAD_NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(3 * 3600);
+const THREAD_NAMES_MAX: usize = 8192;
+
+/// 这条请求接的那条回复上登记的别名（[`THREAD_TOOL_NAMES`]）；不接线程、没登记过或过期了是 `None`。
+pub(crate) fn thread_tool_names(
+    body: Option<&serde_json::Value>,
+) -> Option<std::sync::Arc<ToolNameMap>> {
+    let thread = body?.get("thread")?;
+    if thread.get("type")?.as_str()? != "continue" {
+        return None;
+    }
+    let prev = thread.get("previous_message_id")?.as_str()?;
+    let table = THREAD_TOOL_NAMES.lock();
+    let (map, at) = table.get(prev)?;
+    (at.elapsed() < THREAD_NAMES_TTL).then(|| map.clone())
+}
+
+/// 这条请求走不走原生线程（带 `thread` 字段）：走的才登记别名。
+pub(crate) fn is_threaded(body: Option<&serde_json::Value>) -> bool {
+    body.is_some_and(|b| b.get("thread").is_some_and(|t| t.is_object()))
+}
+
+/// 一条线程请求完整成功：把它用的那份别名记到回复的 `message.id` 名下，见 [`THREAD_TOOL_NAMES`]。
+pub(crate) fn note_thread_tool_names(message_id: &str, map: std::sync::Arc<ToolNameMap>) {
+    let mut table = THREAD_TOOL_NAMES.lock();
+    if table.len() >= THREAD_NAMES_MAX {
+        table.retain(|_, (_, at)| at.elapsed() < THREAD_NAMES_TTL);
+        if table.len() >= THREAD_NAMES_MAX {
+            let mut ages: Vec<std::time::Instant> = table.values().map(|(_, at)| *at).collect();
+            ages.sort();
+            let cut = ages[ages.len() / 2];
+            table.retain(|_, (_, at)| *at > cut);
+        }
+    }
+    table.insert(message_id.to_string(), (map, std::time::Instant::now()));
+}
+
+/// 请求体里声明的全部工具：顶层 `tools`，加消息里按值补的定义（`tool_addition` 块的
+/// `tool: {"type":"tool_definition","definition":{…}}`，inline-tools 那条路只在这里声明的工具不在顶层）。两种映射都按这份
+/// 选要改的名、查撞名：只扫顶层的话，只在内联里声明的自定义工具原名出站，造出来的别名也可能撞上内联声明的工具。
+/// 先顶层、后按消息出现的先后，同名的留头一个。
+fn declared_tools(body: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut out: Vec<&serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let top = body.get("tools").and_then(|t| t.as_array()).into_iter().flatten();
+    let inline = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_addition"))
+        .filter_map(|b| b.get("tool"))
+        .filter(|t| t.get("type").and_then(|t| t.as_str()) == Some("tool_definition"))
+        .filter_map(|t| t.get("definition"));
+    for t in top.chain(inline) {
+        match t.get("name").and_then(|n| n.as_str()) {
+            Some(n) if !seen.insert(n) => {}
+            _ => out.push(t),
+        }
+    }
+    out
 }
 
 /// 工具名的上限：API 规定 `^[a-zA-Z0-9_-]{1,128}$`。
@@ -142,8 +227,17 @@ fn billing_only_alias(name: &str) -> String {
 /// **假名对同一组工具名恒定**：seed 取 `sha256(名字集合)`，同一会话内每轮请求得到同一套假名，
 /// 上游的 prompt cache 才命中得了。客户端中途增删工具会让整套假名全变——历史里的
 /// `tool_use.name` 由 [`apply_tool_names`] 用**新**映射一起重写，故仍然自洽，代价只是缓存失效。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<ToolNameMap> {
-    let tools = body?.get("tools")?.as_array()?;
+    build_tool_name_map_on(body, None)
+}
+
+/// 同 [`build_tool_name_map`]，接着线程里已有的别名（[`thread_tool_names`]）建，见 [`finish_map`]。
+pub(crate) fn build_tool_name_map_on(
+    body: Option<&serde_json::Value>,
+    inherited: Option<&ToolNameMap>,
+) -> Option<ToolNameMap> {
+    let tools = declared_tools(body?);
     let declared: std::collections::HashSet<&str> =
         tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
     let real: Vec<&str> = tools
@@ -151,7 +245,7 @@ pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
         .filter(|t| should_mimic_tool(t))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
-    if real.is_empty() {
+    if real.is_empty() && inherited.is_none() {
         return None;
     }
 
@@ -165,7 +259,7 @@ pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
     let digest = sha2::Digest::finalize(hasher);
     let seed = u64::from_be_bytes(digest[..8].try_into().expect("sha256 至少 8 字节"));
 
-    finish_map(&declared, &real, |name, i| {
+    finish_map(&declared, &real, inherited, |name, i| {
         let prefix = FAKE_TOOL_PREFIXES
             [(seed.wrapping_add(i as u64) % FAKE_TOOL_PREFIXES.len() as u64) as usize];
         // 取真名开头三个 ASCII 字母数字，纯粹为了假名在日志里还认得出是谁。
@@ -175,22 +269,39 @@ pub(crate) fn build_tool_name_map(body: Option<&serde_json::Value>) -> Option<To
 }
 
 /// 按 `stem(真名, 序号)` 给每个要改的名字造假名，装成 [`ToolNameMap`]。两种映射共用：撞名兜底、
-/// 去重、反向表按假名长度倒序都在这一处。`real` 为空返回 `None`。
+/// 去重、反向表按假名长度倒序都在这一处。`real` 为空、又没有沿用的，返回 `None`。
+///
+/// `inherited` 是这条请求接的线程上已经发出去的别名（[`thread_tool_names`]）：整份带进来——之前声明过的工具沿用原来的别名
+/// （这一条里又声明了也不另造），新工具的别名避开它们；这一条一个要改的都没声明，映射就是沿用的那份，回复里调旧工具照样
+/// 还原得了。
 fn finish_map(
     declared: &std::collections::HashSet<&str>,
     real: &[&str],
+    inherited: Option<&ToolNameMap>,
     stem: impl Fn(&str, usize) -> String,
 ) -> Option<ToolNameMap> {
-    if real.is_empty() {
-        return None;
-    }
     let mut forward = std::collections::HashMap::with_capacity(real.len());
     let mut reverse = Vec::with_capacity(real.len());
     let mut used: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(real.len());
-    for (i, name) in real.iter().enumerate() {
+    if let Some(old) = inherited {
+        for (fake, name) in &old.reverse {
+            used.insert(fake.clone());
+            reverse.push((fake.clone(), name.clone()));
+            forward.insert(name.clone(), fake.clone());
+        }
+    }
+    // 这一条新声明的工具原名恰好就是线程上某个旧别名（`mcp__` 开头本来保留原名）：原样出站会与上游线程里缓存的旧工具撞名，
+    // 回程也会被还原成旧工具。这种名字也给它造个别名。排好序，结果与声明的先后无关。
+    let mut clashing: Vec<&str> = declared
+        .iter()
+        .copied()
+        .filter(|n| used.contains(*n) && !forward.contains_key(*n) && !real.contains(n))
+        .collect();
+    clashing.sort_unstable();
+    for (i, name) in real.iter().chain(&clashing).enumerate() {
         if forward.contains_key(*name) {
-            continue; // 同名工具重复声明：一个映射就够。
+            continue; // 同名工具重复声明、或线程上已经有别名：一个映射就够。
         }
         let stem = stem(name, i);
         let mut fake = stem.clone();
@@ -237,8 +348,12 @@ pub(crate) fn apply_tool_names(v: &mut serde_json::Value, map: &ToolNameMap) -> 
     };
 
     if let Some(tools) = v.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        // 改不改看映射里有没有这个名字，不再用「本来该不该混淆」筛一遍：续轮里原名撞上线程旧别名的 MCP 工具也在映射里
+        // （[`finish_map`] 给它另造了别名），漏改的话顶层声明还是旧名、与旧工具的别名重名，引用处却已经改了。服务端工具
+        // （`web_search_20250305` 之类带类型的）照旧不动。
         for t in tools.iter_mut() {
-            if should_mimic_tool(t) {
+            let kind = t.get("type").and_then(|k| k.as_str()).unwrap_or_default();
+            if matches!(kind, "" | "custom" | "function") {
                 rename(t);
             }
         }

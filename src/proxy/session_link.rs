@@ -2140,10 +2140,8 @@ pub(crate) fn client_session_link(
 /// UA 的入口是 `sdk-*`（`-p`、Agent SDK）的输入是 sdk，其余是用户敲的。只在开新一轮时用，见
 /// [`CcSessionLink::load_with_origin`]。
 fn turn_origin_of(v: &serde_json::Value, headers: &HeaderMap) -> TurnOrigin {
-    match super::usage_grace::injected_turn(v) {
-        Some(super::usage_grace::InjectedTurn::TaskNotification) => TurnOrigin::TaskNotification,
-        Some(super::usage_grace::InjectedTurn::Peer) => TurnOrigin::Peer,
-        None => {
+    match injected_origin(v) {
+        TurnOrigin::Human => {
             let sdk = headers
                 .get(axum::http::header::USER_AGENT)
                 .and_then(|h| h.to_str().ok())
@@ -2151,6 +2149,17 @@ fn turn_origin_of(v: &serde_json::Value, headers: &HeaderMap) -> TurnOrigin {
                 .is_some_and(|ep| ep.starts_with("sdk-"));
             if sdk { TurnOrigin::Sdk } else { TurnOrigin::Human }
         }
+        injected => injected,
+    }
+}
+
+/// 只按这一轮的内容认来源：纯后台任务通知、纯同伴消息按注入的那种（[`super::usage_grace::injected_turn`]），其余算用户敲的。
+/// 模拟路径用它——出站恒是 `cli` 入口，不看来访 UA 是不是 `sdk-*`；真实客户端那条路另看入口（[`turn_origin_of`]）。
+pub(super) fn injected_origin(v: &serde_json::Value) -> TurnOrigin {
+    match super::usage_grace::injected_turn(v) {
+        Some(super::usage_grace::InjectedTurn::TaskNotification) => TurnOrigin::TaskNotification,
+        Some(super::usage_grace::InjectedTurn::Peer) => TurnOrigin::Peer,
+        None => TurnOrigin::Human,
     }
 }
 

@@ -35,6 +35,7 @@ use crate::config;
 
 mod bash_ast;
 mod bash_kinds;
+mod bash_places;
 mod bash_reads;
 mod bash_repeat;
 mod body;
@@ -516,6 +517,7 @@ impl Telemetry {
                 subscription_type: s.subscription_type,
                 version: s.version.clone(),
                 agent_id: None,
+                parent_agent_id: None,
                 vcs: s.git_repo.filter(|r| *r).map(|_| "git"),
                 parent_session_id: s.parent_session_id.clone(),
                 sdk: s.sdk,

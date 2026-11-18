@@ -471,7 +471,8 @@ pub(super) struct Subst<'a> {
     /// 这一轮客户端附的提醒里有 `<total_tokens>` 那条（[`super::tool_pool::Scan::total_tokens`]）。体归客户端时
     /// （[`Self::client_tools`]）附件事件里的 `total_tokens_reminder` 跟它走，模拟路径照模板由 luban 补。
     pub(super) body_total_tokens: bool,
-    /// 正文里有延迟加载的工具（`defer_loading: true`）。没有就不发
+    /// 正文里有延迟加载的工具（`defer_loading: true`），或这一轮的提醒里有工具池宣告段落（inline 工具那条路没有 `defer_loading`，
+    /// 工具按 `tool_addition` 补，[`super::tool_pool::PoolDelta::announces`]）。都没有就不发
     /// `tengu_deferred_tools_pool_change`、`tengu_attachments` 里也没有 `deferred_tools_delta`
     /// ——官方 API-key 端（全量声明、无 ToolSearch）正是这个形态（`cap/2.1.258-api/00002`、
     /// `00022`），而订阅端延迟形态两者都有（`cap/2.1.258/00020`、`00032`）。
@@ -1253,38 +1254,60 @@ where
             }
             // 续轮那段模板里的附件只有 `<total_tokens>` 提醒；接着已有对话的这一轮带着工具池附件时官方照列它，估值按这一轮的正文算
             // （`cap/auto-2.1.322-20261111-redefine` 批次 `00076` / `00085`：新输入那轮 `['deferred_tools_delta']`，428 / 118）。
-            let mut own_pool: Option<Option<usize>> = None;
+            // 首轮（会话或子代理头一轮）模板里本就列着工具池附件，估值同样按这一轮的宣告段落算
+            // （[`super::tool_pool::PoolDelta::token_estimate`]），不沿用模板抓包那个会话的固定值：工具规模随号随机器不同
+            // （`cap/auto-team-2.1.326-20261117-bashfail/2.1.326` 首轮 6495、个人 Max 号同名目录 4985，321 起各版 bashfail 首轮逐值
+            // 相同）。首轮的 MCP 服务器说明、子代理清单、技能清单仍是模板值：MCP 说明首轮那份与续轮的估法对不上（按正文算出约
+            // 三倍多），后两样还没有估值器。
+            let mut own: Vec<(&str, Option<usize>)> = Vec::new();
             if e.name == "tengu_attachments"
                 && version_at_least(subst.version, "2.1.319")
-                && let Some(d) = subst.pool.attachment_delta()
                 && let Some(types) = meta.get_mut("attachment_types").and_then(|t| t.as_array_mut())
-                && !types.iter().any(|t| t == "deferred_tools_delta")
             {
-                types.insert(0, json!("deferred_tools_delta"));
-                own_pool = Some(d.token_estimate(subst.pool.history, !subst.sdk));
+                let has = |types: &Vec<Value>, k: &str| types.iter().any(|t| t == k);
+                let first = subst.pool.first_turn();
+                if let Some(d) = subst.pool.attachment_delta() {
+                    if !has(types, "deferred_tools_delta") {
+                        types.insert(0, json!("deferred_tools_delta"));
+                    }
+                    own.push((
+                        "deferred_tools_delta",
+                        d.token_estimate(subst.pool.history, !subst.sdk),
+                    ));
+                } else if first
+                    && has(types, "deferred_tools_delta")
+                    && let Some(d) = subst.pool.delta
+                {
+                    own.push((
+                        "deferred_tools_delta",
+                        d.token_estimate(subst.pool.history, !subst.sdk),
+                    ));
+                }
             }
             // 模板里的附件事件都在主线程新输入之前：交互式紧随其后的是 `repl_main_thread`，
             // `-p` 是 `sdk`（`cap/auto-2.1.285-20260930/00448`）。
             if e.name == "tengu_attachments" && version_at_least(subst.version, "2.1.285") {
                 let source = if subst.sdk { "sdk" } else { "repl_main_thread" };
                 fill_attachment_estimates(&mut meta, source, subst.sdk, subst.model);
-                match own_pool {
-                    Some(Some(n)) => {
-                        if let Some(slot) = meta
-                            .get_mut("attachment_token_estimates")
-                            .and_then(|e| e.as_array_mut())
-                            .and_then(|a| a.first_mut())
-                        {
-                            *slot = json!(n.to_string());
+                // 这一轮的数据没记全：估值按位置一一对应，缺一项整份不报。
+                if own.iter().any(|(_, n)| n.is_none()) {
+                    if let Some(o) = meta.as_object_mut() {
+                        o.shift_remove("attachment_token_estimates");
+                    }
+                } else if !own.is_empty() {
+                    let types: Vec<String> = meta["attachment_types"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    if let Some(est) =
+                        meta.get_mut("attachment_token_estimates").and_then(|e| e.as_array_mut())
+                    {
+                        for (slot, t) in est.iter_mut().zip(&types) {
+                            if let Some((_, Some(n))) = own.iter().find(|(k, _)| k == t) {
+                                *slot = json!(n.to_string());
+                            }
                         }
                     }
-                    // 这一轮的工具池数据没记全：估值按位置一一对应，缺一项整份不报。
-                    Some(None) => {
-                        if let Some(o) = meta.as_object_mut() {
-                            o.shift_remove("attachment_token_estimates");
-                        }
-                    }
-                    None => {}
                 }
             }
             if e.name == "tengu_timer"

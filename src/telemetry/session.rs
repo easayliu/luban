@@ -212,14 +212,17 @@ pub(super) struct Session {
     /// 主线程派出去、子代理还没露面的那几次 `Agent` 调用的 `prompt`（取不到的记空串）。心跳里主线程续轮
     /// 收尾要知道有没有委派的活在跑：这里没认领完的，加上认领了、还没跑完的（[`AgentState::delegated`]）。
     /// 新一轮用户输入清空（失败或被打断、没收尾的不再占着）。
-    pub(super) delegated_pending: Vec<String>,
-    /// 子代理自己再派出去、孙代理还没露面的次数：孙代理首条按它认领，不占主线程那份。
-    pub(super) nested_pending: u32,
+    pub(super) delegated_pending: Vec<Delegation>,
+    /// 子代理自己再派出去、孙代理还没露面的那几次（同 [`Self::delegated_pending`] 记 `prompt` 与给没给名字）：孙代理首条
+    /// 按它认领，不占主线程那份。
+    pub(super) nested_pending: Vec<Delegation>,
     /// 最近一条回复里调了 `Agent` 工具的主线程请求：随后拉起的子代理首条报它为
     /// `invokingRequestId`。不能拿「最近一条主线程请求」代替——子代理是异步跑的，它的首条
     /// 回来之前主线程往往已经又完成了一条（`cap/2.1.280`：主线程 27.020 完成、子代理首条
     /// 28.759 才完成，而 invokingRequestId 指的是 22.953 那条）。
     pub(super) last_spawn_request_id: Option<String>,
+    /// 同一条请求的回复 id、查询链与深度（[`SpawnRef`]）：前台子代理的进度事件挂在那次 `Agent` 调用上。
+    pub(super) last_spawn: Option<SpawnRef>,
     /// 主线程最近一条的权限模式。子代理的请求体里没有 auto 模式的提示（`cap/2.1.280`
     /// Explore 七条一条都没有），官方报的却是 `auto`——子代理沿用主线程的模式。
     pub(super) main_permission: &'static str,
@@ -241,6 +244,20 @@ pub(super) struct AgentView {
     pub(super) tools_hash: Option<String>,
     /// 只有支线首条才有。
     pub(super) invoking_request_id: Option<String>,
+    /// 见 [`AgentState::name_given`]。
+    pub(super) name_given: bool,
+    /// 见 [`AgentState::background`]。
+    pub(super) background: Option<bool>,
+    /// 见 [`AgentState::spawn`]。
+    pub(super) spawn: Option<SpawnRef>,
+    /// 见 [`AgentState::depth`]。
+    pub(super) depth: u32,
+    /// 这条支线的启动（`tengu_agent_tool_selected` 那串）已经报过：头一条请求产出前失败、客户端重发时，重发那条仍是第 0 步，
+    /// 但一次派遣只启动一次。
+    pub(super) launched: bool,
+    /// 父代理自己的父代理（三层以上才有）：孙代理的启动事件挂在父代理身份上，父代理若也是别人派的，那条事件照带它的
+    /// `parent_agent_id`。
+    pub(super) grandparent: Option<String>,
     /// 这条支线上一条请求结束的时刻，见 [`AgentState::last_end`]。
     pub(super) last_end: Option<SystemTime>,
 }
@@ -271,6 +288,53 @@ pub(super) struct SuggestionFork {
     pub(super) candidate_chars: usize,
 }
 
+/// 主线程一次 `Agent` 调用派出去的活（[`Session::delegated_pending`] 的一项）。
+#[derive(Clone, Debug, Default)]
+pub(super) struct Delegation {
+    /// 那次调用的 `prompt`（去掉首尾空白；取不到是空串）。
+    pub(super) prompt: String,
+    /// 调用时给了 `name`、且不是保留给主会话的 `main`（官方 2.1.326 `is_name_given` 的 `Boolean(name && name !== "main")`）。
+    pub(super) name_given: bool,
+    /// 调用的 `subagent_type`（没写是 `general-purpose`，官方缺省）：与子代理请求头 `x-claude-code-agent-type` 写法相同，同一条回复
+    /// 里 `prompt` 相同的几次派遣靠它分开。调用表缺了的那项是 `None`。
+    pub(super) agent_type: Option<String>,
+    /// 调用写明的 `run_in_background`（没写是 `None`，按代理缺省，见 [`super::events`] 里 `agent_tool_selected` 的 `is_async`）。
+    pub(super) background: Option<bool>,
+    /// 那次调用的 `tool_use_id`（调用表缺了的是空串）：fork 子代理的请求尾部带着它（[`super::body::ForkDirective`]）。
+    pub(super) tool_use_id: String,
+    /// 派出去的这个代理的深度（官方 `agent_depth`）：主线程派的是 1，子代理再派的是它自己的深度加一。
+    pub(super) depth: u32,
+    /// 调用写明的 `model`（`opus` / `haiku` 之类，没写是 `None`）：`prompt` 与类型都相同的几次派遣靠它对子代理请求实际用的
+    /// 模型分开。
+    pub(super) model: Option<String>,
+}
+
+/// 拉起子代理的那条主线程回复：前台子代理跑的时候，它每出一条消息官方就在那次 `Agent` 调用上报一条
+/// `tengu_tool_use_progress`，`messageID` / `requestId` / `queryChainId` / `queryDepth` 都是这条回复的
+/// （`cap/auto-{max,team}-2.1.326-20261117-full` web-fetch 子代理各 5 条）。
+#[derive(Clone, Debug, Default)]
+pub(super) struct SpawnRef {
+    pub(super) request_id: Option<String>,
+    pub(super) message_id: Option<String>,
+    pub(super) chain_id: String,
+    pub(super) depth: u32,
+}
+
+/// 这个子代理在不在后台跑（官方 `shouldRunAsync`，`To()`）：派它那次调用写明了 `run_in_background` 就按它；没写按缺省——
+/// web-fetch 在前台跑、结果当工具结果交回，其余内置代理缺省在后台（`cap/auto-{max,team}-2.1.326-20261117-full`）。前台子代理
+/// 没有进度摘要器、不走交回提示。
+///
+/// `headless_nested`：无界面会话（`-p` / SDK）里由子代理再派出去的（官方 `callerIsHeadlessSubagent`）。这种调用方不强制后台
+/// （`forceAsync` 为假）、缺省也不进后台，没写明 `run_in_background: true` 的都在前台跑——SDK 子代理派的 fork 报
+/// `is_async: false`，普通 CLI 里派的 fork 照旧在后台。
+pub(super) fn agent_runs_async(
+    agent_type: Option<&str>,
+    background: Option<bool>,
+    headless_nested: bool,
+) -> bool {
+    background.unwrap_or(agent_type != Some("web-fetch") && !headless_nested)
+}
+
 /// 一个子代理（会话里的一条支线）跨请求要记住的东西。字段取值见 `cap/2.1.280` Explore
 /// 子代理 a51764… 的 6 条请求与它的 1 条摘要请求。
 #[derive(Default)]
@@ -297,6 +361,22 @@ pub(super) struct AgentState {
     pub(super) tether: Option<TetherThread>,
     /// 首条的 `invokingRequestId`（拉起它的那条主线程请求）。
     pub(super) invoking_request_id: Option<String>,
+    /// 派它的那条回复（[`SpawnRef`]）：主线程直接派的是主线程那条，孙代理是父代理那条（[`AgentState::last_spawn`]）；
+    /// 认领不上、又没有父代理号的没有。
+    pub(super) spawn: Option<SpawnRef>,
+    /// 代理深度（[`Delegation::depth`]）：主线程派的 1，孙代理 2……认领不上的按 1（0 是还没建档）。请求头带父代理号的
+    /// 直接按父代理的深度加一，不靠派遣认领。
+    pub(super) depth: u32,
+    /// 父代理号（请求头 `x-claude-code-parent-agent-id`），主线程直接派的没有。
+    pub(super) parent: Option<String>,
+    /// 启动事件已经报过（[`AgentView::launched`]）。
+    pub(super) launched: bool,
+    /// 这个代理最近一条调了 `Agent` 的回复（[`SpawnRef`]）：它派出去的前台孙代理的进度事件挂在那次调用上。
+    pub(super) last_spawn: Option<SpawnRef>,
+    /// 派它那次 `Agent` 调用给了名字（[`Delegation::name_given`]）；认领不上的按没给。
+    pub(super) name_given: bool,
+    /// 派它那次调用写明的 `run_in_background`（[`Delegation::background`]）；认领不上或没写是 `None`。
+    pub(super) background: Option<bool>,
     /// 它是主线程直接派的（认领了 [`Session::delegated_pending`] 里的一项）：跑完才从「委派的活」里扣掉。
     /// 子代理再派的孙代理不算——请求头里没有父子关系，按首条用户消息里那段 `prompt` 认。
     pub(super) delegated: bool,
@@ -1148,6 +1228,12 @@ pub(super) struct TurnFacts {
     /// `tengu_tool_use_can_use_tool_rejected` 在 `decisionReasonType` 后多 `hasFeedback`，`tengu_reactive_compact_succeeded`
     /// 在 `postCompactTokens` 后多一组 `postCompact*Tokens` 分项（`cap/auto-2.1.325-20261114-*`；2.1.324 没有发布）。
     pub(super) v325: bool,
+    /// 2.1.326：失败 Bash 的栈摘要、行列、块名都换了，类名 `Sx` → `UT`；5xx 摘要与行列照旧、只换块名，**又不带**
+    /// `error_constructor`。`tengu_api_success` 在 `ttftMs` 后多 `headersMs`；Bash 的 `tengu_tool_use_success` /
+    /// `tengu_tool_use_error` 多 `bash_places`（失败那条另多 `bash_argv0`）；`tengu_tool_use_can_use_tool_rejected` 把
+    /// `deniedBy` ~ `permissionDurationMs` 挪到 `messageID` 之前；`tengu_agent_tool_selected` 在 `is_fork` 后多
+    /// `is_name_given`（`cap/auto-{max,team}-2.1.326-20261117-*`）。
+    pub(super) v326: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
@@ -1481,8 +1567,9 @@ impl Session {
             thread_bases: HashMap::new(),
             agents: HashMap::new(),
             delegated_pending: Vec::new(),
-            nested_pending: 0,
+            nested_pending: Vec::new(),
             last_spawn_request_id: None,
+            last_spawn: None,
             main_permission: "default",
             main_effort: None,
             turn_origin: "human".to_string(),

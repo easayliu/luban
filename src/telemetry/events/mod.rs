@@ -422,6 +422,7 @@ impl<'a> EventEnv<'a> {
 
     pub(super) fn subst(&self) -> Subst<'_> {
         let f = self.f;
+        let pool = self.shape.pool_turn();
         Subst {
             version: &f.version,
             model: &f.display_model,
@@ -429,8 +430,11 @@ impl<'a> EventEnv<'a> {
             permission_mode: self.shape.permission_mode,
             resumed: f.resumed,
             prompt_index: f.prompt_seq,
-            deferred: self.shape.deferred_tools > 0,
-            pool: self.shape.pool_turn(),
+            // inline 工具那条路（官方 `toolSearchAbsent`）没有 `defer_loading` 的声明，工具靠 `tool_addition` 按值补，提醒里照样有
+            // 工具池宣告：官方照报汇总与 `deferred_tools_delta`。只有 MCP 服务器状态（还在连接、要登录、连接失败）、一个工具都没
+            // 新增的首轮同样照报（[`super::tool_pool::PoolDelta::has_state`]）。
+            deferred: self.shape.deferred_tools > 0 || pool.delta.is_some_and(|d| d.has_state()),
+            pool,
             pool_site: None,
             pool_inline: false,
             tool_search: (!f.tools_unknown)

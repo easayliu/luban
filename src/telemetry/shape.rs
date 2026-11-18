@@ -158,6 +158,9 @@ pub(super) struct RequestShape {
     pub(super) is_subagent: bool,
     pub(super) system_blocks: usize,
     pub(super) system_chars: usize,
+    /// 子代理定义自己那段提示词的长度（官方 `agent_system_prompt_chars` 报的 `getSystemPrompt()` 那段）：system 里它后面固定拼着
+    /// `Messages from the agent that launched you …` 起头的那几段（官方 `CVn`），取这句之前的部分。没有这句的请求是 `None`。
+    pub(super) agent_prompt_chars: Option<usize>,
     /// `system[0]`（billing header）的长度与 sha256。
     pub(super) sys0_len: usize,
     pub(super) sys0_hash: String,
@@ -286,6 +289,9 @@ pub(super) struct RequestShape {
     pub(super) compact_stats: Option<super::compact::CompactStats>,
     /// billing header 的 `cc_entrypoint=sdk-cli`：`-p` 打印模式，主线程报 `querySource: sdk`。
     pub(super) sdk: bool,
+    /// 出站体没要流式（`stream` 不是 `true`）。走 `tengu_api_success` 的那几类官方本来都是流式发的，这样发出去、回复也不是
+    /// SSE 的，就是客户端流式失败后回退成非流式重发的那一条（官方 `didFallBackToNonStreaming`）。
+    pub(super) non_stream: bool,
     /// 这一轮是 `!` 跑的 shell 命令（末条用户消息以 `<bash-input>` 开头）：报 `tengu_input_bash`
     /// 而不是 `tengu_input_prompt`，`turn_origin` 是 `unstamped`（`cap/auto-2.1.285-20260930/00191`）。
     pub(super) bash_input: bool,
@@ -1182,6 +1188,12 @@ pub(super) fn error_trace(
         ("2.1.325", Some(s)) if s >= 500 => {
             Some((Some("Fkn"), "5b32b751db51", "chunk-wryttfdq.js:5:1510"))
         }
+        // 2.1.326 摘要与行列照旧、顶帧换了块；5xx 类压缩后不再是能过构造名校验的名字，**又不带 `error_constructor`**
+        // （`cap/auto-max-2.1.326-20261117-retry` 与 `cap/auto-team-2.1.326-20261117-retry`：两条 `tengu_api_retry` 与收尾的
+        // `tengu_api_error`，两号同值）。
+        ("2.1.326", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-6ybqvknv.js:5:1510"))
+        }
         _ => None,
     }
 }
@@ -1533,6 +1545,8 @@ pub fn last_is_new_prompt_body(body: &Value) -> bool {
 /// 末条消息是不是一次新的用户输入：role 为 user，且 content 里没有 `tool_result`。
 /// 用户打断工具调用后客户端补的那句，见 [`last_is_new_prompt`]。
 pub(super) const INTERRUPTED_FOR_TOOL_USE: &str = "[Request interrupted by user for tool use]";
+/// 用户按 Esc 打断（不是在权限弹框上拒工具）后客户端补的那句。
+pub(super) const INTERRUPTED: &str = "[Request interrupted by user]";
 /// 用户在权限弹框上拒绝后，那个 `tool_result` 的开头。
 pub(super) const USER_REJECTED_TOOL_USE: &str =
     "The user doesn't want to proceed with this tool use.";
@@ -1576,10 +1590,13 @@ pub(super) fn last_is_new_prompt(messages: &[Value]) -> (bool, usize) {
             // 用户在权限弹框上拒了工具、接着敲了下一句：工具结果（拒绝的那段话）与
             // `[Request interrupted by user for tool use]` 和新输入挤在一条消息里
             // （`cap/auto-2.1.285-20260930/00252`）。这是一次新输入，不是续轮。
+            // 普通 Esc 打断（工具在跑、或回复流到一半）补的是另一句 `[Request interrupted by user]`，同样与工具结果、新输入
+            // 挤在一条消息里（`cap/auto-2.1.325-20261114-full/00666`：`tool_result` + 技能正文 + 这句 + 新输入），也是新输入。
             let interrupted = blocks.iter().any(|b| {
-                b.get("text")
-                    .and_then(|t| t.as_str())
-                    .is_some_and(|t| t.trim_start().starts_with(INTERRUPTED_FOR_TOOL_USE))
+                b.get("text").and_then(|t| t.as_str()).is_some_and(|t| {
+                    let t = t.trim_start();
+                    t.starts_with(INTERRUPTED_FOR_TOOL_USE) || t.starts_with(INTERRUPTED)
+                })
             });
             if !interrupted
                 && blocks
@@ -1655,6 +1672,10 @@ pub(super) fn parse_shape(body: &[u8]) -> Option<RequestShape> {
     shape_of(&v, body)
 }
 
+/// 子代理 system 里紧跟代理定义提示词的那句（官方 `CVn` 拼的头一段，`cap/auto-2.1.285-20260930` 起各版 Explore 都在第 1977
+/// 个字符处、2.1.326 web-fetch 在 4262）。
+const AGENT_NOTES_LEAD: &str = "Messages from the agent that launched you \u{2014} your task and any mid-task course corrections";
+
 /// [`parse_shape`] 的主体：`v` 是 `body` 解析出来的那份（几处特征按原始字节找，两样都要）。
 pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
     let mut shape = RequestShape {
@@ -1672,6 +1693,7 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
             .and_then(|e| e.as_str())
             .map(str::to_string),
         fast_mode: v.get("speed").and_then(|s| s.as_str()) == Some("fast"),
+        non_stream: v.get("stream").and_then(Value::as_bool) != Some(true),
         permission_mode: "default",
         has_cache_control: body.windows(15).any(|w| w == b"\"cache_control\""),
         ..Default::default()
@@ -1704,6 +1726,10 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         };
         shape.system_blocks = texts.len();
         shape.system_chars = texts.iter().map(|t| js_len(t)).sum();
+        shape.agent_prompt_chars = texts.iter().find_map(|t| {
+            let at = t.find(AGENT_NOTES_LEAD)?;
+            Some(js_len(t[..at].strip_suffix("\n\n").unwrap_or(&t[..at])))
+        });
         for t in &texts {
             note_total_tokens(t, &mut shape);
         }

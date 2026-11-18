@@ -75,26 +75,61 @@ impl EventBuilder<'_> {
         // 回放那两条夹着工具搜索判定：折叠在前、回显在后。
         // 子代理首步之前，主线程那边先选定子代理类型、解析它的模型（`cap/2.1.285` 06:56:08.488：
         // `agent_tool_selected` 挂在主线程上，`subagent_model_resolve` 已经挂在子代理支线上）。
-        if v285 && kind == Kind::Subagent && thread_step == Some(0) {
+        if v285
+            && kind == Kind::Subagent
+            && thread_step == Some(0)
+            && !env.f.agent.as_ref().is_some_and(|a| a.launched)
+        {
             let ts = ms(t0, -11);
             let family = shape.model.trim_start_matches("claude-").split('-').next().unwrap_or("");
-            let selected = json!({
-                "agent_type": call.agent.agent_type.as_deref().unwrap_or("general-purpose"),
+            let agent_type = call.agent.agent_type.as_deref().unwrap_or("general-purpose");
+            // 跑在后台没有（[`crate::telemetry::session::agent_runs_async`]；抓包里 web-fetch `false`，Explore / Plan / general-purpose
+            // `true`）。
+            let is_async = crate::telemetry::session::agent_runs_async(
+                Some(agent_type),
+                env.f.agent.as_ref().and_then(|a| a.background),
+                shape.sdk && env.f.agent.as_ref().is_some_and(|a| a.depth >= 2),
+            );
+            // 公开的 fork 子代理（`subagent_type: "fork"`，请求头类型 `fork`）：官方 `is_fork: U`。
+            let is_fork = agent_type == "fork";
+            let mut selected = json!({
+                "agent_type": agent_type,
                 "model": &shape.model,
                 "source": if builtin_agent.is_some() { "built-in" } else { "custom" },
                 "is_built_in_agent": builtin_agent.is_some(),
                 "is_resume": false,
-                "is_async": true,
-                "is_fork": false,
-                "agent_depth": 1,
-                "agent_system_prompt_chars": shape.system_chars
+                "is_async": is_async,
+                "is_fork": is_fork,
+                "agent_depth": env.f.agent.as_ref().map_or(1, |a| a.depth.max(1)),
+                // 只算代理定义自己那段提示词（官方 `Ut.length`，`Ut = M.getSystemPrompt(…)`），不含 billing header、身份句与
+                // 后面拼的说明：两个号 326 抓包 Explore 1977、Plan 2284、general-purpose 1434、web-fetch 4262。认不出那段的退回整份。
+                // fork 继承父会话的整份 system，它自己的定义没有提示词（官方 `getSystemPrompt: () => ""`），报 0。
+                "agent_system_prompt_chars": if is_fork {
+                    0
+                } else {
+                    shape.agent_prompt_chars.unwrap_or(shape.system_chars)
+                }
             });
+            // 代理定义里带颜色的（官方 `color: le(M.color)`，没有就不报）紧跟 `source`：内置的只有 web-fetch（blue）与
+            // statusline-setup（orange），抓包里 web-fetch 那条报 `color: "blue"`。
+            if let Some(color) = builtin_agent_color(agent_type).filter(|_| builtin_agent.is_some())
+            {
+                insert_after(&mut selected, "source", vec![("color", json!(color))]);
+            }
             // 2.1.291 在 `is_fork` 后面多报主会话与子代理各自的 effort，**没有就不报**：opus 主线程起
             // 的 Explore 两项都是 high，haiku 主线程起的 haiku Explore 两项都不在
             // （`cap/auto-2.1.291-20261006-full` 的 E4 会话）。主会话那项取主线程最近一条，子代理那项
             // 取子代理这条请求自己的。
-            let mut selected = selected;
-            if v291 {
+            // 2.1.326 起紧跟 `is_fork` 报调 Agent 时给没给 `name`（官方 `Boolean(name && name !== "main")`）：取派它那次 Agent 调用
+            // 的入参（主线程派的与子代理再派的孙代理都记），随派遣认领带到子代理这边（[`crate::telemetry::session::Delegation`]）；
+            // 认领不上的按没给（两个号的抓包里全是没给，`cap/auto-{max,team}-2.1.326-20261117-full`）。
+            if env.f.v326 {
+                let named = env.f.agent.as_ref().is_some_and(|a| a.name_given);
+                insert_after(&mut selected, "is_fork", vec![("is_name_given", json!(named))]);
+            }
+            // fork 不报这两项（官方 fork 不走 effort 解析；`cap/auto-max-2.1.326-20261117-fork` 两份里 fork 那条都没有，同批的
+            // general-purpose 有）。
+            if v291 && !is_fork {
                 let mut pairs = Vec::new();
                 if let Some(e) = main_effort.as_deref() {
                     pairs.push(("session_effort", json!(e)));
@@ -102,15 +137,28 @@ impl EventBuilder<'_> {
                 if let Some(e) = shape.effort.as_deref() {
                     pairs.push(("subagent_effort", json!(e)));
                 }
-                insert_after(&mut selected, "is_fork", pairs);
+                let after = if env.f.v326 { "is_name_given" } else { "is_fork" };
+                insert_after(&mut selected, after, pairs);
             }
             // 顶层 `betas` 是子代理这条请求自己那份（meta 的 `model` 是子代理的模型）：claude-code-guide 跑
             // haiku-5-5 时是 haiku 那 6 项，不是主线程那份（`cap/auto-2.1.308-20261022-gaps`；Explore 跟主线程
             // 同模型，两份本来相同）。
             let mut ctx = env.ctx(ts);
             ctx.betas = &env.f.betas_own;
+            // 这条事件是派它的那一方报的：主线程派的挂会话身份；子代理再派的孙代理挂在父代理身份上（`agent_id` 是父代理，
+            // `cap/auto-max-2.1.326-20261117-fork/p-nested-fork` 那条 fork 的启动事件）。
+            let spawner = match call.agent.parent_agent_id.as_deref().filter(|p| !p.is_empty()) {
+                Some(parent) => Identity {
+                    agent_id: Some(parent.to_string()),
+                    parent_agent_id: env.f.agent.as_ref().and_then(|a| a.grandparent.clone()),
+                    ..base_identity.clone()
+                },
+                None => base_identity.clone(),
+            };
             self.main_side
-                .push((ts, base_identity.event("tengu_agent_tool_selected", ts, &ctx, selected)));
+                .push((ts, spawner.event("tengu_agent_tool_selected", ts, &ctx, selected)));
+            // 前台子代理起步那条进度（任务消息交给它，同一毫秒）。
+            self.agent_progress(ts);
             // 心跳里转入 `subagent_running` 那一下不在这里登记：子代理首条落地时主线程往往已经又完成了
             // 一两条，这里登记的时刻早于已折算过的会被当过时丢掉。改由拉起它的那条主线程请求登记，见
             // `finish.rs` 的 `delegated`。
@@ -206,8 +254,12 @@ impl EventBuilder<'_> {
             );
         }
         if v285 && let Some(step) = thread_step {
-            let recorded = step == 0 && kind == Kind::Subagent;
-            let replayed = step <= 1 && (kind == Kind::Subagent || step == 1);
+            // fork 继承父会话已经记下的那几样：首步不记、不宣告、也不回放，第二步回放一次
+            // （`cap/auto-max-2.1.326-20261117-fork` 两份：首步只有工具搜索判定与线程判定，第二步两条 `*_replayed`）。
+            let fork = kind == Kind::Subagent && call.agent.agent_type.as_deref() == Some("fork");
+            let recorded = step == 0 && kind == Kind::Subagent && !fork;
+            let replayed =
+                step <= 1 && (kind == Kind::Subagent || step == 1) && !(fork && step == 0);
             if recorded {
                 let tr = ms(t0, -5);
                 self.push_dd(tr, "tengu_feature_ok", feature("context_git_detect"));
@@ -765,5 +817,14 @@ impl EventBuilder<'_> {
                 }),
             );
         }
+    }
+}
+
+/// 内置子代理定义里的颜色（官方代理定义的 `color`）：只有 web-fetch 与 statusline-setup 有。
+fn builtin_agent_color(agent_type: &str) -> Option<&'static str> {
+    match agent_type {
+        "web-fetch" => Some("blue"),
+        "statusline-setup" => Some("orange"),
+        _ => None,
     }
 }

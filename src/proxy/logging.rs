@@ -162,6 +162,9 @@ pub(crate) struct ReqLog {
     /// 缓存保活：最终那一发响应要按它登记（重试换过一发时），见
     /// [`super::cache_keepalive::note_final`]。非计费、改写成预热的探针为 `None`。
     pub(super) keepalive: Option<super::cache_keepalive::KeepaliveNote>,
+    /// 原生线程请求用的工具别名：完整成功时记到回复的 `message.id` 名下，接着它的续轮取回来沿用，见
+    /// [`super::body::note_thread_tool_names`]。不走线程、没有改名的为 `None`。
+    pub(super) thread_tool_names: Option<std::sync::Arc<super::body::ToolNameMap>>,
 }
 
 impl Drop for ReqLog {
@@ -459,6 +462,14 @@ impl Drop for ReqLog {
             && self.status == StatusCode::OK.as_u16()
             && failure.is_none();
 
+        // 原生线程上的工具别名随回复留着，接着它的续轮沿用（[`super::body::note_thread_tool_names`]）。
+        if ok
+            && let Some(map) = self.thread_tool_names.take()
+            && let Some(m) = self.sniffer.message_id.as_deref()
+        {
+            super::body::note_thread_tool_names(m, map);
+        }
+
         // 会话链条：把这一条的上游 request-id 与回复 message.id 记回它那条链，链上的下一条
         // 据此写 `cc_prev_req` 与 `diagnostics.previous_message_id`。**只记完整成功的**：官方
         // 链上跳过报错的请求（`cap/auto-2.1.306-20261021-retry` R4，见 [`CcSessionLink::record`]），
@@ -573,6 +584,7 @@ impl Drop for ReqLog {
                     .sniffer
                     .is_stream
                     .then(|| self.sniffer.events.saturating_sub(self.sniffer.pings)),
+                closed_blocks: self.sniffer.closed_blocks,
                 tool_use_lens: self.sniffer.tool_use_lens(),
                 tool_calls: self.sniffer.tool_calls(),
                 cost_usd,
@@ -891,6 +903,7 @@ pub(super) fn telemetry_capture(
             agent_id: header_opt(&upstream.headers, "x-claude-code-agent-id"),
             agent_type: header_opt(&upstream.headers, "x-claude-code-agent-type"),
             request_class: header_opt(&upstream.headers, "x-claude-code-request-class"),
+            parent_agent_id: header_opt(&upstream.headers, "x-claude-code-parent-agent-id"),
         },
         organization_id,
         started_at: started.wall,
@@ -1397,6 +1410,9 @@ pub(crate) struct UsageSniffer {
     pub(super) events: u32,
     /// 其中 `ping` 的个数：遥测的 `streamEventCount` 不算它，见 [`ApiCall::stream_events`](crate::telemetry::ApiCall::stream_events)。
     pub(super) pings: u32,
+    /// 收完了的内容块数：流式数 `content_block_stop`，非流式是整段回复的 `content` 块数。见
+    /// [`ApiCall::closed_blocks`](crate::telemetry::ApiCall::closed_blocks)。
+    pub(super) closed_blocks: u32,
     /// 响应的 `message.id`（`msg_…`）、最终 `stop_reason`，以及正文里 text / thinking 的
     /// 字符数。都是逐请求遥测（`tengu_api_success` / `tengu_turn_first_text` /
     /// `tengu_prompt_cache_diagnosis_received`）要的量，顺着已经在做的逐行解析记下来。
@@ -1623,6 +1639,7 @@ impl UsageSniffer {
                         self.flush_pending_signatures();
                     }
                     "content_block_stop" => {
+                        self.closed_blocks += 1;
                         let index = v.get("index").and_then(|i| i.as_i64());
                         if let Some(index) = index
                             && let Some(sig) = self.pending_signatures.remove(&index)
@@ -1824,6 +1841,7 @@ impl UsageSniffer {
         if !self.is_stream
             && let Some(blocks) = v.get("content").and_then(|c| c.as_array())
         {
+            self.closed_blocks = blocks.len() as u32;
             for (i, b) in blocks.iter().enumerate() {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                     self.text_chars += t.encode_utf16().count();

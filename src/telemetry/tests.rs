@@ -228,6 +228,7 @@ fn call(body: Vec<u8>, request_id: &str, stop: &str) -> ApiCall {
             thinking_chars: 0,
             saw_thinking: false,
             stream_events: Some(12),
+            closed_blocks: 1,
             tool_use_lens: Vec::new(),
             tool_calls: Vec::new(),
             cost_usd: Some(0.18),
@@ -1118,6 +1119,7 @@ fn post_compact_ledger_restores_the_skill_listing_from_2_1_305() {
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         t.ingest(c);
         let after = t.0.state.lock().sessions[&key()].attachment_counts.clone();
@@ -1180,6 +1182,7 @@ fn restored_attachment_count_drops_the_deferred_tools_when_tool_search_is_off() 
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         t.ingest(c);
         let st = t.0.state.lock();
@@ -1371,6 +1374,7 @@ fn feature_name_position_follows_the_version() {
                 agent_id: None,
                 agent_type: None,
                 request_class: class.map(str::to_string),
+                parent_agent_id: None,
             };
             c
         };
@@ -1430,6 +1434,7 @@ fn heron_is_reported_again_after_a_successful_compaction() {
                 agent_id: None,
                 agent_type: None,
                 request_class: Some("compaction".into()),
+                parent_agent_id: None,
             };
         }
         t.ingest(c);
@@ -1476,6 +1481,7 @@ fn a_cancelled_compaction_does_not_report_heron_again() {
                 agent_id: None,
                 agent_type: None,
                 request_class: Some("compaction".into()),
+                parent_agent_id: None,
             };
             c.aborted = true;
         }
@@ -1531,8 +1537,12 @@ fn compact_reports_success_with_the_context_breakdown() {
     c.cache_creation_tokens = 30;
     c.output_tokens = 400;
     c.text_chars = 1_600;
-    c.agent =
-        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("compaction".into()) };
+    c.agent = AgentHeaders {
+        agent_id: None,
+        agent_type: None,
+        request_class: Some("compaction".into()),
+        parent_agent_id: None,
+    };
     // 压缩前账本里已有各轮宣告过的附件：这一条的统计照用，压完之后旧附件都不在上下文里了，账本清空。
     t.0.state
         .lock()
@@ -1907,6 +1917,7 @@ fn cache_heartbeat_follows_a_background_subagent() {
         agent_id: Some("a1".into()),
         agent_type: Some("Explore".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     let mut s1 = call(with_prompt(cc_body(true), PROMPT_2), "req_s1", "tool_use");
     at(&mut s1, 30, 800, 9_000);
@@ -1988,6 +1999,7 @@ fn cache_heartbeat_counts_parallel_agents_by_call() {
         agent_id: Some("a1".into()),
         agent_type: Some("Explore".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     t.ingest(s1);
     // 另一个还在跑时主线程续轮回来。
@@ -2045,6 +2057,7 @@ fn cache_heartbeat_ignores_grandchild_agents() {
         agent_id: Some(id.into()),
         agent_type: Some("general-purpose".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     let continuation = |rid: &str| {
         let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -2130,6 +2143,7 @@ fn cache_heartbeat_a_late_agent_from_an_earlier_turn_does_not_claim() {
         agent_id: Some(id.into()),
         agent_type: Some("general-purpose".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     let mut first = call(cc_body(true), "req_1", "end_turn");
     at(&mut first, 0, 1_000, 3_000);
@@ -2188,6 +2202,7 @@ fn cache_heartbeat_a_late_agent_does_not_rewind_the_prompt() {
         agent_id: Some("old".into()),
         agent_type: Some("general-purpose".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     t.ingest(late);
     // 那个子代理里的 WebFetch 页面处理（没有工具、`auxiliary`、带它的 agent-id）也晚到，同样带第二轮的 prompt。
@@ -2199,6 +2214,7 @@ fn cache_heartbeat_a_late_agent_does_not_rewind_the_prompt() {
         agent_id: Some("old".into()),
         agent_type: None,
         request_class: Some("auxiliary".into()),
+        parent_agent_id: None,
     };
     t.ingest(fetch);
     let fourth_prompt = "a1b2c3d4-0000-4000-8000-000000000004";
@@ -2236,6 +2252,7 @@ fn cache_heartbeat_claims_even_when_a_summary_lands_first() {
         agent_id: Some("a1".into()),
         agent_type: Some("general-purpose".into()),
         request_class: Some(class.into()),
+        parent_agent_id: None,
     };
     let mut summary = call(with_prompt(cc_body(true), PROMPT_2), "req_sum", "end_turn");
     at(&mut summary, 33, 500, 800);
@@ -2293,6 +2310,7 @@ fn cache_heartbeat_reports_a_cancelled_compaction() {
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         match outcome {
             "aborted" => c.aborted = true,
@@ -4749,6 +4767,7 @@ fn tool_and_subagent_replay_matches_the_2_1_285_capture() {
             agent_id: cap_header(&rel, "x-claude-code-agent-id"),
             agent_type: cap_header(&rel, "x-claude-code-agent-type"),
             request_class: cap_header(&rel, "x-claude-code-request-class"),
+            parent_agent_id: None,
         };
         t.ingest(c);
     }
@@ -5073,6 +5092,7 @@ fn replay_calls(calls: &[Value], client_tools: bool) -> Telemetry {
             agent_id: s(c, "agent_id"),
             agent_type: s(c, "agent_type"),
             request_class: s(c, "request_class"),
+            parent_agent_id: None,
         };
         a.message_id = s(c, "message_id");
         a.stop_reason = s(c, "stop_reason");
@@ -5355,6 +5375,7 @@ fn subagent_replay_matches_the_2_1_280_capture() {
             agent_id: cap_header(&rel, "x-claude-code-agent-id"),
             agent_type: cap_header(&rel, "x-claude-code-agent-type"),
             request_class: cap_header(&rel, "x-claude-code-request-class"),
+            parent_agent_id: None,
         };
         t.ingest(c);
     }
@@ -6341,6 +6362,644 @@ fn trimmed_tools_are_reported_like_the_env_switches() {
     assert_eq!(ctx(&trimmed), (json!(29), json!(6983)));
 }
 
+/// 真实客户端流式失败、回退成非流式重发成功的那一条（出站体 `stream: false`、回复不是 SSE）：`tengu_api_success` 报
+/// `didFallBackToNonStreaming: true`，不报 `headersMs`、`firstContentMs`、`clientRequestId`；正常流式那条照报。
+#[test]
+fn non_streaming_fallback_drops_the_streaming_fields() {
+    let run = |stream: bool| {
+        let t = Telemetry::default();
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["stream"] = json!(stream);
+        let mut c = call(v.to_string().into_bytes(), "req_1", "end_turn");
+        c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+        c.client_request_id = Some("crid-1".into());
+        c.client_tools = true;
+        c.stream_events = stream.then_some(12);
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let fell = run(false);
+    assert_eq!(fell["didFallBackToNonStreaming"], json!(true), "{fell}");
+    for k in ["headersMs", "firstContentMs", "clientRequestId", "streamEventCount"] {
+        assert!(fell.get(k).is_none(), "{k}: {fell}");
+    }
+    let ok = run(true);
+    assert_eq!(ok["didFallBackToNonStreaming"], json!(false));
+    for k in ["headersMs", "firstContentMs", "clientRequestId", "streamEventCount"] {
+        assert!(ok.get(k).is_some(), "{k}: {ok}");
+    }
+}
+
+/// 原生就非流式的安全分类（带 `auto-mode-classifier` beta、一次 JSON 请求）不是回退：`didFallBackToNonStreaming: false`、
+/// `clientRequestId` 照报。回退成非流式之后最后仍 400 的，`tengu_api_error` 报 `didFallBackToNonStreaming: true`。
+#[test]
+fn native_non_streaming_and_failed_fallbacks() {
+    let body = |stream: bool| {
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["stream"] = json!(stream);
+        v.to_string().into_bytes()
+    };
+    let meta = |t: &Telemetry, name: &str| {
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == name)
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    let t = Telemetry::default();
+    let mut c = call(body(false), "req_1", "end_turn");
+    c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+    c.client_tools = true;
+    c.client_request_id = Some("crid-1".into());
+    c.betas = Some(format!("oauth-2025-04-20,{}", config::CC_BETA_AUTO_MODE_CLASSIFIER));
+    t.ingest(c);
+    let ok = meta(&t, "tengu_api_success");
+    assert_eq!(ok["didFallBackToNonStreaming"], json!(false), "{ok}");
+    assert_eq!(ok["clientRequestId"], "crid-1");
+
+    let t = Telemetry::default();
+    let mut c = call(body(false), "req_400", "end_turn");
+    c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+    c.client_tools = true;
+    t.ingest(failed(c, Some(400), "invalid_request_error", "bad"));
+    give_up_retries(&t);
+    assert_eq!(meta(&t, "tengu_api_error")["didFallBackToNonStreaming"], json!(true));
+    let t = Telemetry::default();
+    let mut c = call(body(true), "req_400", "end_turn");
+    c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+    c.client_tools = true;
+    t.ingest(failed(c, Some(400), "invalid_request_error", "bad"));
+    give_up_retries(&t);
+    assert_eq!(meta(&t, "tengu_api_error")["didFallBackToNonStreaming"], json!(false));
+}
+
+/// inline 工具那条路的首轮：声明里一个 `defer_loading` 都没有，工具靠 `tool_addition` 按值补、提醒里照样有宣告段落。官方照报
+/// `tengu_deferred_tools_pool_change`，首轮那条 `tengu_attachments` 里照列 `deferred_tools_delta`、估值按这一轮的宣告算；
+/// 既没有 `defer_loading` 也没有宣告的（API-key 那种全量声明）两样都不报。
+#[test]
+fn inline_tool_pool_counts_without_defer_loading() {
+    let run = |announce: bool| {
+        let t = Telemetry::default();
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": "hello there"}]);
+        v["tools"] =
+            json!([{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}]);
+        if announce {
+            v["messages"][0]["content"] = json!([
+                {"type": "tool_addition", "tool": {"type": "tool_definition", "definition":
+                    {"name": "mcp__s__a", "description": "d", "input_schema": {"type": "object"}}}},
+                {"type": "text", "text": "<system-reminder>\nThe following tools just became available and are ready to use:\nmcp__s__a\n</system-reminder>"},
+                {"type": "text", "text": "hello there"}
+            ]);
+        }
+        let mut c = call(v.to_string().into_bytes(), "req_1", "end_turn");
+        c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let evs: Vec<(String, Value)> = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+            .collect();
+        let pool = evs.iter().any(|(n, _)| n == "tengu_deferred_tools_pool_change");
+        let att = evs
+            .iter()
+            .find(|(n, m)| {
+                n == "tengu_attachments"
+                    && m["attachment_types"]
+                        .as_array()
+                        .is_some_and(|t| t.iter().any(|x| x == "environment"))
+            })
+            .map(|(_, m)| m.clone());
+        (pool, att)
+    };
+    let (pool, att) = run(true);
+    assert!(pool, "inline 首轮照报工具池汇总");
+    let att = att.expect("首轮附件");
+    let types = att["attachment_types"].as_array().unwrap();
+    let at = types.iter().position(|x| x == "deferred_tools_delta").expect("首轮列着工具池附件");
+    assert!(att["attachment_token_estimates"][at].as_str().is_some(), "{att}");
+    let (pool, att) = run(false);
+    assert!(!pool);
+    assert!(att.is_none_or(|a| {
+        !a["attachment_types"].as_array().unwrap().iter().any(|x| x == "deferred_tools_delta")
+    }));
+}
+
+/// 首轮只有 MCP 服务器状态（还在连接 / 要登录 / 连接失败）、一个工具都没新增，声明里也没有 `defer_loading`：提醒里有这些段落
+/// 就是官方生成了工具池附件，照报 `tengu_deferred_tools_pool_change`，首轮那条 `tengu_attachments` 里照列 `deferred_tools_delta`。
+#[test]
+fn first_turn_with_only_mcp_server_state_reports_the_pool() {
+    const PENDING: &str = "The following MCP servers are still connecting \u{2014} their tools (typically named mcp__<server>__*) are not yet available but will appear shortly:\nalpha";
+    const AUTH: &str =
+        "The following MCP servers require authentication before their tools can be used:\nbeta";
+    const FAILED: &str = "The following MCP servers are configured but failed to connect \u{2014} their tools (typically named mcp__<server>__*) are unavailable for now; the session retries them in the background:\ngamma";
+    for para in [PENDING, AUTH, FAILED] {
+        let t = Telemetry::default();
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["tools"] =
+            json!([{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}]);
+        v["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": format!("<system-reminder>\n{para}\n</system-reminder>")},
+            {"type": "text", "text": "hello there"}
+        ]}]);
+        let mut c = call(v.to_string().into_bytes(), "req_1", "end_turn");
+        c.ua_out = "claude-cli/2.1.326 (external, cli)".into();
+        c.client_tools = true;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let evs: Vec<(String, Value)> = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+            .collect();
+        assert!(evs.iter().any(|(n, _)| n == "tengu_deferred_tools_pool_change"), "{para}");
+        let att = evs
+            .iter()
+            .find(|(n, m)| {
+                n == "tengu_attachments"
+                    && m["attachment_types"]
+                        .as_array()
+                        .is_some_and(|t| t.iter().any(|x| x == "environment"))
+            })
+            .map(|(_, m)| m.clone())
+            .expect("首轮附件");
+        let types = att["attachment_types"].as_array().unwrap();
+        let at = types.iter().position(|x| x == "deferred_tools_delta").expect(para);
+        assert!(att["attachment_token_estimates"][at].as_str().is_some(), "{att}");
+    }
+}
+
+/// 2.1.326：`claude_ai` 那台 MCP 服务器（官方 `R$`）的工具成功事件不报结果那四项；2.1.325、别的 MCP 工具、`claude.ai` 连接器照报。
+#[test]
+fn claude_ai_tool_success_drops_result_stats_from_2_1_326() {
+    let run = |ua: &str, tool: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":tool,"input":{}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"hello"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_tool_use_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap()
+    };
+    const STATS: [&str; 4] = [
+        "toolResultSizeBytes",
+        "toolResultTokensEst",
+        "toolResultMediaBlocks",
+        "toolResultWillPersist",
+    ];
+    let ok = run("claude-cli/2.1.326 (external, cli)", "mcp__claude_ai__read_conversation");
+    assert!(STATS.iter().all(|k| ok.get(*k).is_none()), "{ok}");
+    for (ua, tool) in [
+        ("claude-cli/2.1.325 (external, cli)", "mcp__claude_ai__read_conversation"),
+        ("claude-cli/2.1.326 (external, cli)", "mcp__other__read"),
+        ("claude-cli/2.1.326 (external, cli)", "mcp__claude_ai_Claude_Docs__guide"),
+    ] {
+        let ok = run(ua, tool);
+        assert!(STATS.iter().all(|k| ok.get(*k).is_some()), "{ua} {tool}: {ok}");
+        assert_eq!(ok["toolResultSizeBytes"], 5, "{ua} {tool}");
+    }
+}
+
+/// 官方发 Datadog 前的删改（2.1.326 `ee`）：`bash_places` 整个删，`bash_command_kinds` 里剔掉 `searches_whole_disk` 那一项，
+/// 剩下的照留；event_logging 那份不动。
+#[test]
+fn datadog_copy_drops_the_326_only_bash_fields() {
+    let meta = json!({
+        "bash_command_kinds": "file_search,searches_whole_disk",
+        "bash_places": "none",
+        "bash_argv0": "find"
+    });
+    let dd = super::identity::snake_flat(&meta);
+    assert_eq!(dd, json!({"bash_command_kinds": "file_search", "bash_argv0": "find"}));
+    let only = super::identity::snake_flat(&json!({"bash_command_kinds": "searches_whole_disk"}));
+    assert_eq!(only, json!({"bash_command_kinds": ""}));
+    let plain = super::identity::snake_flat(&json!({"bash_command_kinds": "file_read"}));
+    assert_eq!(plain, json!({"bash_command_kinds": "file_read"}));
+}
+
+/// 2.1.326 `agent_tool_selected.is_name_given`（官方 `Boolean(name && name !== "main")`）：主线程那次 Agent 调用给了普通名字报
+/// `true`，给 `main` 或没给报 `false`；名字随派遣认领带到子代理这边。
+#[test]
+fn agent_tool_selected_reports_whether_the_agent_was_named() {
+    for (name, want) in
+        [(Some("reviewer"), true), (Some("main"), false), (Some(""), false), (None, false)]
+    {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        let mut input = json!({"subagent_type": "Explore"});
+        if let Some(n) = name {
+            input["name"] = json!(n);
+        }
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input,
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
+        sub.ua_out = ua.into();
+        sub.started_at = base + Duration::from_secs(5);
+        sub.agent = AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some("Explore".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(sub);
+        let st = t.0.state.lock();
+        let selected = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(selected["is_name_given"], json!(want), "{name:?}: {selected}");
+        let keys: Vec<&str> = selected.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert_eq!(at("is_name_given"), at("is_fork") + 1, "{name:?}");
+    }
+}
+
+/// 孙代理同样按派它那次调用给没给名字报：主线程派没命名的 general-purpose，它再派 `name: "grandchild_reviewer"` 的 Explore，
+/// 两条 `agent_tool_selected` 依次是 `false`、`true`。
+#[test]
+fn nested_agents_report_their_own_name() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |input: Value| ToolCall {
+        id: "t1".into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![agent(json!({"subagent_type": "general-purpose"}))];
+    t.ingest(main);
+    let mut child = call(body_for("claude-opus-5-5", Some("high"), true), "req_child", "tool_use");
+    child.ua_out = ua.into();
+    child.started_at = base + Duration::from_secs(5);
+    child.agent = AgentHeaders {
+        agent_id: Some("a1".into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: None,
+    };
+    child.tool_calls =
+        vec![agent(json!({"subagent_type": "Explore", "name": "grandchild_reviewer"}))];
+    t.ingest(child);
+    let mut grand = call(body_for("claude-opus-5-5", Some("high"), true), "req_grand", "end_turn");
+    grand.ua_out = ua.into();
+    grand.started_at = base + Duration::from_secs(10);
+    grand.agent = AgentHeaders {
+        agent_id: Some("a2".into()),
+        agent_type: Some("Explore".into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: None,
+    };
+    t.ingest(grand);
+    let st = t.0.state.lock();
+    let named: Vec<Value> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| meta_of(e)["is_name_given"].clone())
+        .collect();
+    assert_eq!(named, [json!(false), json!(true)]);
+}
+
+/// 同一条回复里 `prompt` 相同的两次派遣（具名的 general-purpose、不具名的 Explore），Explore 先到：按 `subagent_type` 与请求头
+/// `x-claude-code-agent-type` 对上各自那份，Explore 报 `false`、general-purpose 报 `true`，不按排队先后串号。
+#[test]
+fn same_prompt_delegations_are_told_apart_by_agent_type() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, input: Value| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |text: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": text}]}]);
+        v.to_string().into_bytes()
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![
+        agent("t1", json!({"subagent_type": "general-purpose", "prompt": "look", "name": "gp"})),
+        agent("t2", json!({"subagent_type": "Explore", "prompt": "look"})),
+    ];
+    t.ingest(main);
+    for (i, (id, ty)) in [("e", "Explore"), ("g", "general-purpose")].into_iter().enumerate() {
+        let mut c = call(body_with("look"), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some(ty.into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(Value, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| {
+            let m = meta_of(e);
+            (m["agent_type"].clone(), m["is_name_given"].clone())
+        })
+        .collect();
+    assert_eq!(named, [(json!("Explore"), json!(false)), (json!("general-purpose"), json!(true))]);
+}
+
+/// 派遣类型按官方解析后的线上类型对：自定义代理（`subagent_type: "reviewer"`）请求头是 `custom`，内置别名 `explore` 请求头是
+/// 规范名 `Explore`，两种都认得上，`is_name_given` 照报 `true`。
+#[test]
+fn delegation_types_match_custom_agents_and_aliases() {
+    for (dispatched, header) in [
+        ("reviewer", "custom"),
+        // 项目里同名的定义盖掉了内置代理（官方 `hX`）：头上是 `custom`，派遣写的还是内置名字。
+        ("Explore", "custom"),
+        ("Plan", "custom"),
+        ("explore", "Explore"),
+        ("Explore", "Explore"),
+        ("general purpose", "general-purpose"),
+    ] {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": dispatched, "name": "named"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
+        sub.ua_out = ua.into();
+        sub.started_at = base + Duration::from_secs(5);
+        sub.agent = AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some(header.into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(sub);
+        let st = t.0.state.lock();
+        let selected = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(selected["is_name_given"], json!(true), "{dispatched} → {header}");
+    }
+    // 头上是 custom：写着自定义名字的最贴切，写着内置名字的（同名定义盖掉了内置代理）也对得上、排在后面；内置头只认同一个类型。
+    use super::process::agent_type_rank as rank;
+    assert_eq!(rank("plugin:reviewer", "custom"), Some(0));
+    assert_eq!(rank("Explore", "custom"), Some(1));
+    assert_eq!(rank("explore", "Explore"), Some(0));
+    assert_eq!(rank("reviewer", "Explore"), None);
+}
+
+/// 同一条回复里 `prompt` 相同的两次派遣，一次写内置名字、一次写自定义名字：头上是 `custom` 的子代理先认写自定义名字的那份，
+/// 不因为排队在前就占掉写内置名字的那份。
+#[test]
+fn custom_header_prefers_the_custom_named_delegation() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, input: Value| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |text: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": text}]}]);
+        v.to_string().into_bytes()
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![
+        agent("t1", json!({"subagent_type": "Explore", "prompt": "look"})),
+        agent("t2", json!({"subagent_type": "reviewer", "prompt": "look", "name": "rv"})),
+    ];
+    t.ingest(main);
+    for (i, (id, ty)) in [("c", "custom"), ("e", "Explore")].into_iter().enumerate() {
+        let mut c = call(body_with("look"), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some(ty.into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(Value, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| {
+            let m = meta_of(e);
+            (m["agent_type"].clone(), m["is_name_given"].clone())
+        })
+        .collect();
+    assert_eq!(named, [(json!("custom"), json!(true)), (json!("Explore"), json!(false))]);
+}
+
+/// web-fetch 子代理（WebFetch 工具在前台拉起，结果当工具结果交回）的 `agent_tool_selected`：`source` 后跟代理定义的颜色
+/// `color: "blue"`，`is_async: false`；回放两个号 326 抓包里那个子代理的首条与收尾那条，选定事件与官方逐键比（effort 两项要
+/// 主线程上下文，不比），收尾不报进度摘要停止与交回提示。团队号 `00090` / `00093` → 批次 `00105`，个人 Max 号 `00068` /
+/// `00071` → 批次 `00083`。
+#[test]
+fn web_fetch_subagent_selection_matches_the_captures() {
+    for (dir, req, next, batch) in [
+        ("auto-team-2.1.326-20261117-full", "00090_", "00093_", "00105_"),
+        ("auto-max-2.1.326-20261117-full", "00068_", "00071_", "00083_"),
+    ] {
+        let Some((batch_body, _)) = cap_request(&format!("{dir}/{batch}")) else {
+            eprintln!("skipped: cap/{dir} not present");
+            continue;
+        };
+        let official: Value = serde_json::from_slice::<Value>(&batch_body).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| ev_name(e) == "tengu_agent_tool_selected")
+            .map(meta_of)
+            .find(|m| m["agent_type"] == "web-fetch")
+            .unwrap();
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        for (i, f) in [req, next].into_iter().enumerate() {
+            let rel = format!("{dir}/{f}");
+            let (body, betas) = cap_request(&rel).unwrap();
+            let mut c =
+                call(body, &format!("req_wf{i}"), if i == 0 { "tool_use" } else { "end_turn" });
+            c.betas = betas;
+            c.ua_out = cap_header(&rel, "User-Agent").unwrap();
+            c.message_id = cap_reply_id(&rel).or_else(|| Some(format!("msg_wf{i}")));
+            c.started_at = base + Duration::from_secs(5 * i as u64);
+            c.client_tools = true;
+            c.agent = AgentHeaders {
+                agent_id: cap_header(&rel, "x-claude-code-agent-id"),
+                agent_type: cap_header(&rel, "x-claude-code-agent-type"),
+                request_class: cap_header(&rel, "x-claude-code-request-class"),
+                parent_agent_id: None,
+            };
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        // 前台子代理没有进度摘要器、不走交回：收尾不报摘要停止与交回提示（官方那批同样没有）。
+        let all: Vec<(String, Value)> = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .map(|(_, e)| (ev_name(e).to_string(), meta_of(e)))
+            .collect();
+        assert!(all.iter().all(|(n, _)| n != "tengu_agent_summary_stopped"), "{dir}");
+        assert!(
+            all.iter().all(|(n, m)| !(n == "tengu_feature_ok"
+                && m["feature_name"] == "agent_handback_pointer_notice")),
+            "{dir}"
+        );
+        let ours = st
+            .pending
+            .values()
+            .flat_map(|p| &p.events)
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        const KEYS: [&str; 9] = [
+            "agent_type",
+            "source",
+            "color",
+            "is_built_in_agent",
+            "is_resume",
+            "is_async",
+            "is_fork",
+            "is_name_given",
+            "agent_depth",
+        ];
+        for k in KEYS {
+            assert_eq!(ours[k], official[k], "{dir} {k}: {ours}");
+        }
+        let order = |m: &Value| -> Vec<String> {
+            m.as_object().unwrap().keys().filter(|k| KEYS.contains(&k.as_str())).cloned().collect()
+        };
+        assert_eq!(order(&ours), order(&official), "{dir}");
+    }
+}
+
+/// 孙代理认领按 `prompt` 配：子代理派了具名的 Y，上一轮晚到的 X（首条文本对不上）插在前面，不该抢走 Y 那份；随后 Y 到了照样
+/// 报 `is_name_given: true`。
+#[test]
+fn a_late_unrelated_agent_does_not_take_a_nested_delegation() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |input: Value| ToolCall {
+        id: "t1".into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |text: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": text}]}]);
+        v.to_string().into_bytes()
+    };
+    let sub = |id: &str, ty: &str| AgentHeaders {
+        agent_id: Some(id.into()),
+        agent_type: Some(ty.into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: None,
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![agent(json!({"subagent_type": "general-purpose", "prompt": "task C"}))];
+    t.ingest(main);
+    let mut child = call(body_with("task C"), "req_child", "tool_use");
+    child.ua_out = ua.into();
+    child.started_at = base + Duration::from_secs(5);
+    child.agent = sub("c", "general-purpose");
+    child.tool_calls =
+        vec![agent(json!({"subagent_type": "Explore", "prompt": "task Y", "name": "y_named"}))];
+    t.ingest(child);
+    for (i, (id, text)) in [("x", "task X"), ("y", "task Y")].into_iter().enumerate() {
+        let mut c = call(body_with(text), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(10 + i as u64);
+        c.agent = sub(id, "Explore");
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<Value> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| meta_of(e)["is_name_given"].clone())
+        .collect();
+    assert_eq!(named, [json!(false), json!(false), json!(true)], "C、晚到的 X、Y");
+}
+
 /// [`cc_body`] 换模型与 effort（`None` 即去掉 `output_config.effort`，haiku 那样）。
 fn body_for(model: &str, effort: Option<&str>, last_user_text: bool) -> Vec<u8> {
     let mut v: Value = serde_json::from_slice(&cc_body(last_user_text)).unwrap();
@@ -6381,6 +7040,7 @@ fn agent_tool_selected_reports_only_the_efforts_that_exist() {
             agent_id: Some("a1".into()),
             agent_type: Some("Explore".into()),
             request_class: Some("subagent".into()),
+            parent_agent_id: None,
         };
         t.ingest(sub);
         let st = t.0.state.lock();
@@ -6491,6 +7151,7 @@ fn subagent_tether_idle_is_anchored_on_its_own_branch() {
             agent_id: Some("a1".into()),
             agent_type: Some("Explore".into()),
             request_class: Some("subagent".into()),
+            parent_agent_id: None,
         };
         c
     };
@@ -7873,6 +8534,7 @@ fn version_2_1_307_telemetry_shape() {
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         t.ingest(c);
         let st = t.0.state.lock();
@@ -8695,6 +9357,7 @@ fn floats_are_written_like_json_stringify() {
         "npm run dev &",
         Some(super::tools::ShellUsage::typed(0)),
         false,
+        false,
     );
     let text = meta.to_string();
     assert!(text.contains(r#""duration_ms":25,"#), "{text}");
@@ -8720,6 +9383,7 @@ fn bash_meta_v316_key_order() {
         cmd,
         Some(super::tools::ShellUsage::typed(0)),
         true,
+        false,
     );
     let mut repeat = serde_json::Map::new();
     repeat.insert("repeat".into(), json!(false));
@@ -9204,6 +9868,7 @@ fn version_2_1_314_telemetry_shape() {
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         t.ingest(c);
         let st = t.0.state.lock();
@@ -10153,7 +10818,8 @@ fn an_unknown_declared_parent_leaves_its_identity_unknown() {
 
 /// 冷启动时头一回见到的是半截的一轮（线程续轮）：不当成新输入，所接的回复认不出，本轮累计不报（不报成 1 次请求、0 个工具）。
 /// `cap/auto-2.1.321-20261110-bashfail/2.1.321/00063`、`cap/auto-2.1.322-20261110-bashfail/2.1.322/00059`、
-/// `cap/auto-2.1.323-20261113-bashfail/2.1.323/00059`、`cap/auto-2.1.325-20261114-bashfail/2.1.325/00059` 各自单独回放。
+/// `cap/auto-2.1.323-20261113-bashfail/2.1.323/00059`、`cap/auto-2.1.325-20261114-bashfail/2.1.325/00059`、
+/// `cap/auto-team-2.1.326-20261117-bashfail/2.1.326/00067` 各自单独回放。
 #[test]
 fn a_cold_start_on_a_thread_continuation_is_not_a_new_prompt() {
     for rel in [
@@ -10161,6 +10827,7 @@ fn a_cold_start_on_a_thread_continuation_is_not_a_new_prompt() {
         "auto-2.1.322-20261110-bashfail/2.1.322/00059_",
         "auto-2.1.323-20261113-bashfail/2.1.323/00059_",
         "auto-2.1.325-20261114-bashfail/2.1.325/00059_",
+        "auto-team-2.1.326-20261117-bashfail/2.1.326/00067_",
     ] {
         cold_start_on_continuation(rel);
     }
@@ -11141,6 +11808,7 @@ mod parent_reply_refs {
                 agent_id: Some("a1".into()),
                 agent_type: Some("Explore".into()),
                 request_class: Some("subagent".into()),
+                parent_agent_id: None,
             };
             let mut s1 = mk(req(prompt("one"), None, None), "req_s1", "tool_use", 0, "", 5);
             s1.agent = agent.clone();
@@ -11966,6 +12634,7 @@ fn an_unknown_parent_in_a_subagent_propagates_to_the_next_continuation() {
             agent_id: Some("a1b2c3".into()),
             agent_type: Some("Explore".into()),
             request_class: Some("subagent".into()),
+            parent_agent_id: None,
         };
         c.message_id = Some(format!("msg_{id}"));
         c.request_id = Some(id.into());
@@ -12109,7 +12778,7 @@ fn unknown_turn_stats_are_not_written_back() {
 
 /// 子代理同父分叉：Explore 原包 `-full/00103`（create）后接两条同父续轮（`00107` 原样回放两次，回复 id 各不相同）——两条
 /// 的 API 深度都是父回复的加一，不按到达先后累加。2.1.322 那份是 `00104` → `00107`，2.1.323 那份是 `00101` → `00104`，
-/// 2.1.325 那份是 `00104` → `00107`。
+/// 2.1.325 那份是 `00104` → `00107`，2.1.326（团队号）那份是 `00098` → `00101`。
 #[test]
 fn subagent_sibling_continuations_share_the_parent_depth() {
     for (dir, create, cont) in [
@@ -12117,6 +12786,7 @@ fn subagent_sibling_continuations_share_the_parent_depth() {
         ("auto-2.1.322-20261110-full", "00104_", "00107_"),
         ("auto-2.1.323-20261113-full", "00101_", "00104_"),
         ("auto-2.1.325-20261114-full", "00104_", "00107_"),
+        ("auto-team-2.1.326-20261117-full", "00098_", "00101_"),
     ] {
         subagent_sibling_depths(dir, create, cont);
     }
@@ -12144,6 +12814,7 @@ fn subagent_sibling_depths(dir: &str, create: &str, cont: &str) {
             agent_id: cap_header(&rel, "x-claude-code-agent-id"),
             agent_type: cap_header(&rel, "x-claude-code-agent-type"),
             request_class: cap_header(&rel, "x-claude-code-request-class"),
+            parent_agent_id: None,
         };
         c.tool_use_lens = vec![("Bash".into(), 120)];
         t.ingest(c);
@@ -12526,7 +13197,7 @@ fn metas_named(events: &[Value], name: &str, agent: bool) -> Vec<Value> {
 /// 抓包回归：子代理的工具池汇总（`callSite: attachments_subagent`、`querySource` 是子代理自己的）首轮、续轮各一条，续轮
 /// 另有 MCP 服务器说明那条：`cap/auto-2.1.321-20261110-full` 请求 `00103`（Explore create）→ `00107`（continue）→ 批次
 /// `00111` 里子代理的那几条；2.1.322 那份是 `00104` → `00107` → 批次 `00112`，2.1.323 那份是 `00101` → `00104` → 批次 `00108`，
-/// 2.1.325 那份是 `00104` → `00107` → 批次 `00108`。
+/// 2.1.325 那份是 `00104` → `00107` → 批次 `00108`，2.1.326（团队号）那份是 `00098` → `00101` → 批次 `00105`。
 #[test]
 fn subagent_tool_result_turn_pool_summary_matches_the_captures() {
     for (dir, reqs, batch) in [
@@ -12534,6 +13205,7 @@ fn subagent_tool_result_turn_pool_summary_matches_the_captures() {
         ("auto-2.1.322-20261110-full", ["00104_", "00107_"], "00112_"),
         ("auto-2.1.323-20261113-full", ["00101_", "00104_"], "00108_"),
         ("auto-2.1.325-20261114-full", ["00104_", "00107_"], "00108_"),
+        ("auto-team-2.1.326-20261117-full", ["00098_", "00101_"], "00105_"),
     ] {
         subagent_pool_summary(dir, reqs, batch);
     }
@@ -12571,6 +13243,7 @@ fn subagent_pool_summary(dir: &str, reqs: [&str; 2], batch: &str) {
             agent_id: cap_header(&rel, "x-claude-code-agent-id"),
             agent_type: cap_header(&rel, "x-claude-code-agent-type"),
             request_class: cap_header(&rel, "x-claude-code-request-class"),
+            parent_agent_id: None,
         };
         if i == 0 {
             c.tool_use_lens = vec![("Bash".into(), 120)];
@@ -12580,7 +13253,15 @@ fn subagent_pool_summary(dir: &str, reqs: [&str; 2], batch: &str) {
     let st = t.0.state.lock();
     let ours: Vec<Value> =
         st.pending.values().flat_map(|p| &p.events).map(|(_, e)| e.clone()).collect();
-    let theirs = v["events"].as_array().unwrap().clone();
+    // 同一批里可能还有别的子代理的事件（2.1.326 团队号那批另有 A7 web-fetch 子代理续轮的 MCP 说明），只比回放的这个子代理。
+    let aid = cap_header(&format!("{dir}/{}", reqs[0]), "x-claude-code-agent-id");
+    let theirs: Vec<Value> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| aid.is_none() || e["event_data"]["agent_id"].as_str() == aid.as_deref())
+        .cloned()
+        .collect();
     let (a, b) = (
         metas_named(&ours, "tengu_deferred_tools_pool_change", true),
         metas_named(&theirs, "tengu_deferred_tools_pool_change", true),
@@ -12597,11 +13278,14 @@ fn subagent_pool_summary(dir: &str, reqs: [&str; 2], batch: &str) {
         metas_named(&theirs, "tengu_mcp_instructions_pool_change", true),
     );
     assert_eq!((a.len(), b.len()), (1, 1));
-    // 续轮的说明里有一台服务器（`plugin:…:granola`）子代理这边一个工具都没宣告过：认不准，服务器数留为未知。
-    assert_eq!(
-        diff_against_official(&a[0], &b[0], "MCP 说明"),
-        ["addedCount", "messagesLength", "attachmentCount"]
-    );
+    // 续轮的说明里有一台服务器（`plugin:…:granola`）子代理这边一个工具都没宣告过：认不准，服务器数留为未知。2.1.326 团队号
+    // 那次换了号，没有这样的服务器，服务器数报得出、与官方相同。
+    let want: &[&str] = if dir.contains("2.1.326") {
+        &["messagesLength", "attachmentCount"]
+    } else {
+        &["addedCount", "messagesLength", "attachmentCount"]
+    };
+    assert_eq!(diff_against_official(&a[0], &b[0], "MCP 说明"), want);
     // 续轮附件的估值：工具池那条按附件数据算（交互式会话没有要登录的名单），MCP 说明那条按服务器块算。
     let (a, b) = (
         metas_named(&ours, "tengu_attachments", true),
@@ -12723,7 +13407,10 @@ fn departures_on_a_tool_result_turn_are_reported() {
 /// - `cap/auto-2.1.321-20261110-bashfail-fable/2.1.321` 请求 `00056` → `00060` → 批次 `00062` 同理；
 /// - `cap/auto-2.1.322-20261110-bashfail/2.1.322` 请求 `00049` → `00059` → 批次 `00062` 同理；
 /// - `cap/auto-2.1.323-20261113-bashfail/2.1.323` 请求 `00054` → `00059` → 批次 `00061` 同理；
-/// - `cap/auto-2.1.325-20261114-bashfail/2.1.325` 请求 `00051` → `00059` → 批次 `00061` 同理。
+/// - `cap/auto-2.1.325-20261114-bashfail/2.1.325` 请求 `00051` → `00059` → 批次 `00061` 同理；
+/// - `cap/auto-team-2.1.326-20261117-bashfail/2.1.326` 请求 `00063` → `00067` → 批次 `00069`、个人 Max 号
+///   `cap/auto-max-2.1.326-20261117-bashfail/2.1.326` 请求 `00029` → `00032` → 批次 `00034` 同理；这一版附件多
+///   `needsAuthRedials`（要登录那段末尾那句点名的服务器），估值照算（团队号 1812、Max 号 953，同号 325 对照是 1784、940）。
 ///
 /// 首轮、续轮的工具池汇总与 MCP 服务器说明、续轮的 MCP 工具数刷新，键都是官方的子集、顺序相同、值逐个一致；续轮省掉的
 /// 只有复算不出的内部消息数、附件数。续轮附件的类型与估值也对官方。
@@ -12735,6 +13422,8 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         ("auto-2.1.322-20261110-bashfail/2.1.322", ["00049_", "00059_"], "00062_"),
         ("auto-2.1.323-20261113-bashfail/2.1.323", ["00054_", "00059_"], "00061_"),
         ("auto-2.1.325-20261114-bashfail/2.1.325", ["00051_", "00059_"], "00061_"),
+        ("auto-team-2.1.326-20261117-bashfail/2.1.326", ["00063_", "00067_"], "00069_"),
+        ("auto-max-2.1.326-20261117-bashfail/2.1.326", ["00029_", "00032_"], "00034_"),
     ];
     for (dir, reqs, batch) in cases {
         let official_events: Vec<Value> = {
@@ -12801,6 +13490,27 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         let ours: Vec<Value> =
             st.pending.values().flat_map(|p| &p.events).map(|(_, e)| e.clone()).collect();
         let theirs = official_events.clone();
+        // 首轮那条附件（模板里那条，带环境说明、技能清单等）：工具池附件那项按首轮的宣告段落算，与官方逐值相同（321 起各份，
+        // 326 团队号 6495、Max 号 4985）。
+        {
+            let first_att = |evs: &[Value]| {
+                metas_named(evs, "tengu_attachments", false).into_iter().find(|m| {
+                    m["attachment_types"]
+                        .as_array()
+                        .is_some_and(|t| t.iter().any(|x| x == "environment"))
+                })
+            };
+            let est = |m: &Value| {
+                let at = m["attachment_types"]
+                    .as_array()?
+                    .iter()
+                    .position(|x| x == "deferred_tools_delta")?;
+                m["attachment_token_estimates"][at].as_str().map(str::to_string)
+            };
+            let (a, b) = (first_att(&ours).unwrap(), first_att(&theirs).unwrap());
+            assert_eq!(est(&a), est(&b), "{dir}: 首轮工具池估值");
+            assert!(est(&b).is_some(), "{dir}");
+        }
         // 工具池汇总：首轮全报，续轮省掉复算不出的三项。
         let (a, b) = (
             metas_named(&ours, "tengu_deferred_tools_pool_change", false),
@@ -12821,7 +13531,9 @@ fn sdk_tool_result_turn_pool_summary_matches_the_bashfail_captures() {
         // fable 那组首轮有一台只给了说明、一个工具都没宣告的服务器（`luban-47-…`）：认不准，服务器数留为未知（不报
         // `addedCount`），之后的账本也就不准（续轮不报 `priorAnnouncedCount`）。另一组每台都认得出，全报。
         // 2.1.325 那份同理：那次 `luban-beehears-01` 只给了说明、没宣告工具（`cap/auto-2.1.325-20261114-bashfail/2.1.325/00051`）。
-        let instruction_only = dir.contains("fable") || dir.contains("2.1.325");
+        // 2.1.326 团队号那份同理（同一套 MCP 配置，`cap/auto-team-2.1.326-20261117-bashfail/2.1.326/00063`）；个人 Max 号那份每台都认得出。
+        let instruction_only =
+            dir.contains("fable") || dir.contains("2.1.325") || dir.contains("team-2.1.326");
         let (first_missing, next_missing): (&[&str], &[&str]) = if instruction_only {
             (&["addedCount"], &["priorAnnouncedCount", "messagesLength", "attachmentCount"])
         } else {
@@ -13049,6 +13761,7 @@ fn a_subagent_reshape_is_not_flagged_unclaimed() {
         agent_id: Some("a1".into()),
         agent_type: Some("Explore".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     let body = |edit: bool| {
         let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
@@ -13588,6 +14301,24 @@ fn version_2_1_325_moves_the_5xx_frame() {
             (&m["error_stack_hash"], &m["error_top_frame"]),
             (&json!("5b32b751db51"), &json!("chunk-wryttfdq.js:5:1510")),
             "2.1.325 {n}"
+        );
+    }
+    assert!(seen > 0);
+}
+
+/// 2.1.326（`cap/auto-max-2.1.326-20261117-retry`、`cap/auto-team-2.1.326-20261117-retry`）：5xx 栈哈希与行列照旧、顶帧换块，
+/// **又不带 `error_constructor`**。
+#[test]
+fn version_2_1_326_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.326 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert!(m.get("error_constructor").is_none(), "2.1.326 {n}: {m}");
+        assert_eq!(
+            (&m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("5b32b751db51"), &json!("chunk-6ybqvknv.js:5:1510")),
+            "2.1.326 {n}"
         );
     }
     assert!(seen > 0);
@@ -14624,6 +15355,7 @@ fn suggestion_fork_replay_matches_the_2_1_307_capture() {
         agent_id: None,
         agent_type: None,
         request_class: Some("auxiliary".into()),
+        parent_agent_id: None,
     };
     let mut s1 = call(b1, "req_011CgGUpJb2rDMrUAuobQwT7", "tool_use");
     s1.betas = betas1;
@@ -14817,6 +15549,51 @@ fn version_2_1_305_telemetry_shape() {
     assert!(run("claude-cli/2.1.303 (external, cli)", Some(17)).get("streamEventCount").is_none());
 }
 
+/// 2.1.326 的遥测（`cap/auto-{max,team}-2.1.326-20261117-*`）：`tengu_api_success` 在 `ttftMs` 后多 `headersMs`（不比首字节晚），
+/// Bash 的 `tengu_tool_use_success` 在 `has_pipe` 后多 `bash_places`；拒绝事件的键序另有回放核过。2.1.325 都没有。
+#[test]
+fn version_2_1_326_telemetry_shape() {
+    let run = |ua: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat /etc/hosts","description":"read"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"127.0.0.1 localhost"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let find = |n: &str| {
+            p.events.iter().find(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).unwrap()
+        };
+        // Datadog 那份：2.1.326 官方发之前删掉 `bash_places`，`bash_argv0` 照留。
+        let dd =
+            p.dd.iter()
+                .find(|e| e.to_string().contains("tengu_tool_use_success"))
+                .cloned()
+                .unwrap();
+        assert!(dd.get("bash_places").is_none() && dd.get("bash_argv0").is_some(), "{dd}");
+        (find("tengu_api_success"), find("tengu_tool_use_success"))
+    };
+    let keys = |m: &Value| m.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    let (api, ok) = run("claude-cli/2.1.326 (external, cli)");
+    let k = keys(&api);
+    let at = k.iter().position(|k| k == "ttftMs").unwrap();
+    assert_eq!(k[at + 1], "headersMs", "{api}");
+    let (ttft, headers) = (api["ttftMs"].as_i64().unwrap(), api["headersMs"].as_i64().unwrap());
+    assert!((0..=3).contains(&(ttft - headers)), "{api}");
+    let k = keys(&ok);
+    let at = k.iter().position(|k| k == "has_pipe").unwrap();
+    assert_eq!(k[at + 1], "bash_places", "{ok}");
+    assert_eq!(ok["bash_places"], "other_absolute_path");
+
+    let (api, ok) = run("claude-cli/2.1.325 (external, cli)");
+    assert!(api.get("headersMs").is_none() && ok.get("bash_places").is_none(), "{api} {ok}");
+}
+
 /// 2.1.303 的遥测（`cap/auto-2.1.303-20261019-full`）：`tengu_init` 在 `mcpClientCount` 之后多
 /// `repoMcpAllowList` / `repoMcpDenyList` / `mcpConfigBlockedCount`，`tengu_tool_use_success` 在
 /// `messageID` 之后多 `toolUseID`；`-p` 模板多一条 `tengu_fork_subagent_enabled`。2.1.301 都没有。
@@ -14879,6 +15656,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.326 摘要、行列、块名都换了（`cap/auto-{max,team}-2.1.326-20261117-bashfail/2.1.326`）。
+        ("claude-cli/2.1.326 (external, cli)", "96e266587f52", "chunk-4h798pp0.js:3710:10163"),
         // 2.1.325 摘要、行列、块名都换了（`cap/auto-2.1.325-20261114-bashfail/2.1.325`）。
         ("claude-cli/2.1.325 (external, cli)", "5ae540068e38", "chunk-wqb2b4v0.js:3690:9609"),
         // 2.1.323 摘要、行列、块名都换了（`cap/auto-2.1.323-20261113-bashfail/2.1.323`）。
@@ -14914,14 +15693,17 @@ fn version_2_1_303_telemetry_shape() {
         // 2.1.321 的 `ShellError` 压缩后是 `Rx`，带构造名、夹在消息摘要与栈摘要之间
         // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`），2.1.322 同；2.1.293 ~ 2.1.319 不带。
         let keys: Vec<&str> = err.as_object().unwrap().keys().map(String::as_str).collect();
-        if ua.contains("2.1.325")
+        if ua.contains("2.1.326")
+            || ua.contains("2.1.325")
             || ua.contains("2.1.323")
             || ua.contains("2.1.322")
             || ua.contains("2.1.321")
             || ua.contains("2.1.320")
         {
-            // 2.1.323 类名压缩后换成 `JR`、2.1.325 换成 `Sx`，位置不变。
-            let want = if ua.contains("2.1.325") {
+            // 2.1.323 类名压缩后换成 `JR`、2.1.325 换成 `Sx`、2.1.326 换成 `UT`，位置不变。
+            let want = if ua.contains("2.1.326") {
+                "UT"
+            } else if ua.contains("2.1.325") {
                 "Sx"
             } else if ua.contains("2.1.323") {
                 "JR"
@@ -14937,6 +15719,16 @@ fn version_2_1_303_telemetry_shape() {
             );
         } else {
             assert!(err.get("error_constructor").is_none(), "{ua}");
+        }
+        // 2.1.326 末尾多命令词与位置类别（`cap/auto-team-2.1.326-20261117-bashfail/2.1.326` 那条 `ls`：`ls` / `none`）。
+        if ua.contains("2.1.326") {
+            assert_eq!(keys[keys.len() - 2..], ["bash_argv0", "bash_places"], "{ua}");
+            assert_eq!(
+                (&err["bash_argv0"], &err["bash_places"]),
+                (&json!("false"), &json!("none"))
+            );
+        } else {
+            assert!(err.get("bash_places").is_none() && err.get("bash_argv0").is_none(), "{ua}");
         }
     }
 
@@ -15108,6 +15900,7 @@ fn agent_summary_stopped_2_1_316_writer_and_mode() {
             agent_id: Some("a1".into()),
             agent_type: Some("general-purpose".into()),
             request_class: Some(class.into()),
+            parent_agent_id: None,
         };
         let tool = |id: &str, name: &str| ToolCall {
             id: id.into(),
@@ -15275,6 +16068,7 @@ fn agent_summary_writer_follows_the_config_and_failures() {
             agent_id: Some("a1".into()),
             agent_type: Some("general-purpose".into()),
             request_class: Some(class.into()),
+            parent_agent_id: None,
         };
         let tool = |id: &str, name: &str| ToolCall {
             id: id.into(),
@@ -15420,6 +16214,7 @@ fn short_agent_summaries_are_reported_and_counted() {
             agent_id: Some("a1".into()),
             agent_type: Some("general-purpose".into()),
             request_class: Some(class.into()),
+            parent_agent_id: None,
         };
         let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_m", "tool_use");
         at(&mut main, 0);
@@ -15627,6 +16422,7 @@ fn summary_stopped_for(ua: &str) -> Value {
         agent_id: Some("a1".into()),
         agent_type: Some("Explore".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     t.ingest(sub);
     let st = t.0.state.lock();
@@ -15672,6 +16468,7 @@ fn agent_summary_stopped_keeps_the_model_from_spawn_time() {
         agent_id: Some("a2".into()),
         agent_type: Some("Explore".into()),
         request_class: Some("subagent".into()),
+        parent_agent_id: None,
     };
     t.ingest(sub);
     let st = t.0.state.lock();
@@ -15714,7 +16511,12 @@ fn a_main_class_request_without_tools_is_reported_as_main() {
     v.as_object_mut().unwrap().remove("tools");
     let mut c = call(v.to_string().into_bytes(), "req_notools", "end_turn");
     c.ua_out = "claude-cli/2.1.303 (external, cli)".into();
-    c.agent = AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    c.agent = AgentHeaders {
+        agent_id: None,
+        agent_type: None,
+        request_class: Some("main".into()),
+        parent_agent_id: None,
+    };
     t.ingest(c);
     let st = t.0.state.lock();
     let p = &st.pending[&key()];
@@ -15740,8 +16542,12 @@ fn a_tool_less_main_thread_continue_is_filled_from_its_create() {
     let mut c1 = call(first.to_string().into_bytes(), "req_c1", "end_turn");
     c1.ua_out = "claude-cli/2.1.303 (external, cli)".into();
     c1.started_at = base;
-    c1.agent =
-        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    c1.agent = AgentHeaders {
+        agent_id: None,
+        agent_type: None,
+        request_class: Some("main".into()),
+        parent_agent_id: None,
+    };
     let msg_id = c1.message_id.clone();
     t.ingest(c1);
     // 续轮：system 只剩 billing header，messages 只有新增那条。
@@ -15756,8 +16562,12 @@ fn a_tool_less_main_thread_continue_is_filled_from_its_create() {
     let mut c2 = call(second.to_string().into_bytes(), "req_c2", "end_turn");
     c2.ua_out = "claude-cli/2.1.303 (external, cli)".into();
     c2.started_at = base + Duration::from_secs(20);
-    c2.agent =
-        AgentHeaders { agent_id: None, agent_type: None, request_class: Some("main".into()) };
+    c2.agent = AgentHeaders {
+        agent_id: None,
+        agent_type: None,
+        request_class: Some("main".into()),
+        parent_agent_id: None,
+    };
     t.ingest(c2);
     let st = t.0.state.lock();
     let ok: Vec<Value> = st.pending[&key()]
@@ -15931,7 +16741,7 @@ fn bash_success_extensions_follow_their_versions() {
     };
     let keys = |command: &str, v277: bool, v285: bool| {
         let mut success = json!({ "toolInputSizeBytes": 40 });
-        tool_success_extras(&mut success, &tu(command), &mut HashMap::new(), v277, v285);
+        tool_success_extras(&mut success, &tu(command), &mut HashMap::new(), v277, v285, false);
         let keys: Vec<String> = success.as_object().unwrap().keys().take(4).cloned().collect();
         (keys, success)
     };
@@ -16498,6 +17308,7 @@ fn gaps_call(step: &GapStep, cred_id: i64, at: SystemTime) -> Option<ApiCall> {
         agent_id: cap_header(&rel, "x-claude-code-agent-id"),
         agent_type: cap_header(&rel, "x-claude-code-agent-type"),
         request_class: cap_header(&rel, "x-claude-code-request-class"),
+        parent_agent_id: None,
     };
     Some(c)
 }
@@ -17385,6 +18196,7 @@ fn version_2_1_325_breaks_down_post_compact_tokens() {
             agent_id: None,
             agent_type: None,
             request_class: Some("compaction".into()),
+            parent_agent_id: None,
         };
         t.ingest(c);
         let st = t.0.state.lock();
@@ -17563,4 +18375,1334 @@ fn attacker_sized_inputs_stay_linear() {
     assert_eq!((got[0].id.as_str(), got[0].result_len, got[0].is_error), ("toolu_0", 2, false));
 
     assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}
+
+/// 前台子代理（web-fetch）的进度事件与提示词长度，回放两个号 326 抓包里那个子代理：主线程派它的那条回复（合成，带官方那条
+/// 进度事件里的 request-id / message-id）→ 子代理首条 → 收尾那条（交回）。官方 5 条 `tengu_tool_use_progress`（起步、两条回复、
+/// 两次工具结果），挂在子代理身份上，`messageID` / `requestId` / `queryDepth` 是派它的那条主线程回复的；
+/// `agent_system_prompt_chars` 只算代理定义那段（4262），不是整份 system。团队号 `00090` / `00093` → 批次 `00105`，个人 Max 号
+/// `00068` / `00071` → 批次 `00083`。
+#[test]
+fn foreground_subagent_progress_matches_the_captures() {
+    for (dir, req, next, batch) in [
+        ("auto-team-2.1.326-20261117-full", "00090_", "00093_", "00105_"),
+        ("auto-max-2.1.326-20261117-full", "00068_", "00071_", "00083_"),
+    ] {
+        let Some((batch_body, _)) = cap_request(&format!("{dir}/{batch}")) else {
+            eprintln!("skipped: cap/{dir} not present");
+            continue;
+        };
+        let aid = cap_header(&format!("{dir}/{req}"), "x-claude-code-agent-id").unwrap();
+        let events: Value = serde_json::from_slice(&batch_body).unwrap();
+        let events = events["events"].as_array().unwrap();
+        let official: Vec<Value> = events
+            .iter()
+            .filter(|e| {
+                ev_name(e) == "tengu_tool_use_progress"
+                    && e["event_data"]["agent_id"].as_str() == Some(aid.as_str())
+            })
+            .map(meta_of)
+            .collect();
+        assert_eq!(official.len(), 5, "{dir}");
+        let selected = events
+            .iter()
+            .filter(|e| ev_name(e) == "tengu_agent_tool_selected")
+            .map(meta_of)
+            .find(|m| m["agent_type"] == "web-fetch")
+            .unwrap();
+        let (rid, mid) = (
+            official[0]["requestId"].as_str().unwrap().to_string(),
+            official[0]["messageID"].as_str().unwrap().to_string(),
+        );
+
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = cap_header(&format!("{dir}/{req}"), "User-Agent").unwrap();
+        let (first_body, _) = cap_request(&format!("{dir}/{req}")).unwrap();
+        let first: Value = serde_json::from_slice(&first_body).unwrap();
+        let prompt = first["messages"][0]["content"][1]["text"].as_str().unwrap().to_string();
+        // 主线程那条与子代理同一个会话（`metadata.user_id` 里的会话 id）。
+        let mut main_body: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("medium"), true)).unwrap();
+        main_body["metadata"] = first["metadata"].clone();
+        let mut main = call(main_body.to_string().into_bytes(), &rid, "tool_use");
+        main.ua_out = ua.clone();
+        main.started_at = base;
+        main.message_id = Some(mid.clone());
+        main.tool_calls = vec![ToolCall {
+            id: "toolu_spawn".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": "web-fetch", "prompt": prompt, "description": "fetch"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        for (i, f) in [req, next].into_iter().enumerate() {
+            let rel = format!("{dir}/{f}");
+            let (body, betas) = cap_request(&rel).unwrap();
+            let mut c = call(body, &format!("req_fg{i}"), "tool_use");
+            c.betas = betas;
+            c.ua_out = ua.clone();
+            c.message_id = cap_reply_id(&rel).or_else(|| Some(format!("msg_fg{i}")));
+            c.started_at = base + Duration::from_secs(5 + 10 * i as u64);
+            c.client_tools = true;
+            c.agent = AgentHeaders {
+                agent_id: cap_header(&rel, "x-claude-code-agent-id"),
+                agent_type: cap_header(&rel, "x-claude-code-agent-type"),
+                request_class: cap_header(&rel, "x-claude-code-request-class"),
+                parent_agent_id: None,
+            };
+            if i == 0 {
+                // 首条回复调了 WebFetch：结果在收尾那条请求里带回来，按它的 `tool_use_id` 配。
+                let (next_body, _) = cap_request(&format!("{dir}/{next}")).unwrap();
+                let next_v: Value = serde_json::from_slice(&next_body).unwrap();
+                let id = next_v["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|m| m["content"].as_array())
+                    .flatten()
+                    .find(|b| b["type"] == "tool_result")
+                    .and_then(|b| b["tool_use_id"].as_str())
+                    .unwrap()
+                    .to_string();
+                c.tool_calls = vec![ToolCall {
+                    id,
+                    name: "WebFetch".into(),
+                    input: json!({"url": "https://example.com", "prompt": "summarize"}),
+                    verdict: None,
+                    input_stream_ms: Some(168),
+                }];
+                c.tool_use_lens = vec![("WebFetch".into(), 87)];
+            }
+            if i == 1 {
+                c.tool_calls = vec![ToolCall {
+                    id: "toolu_hb".into(),
+                    name: "SubagentHandback".into(),
+                    input: json!({"message": "done"}),
+                    verdict: None,
+                    input_stream_ms: Some(352),
+                }];
+            }
+            t.ingest(c);
+        }
+        let st = t.0.state.lock();
+        let all: Vec<&Value> =
+            st.pending.values().flat_map(|p| &p.events).map(|(_, e)| e).collect();
+        let ours: Vec<&Value> =
+            all.iter().copied().filter(|e| ev_name(e) == "tengu_tool_use_progress").collect();
+        assert_eq!(ours.len(), 5, "{dir}");
+        for (e, theirs) in ours.iter().zip(&official) {
+            assert_eq!(e["event_data"]["agent_id"].as_str(), Some(aid.as_str()), "{dir}");
+            let m = meta_of(e);
+            // 查询链 id 是每个会话随机生成的，换成官方那个再逐键比。
+            let mut same_chain = m.clone();
+            same_chain["queryChainId"] = theirs["queryChainId"].clone();
+            assert!(diff_against_official(&same_chain, theirs, dir).is_empty(), "{dir}: {m}");
+            // 查询链是派它的那条主线程回复的，不是子代理自己的。
+            assert_eq!(m["queryChainId"].as_str().map(str::len), Some(36), "{dir}");
+        }
+        let chains: std::collections::HashSet<String> =
+            ours.iter().map(|e| meta_of(e)["queryChainId"].as_str().unwrap().to_string()).collect();
+        assert_eq!(chains.len(), 1, "{dir}");
+        let sub_chain = all
+            .iter()
+            .find(|e| ev_name(e) == "tengu_api_query" && e["event_data"]["agent_id"].is_string())
+            .map(|e| meta_of(e)["queryChainId"].as_str().unwrap().to_string())
+            .unwrap();
+        assert!(!chains.contains(&sub_chain), "{dir}: 进度事件不挂子代理自己的查询链");
+        let ours_selected = all
+            .iter()
+            .find(|e| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|e| meta_of(e))
+            .unwrap();
+        assert_eq!(
+            ours_selected["agent_system_prompt_chars"], selected["agent_system_prompt_chars"],
+            "{dir}"
+        );
+        assert_eq!(ours_selected["agent_system_prompt_chars"], json!(4262), "{dir}");
+        // 收尾那条完成事件同样报前台（官方两个号都是 `is_async: false`、`agent_depth: 1`）。
+        let completed = |evs: &[&Value]| {
+            evs.iter()
+                .find(|e| ev_name(e) == "tengu_agent_tool_completed")
+                .map(|e| meta_of(e))
+                .unwrap()
+        };
+        let official_done = completed(
+            &events
+                .iter()
+                .filter(|e| e["event_data"]["agent_id"].as_str() == Some(aid.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let ours_done = completed(&all);
+        for k in ["is_async", "agent_depth"] {
+            assert_eq!(ours_done[k], official_done[k], "{dir} {k}");
+        }
+        assert_eq!(ours_done["is_async"], json!(false), "{dir}");
+    }
+}
+
+/// 末条用户消息里工具结果、中断标记与新输入挤在一起：普通 Esc 的 `[Request interrupted by user]`
+/// （`cap/auto-2.1.325-20261114-full/00666`）与弹框上拒工具的 `[Request interrupted by user for tool use]` 都是一次新输入；
+/// 只有工具结果（外加提醒）的是续轮。
+#[test]
+fn interrupted_turns_with_new_input_are_new_prompts() {
+    let last = |extra: Value| {
+        let mut blocks =
+            vec![json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "out"})];
+        blocks.extend(extra.as_array().unwrap().iter().cloned());
+        json!({"messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": blocks}
+        ]})
+    };
+    let text = |t: &str| json!({"type": "text", "text": t});
+    for marker in
+        ["[Request interrupted by user]\n", "[Request interrupted by user for tool use]\n"]
+    {
+        let body = last(json!([text(marker), text("never mind, just say ok")]));
+        assert!(crate::telemetry::last_is_new_prompt_body(&body), "{marker}");
+        let (new, len) = super::shape::last_is_new_prompt(body["messages"].as_array().unwrap());
+        assert_eq!((new, len), (true, "never mind, just say ok".len()), "{marker}");
+    }
+    let cont = last(json!([text("<system-reminder>\nnote\n</system-reminder>")]));
+    assert!(!crate::telemetry::last_is_new_prompt_body(&cont), "纯工具续轮");
+    assert!(!crate::telemetry::last_is_new_prompt_body(&last(json!([]))), "纯工具续轮");
+}
+
+/// `prompt`、类型都相同的两次自定义代理派遣，各自写明了 `model`、只有 opus 那次具名：按子代理请求实际用的模型认，haiku 的
+/// 请求先到也不占掉 opus 那份。
+#[test]
+fn same_prompt_delegations_are_told_apart_by_model() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, input: Value| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |model: &str| {
+        let mut v: Value = serde_json::from_slice(&body_for(model, Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": "look"}]}]);
+        v.to_string().into_bytes()
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![
+        agent(
+            "t1",
+            json!({"subagent_type": "reviewer", "prompt": "look", "model": "opus", "name": "rv"}),
+        ),
+        agent("t2", json!({"subagent_type": "reviewer", "prompt": "look", "model": "haiku"})),
+    ];
+    t.ingest(main);
+    for (i, (id, model)) in
+        [("h", "claude-haiku-5-5"), ("o", "claude-opus-5-5")].into_iter().enumerate()
+    {
+        let mut c = call(body_with(model), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some("custom".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(Value, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| {
+            let m = meta_of(e);
+            (m["model"].clone(), m["is_name_given"].clone())
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [(json!("claude-haiku-5-5"), json!(false)), (json!("claude-opus-5-5"), json!(true))]
+    );
+}
+
+/// 前台子代理一条回复里调了两个工具：每个工具调用块各报一条进度（官方按 `tool_use` / `tool_result` 开头的消息逐条转），两次
+/// 结果各一条；纯文字收尾的回复不报。起步 1 + 调用 2 + 结果 2 = 5。
+#[test]
+fn foreground_subagent_progress_counts_each_tool_call() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let tool = |id: &str, name: &str, input: Value| ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input,
+        verdict: None,
+        input_stream_ms: Some(100),
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.message_id = Some("msg_main".into());
+    main.tool_calls =
+        vec![tool("t1", "Agent", json!({"subagent_type": "web-fetch", "prompt": "fetch two"}))];
+    t.ingest(main);
+    let sub = |msgs: Value, id: &str, stop: &str, at: u64| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-haiku-5-5", Some("medium"), true)).unwrap();
+        v["messages"] = msgs;
+        let mut c = call(v.to_string().into_bytes(), id, stop);
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(at);
+        c.message_id = Some(format!("msg_{id}"));
+        c.agent = AgentHeaders {
+            agent_id: Some("fg".into()),
+            agent_type: Some("web-fetch".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        c
+    };
+    let first = json!([{"role": "user", "content": [{"type": "text", "text": "fetch two"}]}]);
+    let mut c0 = sub(first.clone(), "req_s0", "tool_use", 5);
+    c0.tool_calls = vec![
+        tool("w1", "WebFetch", json!({"url": "https://a.example", "prompt": "p"})),
+        tool("w2", "WebFetch", json!({"url": "https://b.example", "prompt": "p"})),
+    ];
+    t.ingest(c0);
+    let mut msgs = first.as_array().unwrap().clone();
+    msgs.push(json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "w1", "name": "WebFetch", "input": {"url": "https://a.example", "prompt": "p"}},
+        {"type": "tool_use", "id": "w2", "name": "WebFetch", "input": {"url": "https://b.example", "prompt": "p"}}
+    ]}));
+    msgs.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "w1", "content": "page a"},
+        {"type": "tool_result", "tool_use_id": "w2", "content": "page b"}
+    ]}));
+    t.ingest(sub(Value::Array(msgs), "req_s1", "end_turn", 20));
+    let st = t.0.state.lock();
+    let n = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_tool_use_progress")
+        .count();
+    assert_eq!(n, 5);
+}
+
+/// 孙代理的深度：主线程 → 子代理（深度 1）→ 子代理再派的孙代理（深度 2），启动与完成两条事件都按父深度加一报。
+#[test]
+fn nested_agents_report_their_depth() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, prompt: &str| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input: json!({"subagent_type": "general-purpose", "prompt": prompt}),
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |text: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": text}]}]);
+        v.to_string().into_bytes()
+    };
+    let headers = |id: &str| AgentHeaders {
+        agent_id: Some(id.into()),
+        agent_type: Some("general-purpose".into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: None,
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![agent("t1", "outer task")];
+    t.ingest(main);
+    let mut parent = call(body_with("outer task"), "req_parent", "tool_use");
+    parent.ua_out = ua.into();
+    parent.started_at = base + Duration::from_secs(5);
+    parent.agent = headers("parent");
+    parent.tool_calls = vec![agent("t2", "inner task")];
+    t.ingest(parent);
+    let mut child = call(body_with("inner task"), "req_child", "end_turn");
+    child.ua_out = ua.into();
+    child.started_at = base + Duration::from_secs(10);
+    child.agent = headers("child");
+    t.ingest(child);
+    let st = t.0.state.lock();
+    let depths = |name: &str| -> Vec<Value> {
+        st.pending[&key()]
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == name)
+            .map(|(_, e)| meta_of(e)["agent_depth"].clone())
+            .collect()
+    };
+    assert_eq!(depths("tengu_agent_tool_selected"), [json!(1), json!(2)]);
+    assert_eq!(depths("tengu_agent_tool_completed"), [json!(2)], "孙代理收尾");
+}
+
+/// 写明的模型与实际不同族先于类型上的软偏好：具名的自定义 Explore（同名定义盖掉内置的）写明 opus、不具名的 reviewer 写明
+/// haiku，两条请求头都是 `custom`、`prompt` 相同。opus 的请求先到认 Explore 那份，不因为 reviewer 名字更像自定义就认它。
+#[test]
+fn explicit_model_outranks_the_custom_name_preference() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, input: Value| ToolCall {
+        id: id.into(),
+        name: "Agent".into(),
+        input,
+        verdict: None,
+        input_stream_ms: None,
+    };
+    let body_with = |model: &str| {
+        let mut v: Value = serde_json::from_slice(&body_for(model, Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": "look"}]}]);
+        v.to_string().into_bytes()
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![
+        agent(
+            "t1",
+            json!({"subagent_type": "Explore", "prompt": "look", "model": "opus", "name": "ex"}),
+        ),
+        agent("t2", json!({"subagent_type": "reviewer", "prompt": "look", "model": "haiku"})),
+    ];
+    t.ingest(main);
+    for (i, (id, model)) in
+        [("o", "claude-opus-5-5"), ("h", "claude-haiku-5-5")].into_iter().enumerate()
+    {
+        let mut c = call(body_with(model), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some("custom".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(Value, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| {
+            let m = meta_of(e);
+            (m["model"].clone(), m["is_name_given"].clone())
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [(json!("claude-opus-5-5"), json!(true)), (json!("claude-haiku-5-5"), json!(false))]
+    );
+}
+
+/// 前台子代理的进度只数收完的客户端工具调用块：流式回复里入参没收完就断掉的不算（只有起步那 1 条），收完之后再断的照算
+/// （2 条），只有服务端工具（`server_tool_use`，不进调用表）的不算（1 条）。
+#[test]
+fn foreground_subagent_progress_only_counts_finished_client_tool_calls() {
+    let run = |tool_calls: Vec<ToolCall>, lens: Vec<(String, usize)>| {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.message_id = Some("msg_main".into());
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": "web-fetch", "prompt": "fetch"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-haiku-5-5", Some("medium"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": "fetch"}]}]);
+        let mut c = call(v.to_string().into_bytes(), "req_s0", "tool_use");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5);
+        c.stream_events = Some(12);
+        c.agent = AgentHeaders {
+            agent_id: Some("fg".into()),
+            agent_type: Some("web-fetch".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        c.tool_calls = tool_calls;
+        c.tool_use_lens = lens;
+        t.ingest(c);
+        let st = t.0.state.lock();
+        st.pending[&key()]
+            .events
+            .iter()
+            .filter(|(_, e)| ev_name(e) == "tengu_tool_use_progress")
+            .count()
+    };
+    let fetch = |stream_ms: Option<u64>| ToolCall {
+        id: "w1".into(),
+        name: "WebFetch".into(),
+        input: json!({"url": "https://a.example"}),
+        verdict: None,
+        input_stream_ms: stream_ms,
+    };
+    assert_eq!(run(vec![fetch(None)], vec![("WebFetch".into(), 10)]), 1, "入参没收完");
+    assert_eq!(run(vec![fetch(Some(120))], vec![("WebFetch".into(), 30)]), 2, "收完了");
+    assert_eq!(run(vec![], vec![("web_search".into(), 20)]), 1, "只有服务端工具");
+}
+
+/// 公开的 fork 子代理（请求头类型 `fork`，继承父会话的整份 system）：`is_fork: true`，它自己的定义没有提示词，
+/// `agent_system_prompt_chars` 报 0，不是继承来的那份 system 的长度。普通子代理照旧。
+#[test]
+fn fork_subagents_report_is_fork_and_no_prompt_chars() {
+    for (ty, fork) in [("fork", true), ("general-purpose", false)] {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": ty, "prompt": "do it"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
+        sub.ua_out = ua.into();
+        sub.started_at = base + Duration::from_secs(5);
+        sub.agent = AgentHeaders {
+            agent_id: Some("a1".into()),
+            agent_type: Some(ty.into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(sub);
+        let st = t.0.state.lock();
+        let selected = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        assert_eq!(selected["is_fork"], json!(fork), "{ty}");
+        let chars = selected["agent_system_prompt_chars"].as_u64().unwrap();
+        assert_eq!(chars == 0, fork, "{ty}: {chars}");
+    }
+}
+
+/// fork 的前后台看调用方：普通 CLI 会话里主线程派的 fork 在后台（`is_async: true`）；`-p` / SDK 会话里由子代理再派出去的 fork
+/// 没写明 `run_in_background` 就在前台跑（官方 `callerIsHeadlessSubagent`），启动与完成两条事件都报 `is_async: false`，写明
+/// `true` 的照旧在后台。
+#[test]
+fn forks_spawned_by_sdk_subagents_run_in_the_foreground() {
+    let run = |sdk: bool, nested: bool, background: Option<bool>| {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = if sdk {
+            "claude-cli/2.1.326 (external, sdk-cli)"
+        } else {
+            "claude-cli/2.1.326 (external, cli)"
+        };
+        let body = |text: Option<&str>| {
+            let mut raw =
+                String::from_utf8(body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+            if sdk {
+                raw = raw.replace("cc_entrypoint=cli", "cc_entrypoint=sdk-cli");
+            }
+            let mut v: Value = serde_json::from_str(&raw).unwrap();
+            if let Some(t) = text {
+                v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": t}]}]);
+            }
+            v.to_string().into_bytes()
+        };
+        let agent = |id: &str, ty: &str, prompt: &str, bg: Option<bool>| {
+            let mut input = json!({"subagent_type": ty, "prompt": prompt});
+            if let Some(b) = bg {
+                input["run_in_background"] = json!(b);
+            }
+            ToolCall {
+                id: id.into(),
+                name: "Agent".into(),
+                input,
+                verdict: None,
+                input_stream_ms: None,
+            }
+        };
+        let headers = |id: &str, ty: &str| AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some(ty.into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        let mut main = call(body(None), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.tool_calls = if nested {
+            vec![agent("t1", "general-purpose", "outer", None)]
+        } else {
+            vec![agent("t1", "fork", "inner", background)]
+        };
+        t.ingest(main);
+        if nested {
+            let mut parent = call(body(Some("outer")), "req_parent", "tool_use");
+            parent.ua_out = ua.into();
+            parent.started_at = base + Duration::from_secs(5);
+            parent.agent = headers("parent", "general-purpose");
+            parent.tool_calls = vec![agent("t2", "fork", "inner", background)];
+            t.ingest(parent);
+        }
+        // 官方的继承布局（`SNs`）：父的历史、父那条调了 `Agent` 的回复，再接一条用户消息——占位的工具结果加尾部指令。首条
+        // 用户消息是父的，不是派它的那段 `prompt`。
+        let (history, spawn_id) = if nested { ("outer", "t2") } else { ("original request", "t1") };
+        let mut fork_body: Value = serde_json::from_slice(&body(Some(history))).unwrap();
+        let directive = "<fork-boilerplate>\nYou are a worker fork. The transcript above is the parent's history.\n</fork-boilerplate>\n\nYour directive: inner";
+        fork_body["messages"].as_array_mut().unwrap().extend([
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": spawn_id, "name": "Agent",
+                 "input": {"subagent_type": "fork", "prompt": "inner"}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": spawn_id,
+                 "content": [{"type": "text", "text": "Fork started \u{2014} that fork is you."}]},
+                {"type": "text", "text": directive}
+            ]}),
+        ]);
+        let mut fork = call(fork_body.to_string().into_bytes(), "req_fork", "end_turn");
+        fork.ua_out = ua.into();
+        fork.started_at = base + Duration::from_secs(10);
+        fork.agent = headers("fork", "fork");
+        t.ingest(fork);
+        let st = t.0.state.lock();
+        let all: Vec<Value> =
+            st.pending.values().flat_map(|p| &p.events).map(|(_, e)| e.clone()).collect();
+        let pick = |name: &str| {
+            all.iter()
+                .filter(|e| ev_name(e) == name)
+                .map(meta_of)
+                .find(|m| name != "tengu_agent_tool_selected" || m["agent_type"] == "fork")
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let selected = pick("tengu_agent_tool_selected");
+        assert_eq!(selected["is_fork"], json!(true));
+        // 派遣认领上了：深度按调用方算（主线程派的 1，子代理派的 2）。
+        assert_eq!(selected["agent_depth"], json!(if nested { 2 } else { 1 }));
+        (selected["is_async"].clone(), pick("tengu_agent_tool_completed")["is_async"].clone())
+    };
+    assert_eq!(run(false, false, None), (json!(true), json!(true)), "CLI 主线程派的 fork");
+    assert_eq!(run(false, true, None), (json!(true), json!(true)), "CLI 子代理派的 fork");
+    assert_eq!(run(true, false, None), (json!(true), json!(true)), "SDK 主线程派的 fork");
+    assert_eq!(run(true, true, None), (json!(false), json!(false)), "SDK 子代理派的 fork");
+    assert_eq!(run(true, true, Some(true)), (json!(true), json!(true)), "写明了后台");
+}
+
+/// 同一条回复里派了两个 fork、`prompt` 相同、只有一个具名：fork 请求尾部给父回复的每个工具调用各带一个占位结果，自己那次
+/// 写「就是你」、另一次写「这是父的调用」，按自己那次的 `tool_use_id` 认派遣，后派的先到也不认错。
+#[test]
+fn parallel_forks_are_claimed_by_their_tool_use_id() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, name: Option<&str>| {
+        let mut input = json!({"subagent_type": "fork", "prompt": "same directive"});
+        if let Some(n) = name {
+            input["name"] = json!(n);
+        }
+        ToolCall {
+            id: id.into(),
+            name: "Agent".into(),
+            input,
+            verdict: None,
+            input_stream_ms: None,
+        }
+    };
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![agent("f1", None), agent("f2", Some("second"))];
+    t.ingest(main);
+    let fork_body = |own: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        let result = |id: &str| {
+            let text = if id == own {
+                "Fork started \u{2014} that fork is you."
+            } else {
+                "This is the parent's call, not yours. It may not have run yet, and its result goes to the parent."
+            };
+            json!({"type": "tool_result", "tool_use_id": id, "content": [{"type": "text", "text": text}]})
+        };
+        v["messages"] = json!([
+            {"role": "user", "content": "original request"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "f1", "name": "Agent", "input": {"subagent_type": "fork", "prompt": "same directive"}},
+                {"type": "tool_use", "id": "f2", "name": "Agent", "input": {"subagent_type": "fork", "prompt": "same directive", "name": "second"}}
+            ]},
+            {"role": "user", "content": [
+                result("f1"),
+                result("f2"),
+                {"type": "text", "text": "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nYour directive: same directive"}
+            ]}
+        ]);
+        v.to_string().into_bytes()
+    };
+    for (i, own) in ["f2", "f1"].into_iter().enumerate() {
+        let mut c = call(fork_body(own), &format!("req_{own}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(5 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(own.into()),
+            agent_type: Some("fork".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<Value> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| meta_of(e)["is_name_given"].clone())
+        .collect();
+    assert_eq!(named, [json!(true), json!(false)], "先到的是具名的 f2");
+}
+
+/// 一份抓包目录里所有 event_logging 批次的事件，按客户端时间排好。目录不在返回 `None`。
+fn cap_events(dir: &str) -> Option<Vec<Value>> {
+    let path = format!("{}/cap/{dir}", env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(path).ok()?.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".req.raw") {
+            continue;
+        }
+        let raw = std::fs::read(e.path()).ok()?;
+        if !raw[..raw.len().min(300)].windows(13).any(|w| w == b"event_logging") {
+            continue;
+        }
+        let at = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let Ok(v) = serde_json::from_slice::<Value>(&raw[at..]) else { continue };
+        out.extend(v["events"].as_array().cloned().unwrap_or_default());
+    }
+    out.sort_by_key(|e| e["event_data"]["client_timestamp"].as_str().unwrap_or("").to_string());
+    Some(out)
+}
+
+/// fork 子代理的真实抓包回放（2.1.326、个人 Max 号、`-p`，`cap/auto-max-2.1.326-20261117-fork`）：
+///
+/// - `p-main-fork`：主线程派 fork（请求 `00036` → fork `00038` / `00040`）。fork 在后台跑：`is_fork: true`、`is_async: true`、
+///   `agent_depth: 1`、`agent_system_prompt_chars: 0`，没有进度事件。
+/// - `p-nested-fork`：主线程派 general-purpose（`00036` → `00037`），它再派 fork（`00038` / `00039`）。fork 在前台跑：启动事件
+///   挂在父代理身份上，`is_async: false`、`agent_depth: 2`；fork 名下的事件 meta 都带 `parent_agent_id`；3 条进度事件
+///   （起步、一次工具调用、一次工具结果）挂在父代理那次 `Agent` 调用上；完成事件同样 `is_async: false`、`agent_depth: 2`。
+///
+/// 两份抓包的主模型是 Mythos 5.2，官方遥测把模型名报成 `confidential`，这几条的 `model` / `final_model` 不比。
+#[test]
+fn fork_subagent_lifecycle_matches_the_captures() {
+    let root = "auto-max-2.1.326-20261117-fork";
+    // (目录, 主线程请求, 中间的父代理请求, fork 的两条请求)
+    for (sub, main_req, parent_req, fork_reqs) in [
+        ("p-main-fork", "00036_", None, ["00038_", "00040_"]),
+        ("p-nested-fork", "00036_", Some("00037_"), ["00038_", "00039_"]),
+    ] {
+        let dir = format!("{root}/{sub}");
+        let Some(official) = cap_events(&dir) else {
+            eprintln!("skipped: cap/{dir} not present");
+            continue;
+        };
+        let nested = parent_req.is_some();
+        let header = |f: &str, name: &str| cap_header(&format!("{dir}/{f}"), name);
+        let fork_id = header(fork_reqs[0], "x-claude-code-agent-id").unwrap();
+        let body_of = |f: &str| -> Value {
+            serde_json::from_slice(&cap_request(&format!("{dir}/{f}")).unwrap().0).unwrap()
+        };
+        // 一条请求里某条消息的工具调用 / 工具结果 id。
+        let last_tool_use = |v: &Value| -> (String, Value) {
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .rfind(|b| b["type"] == "tool_use")
+                .map(|b| (b["id"].as_str().unwrap().to_string(), b["input"].clone()))
+                .unwrap()
+        };
+        let first_result_id = |v: &Value| -> String {
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .find(|b| b["type"] == "tool_result")
+                .and_then(|b| b["tool_use_id"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        let tool = |id: String, name: &str, input: Value| ToolCall {
+            id,
+            name: name.into(),
+            input,
+            verdict: None,
+            input_stream_ms: Some(120),
+        };
+        let fork_first = body_of(fork_reqs[0]);
+        let (spawn_id, spawn_input) = last_tool_use(&fork_first);
+        // 官方进度事件里记着派 fork 的那条回复的 request-id / message-id（只有前台的嵌套 fork 才有）。
+        let progress: Vec<Value> = official
+            .iter()
+            .filter(|e| {
+                ev_name(e) == "tengu_tool_use_progress"
+                    && e["event_data"]["agent_id"].as_str() == Some(fork_id.as_str())
+            })
+            .map(meta_of)
+            .collect();
+        assert_eq!(progress.len(), if nested { 3 } else { 0 }, "{sub}");
+
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(120);
+        let mut at = 0u64;
+        let mut ingest = |f: &str, id: &str, stop: &str, calls: Vec<ToolCall>| {
+            let rel = format!("{dir}/{f}");
+            let (body, betas) = cap_request(&rel).unwrap();
+            let mut c = call(body, id, stop);
+            c.betas = betas;
+            c.ua_out = cap_header(&rel, "User-Agent").unwrap();
+            c.message_id = cap_reply_id(&rel).or_else(|| Some(format!("msg_{id}")));
+            c.client_tools = true;
+            at += 10;
+            c.started_at = base + Duration::from_secs(at);
+            c.agent = AgentHeaders {
+                agent_id: cap_header(&rel, "x-claude-code-agent-id"),
+                agent_type: cap_header(&rel, "x-claude-code-agent-type"),
+                request_class: cap_header(&rel, "x-claude-code-request-class"),
+                parent_agent_id: cap_header(&rel, "x-claude-code-parent-agent-id"),
+            };
+            c.tool_calls = calls;
+            t.ingest(c);
+        };
+        match parent_req {
+            None => {
+                ingest(
+                    main_req,
+                    "req_main",
+                    "tool_use",
+                    vec![tool(spawn_id, "Agent", spawn_input)],
+                );
+            }
+            Some(p) => {
+                let parent = body_of(p);
+                let prompt = parent["messages"][0]["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rfind(|b| b["type"] == "text")
+                    .and_then(|b| b["text"].as_str())
+                    .unwrap();
+                let outer = json!({"subagent_type": "general-purpose", "prompt": prompt});
+                ingest(
+                    main_req,
+                    "req_main",
+                    "tool_use",
+                    vec![tool("toolu_outer".into(), "Agent", outer)],
+                );
+                // 父代理那条回复用官方进度事件里记的 request-id，回复 id 取抓包里的。
+                let rid = progress[0]["requestId"].as_str().unwrap().to_string();
+                ingest(p, &rid, "tool_use", vec![tool(spawn_id, "Agent", spawn_input)]);
+            }
+        }
+        let bash_id = first_result_id(&body_of(fork_reqs[1]));
+        ingest(
+            fork_reqs[0],
+            "req_fork0",
+            "tool_use",
+            vec![tool(bash_id, "Bash", json!({"command": "ls"}))],
+        );
+        ingest(fork_reqs[1], "req_fork1", "end_turn", vec![]);
+
+        let st = t.0.state.lock();
+        let ours: Vec<Value> =
+            st.pending.values().flat_map(|p| &p.events).map(|(_, e)| e.clone()).collect();
+        let skip_model = |m: &Value| {
+            let mut m = m.clone();
+            for k in ["model", "final_model", "queryChainId"] {
+                m.as_object_mut().unwrap().shift_remove(k);
+            }
+            m
+        };
+        let pick = |evs: &[Value], name: &str| -> Value {
+            evs.iter()
+                .filter(|e| ev_name(e) == name)
+                .find(|e| {
+                    let m = meta_of(e);
+                    m["agent_type"] == "fork"
+                        && (name != "tengu_agent_tool_completed"
+                            || e["event_data"]["agent_id"].as_str() == Some(fork_id.as_str()))
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("{sub}: {name}"))
+        };
+        // 启动事件：逐键比（官方有、这边没报的只能是时长这类回放不出的量）；挂在谁的身份上也要一样。
+        let (a, b) = (
+            pick(&ours, "tengu_agent_tool_selected"),
+            pick(&official, "tengu_agent_tool_selected"),
+        );
+        let missing =
+            diff_against_official(&skip_model(&meta_of(&a)), &skip_model(&meta_of(&b)), sub);
+        assert!(missing.is_empty(), "{sub}: 启动事件缺 {missing:?}");
+        assert_eq!(
+            a["event_data"]["agent_id"], b["event_data"]["agent_id"],
+            "{sub}: 启动事件的身份"
+        );
+        // 完成事件：字数、步数、耗时这些回放出来的量不比，比形态相关的那几项与键序。
+        let (a, b) = (
+            meta_of(&pick(&ours, "tengu_agent_tool_completed")),
+            meta_of(&pick(&official, "tengu_agent_tool_completed")),
+        );
+        for k in [
+            "agent_type",
+            "is_built_in_agent",
+            "is_async",
+            "agent_depth",
+            "model_swapped",
+            "parent_agent_id",
+            // 指令正文的长度与这条支线实际跑过的工具数：继承来的占位工具结果两样都不算（官方 52 / 1）。
+            "prompt_char_count",
+            "total_tool_uses",
+            "assistant_message_count",
+        ] {
+            assert_eq!(a.get(k), b.get(k), "{sub} 完成事件 {k}");
+        }
+        let keys = |m: &Value| -> Vec<String> { m.as_object().unwrap().keys().cloned().collect() };
+        assert_eq!(keys(&a), keys(&b), "{sub}: 完成事件键序");
+        // 进度事件：条数与每条的内容。
+        let mine: Vec<Value> = ours
+            .iter()
+            .filter(|e| ev_name(e) == "tengu_tool_use_progress")
+            .inspect(|e| assert_eq!(e["event_data"]["agent_id"].as_str(), Some(fork_id.as_str())))
+            .map(meta_of)
+            .collect();
+        // fork 两条请求的查询深度：主线程派的 2、3；孙代理接在父代理那次调用的深度后面，4、5。
+        let depths = |evs: &[Value]| -> Vec<Value> {
+            evs.iter()
+                .filter(|e| {
+                    ev_name(e) == "tengu_api_query"
+                        && e["event_data"]["agent_id"].as_str() == Some(fork_id.as_str())
+                })
+                .map(|e| meta_of(e)["queryDepth"].clone())
+                .collect()
+        };
+        assert_eq!(depths(&ours), depths(&official), "{sub}: 查询深度");
+        // 首步不把继承来的占位工具结果当成自己跑过的工具，也不记 / 宣告上下文；整条支线上这几样的条数与官方相同。
+        for name in [
+            "tengu_tool_use_success",
+            "tengu_tool_use_can_use_tool_allowed",
+            "tengu_context_announcement",
+            "tengu_reminder_fold_recorded",
+            "tengu_reminder_fold_replayed",
+            "tengu_wire_tool_input_echo_recorded",
+            "tengu_wire_tool_input_echo_replayed",
+            "tengu_context_rendering_recorded",
+            "tengu_tool_schema_sizes",
+            "tengu_agent_summary_stopped",
+        ] {
+            let count = |evs: &[Value]| {
+                evs.iter()
+                    .filter(|e| {
+                        ev_name(e) == name
+                            && e["event_data"]["agent_id"].as_str() == Some(fork_id.as_str())
+                    })
+                    .count()
+            };
+            assert_eq!(count(&ours), count(&official), "{sub}: {name}");
+        }
+        assert_eq!(mine.len(), progress.len(), "{sub}: 进度条数");
+        for (m, theirs) in mine.iter().zip(&progress) {
+            assert!(
+                diff_against_official(&skip_model(m), &skip_model(theirs), sub).is_empty(),
+                "{sub}: {m}"
+            );
+        }
+        // fork 名下的事件带不带 `parent_agent_id`，与官方一致（嵌套的全带，主线程派的全不带）。
+        let with_parent = |evs: &[Value]| -> (usize, usize) {
+            let own: Vec<Value> = evs
+                .iter()
+                .filter(|e| e["event_data"]["agent_id"].as_str() == Some(fork_id.as_str()))
+                .map(meta_of)
+                .collect();
+            (own.iter().filter(|m| m.get("parent_agent_id").is_some()).count(), own.len())
+        };
+        let (n, all) = with_parent(&ours);
+        let (on, oall) = with_parent(&official);
+        assert_eq!(n == all, on == oall, "{sub}: parent_agent_id 覆盖面 {n}/{all} 对 {on}/{oall}");
+        assert_eq!(n > 0, nested, "{sub}");
+    }
+}
+
+/// fork 指令首尾带空白：认领派遣按裁过的文本配（照样认得上、`is_name_given` 对），`prompt_char_count` 按原样的长度报
+/// （UTF-16 码元，首尾空白与非 BMP 字符照算）。
+#[test]
+fn fork_prompt_chars_keep_surrounding_whitespace() {
+    for raw in ["  do it  ", "\n\nrun the checks, then report\n", "go 😀\n\n"] {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.tool_calls = vec![ToolCall {
+            id: "f1".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": "fork", "prompt": raw, "name": "worker"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([
+            {"role": "user", "content": "original request"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "f1", "name": "Agent", "input": {"subagent_type": "fork", "prompt": raw}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "f1",
+                 "content": [{"type": "text", "text": "Fork started \u{2014} that fork is you."}]},
+                {"type": "text", "text": format!("<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nYour directive: {raw}")}
+            ]}
+        ]);
+        let mut fork = call(v.to_string().into_bytes(), "req_fork", "end_turn");
+        fork.ua_out = ua.into();
+        fork.started_at = base + Duration::from_secs(5);
+        fork.agent = AgentHeaders {
+            agent_id: Some("fk".into()),
+            agent_type: Some("fork".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(fork);
+        let st = t.0.state.lock();
+        let meta = |name: &str| {
+            st.pending[&key()]
+                .events
+                .iter()
+                .find(|(_, e)| ev_name(e) == name)
+                .map(|(_, e)| meta_of(e))
+                .unwrap()
+        };
+        assert_eq!(meta("tengu_agent_tool_selected")["is_name_given"], json!(true), "{raw:?}");
+        assert_eq!(
+            meta("tengu_agent_tool_completed")["prompt_char_count"],
+            json!(raw.encode_utf16().count()),
+            "{raw:?}"
+        );
+    }
+}
+
+/// 主线程和子代理各派一个指令相同的 fork（调用 id 不同），嵌套的那个先完成：按调用 id 精确认，不按文本把主线程队列里的
+/// 那份取走。具名的是嵌套那个，晚到的主线程 fork 不具名。
+#[test]
+fn cross_level_forks_with_the_same_directive_are_claimed_by_id() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let agent = |id: &str, ty: &str, prompt: &str, name: Option<&str>| {
+        let mut input = json!({"subagent_type": ty, "prompt": prompt});
+        if let Some(n) = name {
+            input["name"] = json!(n);
+        }
+        ToolCall {
+            id: id.into(),
+            name: "Agent".into(),
+            input,
+            verdict: None,
+            input_stream_ms: None,
+        }
+    };
+    let headers = |id: &str, ty: &str, parent: Option<&str>| AgentHeaders {
+        agent_id: Some(id.into()),
+        agent_type: Some(ty.into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: parent.map(str::to_string),
+    };
+    let body_with = |msgs: Value| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = msgs;
+        v.to_string().into_bytes()
+    };
+    let fork_body = |history: &str, spawn_id: &str| {
+        body_with(json!([
+            {"role": "user", "content": history},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": spawn_id, "name": "Agent", "input": {"subagent_type": "fork", "prompt": "same directive"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": spawn_id,
+                 "content": [{"type": "text", "text": "Fork started \u{2014} that fork is you."}]},
+                {"type": "text", "text": "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nYour directive: same directive"}
+            ]}
+        ]))
+    };
+    // 主线程：一个 general-purpose 加一个不具名的 fork。
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.tool_calls = vec![
+        agent("m_gp", "general-purpose", "outer", None),
+        agent("m_fork", "fork", "same directive", None),
+    ];
+    t.ingest(main);
+    // 子代理再派一个具名的 fork，指令一字不差。
+    let mut parent =
+        call(body_with(json!([{"role": "user", "content": "outer"}])), "req_parent", "tool_use");
+    parent.ua_out = ua.into();
+    parent.started_at = base + Duration::from_secs(3);
+    parent.agent = headers("parent", "general-purpose", None);
+    parent.tool_calls = vec![agent("n_fork", "fork", "same directive", Some("inner"))];
+    t.ingest(parent);
+    // 嵌套的 fork 先完成，主线程的 fork 后完成。
+    for (i, (id, history, spawn, parent)) in
+        [("nested", "outer", "n_fork", Some("parent")), ("top", "original", "m_fork", None)]
+            .into_iter()
+            .enumerate()
+    {
+        let mut c = call(fork_body(history, spawn), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(6 + i as u64);
+        c.agent = headers(id, "fork", parent);
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(Value, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+        .map(|(_, e)| meta_of(e))
+        .filter(|m| m["agent_type"] == "fork")
+        .map(|m| (m["agent_depth"].clone(), m["is_name_given"].clone()))
+        .collect();
+    assert_eq!(named, [(json!(2), json!(true)), (json!(1), json!(false))]);
+}
+
+/// 前台子代理的工具调用块收完之后，这条回复才在流里报错（终态 `error` 事件）：那个块的进度照报，API 失败也照报。
+#[test]
+fn foreground_progress_survives_a_late_stream_error() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(60);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+    main.ua_out = ua.into();
+    main.started_at = base;
+    main.message_id = Some("msg_main".into());
+    main.tool_calls = vec![ToolCall {
+        id: "t1".into(),
+        name: "Agent".into(),
+        input: json!({"subagent_type": "web-fetch", "prompt": "fetch"}),
+        verdict: None,
+        input_stream_ms: None,
+    }];
+    t.ingest(main);
+    let mut v: Value =
+        serde_json::from_slice(&body_for("claude-haiku-5-5", Some("medium"), true)).unwrap();
+    v["messages"] = json!([{"role": "user", "content": [{"type": "text", "text": "fetch"}]}]);
+    let mut c = call(v.to_string().into_bytes(), "req_s0", "tool_use");
+    c.ua_out = ua.into();
+    c.started_at = base + Duration::from_secs(5);
+    c.stream_events = Some(9);
+    c.agent = AgentHeaders {
+        agent_id: Some("fg".into()),
+        agent_type: Some("web-fetch".into()),
+        request_class: Some("subagent".into()),
+        parent_agent_id: None,
+    };
+    c.tool_calls = vec![ToolCall {
+        id: "w1".into(),
+        name: "WebFetch".into(),
+        input: json!({"url": "https://a.example"}),
+        verdict: None,
+        input_stream_ms: Some(140),
+    }];
+    c.failure = Some(CallFailure {
+        status: None,
+        error_type: Some("overloaded_error".into()),
+        message: "Overloaded".into(),
+        in_band: true,
+    });
+    t.ingest(c);
+    let st = t.0.state.lock();
+    let count =
+        |name: &str| st.pending[&key()].events.iter().filter(|(_, e)| ev_name(e) == name).count();
+    assert_eq!(count("tengu_tool_use_progress"), 2, "起步一条、收完的工具块一条");
+    assert_eq!(count("tengu_api_error"), 1);
+}
+
+/// 用两份真实 fork 抓包里 fork 的首条请求体造一个 fork 首步，`own` 是它的调用 id、`directive` 是指令。
+fn fork_first_body(spawn_id: &str, directive: &str) -> Vec<u8> {
+    let mut v: Value =
+        serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+    v["messages"] = json!([
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": spawn_id, "name": "Agent", "input": {"subagent_type": "fork", "prompt": directive}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": spawn_id,
+             "content": [{"type": "text", "text": "Fork started \u{2014} that fork is you."}]},
+            {"type": "text", "text": format!("<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\nYour directive: {directive}")}
+        ]}
+    ]);
+    v.to_string().into_bytes()
+}
+
+/// 上一轮派的后台 fork 首条响应还没回来，用户又输入了一轮、派了一个指令相同的具名 fork；旧 fork 晚到，它带的调用 id 与新
+/// 派遣明确不同，不能按文本把新派遣认走。旧的不具名，新的具名。
+#[test]
+fn a_late_fork_from_the_previous_turn_does_not_take_the_new_delegation() {
+    let t = Telemetry::default();
+    let base = frozen_now() - Duration::from_secs(120);
+    let ua = "claude-cli/2.1.326 (external, cli)";
+    let spawn = |id: &str, name: Option<&str>| {
+        let mut input = json!({"subagent_type": "fork", "prompt": "same directive"});
+        if let Some(n) = name {
+            input["name"] = json!(n);
+        }
+        ToolCall {
+            id: id.into(),
+            name: "Agent".into(),
+            input,
+            verdict: None,
+            input_stream_ms: None,
+        }
+    };
+    let turn = |text: &str| {
+        let mut v: Value =
+            serde_json::from_slice(&body_for("claude-opus-5-5", Some("high"), true)).unwrap();
+        v["messages"] = json!([{"role": "user", "content": text}]);
+        v.to_string().into_bytes()
+    };
+    let mut first = call(turn("round one"), "req_r1", "tool_use");
+    first.ua_out = ua.into();
+    first.started_at = base;
+    first.message_id = Some("msg_r1".into());
+    first.tool_calls = vec![spawn("old_fork", None)];
+    t.ingest(first);
+    let mut second = call(turn("round two"), "req_r2", "tool_use");
+    second.ua_out = ua.into();
+    second.started_at = base + Duration::from_secs(20);
+    second.message_id = Some("msg_r2".into());
+    second.tool_calls = vec![spawn("new_fork", Some("worker"))];
+    t.ingest(second);
+    // 旧 fork 先到（晚了一轮），新 fork 后到。
+    for (i, (id, spawn_id)) in [("old", "old_fork"), ("new", "new_fork")].into_iter().enumerate() {
+        let mut c =
+            call(fork_first_body(spawn_id, "same directive"), &format!("req_{id}"), "end_turn");
+        c.ua_out = ua.into();
+        c.started_at = base + Duration::from_secs(30 + i as u64);
+        c.agent = AgentHeaders {
+            agent_id: Some(id.into()),
+            agent_type: Some("fork".into()),
+            request_class: Some("subagent".into()),
+            parent_agent_id: None,
+        };
+        t.ingest(c);
+    }
+    let st = t.0.state.lock();
+    let named: Vec<(String, Value)> = st.pending[&key()]
+        .events
+        .iter()
+        .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_completed")
+        .map(|(_, e)| e["event_data"]["agent_id"].as_str().unwrap_or("").to_string())
+        .zip(
+            st.pending[&key()]
+                .events
+                .iter()
+                .filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected")
+                .map(|(_, e)| meta_of(e)["is_name_given"].clone()),
+        )
+        .collect();
+    assert_eq!(named, [("old".to_string(), json!(false)), ("new".to_string(), json!(true))]);
+}
+
+/// fork 首条请求还没产出消息就失败，客户端原样重发，重发直接以文本收尾、没跑工具：完成事件报 1 条消息、0 次工具，失败那次
+/// 不算一步，继承来的占位工具结果也不算；启动事件只报一次。两种失败：HTTP 529（连 `message_start` 都没有），与只到
+/// `message_start`（已有 `message.id`）就在流里过载。
+#[test]
+fn a_fork_retried_before_any_output_counts_one_step() {
+    for message_start in [false, true] {
+        let t = Telemetry::default();
+        let base = frozen_now() - Duration::from_secs(60);
+        let ua = "claude-cli/2.1.326 (external, cli)";
+        let mut main =
+            call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
+        main.ua_out = ua.into();
+        main.started_at = base;
+        main.tool_calls = vec![ToolCall {
+            id: "f1".into(),
+            name: "Agent".into(),
+            input: json!({"subagent_type": "fork", "prompt": "do it"}),
+            verdict: None,
+            input_stream_ms: None,
+        }];
+        t.ingest(main);
+        let fork = |id: &str, at: u64, failed: bool, message_start: bool| {
+            let mut c = call(fork_first_body("f1", "do it"), id, "end_turn");
+            c.ua_out = ua.into();
+            c.started_at = base + Duration::from_secs(at);
+            c.agent = AgentHeaders {
+                agent_id: Some("fk".into()),
+                agent_type: Some("fork".into()),
+                request_class: Some("subagent".into()),
+                parent_agent_id: None,
+            };
+            if failed {
+                // 529：连 `message_start` 都没有；流内过载：`message_start` 已带 `message.id`，一个内容块都没收完就报错。
+                c.message_id = message_start.then(|| "msg_partial".to_string());
+                c.stop_reason = None;
+                c.closed_blocks = 0;
+                c.tool_calls = Vec::new();
+                c.failure = Some(CallFailure {
+                    status: (!message_start).then_some(529),
+                    error_type: Some("overloaded_error".into()),
+                    message: "Overloaded".into(),
+                    in_band: message_start,
+                });
+            }
+            c
+        };
+        t.ingest(fork("req_try1", 5, true, message_start));
+        t.ingest(fork("req_try2", 8, false, false));
+        let st = t.0.state.lock();
+        let events = &st.pending[&key()].events;
+        let done = events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_agent_tool_completed")
+            .map(|(_, e)| meta_of(e))
+            .expect("收尾");
+        assert_eq!(done["assistant_message_count"], json!(1), "{message_start}: {done}");
+        assert_eq!(done["total_tool_uses"], json!(0), "{message_start}: {done}");
+        // 一次派遣只启动一次：失败那次已经报过，重发不再报。
+        let launches =
+            events.iter().filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected").count();
+        assert_eq!(launches, 1, "{message_start}");
+    }
 }

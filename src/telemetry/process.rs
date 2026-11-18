@@ -250,6 +250,18 @@ impl Telemetry {
             subscription_type: subscription_type(call.org_type.as_deref()).to_string(),
             version: version.clone(),
             agent_id: if is_agent { call.agent.agent_id.clone() } else { None },
+            // 孙代理：请求头带父代理号；它的摘要请求头上只有自己的号，父代理号从会话里它那条支线上取。
+            parent_agent_id: if is_agent {
+                call.agent.parent_agent_id.clone().filter(|p| !p.is_empty()).or_else(|| {
+                    let id = call.agent.agent_id.as_deref()?;
+                    st.sessions
+                        .get(&(call.cred_id, session_id.clone()))
+                        .and_then(|s| s.agents.get(id))
+                        .and_then(|a| a.parent.clone())
+                })
+            } else {
+                None
+            },
             vcs: shape
                 .git_repo
                 .or_else(|| {
@@ -259,7 +271,7 @@ impl Telemetry {
                 .map(|_| "git"),
         };
         // 会话级的那份（待发批次、退出收尾、启动模板用）不带支线号。
-        let base_identity = Identity { agent_id: None, ..identity.clone() };
+        let base_identity = Identity { agent_id: None, parent_agent_id: None, ..identity.clone() };
 
         if kind.runs_in_default_mode() {
             shape.permission_mode = "default";
@@ -480,7 +492,12 @@ impl Telemetry {
                         })
             };
         // 续轮（不是新输入）所接的回复认不出：这一轮的来龙去脉（查询链、深度、轮累计）也说不准。
-        let parent_unknown = !new_prompt && parent_ref_unknown;
+        // fork 的首条请求是它那条支线的起点：末尾那个工具结果是继承来的占位（官方 `SNs`），体里带的上一条回复指针也是父会话
+        // 的，都不是「接着支线上某条回复」，不算认不出。
+        let fork_start = kind == Kind::Subagent
+            && call.body.facts().fork_directive.is_some()
+            && agent.as_ref().is_some_and(|a| a.steps == 0);
+        let parent_unknown = !new_prompt && parent_ref_unknown && !fork_start;
         // 这条所在那一轮（主线程的一轮、子代理的那条支线）的来龙去脉说不准：所接的回复认不出，或接的那条自己那一轮就说不准
         // （它底本上记着 [`ThreadBase::turn_unknown`]）。查询链、深度、轮时长都不报，底本也照记「说不准」传给接着它的续轮
         // ——主线程、子代理一样。
@@ -607,7 +624,12 @@ impl Telemetry {
             if kind == Kind::Main {
                 sess.turn_depth = query_depth;
             } else if let Some(a) = sess.agents.get_mut(&agent_key) {
-                a.steps = query_depth.saturating_sub(2);
+                // 步数 = 深度减去这条支线起步的深度：主线程派的从 2 起，孙代理接在父代理那次调用后面（同 [`Session::chain_for`]）。
+                let base = match (&a.spawn, a.depth >= 2) {
+                    (Some(s), true) => s.depth + 2,
+                    _ => 2,
+                };
+                a.steps = query_depth.saturating_sub(base);
             }
         }
         // 分叉的回复调了工具：客户端会带着拒绝结果接着发，记下到这条为止的分叉。不再调工具（收尾）、失败、
@@ -756,6 +778,8 @@ impl Telemetry {
         let v323 = version_at_least(&version, "2.1.323");
         // 2.1.325：错误栈换块、5xx 带回构造名，几个事件多键，见 [`TurnFacts::v325`]。
         let v325 = version_at_least(&version, "2.1.325");
+        // 2.1.326：错误栈换块、几个事件改键，见 [`TurnFacts::v326`]。
+        let v326 = version_at_least(&version, "2.1.326");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -1261,6 +1285,7 @@ impl Telemetry {
             v322,
             v323,
             v325,
+            v326,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,
@@ -1548,6 +1573,69 @@ struct CallRecord {
     agent_done: Option<AgentState>,
 }
 
+/// 官方内置的子代理类型（请求头 `x-claude-code-agent-type` 报的就是这几个规范名，`cap/auto-*-2.1.326-20261117-full`）。
+const BUILTIN_AGENT_TYPES: [&str; 6] =
+    ["general-purpose", "Explore", "Plan", "web-fetch", "claude-code-guide", "statusline-setup"];
+
+/// 官方 `dje`：小写、去掉空白 / 连字符 / 下划线。精确找不到时按它找唯一的那个（`explore` → `Explore`）。
+fn agent_type_key(t: &str) -> String {
+    t.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+        .collect()
+}
+
+/// 派遣时写的 `subagent_type` 与子代理请求头的类型对得上几分：头上是内置规范名的，按官方 `dje` 规范化后比（合法别名照认）；
+/// 头上是 `custom`（官方 `agent:custom:<名>` 报成 `custom`）的，派遣写的不是内置名字最贴切（`0`），写的是内置名字也可能对——
+/// 项目 / 用户 / 插件里同名的定义会盖掉内置的那份（官方 `hX` 按 `agentType` 后来的盖先前的），盖掉之后头上就是 `custom`，
+/// 只是排在后面（`1`）。对不上是 `None`。
+pub(super) fn agent_type_rank(dispatched: &str, header: &str) -> Option<u8> {
+    let key = agent_type_key(dispatched);
+    if header == "custom" {
+        let builtin = BUILTIN_AGENT_TYPES.iter().any(|b| agent_type_key(b) == key);
+        return Some(u8::from(builtin));
+    }
+    (key == agent_type_key(header)).then_some(0)
+}
+
+/// 一条回复里那几次 `Agent` 调用派出去的活（[`Delegation`]）：`prompt` 去掉首尾空白，`name` 非空且不是保留给主会话的
+/// `main` 才算给了名字（官方 2.1.326 `is_name_given`）。调用表缺了的按 `spawned` 补空项。
+fn delegations(call: &ApiCall, spawned: usize, depth: u32) -> Vec<Delegation> {
+    let mut out: Vec<Delegation> = call
+        .tool_calls
+        .iter()
+        .filter(|c| c.name == "Agent" || c.name == "Task")
+        .map(|c| Delegation {
+            prompt: c.input.get("prompt").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            name_given: c
+                .input
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty() && n != "main"),
+            agent_type: Some(
+                c.input
+                    .get("subagent_type")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("general-purpose")
+                    .to_string(),
+            ),
+            background: c.input.get("run_in_background").and_then(Value::as_bool),
+            tool_use_id: c.id.clone(),
+            depth,
+            model: c
+                .input
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
+        })
+        .collect();
+    out.resize(spawned, Delegation { depth, ..Default::default() });
+    out
+}
+
 impl Session {
     /// 把这条请求里与会话相关的形态记下、并按会话补全：给续轮带回的工具结果配上上一条回复的
     /// 调用、记下工作目录与 git 状态、对齐权限模式。返回上一条回复的工具调用与 git 探测结果。
@@ -1817,7 +1905,7 @@ impl Session {
         // 新一轮用户输入：上一轮派出去没跑完的不再占着（子代理失败或被打断不会收尾，别让它一直挂着）。
         if new_prompt {
             self.delegated_pending.clear();
-            self.nested_pending = 0;
+            self.nested_pending.clear();
             for a in self.agents.values_mut() {
                 a.delegated = false;
             }
@@ -1850,32 +1938,110 @@ impl Session {
     /// 对不上、而子代理那边有没认领的派遣，就是孙代理。只有缺了可比的信息才退回：派遣那头 `prompt` 取不到
     /// （空串那项），或这条请求体读不出首条用户消息。两头都有文本却对不上（上一轮的后台代理晚到）不认领，
     /// 免得占掉这一轮别人的那份。返回它是不是占了主线程那份。
-    fn claim_delegation(&mut self, call: &ApiCall) -> bool {
-        if self.delegated_pending.is_empty() && self.nested_pending == 0 {
-            return false;
+    ///
+    /// 交回认领到的那次派遣与它是不是主线程那份（孙代理认领的是子代理派的那份，见 [`Session::nested_pending`]：同样按
+    /// `prompt` 配，两头都有文本却对不上的不认领）。
+    ///
+    /// `model` 是这条子代理请求实际用的模型：派遣写明的 `model` 与它不同族的排最后（不直接排除：写明的模型可能被封顶或
+    /// 换掉）；其余的先比类型贴切程度，再比模型（同族的先于没写的）。仍然分不出的取排在前面的那份。
+    fn claim_delegation(&mut self, call: &ApiCall, model: &str) -> Option<(Delegation, bool)> {
+        if self.delegated_pending.is_empty() && self.nested_pending.is_empty() {
+            return None;
         }
         let facts = call.body.facts();
-        let texts = &facts.first_user_texts;
-        if let Some(i) = self
-            .delegated_pending
-            .iter()
-            .position(|p| !p.is_empty() && texts.iter().any(|t| t.trim() == p))
-        {
-            self.delegated_pending.remove(i);
-            return true;
+        // fork 继承父会话的历史：首条用户消息是父的，不拿它配；派它的那段 `prompt` 在尾部的指令里，另带着那次调用的
+        // `tool_use_id`（[`super::body::ForkDirective`]）。
+        let fork = facts.fork_directive.as_ref();
+        let fork_texts: Vec<String>;
+        let texts = match fork {
+            Some(f) => {
+                fork_texts = vec![f.prompt.clone()];
+                &fork_texts
+            }
+            None => &facts.first_user_texts,
+        };
+        let by_id = |d: &Delegation| {
+            fork.and_then(|f| f.tool_use_id.as_deref())
+                .is_some_and(|id| !d.tool_use_id.is_empty() && d.tool_use_id == id)
+        };
+        // 两头的调用 id 都知道、却不一样：明确不是这次派遣，文本再像也不认（上一轮的后台 fork 晚到，指令与这一轮新派的相同）。
+        let id_conflict = |d: &Delegation| {
+            fork.and_then(|f| f.tool_use_id.as_deref())
+                .is_some_and(|id| !d.tool_use_id.is_empty() && d.tool_use_id != id)
+        };
+        // 类型对得上（两头有一头不知道就不拿它排除）：同一条回复里 `prompt` 相同的几次派遣（具名的 general-purpose 与不具名的
+        // Explore）先到的按类型认，不按排队先后。
+        let own_type = call.agent.agent_type.as_deref().filter(|t| !t.is_empty());
+        let family = model_family(model);
+        let model_rank = |d: &Delegation| match d.model.as_deref().map(model_family) {
+            Some(f) if f != "other" && family != "other" => {
+                if f == family {
+                    0u8
+                } else {
+                    2
+                }
+            }
+            _ => 1,
+        };
+        let rank = |d: &Delegation| {
+            let by_type = match (d.agent_type.as_deref(), own_type) {
+                (Some(a), Some(b)) => agent_type_rank(a, b)?,
+                _ => 0,
+            };
+            // 写明的模型与实际不同族是最硬的反证，先于类型上的软偏好（头上 `custom` 时写着内置名字的排后）：具名的自定义
+            // Explore 写明 opus、不具名的 reviewer 写明 haiku，opus 的请求认前者。
+            let by_model = model_rank(d);
+            Some((by_model == 2, by_type, by_model))
+        };
+        let type_ok = |d: &Delegation| rank(d).is_some() && !id_conflict(d);
+        // `prompt` 对得上的里头取类型最贴切的那份（同分取排在前面的）：头上是 `custom` 时，写着自定义名字的先于写着内置名字的
+        // （后者是同名定义盖掉了内置代理）。
+        let same = |list: &[Delegation]| {
+            list.iter()
+                .enumerate()
+                .filter(|(_, d)| {
+                    by_id(d)
+                        || (!id_conflict(d)
+                            && !d.prompt.is_empty()
+                            && texts.iter().any(|t| t.trim() == d.prompt))
+                })
+                // 调用 id 对得上的最先（fork 才有），其余照旧。
+                .filter_map(|(i, d)| rank(d).map(|r| ((!by_id(d), r), i)))
+                .min()
+                .map(|(_, i)| i)
+        };
+        // 调用 id 精确对上的最先认，两个队列都先查一遍：主线程和子代理各派了一个指令相同的 fork 时，嵌套的那个先到也不会
+        // 按文本把主线程队列里的那份取走。
+        if let Some(i) = self.delegated_pending.iter().position(|d| by_id(d) && type_ok(d)) {
+            return Some((self.delegated_pending.remove(i), true));
         }
-        if self.nested_pending > 0 {
-            self.nested_pending -= 1;
-            return false;
+        if let Some(i) = self.nested_pending.iter().position(|d| by_id(d) && type_ok(d)) {
+            return Some((self.nested_pending.remove(i), false));
+        }
+        if let Some(i) = same(&self.delegated_pending) {
+            return Some((self.delegated_pending.remove(i), true));
+        }
+        if !self.nested_pending.is_empty() {
+            // 同主线程那份：配上了就是它；配不上只在缺了可比的信息时退回（这条读不出首条用户消息取最早那份，或派遣那头
+            // `prompt` 取不到的那份）。两头都有文本却对不上（上一轮的子代理晚到）不认领，免得抢走这一轮孙代理那份。
+            if let Some(i) = same(&self.nested_pending) {
+                return Some((self.nested_pending.remove(i), false));
+            }
+            let i = if texts.is_empty() {
+                Some(0)
+            } else {
+                self.nested_pending.iter().position(|d| d.prompt.is_empty() && type_ok(d))
+            };
+            if let Some(i) = i {
+                return Some((self.nested_pending.remove(i), false));
+            }
         }
         let i = if texts.is_empty() {
             (!self.delegated_pending.is_empty()).then_some(0)
         } else {
-            self.delegated_pending.iter().position(String::is_empty)
+            self.delegated_pending.iter().position(|d| d.prompt.is_empty() && type_ok(d))
         };
-        let Some(i) = i else { return false };
-        self.delegated_pending.remove(i);
-        true
+        Some((self.delegated_pending.remove(i?), true))
     }
 
     /// 子代理支线：首条请求建档（链、起点、拉起它的那条主线程请求），之后每条读它。
@@ -1888,12 +2054,22 @@ impl Session {
         kind: Kind,
     ) -> AgentView {
         let spawn = self.last_spawn_request_id.clone();
+        let spawn_ref = self.last_spawn.clone();
         // 摘要器在子代理起跑时读当前主模型：按它首条请求的发出时刻查，处理到这条时主线程可能已经换了。
         let session_model = self.main_model_at(call.started_at);
         let first =
             kind == Kind::Subagent && self.agents.get(agent_key).is_none_or(|a| !a.claim_checked);
-        let delegated = first && self.claim_delegation(call);
+        let claimed = if first { self.claim_delegation(call, &shape.model) } else { None };
+        // 请求头带父代理号的孙代理：深度、派它的那条回复、父代理的父代理都从父代理那条支线上取，不靠派遣认领。
+        let parent_id = call.agent.parent_agent_id.clone().filter(|p| !p.is_empty());
+        let parent = parent_id
+            .as_deref()
+            .and_then(|p| self.agents.get(p))
+            .map(|p| (p.depth.max(1), p.last_spawn.clone(), p.parent.clone()));
         let a = self.agents.entry(agent_key.to_string()).or_default();
+        if a.parent.is_none() {
+            a.parent = parent_id;
+        }
         if a.agent_type.is_none() {
             a.agent_type = call.agent.agent_type.clone().filter(|t| !t.is_empty());
         }
@@ -1904,11 +2080,28 @@ impl Session {
             a.chain_id = uuid_v4();
             a.started = Some(call.started_at);
             a.session_model = session_model;
-            a.prompt_chars = shape.prompt_len;
+            // fork 的任务在尾部的指令里（[`super::body::ForkDirective`]），末条消息以占位工具结果开头、按普通口径量出来是 0：
+            // 官方 `prompt_char_count` 报的是指令正文（`cap/auto-max-2.1.326-20261117-fork` 两份都是 52）。
+            a.prompt_chars = match &call.body.facts().fork_directive {
+                Some(f) => f.prompt_chars,
+                None => shape.prompt_len,
+            };
             a.invoking_request_id = spawn;
         }
         if first {
-            a.delegated = delegated;
+            a.delegated = claimed.as_ref().is_some_and(|(_, main)| *main);
+            a.spawn = match &parent {
+                Some((_, spawn, _)) => spawn.clone(),
+                None => spawn_ref.filter(|_| a.delegated),
+            };
+            a.name_given = claimed.as_ref().is_some_and(|(d, _)| d.name_given);
+            a.depth = match (&parent, a.parent.is_some()) {
+                (Some((depth, ..)), _) => depth + 1,
+                // 有父代理号、父代理那条支线却没见过（它的请求没经过这里）：至少是第二层。
+                (None, true) => claimed.as_ref().map_or(2, |(d, _)| d.depth.max(2)),
+                (None, false) => claimed.as_ref().map_or(1, |(d, _)| d.depth.max(1)),
+            };
+            a.background = claimed.and_then(|(d, _)| d.background);
             a.claim_checked = true;
         }
         AgentView {
@@ -1919,6 +2112,16 @@ impl Session {
             prev_total: a.prev_total,
             tools_hash: a.tools_hash.clone(),
             invoking_request_id: (a.steps == 0).then(|| a.invoking_request_id.clone()).flatten(),
+            name_given: a.name_given,
+            background: a.background,
+            spawn: a.spawn.clone(),
+            depth: a.depth.max(1),
+            launched: {
+                let was = a.launched;
+                a.launched |= kind == Kind::Subagent;
+                was
+            },
+            grandparent: parent.and_then(|(_, _, grand)| grand),
             last_end: a.last_end,
         }
     }
@@ -1952,7 +2155,13 @@ impl Session {
             Kind::Suggestion | Kind::AwaySummary => (uuid_v4(), self.last_main_depth + 2),
             Kind::Subagent => {
                 let a = agent.expect("subagent calls carry agent state");
-                (a.chain_id.clone(), 2 + a.steps)
+                // 孙代理接在父代理那条调用的深度后面：父代理深度 2 时派的 fork 是 4、5
+                // （`cap/auto-max-2.1.326-20261117-fork/p-nested-fork`）；主线程派的从 2 起。
+                let base = match (&a.spawn, a.depth >= 2) {
+                    (Some(s), true) => s.depth + 2,
+                    _ => 2,
+                };
+                (a.chain_id.clone(), base + a.steps)
             }
             Kind::AgentSummary => (uuid_v4(), 3),
             Kind::SideQuestion | Kind::Compact => (uuid_v4(), 1),
@@ -2325,27 +2534,31 @@ impl Session {
             .max(usize::from(call.tool_use_lens.iter().any(|(name, _)| is_agent(name))));
         if is_main && spawned > 0 {
             self.last_spawn_request_id = call.request_id.clone();
+            self.last_spawn = Some(SpawnRef {
+                request_id: call.request_id.clone(),
+                message_id: call.message_id.clone(),
+                chain_id: self.chain_id.clone(),
+                depth: self.last_main_depth,
+            });
             if !failed && !aborted {
-                let mut prompts: Vec<String> = call
-                    .tool_calls
-                    .iter()
-                    .filter(|c| is_agent(&c.name))
-                    .map(|c| {
-                        c.input
-                            .get("prompt")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            .to_string()
-                    })
-                    .collect();
-                prompts.resize(spawned, String::new());
-                self.delegated_pending.extend(prompts);
+                self.delegated_pending.extend(delegations(call, spawned, 1));
             }
         }
-        // 子代理再派的孙代理：只记个数，孙代理首条按它认领，不占主线程那份。
+        // 子代理再派的孙代理：同样记下派了哪几次，孙代理首条按它认领，不占主线程那份。
         if kind == Kind::Subagent && spawned > 0 && !failed && !aborted {
-            self.nested_pending += spawned as u32;
+            // 这条回复记成这个子代理最近一次派遣（[`AgentState::last_spawn`]）：它派的前台孙代理的进度事件挂在这次调用上，
+            // 查询链与深度是这个子代理自己的（深度 = 2 + 已完成的步数，这一条还没计进去）。
+            if let Some(a) = self.agents.get_mut(agent_key) {
+                a.last_spawn = Some(SpawnRef {
+                    request_id: call.request_id.clone(),
+                    message_id: call.message_id.clone(),
+                    chain_id: a.chain_id.clone(),
+                    depth: 2 + a.steps,
+                });
+            }
+            // 孙代理比派它的子代理深一层（官方 `agent_depth` = 父深度 + 1）。
+            let parent = self.agents.get(agent_key).map_or(1, |a| a.depth.max(1));
+            self.nested_pending.extend(delegations(call, spawned, parent + 1));
         }
         // 子代理以 SubagentHandback 收尾（`cap/auto-2.1.285-20260930` 07:51:29.419–.455）：那个工具
         // 客户端当场执行，子代理不再发请求，这一条就是它的最后一条。
@@ -2428,9 +2641,20 @@ impl Session {
         if kind == Kind::Subagent
             && let Some(a) = self.agents.get_mut(agent_key)
         {
-            a.steps += 1;
+            // 一次网络尝试不等于一步：还没产出消息就失败了（529，或只到 `message_start` 就在流里报错）的那次，客户端原样重发同一条请求，
+            // 消息数、深度、带回的工具结果都算在重发成功的那次上，这里不推进（`assistant_message_count` / `total_tool_uses`）。
+            // 是否产出看有没有收完的内容块，不看 `message.id`：只到 `message_start` 就在流里报错的那次已经带了 id，却一条
+            // 消息都没产出（官方要等块闭合才产出）。
+            let produced = !failed || call.closed_blocks > 0;
+            // fork 首条请求末尾的工具结果是继承来的占位，不是它跑过的工具，不计进 `total_tool_uses`（两份抓包都是 1）。
+            let inherited = a.steps == 0 && call.body.facts().fork_directive.is_some();
+            if produced {
+                a.steps += 1;
+                if !inherited {
+                    a.tool_uses += shape.tool_uses.len() as u32;
+                }
+            }
             a.last_end = Some(this_end_wall(call));
-            a.tool_uses += shape.tool_uses.len() as u32;
             a.last_request_id = call.request_id.clone().or(a.last_request_id.take());
             a.last_message_id = call.message_id.clone().or(a.last_message_id.take());
             if let Some(m) = call.resp_model.clone().filter(|m| !m.is_empty()) {

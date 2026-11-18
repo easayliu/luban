@@ -104,6 +104,47 @@ const NEEDS_AUTH_HEAD: &str =
 /// 应用自带的回复服务器要登录（官方 `tSe("needs_auth")`）：不写名字，名单里却算一个。
 const HIDDEN_NEEDS_AUTH: &str = "The app's own tool server could not sign in";
 
+/// 2.1.326 起要登录那段的说明末尾多一句（官方 `needsAuthRedials` 非空时）：`… For A, B, a sign-in may still be good: calling one
+/// of a server's tools by name …`。名字夹在最后一个 `For ` 与这一截之间，逗号分隔（`cap/auto-team-2.1.326-20261117-bashfail/2.1.326`
+/// 请求 `00067` 两台、`cap/auto-max-2.1.326-20261117-bashfail/2.1.326` 请求 `00032` 一台）。
+const REDIAL_MARK: &str = ", a sign-in may still be good: ";
+
+/// redial 那句前面固定是要登录那段说明的最后一句（官方 `…Do not ask the user for authorization codes, tokens, or callback
+/// URLs.`），名单从它后面的 `For ` 起。不拿 `rfind(" For ")` 找：服务器名里可能就有 ` For `（`claude.ai Tickets For Support`）。
+const REDIAL_LEAD: &str = "callback URLs. For ";
+
+/// 把 redial 那串（官方 `Hn.join(", ")`）拆回名字：按同一段里已经列出来的要登录服务器名逐个认（名字里有 `, ` 或 ` For ` 也
+/// 不会拆错，几个都对得上取最长的），认不出的才按 `, ` 切到下一个分隔处。
+fn split_known_names<'a>(list: &'a str, known: &[String]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = list.trim();
+    while !rest.is_empty() {
+        let hit = known
+            .iter()
+            .filter(|n| {
+                rest.strip_prefix(n.as_str())
+                    .is_some_and(|after| after.is_empty() || after.starts_with(", "))
+            })
+            .map(String::len)
+            .max();
+        let len = hit.unwrap_or_else(|| rest.find(", ").unwrap_or(rest.len()));
+        let name = rest[..len].trim();
+        if !name.is_empty() {
+            out.push(name);
+        }
+        rest = rest[len..].strip_prefix(", ").unwrap_or(&rest[len..]);
+    }
+    out
+}
+
+/// 2.1.326 「连接失败」那段里点名调一下就会重连的那一组（官方 `willRetry: "on_reach"`）的后缀开头。
+const REACH_HEAD: &str = "for now; calling one of a server's tools by name";
+
+/// 2.1.326 重连说明（官方 `Qt`）里那半句 ToolSearch 的说法：会话没有工具搜索、或官方给附件设了 `searchMayBeAbsent`（有
+/// `needsAuthRedials` 或 `on_reach` 的服务器、本地 CLI 工具搜索不是常开时）就不写。`, or a ToolSearch query that contains
+/// the server's name,`。
+const SEARCH_CLAUSE: &str = ", or a ToolSearch query that contains the server's name,";
+
 /// 应用自带的回复服务器没连上（官方 `tSe("failed" / "failed_for_session" / "failed_retrying")`）：不写名字，名单里却算一个。
 const HIDDEN_FAILED: &str = "The app's own tool server failed to connect, so its tools";
 
@@ -182,7 +223,7 @@ pub(super) struct FailedServer {
     name: String,
     code: Option<String>,
     error: Option<String>,
-    /// 重试状态（官方 `willRetry`），按所在那一段分：`false` / `true` / `on_search`；策略拦下的、地址保留的另记
+    /// 重试状态（官方 `willRetry`），按所在那一段分：`false` / `true` / `on_search` / `on_reach`（2.1.326 起）；策略拦下的、地址保留的另记
     /// `policy` / `reserved`（那两段不写错误文本，同一分组前后两轮一致就算没变）。
     retry: &'static str,
     /// 错误文本截断过（[`MAX_ERROR_LEN`]）：截下来的前缀相同，原文也可能不同。
@@ -370,6 +411,17 @@ pub(super) struct PoolDelta {
     failed: FailedList,
     pending: NameList,
     needs_auth: NameList,
+    /// 要登录的服务器里「登录可能还在、点名调一下就能重连」的那几台（官方 2.1.326 `needsAuthRedials`，正文是要登录那段末尾的
+    /// `For A, B, a sign-in may still be good: …`，[`REDIAL_MARK`]）。附件里这一项排在最后，估值照算。
+    redials: Vec<String>,
+    /// 这份附件出自没有 ToolSearch 的会话（官方 `toolSearchAbsent`）：新增那段用 `The following tools are now available:` 开头
+    /// （[`ANNOUNCE_HEADS`] 第五种，官方 `ZMi`）。附件与工具池汇总都报它。
+    pub(super) tool_search_absent: bool,
+    /// 这份附件里有只在会话里有 ToolSearch 时才出现的文案：把工具叫 `deferred tool` 的段落（走 ToolSearch 的宣告、断连、其他
+    /// 原因走掉、「又能用了」）、重连说明里带 [`SEARCH_CLAUSE`] 的（redial 那句、`on_reach` 那段）、按搜索重连的 `on_search` 那组。
+    tool_search_present: bool,
+    /// 官方附件带 `searchMayBeAbsent: true`（2.1.326）：redial 那句或 `on_reach` 那段的重连说明里少了 [`SEARCH_CLAUSE`]。
+    search_may_be_absent: bool,
     /// 这份变更还能复制多少字节的名字与错误文本（[`MAX_DELTA_BYTES`] 起扣，见 [`charge`]）。
     budget: usize,
     /// 宣告 / 走掉的名字有因为预算或上限没记下的：账本叠上它就不准了。
@@ -408,6 +460,28 @@ impl PoolDelta {
     /// `R3r` 组装附件时报一条 `tengu_inline_tools_announced{definitions, replacements, pointers, withdrawals}`
     /// （`cap/auto-2.1.322-20261111-redefine` 批次 `00076`：2 / 0，`00085`：0 / 1；`00070` 首轮 3 / 0）。`pointers`（连回来、
     /// 定义没变的）与 `withdrawals`（按块撤掉的）从正文认不出，按 0。
+    /// 这份附件宣告了工具（新增的、按值补了定义的）：会话有延迟工具池，哪怕声明里一个 `defer_loading` 都没有（inline 那条路）。
+    pub(super) fn announces(&self) -> bool {
+        !self.added.is_empty() || !self.surfaced.is_empty()
+    }
+
+    /// 这份附件有东西可报：宣告了工具（[`Self::announces`]），或带着 MCP 服务器的状态（还在连接、要登录、连接失败）。提醒里有
+    /// 这些段落就是官方生成了 `deferred_tools_delta`：首轮只有服务器状态、一个工具都没新增（声明里也没有 `defer_loading`）时，
+    /// 官方照报汇总与附件。
+    pub(super) fn has_state(&self) -> bool {
+        self.announces()
+            || self.pending.count > 0
+            || self.needs_auth.count > 0
+            || self.failed.count > 0
+    }
+
+    /// 这一轮官方附件带不带 `toolSearchAbsent`：段落开头看得出就按它（[`Self::tool_search_absent`] / 明写走 ToolSearch 的为假），
+    /// 看不出（只有登录、连接状态变化）沿用会话账本里的（[`PoolHistory::tool_search_absent`]）。
+    pub(super) fn search_absent(&self, history: Option<&PoolHistory>) -> bool {
+        self.tool_search_absent
+            || (!self.tool_search_present && history.is_some_and(|h| h.tool_search_absent))
+    }
+
     pub(super) fn inline_counts(&self) -> Option<(usize, usize)> {
         (!self.surfaced.is_empty() || !self.replaced.is_empty())
             .then_some((self.surfaced.len(), self.replaced.len()))
@@ -673,6 +747,9 @@ impl PoolDelta {
                     "on_search" => {
                         o.insert("willRetry".into(), json!("on_search"));
                     }
+                    "on_reach" => {
+                        o.insert("willRetry".into(), json!("on_reach"));
+                    }
                     _ => {}
                 }
                 Value::Object(o)
@@ -715,6 +792,20 @@ impl PoolDelta {
         att["failedMcpServers"] = Value::Array(failed);
         if !self.surfaced.is_empty() {
             att["surfacedNames"] = names(&self.surfaced);
+        }
+        // 2.1.326：附件组装完再补的那项（官方 `xe.needsAuthRedials`），只在有要登录的服务器时才有。正文里点名的最多 30 台，
+        // 附件是全份；点满 30 台的说不准，不报。
+        if !self.redials.is_empty() {
+            if self.redials.len() >= 30 {
+                return None;
+            }
+            att["needsAuthRedials"] = names(&self.redials);
+        }
+        if self.search_absent(history) {
+            att["toolSearchAbsent"] = json!(true);
+        }
+        if self.search_may_be_absent {
+            att["searchMayBeAbsent"] = json!(true);
         }
         let len = utf16_len(&att.to_string()) + self.by_value_len()?;
         Some(token_round(len))
@@ -900,10 +991,19 @@ fn parse_text(t: &str, out: &mut PoolDelta) -> bool {
     }
     let mut found = false;
     while let Some(l) = it.next() {
+        // 官方只在会话里有 ToolSearch 时把工具叫 `deferred tool`（宣告、断连、其他原因走掉、「又能用了」计数行都是），没有时
+        // 只叫 `tool`：带这个说法的段落说明 ToolSearch 在。
+        if l.starts_with("The following deferred tools ")
+            || (l.starts_with(|c: char| c.is_ascii_digit()) && l.contains(" deferred tool"))
+        {
+            out.tool_search_present = true;
+        }
         if ANNOUNCE_HEADS.iter().any(|h| l.starts_with(h)) {
             let surfaced = ANNOUNCE_HEADS[..2].iter().any(|h| l.starts_with(h));
             let still_defined = l.starts_with(ANNOUNCE_HEADS[5]);
             let replaced = l.starts_with(ANNOUNCE_HEADS[1]);
+            // 官方会话里没有 ToolSearch（inline 工具那条路，`toolSearchAbsent`）时新增的那段换成这个开头（官方 `ZMi`）。
+            out.tool_search_absent |= l.trim_end() == ANNOUNCE_HEADS[4];
             let dropped = each_item(&mut it, MAX_NAME_LEN, |n| {
                 let cost = if surfaced || still_defined { 2 * n.len() } else { n.len() };
                 if !charge(&mut out.budget, cost) {
@@ -993,7 +1093,15 @@ fn parse_text(t: &str, out: &mut PoolDelta) -> bool {
                 "false"
             } else if suffix.starts_with("for now; the session retries") {
                 "true"
+            } else if suffix.starts_with(REACH_HEAD) {
+                // 2.1.326 起点名调一下就会重连的（官方 `willRetry: "on_reach"`）；那半句里少了 ToolSearch 的说法，是官方给附件
+                // 设了 `searchMayBeAbsent`（[`SEARCH_CLAUSE`]）。
+                out.search_may_be_absent |= !suffix.contains(SEARCH_CLAUSE);
+                out.tool_search_present |= suffix.contains(SEARCH_CLAUSE);
+                "on_reach"
             } else {
+                // 按搜索重连的那一组官方只在会话里有 ToolSearch 时才分出来（`willRetry === "on_search" && !E`）。
+                out.tool_search_present = true;
                 "on_search"
             };
             let mut items = Vec::new();
@@ -1019,6 +1127,20 @@ fn parse_text(t: &str, out: &mut PoolDelta) -> bool {
                 out.pending.merge(names);
             } else {
                 out.needs_auth.merge(names);
+            }
+            found = true;
+        } else if let Some(names) = l.find(REDIAL_MARK).and_then(|at| {
+            let head = &l[..at];
+            head.rfind(REDIAL_LEAD).map(|f| &head[f + REDIAL_LEAD.len()..])
+        }) {
+            out.search_may_be_absent |= !l.contains(SEARCH_CLAUSE);
+            out.tool_search_present |= l.contains(SEARCH_CLAUSE);
+            for n in split_known_names(names, &out.needs_auth.names) {
+                if charge(&mut out.budget, n.len()) {
+                    out.redials.push(n.to_string());
+                } else {
+                    out.overflow = true;
+                }
             }
             found = true;
         } else if l.starts_with(HIDDEN_NEEDS_AUTH) {
@@ -1287,6 +1409,9 @@ pub(super) struct PoolHistory {
     last_failed: FailedList,
     last_pending: NameList,
     last_needs_auth: NameList,
+    /// 会话里没有 ToolSearch（官方 `toolSearchAbsent`）：最近一段宣告段落用的是 [`ANNOUNCE_HEADS`] 第五种开头。只有登录、
+    /// 连接状态变化、没有新增工具段落的那几轮看不出，沿用它（见 [`PoolDelta::search_absent`]）。
+    tool_search_absent: bool,
     /// 这一轮之前对话里有过几段（两条 assistant 之间算一段）：0 是会话头一轮。
     pub(super) turns: usize,
     /// MCP 服务器说明（另一条附件 `mcp_instructions_delta`，[`McpInstr`]）宣告过的服务器，与叠过几条（`midCount`）。
@@ -1309,6 +1434,7 @@ impl Default for PoolHistory {
             last_failed: FailedList::default(),
             last_pending: NameList::default(),
             last_needs_auth: NameList::default(),
+            tool_search_absent: false,
             turns: 0,
             mcp_servers: HashSet::new(),
             mid: 0,
@@ -1364,6 +1490,7 @@ impl PoolHistory {
     /// 叠上一条附件。
     pub(super) fn apply(&mut self, d: &PoolDelta) {
         self.dtd = self.dtd.saturating_add(1);
+        self.tool_search_absent = d.search_absent(Some(self));
         // 宣告或走掉的没记全：叠完的名单少扣了或少加了，之后的 `priorAnnouncedCount` 不报。
         if d.overflow || d.removed_incomplete {
             self.exact = false;
@@ -2171,6 +2298,11 @@ pub(super) fn fill_summary(meta: &mut Value, version: &str, pool: PoolTurn<'_>) 
         (
             "priorAnnouncedCount",
             pool.history.and_then(PoolHistory::announced_count).map(|n| json!(n)),
+        ),
+        // 没有 ToolSearch 的会话（官方 `toolSearchAbsent: re`）：看这一轮的宣告段落开头（[`PoolDelta::tool_search_absent`]）。
+        (
+            "toolSearchAbsent",
+            Some(json!(d.map_or(h.is_some_and(|h| h.tool_search_absent), |d| d.search_absent(h)))),
         ),
         ("dtdCount", pool.history.map(|h| json!(h.dtd_count()))),
         // 头一轮的内部消息列表是空的：0 / 0 / 空串（模板里本就是这些值），照报；续轮复算不出，不报。
@@ -3316,6 +3448,166 @@ mod tests {
         );
         let f = delta(&trunc).failed;
         assert_eq!((f.count, f.complete), (32, false));
+    }
+
+    /// 2.1.326：连接失败里点名调一下就会重连的那一组认作 `on_reach`（与 `on_search` 不同，重试状态变了算 `failedChanged`），
+    /// 附件写 `"willRetry":"on_reach"`；重连说明里少了 ToolSearch 那半句的，附件另有 `"searchMayBeAbsent":true`。
+    #[test]
+    fn on_reach_and_search_may_be_absent_from_2_1_326() {
+        const FAILED: &str = "The following MCP servers are configured but failed to connect \u{2014} their tools (typically named mcp__<server>__*) are unavailable ";
+        let search = format!(
+            "{FAILED}for now; a ToolSearch query that contains a server's name connects to it again, so once the server is running (for example after you start the app that serves it), search for its tools that way instead of reaching the server another way:\nalpha"
+        );
+        let reach = |with_search: bool| {
+            let clause = if with_search { SEARCH_CLAUSE } else { "" };
+            format!(
+                "{FAILED}for now; calling one of a server's tools by name (mcp__<server>__<tool>){clause} connects to it again, with waits between tries, so try that instead of reaching the server another way:\nalpha"
+            )
+        };
+        let (s, r) = (delta(&search), delta(&reach(true)));
+        assert_eq!(s.failed.servers[0].retry, "on_search");
+        assert_eq!(r.failed.servers[0].retry, "on_reach");
+        assert_ne!(s.failed.servers, r.failed.servers, "重试状态变了，failedChanged 要报 true");
+        assert!(!r.search_may_be_absent);
+        let est = |d: &PoolDelta| d.token_estimate(None, false).unwrap();
+        let bare = delta(&reach(false));
+        assert!(bare.search_may_be_absent);
+        let base = json!({
+            "type": "deferred_tools_delta", "addedNames": [], "addedLines": [], "removedNames": [],
+            "wireHiddenNames": [], "readdedNames": [], "pendingMcpServers": [], "needsAuthMcpServers": [],
+            "failedMcpServers": [{"name": "alpha", "willRetry": "on_reach"}],
+        });
+        assert_eq!(est(&r), token_round(utf16_len(&base.to_string())));
+        let mut with_flag = base.clone();
+        with_flag["searchMayBeAbsent"] = json!(true);
+        assert_eq!(est(&bare), token_round(utf16_len(&with_flag.to_string())));
+
+        // redial 那句同理：带 ToolSearch 半句不设，少了才设。
+        let auth = |clause: &str| {
+            format!(
+                "The following MCP servers require authentication before their tools can be used:\nbeta\n\nThis session is non-interactive, so Claude cannot run the OAuth flow here. Do not ask the user for authorization codes, tokens, or callback URLs. For beta, a sign-in may still be good: calling one of a server's tools by name (mcp__<server>__<tool>){clause} connects to it again, with the sign-in already held. Try that first, and tell the user only if it is refused."
+            )
+        };
+        assert!(!delta(&auth(SEARCH_CLAUSE)).search_may_be_absent);
+        let d = delta(&auth(""));
+        assert!(d.search_may_be_absent && d.redials == ["beta"]);
+    }
+
+    /// redial 名单按要登录那段已列出的服务器名认：名字里有 ` For ` 或逗号也不拆错（`claude.ai Tickets For Support`、
+    /// `acme, inc`），名单里没有的才按逗号切。
+    #[test]
+    fn redial_names_keep_for_and_commas() {
+        let text = "The following MCP servers require authentication before their tools can be used:\nacme, inc\nclaude.ai Tickets For Support\nplain\n\nThis session is non-interactive, so Claude cannot run the OAuth flow here. If the user's request depends on one of these servers (even if they didn't name it explicitly), or they ask about it, tell them that it needs to be authorized \u{2014} via /mcp \u{2014} and that the capability is unavailable until they do. Otherwise carry on with the request and do not mention these servers. Do not ask the user for authorization codes, tokens, or callback URLs. For claude.ai Tickets For Support, acme, inc, plain, unknown, a sign-in may still be good: calling one of a server's tools by name (mcp__<server>__<tool>), or a ToolSearch query that contains the server's name, connects to it again, with the sign-in already held. Try that first, and tell the user only if it is refused.";
+        let d = delta(text);
+        assert_eq!(d.redials, ["claude.ai Tickets For Support", "acme, inc", "plain", "unknown"]);
+        assert!(!d.search_may_be_absent);
+    }
+
+    /// 没有 ToolSearch 的会话（inline 工具那条路）：新增那段用 `The following tools are now available:` 开头，附件带
+    /// `toolSearchAbsent: true`，可以与 redial 那句缺了 ToolSearch 半句带出的 `searchMayBeAbsent: true` 同时在；工具池汇总
+    /// 同样报 `toolSearchAbsent: true`。有 ToolSearch 的会话两样都不带。
+    #[test]
+    fn tool_search_absent_reaches_the_attachment_and_the_summary() {
+        let auth = "The following MCP servers require authentication before their tools can be used:\nbeta\n\nThis session is non-interactive, so Claude cannot run the OAuth flow here. Do not ask the user for authorization codes, tokens, or callback URLs. For beta, a sign-in may still be good: calling one of a server's tools by name (mcp__<server>__<tool>) connects to it again, with the sign-in already held. Try that first, and tell the user only if it is refused.";
+        let text = format!("The following tools are now available:\nmcp__a__x\n\n{auth}");
+        let d = delta(&text);
+        assert!(d.tool_search_absent && d.search_may_be_absent);
+        let mut want = json!({
+            "type": "deferred_tools_delta", "addedNames": ["mcp__a__x"], "addedLines": ["mcp__a__x"],
+            "removedNames": [], "wireHiddenNames": [], "readdedNames": [], "pendingMcpServers": [],
+            "needsAuthMcpServers": ["beta"], "failedMcpServers": [], "needsAuthRedials": ["beta"],
+        });
+        want["toolSearchAbsent"] = json!(true);
+        want["searchMayBeAbsent"] = json!(true);
+        let h = PoolHistory { turns: 1, ..Default::default() };
+        assert_eq!(
+            d.token_estimate(Some(&h), false),
+            Some(token_round(utf16_len(&want.to_string())))
+        );
+        let normal = delta(&format!("{HEAD}\nmcp__a__x"));
+        assert!(!normal.tool_search_absent);
+
+        let summary = |d: &PoolDelta| {
+            let turn = PoolTurn {
+                departed: d.departed(Some(&h)),
+                history: Some(&h),
+                delta: Some(d),
+                mcp: None,
+            };
+            let mut meta = json!({"removedCount": 0, "toolSearchAbsent": false});
+            fill_summary(&mut meta, "2.1.326", turn);
+            meta["toolSearchAbsent"].clone()
+        };
+        assert_eq!(summary(&d), json!(true));
+        assert_eq!(summary(&normal), json!(false));
+    }
+
+    /// 没有 ToolSearch 的会话，下一轮只有登录状态变化、没有新增工具段落：沿用账本里的 `toolSearchAbsent`，附件与汇总都照报；
+    /// 之后明写走 ToolSearch 的一轮清掉它。
+    #[test]
+    fn tool_search_absent_carries_over_turns_without_announcements() {
+        let mut h = PoolHistory { turns: 1, ..Default::default() };
+        h.apply(&delta("The following tools are now available:\nmcp__a__x"));
+        let auth = delta(
+            "The following MCP servers require authentication before their tools can be used:\nbeta\n\nThis session is non-interactive, so Claude cannot run the OAuth flow here. Do not ask the user for authorization codes, tokens, or callback URLs.",
+        );
+        assert!(!auth.tool_search_absent && auth.search_absent(Some(&h)));
+        let want = json!({
+            "type": "deferred_tools_delta", "addedNames": [], "addedLines": [], "removedNames": [],
+            "wireHiddenNames": [], "readdedNames": [], "pendingMcpServers": [],
+            "needsAuthMcpServers": ["beta"], "failedMcpServers": [], "toolSearchAbsent": true,
+        });
+        assert_eq!(
+            auth.token_estimate(Some(&h), false),
+            Some(token_round(utf16_len(&want.to_string())))
+        );
+        let turn = PoolTurn {
+            departed: auth.departed(Some(&h)),
+            history: Some(&h),
+            delta: Some(&auth),
+            mcp: None,
+        };
+        let mut meta = json!({"removedCount": 0, "toolSearchAbsent": false});
+        fill_summary(&mut meta, "2.1.326", turn);
+        assert_eq!(meta["toolSearchAbsent"], json!(true), "{meta}");
+
+        h.apply(&auth);
+        let with_search = delta(&format!("{}. x:\nmcp__b__y", ANNOUNCE_HEADS[2]));
+        assert!(!with_search.search_absent(Some(&h)), "明写走 ToolSearch");
+        h.apply(&with_search);
+        assert!(!auth.search_absent(Some(&h)), "账本跟着清掉");
+    }
+
+    /// 先确认没有 ToolSearch，之后 ToolSearch 恢复了、这一轮没有新增工具段落，只有带 ToolSearch 半句的重连说明（redial 那句、
+    /// `on_reach` 那段）或按搜索重连的 `on_search` 那组：这一轮不再继承 `toolSearchAbsent`，附件不带、账本跟着清掉。
+    #[test]
+    fn tool_search_returning_clears_the_absent_state() {
+        const FAILED: &str = "The following MCP servers are configured but failed to connect \u{2014} their tools (typically named mcp__<server>__*) are unavailable ";
+        let redial = format!(
+            "The following MCP servers require authentication before their tools can be used:\nbeta\n\nThis session is non-interactive, so Claude cannot run the OAuth flow here. Do not ask the user for authorization codes, tokens, or callback URLs. For beta, a sign-in may still be good: calling one of a server's tools by name (mcp__<server>__<tool>){SEARCH_CLAUSE} connects to it again, with the sign-in already held. Try that first, and tell the user only if it is refused."
+        );
+        let reach = format!(
+            "{FAILED}for now; calling one of a server's tools by name (mcp__<server>__<tool>){SEARCH_CLAUSE} connects to it again, with waits between tries, so try that instead of reaching the server another way:\nalpha"
+        );
+        let search = format!(
+            "{FAILED}for now; a ToolSearch query that contains a server's name connects to it again, so once the server is running (for example after you start the app that serves it), search for its tools that way instead of reaching the server another way:\nalpha"
+        );
+        for text in [redial, reach, search] {
+            let mut h = PoolHistory { turns: 1, ..Default::default() };
+            h.apply(&delta("The following tools are now available:\nmcp__a__x"));
+            assert!(h.tool_search_absent);
+            let d = delta(&text);
+            assert!(!d.search_absent(Some(&h)), "{text}");
+            let est = d.token_estimate(Some(&h), false).unwrap();
+            let mut with = d.clone();
+            with.tool_search_absent = true;
+            assert!(
+                est < with.token_estimate(Some(&h), false).unwrap(),
+                "附件不带 toolSearchAbsent"
+            );
+            h.apply(&d);
+            assert!(!h.tool_search_absent, "账本跟着清掉");
+        }
     }
 
     /// 只认客户端自己附的提醒：`system` 角色的消息，或用户消息里包在 `<system-reminder>` 里的文本块。用户贴进来的同样文字、

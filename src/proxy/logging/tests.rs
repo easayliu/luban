@@ -985,3 +985,35 @@ fn shape_summary_bounds_unknown_fields() {
     assert_eq!(shape["deep"]["kind"], "array");
     assert!(shape.to_string().len() < 2048);
 }
+
+/// 从 SSE 解析入口喂两组「流里报错」：内容块还没闭合就报错（只有 `message_start` 与一个块的开头和增量），与内容块闭合之后
+/// 才报错。传进遥测的闭合块数（`ApiCall::closed_blocks`，原样取自 [`UsageSniffer::closed_blocks`]）分别是 0 和 1；两组都已经
+/// 有 `message.id`，所以「有没有产出消息」不能看 id。数据按任意位置切块喂进去，半行留到下一块拼齐。
+#[test]
+fn closed_blocks_count_only_finished_content_blocks() {
+    let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fork\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\n";
+    let block = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n";
+    let stop = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+    let error = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+    for (closed, stream) in
+        [(0, format!("{start}{block}{error}")), (1, format!("{start}{block}{stop}{error}"))]
+    {
+        let mut s = UsageSniffer::new(true, false);
+        for chunk in stream.as_bytes().chunks(37) {
+            s.feed(chunk);
+        }
+        s.finish();
+        assert_eq!(s.closed_blocks, closed, "{stream}");
+        assert_eq!(s.message_id.as_deref(), Some("msg_fork"), "两组都已经有 message.id");
+        assert!(s.stream_error.is_some(), "两组都在流里报了错");
+        // 闭合了的工具块有块耗时（进度事件按它数），没闭合的没有。
+        let calls = s.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input_stream_ms.is_some(), closed == 1);
+    }
+    // 非流式：整段回复里的 `content` 块都算收完。
+    let mut whole = UsageSniffer::new(false, false);
+    whole.feed(br#"{"id":"msg_2","type":"message","content":[{"type":"text","text":"a"},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}"#);
+    whole.finish();
+    assert_eq!(whole.closed_blocks, 2);
+}

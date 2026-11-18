@@ -116,6 +116,9 @@ impl EventBuilder<'_> {
                 if env.f.v312 {
                     can_use_tool_v312(&mut can_use, &c.id);
                 }
+                if env.f.v326 {
+                    can_use_tool_v326(&mut can_use);
+                }
                 self.push(t_rej, "tengu_tool_use_can_use_tool_rejected", can_use);
                 if safety_events {
                     let safety =
@@ -394,10 +397,59 @@ impl EventBuilder<'_> {
         }
     }
 
+    /// 前台子代理（web-fetch 那种，[`crate::telemetry::session::agent_runs_async`] 为假）每出一条消息，官方就在派它的那次
+    /// `Agent` 调用上报一条 `tengu_tool_use_progress`（官方 `TXs` 的 `Re`）：事件挂在子代理身份上，`messageID` / `requestId` /
+    /// `queryChainId` / `queryDepth` 却是派它的那条主线程回复的。两个号 326 抓包里那个 web-fetch 子代理各 5 条：起步 1 条
+    /// （与 `agent_tool_selected` 同一毫秒）、两条回复各 1 条（流到一半，早于 `api_success`）、两次工具结果各 1 条（紧跟工具
+    /// 成功那条 1–2ms）。后台子代理不报；派它的那条回复认不出（孙代理、认领不上的）也不报。
+    pub(super) fn agent_progress(&mut self, dt: DateTime<Utc>) {
+        let env = self.env;
+        let Some(agent) = env.f.agent.as_ref() else { return };
+        let Some(spawn) = agent.spawn.as_ref() else { return };
+        if env.f.kind != Kind::Subagent
+            || crate::telemetry::session::agent_runs_async(
+                env.call.agent.agent_type.as_deref(),
+                agent.background,
+                env.shape.sdk && agent.depth >= 2,
+            )
+        {
+            return;
+        }
+        let mut meta = json!({
+            "messageID": spawn.message_id.as_deref().unwrap_or(""),
+            "toolName": "Agent",
+            "isMcp": false,
+            "queryChainId": &spawn.chain_id,
+            "queryDepth": spawn.depth,
+        });
+        if let Some(rid) = spawn.request_id.as_deref().filter(|r| !r.is_empty()) {
+            meta["requestId"] = json!(rid);
+        }
+        // 不走 [`Self::push`] 的「所接回复认不出就去掉深度与查询链」：这里的查询链与深度是派它的那条回复的，不是这条请求的。
+        let ctx = self.ctx_at(dt);
+        self.events.push((dt, env.f.identity.event("tengu_tool_use_progress", dt, &ctx, meta)));
+    }
+
     /// SubagentHandback 当场执行的工具串，与子代理跑完时的收尾。
     pub(super) fn emit_agent_steps(&mut self) {
         let env = self.env;
         let (call, shape) = (env.call, env.shape);
+        // 前台子代理这条回复里每个工具调用块落成一条消息、各报一条进度（官方只转 `tool_use` / `tool_result` 开头的消息，纯文字
+        // 的回复不报）：抓包里比 `api_success` 早 255 / 529ms、晚于请求发出 1.1–2.2s。一条回复调几个工具就报几条，挨个隔几十毫秒。
+        // 只数客户端要执行、而且收完了的工具调用块：服务端工具（`server_tool_use` / `mcp_tool_use`）不成客户端消息，入参还没
+        // 收完就断掉的块也没落成消息（流式回复里收完的块才有 `input_stream_ms`；非流式整条都是完整的）。块一收完官方就报，之后
+        // 这条回复再出错（流里的终态 `error` 事件）也不撤回：失败的请求照数已经收完的块，只是不拿「非流式整条完整」那条兜底。
+        {
+            let whole = call.stream_events.is_none() && call.failure.is_none();
+            let uses =
+                call.tool_calls.iter().filter(|c| whole || c.input_stream_ms.is_some()).count()
+                    as i64;
+            let lead = 250 + i64::from(env.req_hash % 280);
+            let first = ms(env.t_end, -lead).max(ms(env.t0, 1));
+            for i in 0..uses {
+                self.agent_progress(ms(first, 37 * i).min(ms(env.t_end, -5)));
+            }
+        }
         let TurnFacts {
             ref display_model,
             ref chain_id,
@@ -518,6 +570,8 @@ impl EventBuilder<'_> {
                 insert_after(&mut ok, "durationMs", vec![("tool_input_stream_ms", json!(stream))]);
             }
             self.push_dd_snake(td, "tengu_tool_use_success", ok);
+            // 交回的结果作为一条消息回到前台子代理这边（抓包里紧跟成功那条 1ms）。
+            self.agent_progress(ms(td, 1));
         }
         if let Some(done) = &agent_done {
             let t1 = ms(t_end, 1);
@@ -552,7 +606,15 @@ impl EventBuilder<'_> {
             // （[`crate::proxy::agent_summary_config`]）；抓包那个号三个开关都没下发，六条都是 `fallback`、
             // `[30]` 秒、`full`、2000。
             let summary_ms = elapsed + 10;
-            if env.f.v300 {
+            // 前台子代理（web-fetch 那种，[`crate::telemetry::session::agent_runs_async`]）没有进度摘要器，不报停；交回提示同理
+            // （`cap/auto-team-2.1.326-20261117-full` A0 的 web-fetch 子代理两样都没有）。
+            let runs_async = crate::telemetry::session::agent_runs_async(
+                done.agent_type.as_deref(),
+                done.background,
+                shape.sdk && done.depth >= 2,
+            );
+            // fork 也没有进度摘要器（`p-main-fork` 那个后台 fork 收尾没有这条）。
+            if env.f.v300 && runs_async && done.agent_type.as_deref() != Some("fork") {
                 let session_family = model_family(&done.session_model);
                 let agent_family = model_family(display_model);
                 // 收尾报的是摘要器**最后一次读到**的配置，不是此刻号的最新 eval：它启动时读一次，之后每次
@@ -805,7 +867,7 @@ impl EventBuilder<'_> {
                 }
                 self.push(t2, "tengu_agent_summary_stopped", stopped);
             }
-            if handback.is_some() {
+            if handback.is_some() && runs_async {
                 self.push_dd(t2, "tengu_feature_ok", feature("agent_handback_pointer_notice"));
             }
             if !v285 || handback.is_some() {
@@ -828,8 +890,9 @@ impl EventBuilder<'_> {
                     "duration_ms": if env.f.v300 { summary_ms + 28 } else { elapsed + 16 },
                     "total_tokens": done.prev_total,
                     "is_built_in_agent": builtin_agent.is_some(),
-                    "is_async": true,
-                    "agent_depth": 1,
+                    // 前台子代理（web-fetch）报 `false`（两个号 326 抓包那条完成事件），同 `agent_tool_selected`。
+                    "is_async": runs_async,
+                    "agent_depth": done.depth.max(1),
                     "final_model": &display_model,
                     "model_swapped": false
                 }),

@@ -422,7 +422,7 @@ impl Simulation {
             profile.has_billing_header(),
             None,
             new_prompt.then(|| super::session_link::turn_fp(v)).flatten(),
-            super::session_link::TurnOrigin::Human,
+            super::session_link::injected_origin(v),
             Some(v),
         );
         // 那台「机器」：来访自己写了工作目录就用它那份（[`client_env`]），没写才按账号 + 设备派生
@@ -488,7 +488,7 @@ impl Simulation {
             first_party_class: if cc_kind == super::CcRequestKind::Suggestion {
                 "followup-generation"
             } else {
-                config::cc_first_party_request_class(profile.kind)
+                config::cc_first_party_request_class(profile.kind, profile.version)
             },
             lapis,
             fill_absent_tools: flags.fill_absent_tools,
@@ -2424,16 +2424,21 @@ pub(crate) fn simulated_billing_header_text(v: &serde_json::Value, sim: &Simulat
     }
     if let Some(pid) = &sim.link.prompt_id {
         // 2.1.277 起 `cc_prompt_id` 后面跟着这一轮是谁发起的：用户输入是 `human`，后台任务
-        // 通知是 `task_notification`（`cap/2.1.277/00348`）。模拟路径接的都是客户端发来的一轮
-        // 对话，写 `human`；没有 `cc_prompt_id` 的工具续轮官方也不写它（`00050`）。
-        s.push_str(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;"));
+        // 通知是 `task_notification`（`cap/2.1.277/00348`），同伴消息是 `peer`。按会话链里这一轮的来源写
+        // （[`super::session_link::injected_origin`]，工具续轮沿用本轮的）；没有 `cc_prompt_id` 的工具续轮官方也不写它（`00050`）。
+        s.push_str(&format!(
+            " cc_prompt_id={pid}; cc_turn_origin={};",
+            sim.link.turn_origin.as_str()
+        ));
         // 2.1.285 起紧跟着这一轮在会话里的位置（`cap/2.1.285/00030`：`…cc_turn_origin=human;
         // cc_prompt_index=1; cc_turn_index=1;`，之后每换一个模型问一句各加一）。官方与
         // `cc_prompt_id` / `cc_turn_origin` 同条件写：2.1.285 的工具续轮同样带着 `cc_prompt_id`，
         // 这几项也跟着写、沿用本轮的数（`cap/2.1.285/00115`、`00121`，见
-        // [`config::cc_2_1_285_missing_samples`] 第 1 条），这里跟着 `cc_prompt_id` 走。模拟的每一轮
-        // 都是 human 发起，`promptIndex` 与 `turnIndex` 同步加一，恒等。
-        if sim.link.prompt_index > 0
+        // [`config::cc_2_1_285_missing_samples`] 第 1 条），这里跟着 `cc_prompt_id` 走。`promptIndex` 只在用户输入的
+        // 一轮加，`turnIndex` 每轮加。
+        // 在会话链上就写（`turn_index` 不为 0）：首轮就是后台通知或同伴消息时 `cc_prompt_index` 合法地是 0，同真实客户端那条路
+        // （[`super::body::billing`] 的 `on_chain`）。
+        if sim.link.turn_index > 0
             && super::parse_version(p.version).is_some_and(|v| v >= (2, 1, 285))
         {
             let (n, t) = (sim.link.prompt_index, sim.link.turn_index);

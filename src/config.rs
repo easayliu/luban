@@ -40,6 +40,7 @@ mod v2_1_321;
 mod v2_1_322;
 mod v2_1_323;
 mod v2_1_325;
+mod v2_1_326;
 
 pub use betas::*;
 pub use client::*;
@@ -78,9 +79,70 @@ pub use v2_1_321::*;
 pub use v2_1_322::*;
 pub use v2_1_323::*;
 pub use v2_1_325::*;
+pub use v2_1_326::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `x-claude-1p-request-class` 2.1.326 换了分法：子代理一律 `blocking-subagent`、预热归 `main`，其余照旧
+    /// （`cap/auto-team-2.1.326-20261117-{full,model}` 对 `cap/auto-2.1.325-20261114-{full,model}`）。
+    #[test]
+    fn first_party_request_class_by_version() {
+        use CcProfileKind::*;
+        let at = |k, v| cc_first_party_request_class(k, v);
+        for v in ["2.1.323", "2.1.325"] {
+            assert_eq!(at(SdkSubagentHaiku, v), "background-task", "{v}");
+            assert_eq!(at(Prewarm, v), "summary-extraction", "{v}");
+        }
+        assert_eq!(at(SdkSubagentHaiku, "2.1.326"), "blocking-subagent");
+        assert_eq!(at(Prewarm, "2.1.326"), "main");
+        for v in ["2.1.325", "2.1.326"] {
+            assert_eq!(at(MainOpus, v), "main", "{v}");
+            assert_eq!(at(QuotaProbe, v), "summary-extraction", "{v}");
+            assert_eq!(at(SessionTitleHaiku, v), "summary-extraction", "{v}");
+        }
+    }
+
+    /// 头序表与真实线序一致：孙代理（嵌套 fork）的请求带 `x-claude-code-parent-agent-id`，落在 `agent-type` 之后、
+    /// `prev-tool-durations` / `prompt-id` 之前（`cap/auto-max-2.1.326-20261117-fork/p-nested-fork` 请求 `00038`、`00039`）。
+    /// 抓包里出现、表里也有的头，先后与表里相同。
+    #[test]
+    fn header_order_covers_the_parent_agent_header() {
+        let at = |name: &str| CC_HEADER_ORDER.iter().position(|h| h.eq_ignore_ascii_case(name));
+        let parent = at("x-claude-code-parent-agent-id").expect("表里有父代理头");
+        assert_eq!(at("x-claude-code-agent-type"), Some(parent - 1));
+        assert_eq!(at("x-claude-code-prev-tool-durations"), Some(parent + 1));
+        let dir = format!(
+            "{}/cap/auto-max-2.1.326-20261117-fork/p-nested-fork",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            eprintln!("skipped: {dir} not present");
+            return;
+        };
+        let mut checked = 0;
+        for e in entries.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("00038_") || name.starts_with("00039_"))
+                || !name.ends_with(".req.raw")
+            {
+                continue;
+            }
+            let raw = std::fs::read(e.path()).unwrap();
+            let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&raw[..end]).to_string();
+            let wire: Vec<usize> = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_once(':'))
+                .filter_map(|(n, _)| at(n.trim()))
+                .collect();
+            assert!(wire.contains(&parent), "{name}: 抓包里带父代理头");
+            assert!(wire.windows(2).all(|w| w[0] < w[1]), "{name}: 线序与表一致 {wire:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
 
     /// [`CC_TOOL_NAMES`] 不得有重名（重名说明两段之间抄串了），且几个已证实的老版本旧名
     /// 必须在——它们不在时老版本 CC 的 `Glob` / `Grep` / `Task` 会被混淆成 `mcp__luban__*`。
@@ -283,7 +345,8 @@ mod tests {
                 "2.1.324 没发布: {kind:?}"
             );
             assert_eq!(cc_profile_at(kind, Some((2, 1, 325))).version, "2.1.325", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.325", "模拟路径用 2.1.325 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 326))).version, "2.1.326", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.326", "模拟路径用 2.1.326 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
             let (old, mid) =
                 (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
@@ -401,7 +464,7 @@ mod tests {
             ),
         ] {
             let latest = cc_profile(kind);
-            assert_eq!((latest.kind, latest.version), (kind, "2.1.325"));
+            assert_eq!((latest.kind, latest.version), (kind, "2.1.326"));
             assert_eq!(latest.beta, want, "{kind:?}");
             assert!(!cc_profile_at(kind, Some((2, 1, 318))).beta.contains(CC_BETA_SIDE_QUERY), "{kind:?}");
             assert_eq!(CC_PROFILES.iter().filter(|p| p.kind == kind).count(), 1, "{kind:?} 只有一行");
@@ -457,6 +520,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.323").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.324").is_none(), "2.1.324 没有发布");
         assert!(cc_profile_exact(MainOpus, "2.1.325").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.326").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

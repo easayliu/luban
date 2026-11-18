@@ -150,6 +150,9 @@ pub const CC_HEADER_ORDER: &[&str] = &[
     // （[`CcProfile::request_class`]），其余三个是真 CC 来访自己带的，列在这里是为了归位。
     "x-claude-code-agent-id",
     "x-claude-code-agent-type",
+    // 子代理再派出去的孙代理才带，值是父代理的 `agent-id`；落在 `agent-type` 与 `prev-tool-durations` 之间
+    // （`cap/auto-max-2.1.326-20261117-fork/p-nested-fork` 请求 `00038` / `00039`）。真 CC 来访自己带的，列在这里归位。
+    "x-claude-code-parent-agent-id",
     "x-claude-code-prev-tool-durations",
     // 2.1.285 起（2.1.283 的 CHANGELOG：「gateway hint headers」），凡 billing header 里写了
     // `cc_prompt_id` 的请求都带，值与它相同（`cap/2.1.285/00030` 主线程、`00115` 工具续轮、

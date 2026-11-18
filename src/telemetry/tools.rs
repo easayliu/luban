@@ -413,8 +413,9 @@ pub(super) fn bash_meta_v311(
     command: &str,
     usage: Option<ShellUsage>,
     v316: bool,
+    v326: bool,
 ) -> super::bash_kinds::ShellRun {
-    let run = super::bash_kinds::shell_run(command, v316);
+    let run = super::bash_kinds::shell_run_at(command, v316, v326);
     let kinds = vec![("bash_command_kinds", json!(run.kinds))];
     if meta.get("bash_subcommand").is_some() {
         insert_after(meta, "bash_subcommand", kinds);
@@ -930,6 +931,7 @@ pub(super) fn tool_success_extras(
     sizes: &mut HashMap<String, usize>,
     v277: bool,
     v285: bool,
+    v326: bool,
 ) {
     let path = tu.input.get("file_path").and_then(|p| p.as_str()).unwrap_or("");
     let path_fields = |v: &mut Value| {
@@ -1008,6 +1010,10 @@ pub(super) fn tool_success_extras(
                     success["bash_subcommand"] = json!(sub);
                 }
                 success["has_pipe"] = json!(p.has_pipe);
+                // 2.1.326 紧跟一项命令里提到的位置类别（官方 `MEa`，[`super::bash_places::bash_places`]）。
+                if v326 {
+                    success["bash_places"] = json!(super::bash_places::bash_places(command));
+                }
             }
         }
         _ => {}
@@ -1290,6 +1296,27 @@ pub(super) fn auto_mode_decision_v319(v: &mut Value) {
 /// 即这次调用的 tool_use id（`cap/auto-2.1.312-20261028-full` 的 60 条 allowed 与 B1 那条 rejected）。
 pub(super) fn can_use_tool_v312(v: &mut Value, tool_use_id: &str) {
     insert_after(v, "messageID", vec![("toolUseID", json!(tool_use_id))]);
+}
+
+/// 2.1.326 起 `tengu_tool_use_can_use_tool_rejected` 先写拒绝那几项（`deniedBy` ~ `permissionDurationMs`，官方把它们连同
+/// auto 模式字段一起作为开头那份展开传进 `jho`），再写 `messageID` / `toolUseID` / `toolName` 与其余
+/// （`cap/auto-{max,team}-2.1.326-20261117-full` B1 那条）。
+pub(super) fn can_use_tool_v326(v: &mut Value) {
+    const FIRST: [&str; 5] = [
+        "deniedBy",
+        "decisionReasonType",
+        "hasFeedback",
+        "preToolHookDurationMs",
+        "permissionDurationMs",
+    ];
+    let Some(map) = v.as_object_mut() else { return };
+    let old = std::mem::take(map);
+    let (first, rest): (Vec<_>, Vec<_>) =
+        old.into_iter().partition(|(k, _)| FIRST.contains(&k.as_str()));
+    let mut first = first;
+    first.sort_by_key(|(k, _)| FIRST.iter().position(|f| f == k));
+    map.extend(first);
+    map.extend(rest);
 }
 
 /// 工具是谁拒的：2.1.307 `tengu_safety_event` 的类别、来源与判据那几项按它填（官方 `NMn` 读的那份判定记录，

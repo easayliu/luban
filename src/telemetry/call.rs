@@ -14,6 +14,9 @@ pub struct AgentHeaders {
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
     pub request_class: Option<String>,
+    /// 出站头 `x-claude-code-parent-agent-id`：子代理再派出去的孙代理才有，值是派它的那个子代理的 `agent-id`
+    /// （`cap/auto-max-2.1.326-20261117-fork/p-nested-fork` 请求 `00038`）。
+    pub parent_agent_id: Option<String>,
 }
 
 /// 转发路径在响应流结束时交过来的一条已完成的 `/v1/messages`。
@@ -71,6 +74,9 @@ pub struct ApiCall {
     /// 逐事件累加、跳过 ping，`cap/auto-2.1.305-20261021-full` 165 条都是事件总数减一个 ping）；
     /// 非流式为 `None`，官方回退到非流式时也不报。
     pub stream_events: Option<u32>,
+    /// 回复里收完了的内容块数（流式数 `content_block_stop`，非流式是 `content` 的块数）。官方要等块闭合才产出一条 assistant
+    /// 消息：只到 `message_start`（已经有 `message.id`）就报错的那次，一条消息都没产出。
+    pub closed_blocks: u32,
     /// 响应里每个工具的入参 JSON 字符数（工具名 → 之和，按首次出现排序），
     /// 即 `toolUseContentLengths`。
     pub tool_use_lens: Vec<(String, usize)>,
@@ -341,6 +347,7 @@ impl Capture {
             thinking_chars: 0,
             saw_thinking: false,
             stream_events: None,
+            closed_blocks: 0,
             tool_use_lens: Vec::new(),
             tool_calls: Vec::new(),
             cost_usd: None,

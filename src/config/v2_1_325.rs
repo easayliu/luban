@@ -1,9 +1,9 @@
-//! 2.1.325 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.325 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.325 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.325 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.325 的 profile 表：2.1.325 来访的 beta 参照（[`cc_profile_at`]）。2.1.326 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.323（[`CC_PROFILES_2_1_323`]）完全相同**（2.1.324 没有发布，更新日志里也没有这一条）：两版的 beta
 /// 名字清单、`x-`/`anthropic-` 头名、`/v1` 端点逐个相同，luban 资产（system 各段、工具描述与 schema）里 323 能找到的句子
@@ -11,7 +11,7 @@ use super::*;
 /// haiku-5-5 / haiku-4-5 / fable-5-1 主线程 system 各块（测试项目路径归一后）、工具定义、头顺序、beta、body 键都没变，
 /// 只有 sandy-plover 随场景用到的工具在变；`-model` 那份同样。原生层 `__text` 变了但 cch 种子常量还在，全量 cch 回归
 /// （含 325）全中。这一版对 luban 的改动只在遥测（错误栈、几个事件键），见 [`crate::telemetry`] 里的 `v325`。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_325: &[CcProfile] = &[
     at_325(CC_PROFILES_2_1_323[0]),
     at_325(CC_PROFILES_2_1_323[1]),
     at_325(CC_PROFILES_2_1_323[2]),
