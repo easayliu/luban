@@ -791,6 +791,33 @@ pub(super) fn last_user_text_starts_with(v: &serde_json::Value, prefix: &str) ->
     text.is_some_and(|t| t.trim_start().starts_with(prefix))
 }
 
+/// 末条**非 system** 消息是 user，且它的**最后一个** text 块（或字符串 content）以 `prefix` 开头（忽略开头空白）。
+///
+/// `/compact` 的提示是追加在末条用户消息**最后**的一块：用户排着队的那句话会并在它前面，其后还可能跟一条 `<total_tokens>`
+/// 的 system 消息（`cap/auto-2.1.308-20261022-api/00061`：首块是「summarize the last command output in 5 words」、末块才是
+/// 「CRITICAL: Respond with TEXT ONLY…」）。只看首块（[`last_user_text_starts_with`]）认不出；任一块都认又会把正文中间引用了
+/// 这句、最后才提问的普通输入当成压缩。与遥测侧的判据（[`crate::telemetry`] 的 `parse_shape` 取末块）一致，2.1.293 / 2.1.308
+/// API Key 与 2.1.327 订阅抓包里的压缩请求都是这个位置。
+pub(super) fn last_user_last_text_starts_with(v: &serde_json::Value, prefix: &str) -> bool {
+    let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };
+    let Some(last) =
+        msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+    else {
+        return false;
+    };
+    if last.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let text = match last.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.iter().rev().find_map(|b| b.get("text").and_then(|t| t.as_str()))
+        }
+        _ => None,
+    };
+    text.is_some_and(|t| t.trim_start().starts_with(prefix))
+}
+
 /// 末条 `role:"user"` 消息里是否有某个 text 块（或字符串 content）包含 `needle`。
 pub(super) fn last_user_text_contains(v: &serde_json::Value, needle: &str) -> bool {
     let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) else { return false };

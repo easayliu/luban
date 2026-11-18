@@ -190,6 +190,9 @@ pub struct ClientDataWait {
     pub timed_out: bool,
     /// 等到了且槽位有了缓存（官方 `Iht()`）：只有这时报成功那条。
     pub ready: bool,
+    /// 这是这个模拟会话头一回等（官方 `waitedForClientData`，在等之前锁存，见
+    /// [`crate::proxy::session_link::first_client_data_wait`]）：2.1.327 起报进 `is_first`。
+    pub is_first: bool,
 }
 
 /// 发出前这个号 `model` 的 `client_data` 要怎么等（官方 2.1.318 `UWt` / `SIi`）。
@@ -239,6 +242,7 @@ pub(crate) async fn wait(
     cred_id: i64,
     model: &str,
     mut rx: tokio::sync::watch::Receiver<bool>,
+    is_first: bool,
 ) -> ClientDataWait {
     let t0 = Instant::now();
     let timed_out =
@@ -247,14 +251,14 @@ pub(crate) async fn wait(
     if timed_out {
         give_up(&fetch_key(cred_id, model), &rx);
     }
-    ClientDataWait { waited_ms, timed_out, ready: !timed_out && has_slot(cred_id, model) }
+    ClientDataWait { waited_ms, timed_out, ready: !timed_out && has_slot(cred_id, model), is_first }
 }
 
 /// [`plan`] + [`wait`]，不当场发起拉取（没有记录也不等）：测试与不便发请求的调用方用。
 #[cfg(test)]
 pub(crate) async fn wait_for(cred_id: i64, model: &str) -> Option<ClientDataWait> {
     match plan(cred_id, model) {
-        WaitPlan::Wait(rx) if waits(cred_id) => Some(wait(cred_id, model, rx).await),
+        WaitPlan::Wait(rx) if waits(cred_id) => Some(wait(cred_id, model, rx, true).await),
         WaitPlan::Skip | WaitPlan::Wait(_) => None,
         WaitPlan::Start(guard, _) => {
             drop(guard);

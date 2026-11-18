@@ -846,6 +846,12 @@ const READ_ALLOW_LARGE_TOKENS: u64 = 83;
 /// 交互式另有 Artifact 那 40，见 [`artifact_schema_delta`]）。
 const SHARE_GUIDE_TOKENS_2_1_317: u64 = 21;
 
+/// 2.1.327 起 `ListAgents` 多 `cursor` 参数与描述末尾那句分页说明，`non_mcp_tools_tokens` 各族（含 `-p`、haiku-4.5）一律多 39，
+/// 工具数不变（`cap/auto-max-2.1.327-20261118-full` 对 `cap/auto-max-2.1.326-20261117-full` 同场景逐个：opus 等 15525→15564、
+/// haiku-5-5 15495→15534、haiku-4.5 15996→16035、`-p` 3090→3129）。关掉 ListAgents 时连这部分一起不算。`-p` 2.1.323 起按出站
+/// 实际发出的 schema 现算（`sent_schema`），资产里那份已是 327 的，不再另加。
+const LIST_AGENTS_CURSOR_TOKENS_2_1_327: u64 = 39;
+
 /// 2.1.300 起 `Artifact` 的 schema 按版本变，交互式各族（`-p` 没有 Artifact）的 token 跟着变、工具数不变；
 /// 关掉 Artifact 时连这部分一起减。逐版对抓包里 `Artifact.input_schema` 的 `round(长度 / 4)` 差：
 /// 2.1.300 加 `edits` 参数 +274（`cap/auto-2.1.300-20261015-full`：opus 等 14299、haiku-5-5 14269、
@@ -1340,6 +1346,9 @@ where
                 if version_at_least(subst.version, "2.1.317") {
                     tokens += SHARE_GUIDE_TOKENS_2_1_317;
                 }
+                if version_at_least(subst.version, "2.1.327") && !off.list_agents {
+                    tokens += LIST_AGENTS_CURSOR_TOKENS_2_1_327;
+                }
                 if subst.sdk {
                     if version_at_least(subst.version, "2.1.303") {
                         tokens += SDK_AGENT_FORK_TOKENS_2_1_303;
@@ -1413,6 +1422,10 @@ where
                 catalog_picker_served_now(&mut meta);
                 catalog_picker_with_current_model(&mut meta);
                 catalog_served_state(&mut meta, subst.tool_family == ToolFamily::HaikuLong);
+            }
+            if e.name == "tengu_model_catalog_compare" && version_at_least(subst.version, "2.1.327")
+            {
+                catalog_skipped_v327(&mut meta, subst.sdk);
             }
             // 2.1.310 起组织配置闸的影子判定在 `settings_cache_age_ms` 后多五项（`cap/auto-2.1.310-20261024-full`
             // 全部 25 条都带）：两份签名副本恒 `trusted`；现拉的签名在那一侧还没答复（`unavailable_pending`）时报
@@ -1804,6 +1817,31 @@ pub(super) fn catalog_served_state(meta: &mut Value, haiku_long: bool) {
             *slot = v;
         }
     }
+}
+
+/// 2.1.327 的模型目录那条在 `compare_failed` 后多 `skipped`（官方 `k`）：非交互（`-p`）会话、目录取自新鲜缓存
+/// （`fetch_status: "cache_fresh"`）且这个进程还没问过服务端目录时不做比对，报 `true`，后面那串比对项一项都不带；
+/// 其余报 `false`、比对照旧（`cap/auto-max-2.1.327-20261118-full`：交互式 16 条 `false`，`-p` 6 条 `true`、只到 `skipped`）。
+pub(super) fn catalog_skipped_v327(meta: &mut Value, non_interactive: bool) {
+    let Some(o) = meta.as_object_mut() else { return };
+    if !o.contains_key("compare_failed") {
+        return;
+    }
+    let skipped =
+        non_interactive && o.get("fetch_status").and_then(Value::as_str) == Some("cache_fresh");
+    if skipped {
+        let keep: Map<String, Value> = std::mem::take(o)
+            .into_iter()
+            .scan(false, |past, (k, v)| {
+                let out = (!*past).then_some((k.clone(), v));
+                *past |= k == "compare_failed";
+                Some(out)
+            })
+            .flatten()
+            .collect();
+        *o = keep;
+    }
+    insert_after(meta, "compare_failed", vec![("skipped", json!(skipped))]);
 }
 
 /// 当前主循环模型不在内置选择器（`picker_old`）里时，官方把它接在同族最后一项后面、计数加一；没有同族的接在末尾

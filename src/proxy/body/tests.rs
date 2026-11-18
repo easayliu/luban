@@ -1104,7 +1104,7 @@ fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
     assert!(build_tool_name_map(Some(&legacy_only)).is_none());
 }
 
-/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 / 2.1.326 各份抓包（团队号、个人 Max 号、Ultra）的每条
+/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 ~ 2.1.327 各份抓包（团队号、个人 Max 号、Ultra）的每条
 /// `/v1/messages`，按白名单建映射应当为空，整条出站改写（真实 CC 透传那条路、工具名混淆开着）之后 `tools` 的名字与
 /// 先后逐个不变。Max 号延迟池里的 `SendToProject` / `SendToProjectContext` 与按号下发的 `Yield` 此前漏在白名单外，
 /// 会被改成 `mcp__luban__*`。抓包不在就跳过。
@@ -1119,7 +1119,7 @@ fn official_tool_names_survive_the_outbound_rewrite() {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for d in dirs.flatten() {
         let name = d.file_name().to_string_lossy().to_string();
-        if !(name.contains("2.1.325-") || name.contains("2.1.326-")) {
+        if !(name.contains("2.1.325-") || name.contains("2.1.326-") || name.contains("2.1.327-")) {
             continue;
         }
         let mut stack = vec![d.path()];
@@ -2818,8 +2818,9 @@ fn core_tool_stubs_are_profile_specific() {
     );
     // 2.1.300 多一句「You will be notified when it exits — do not poll…」（2.1.293 ~ 2.1.299 是 3018）；
     // 2.1.309 的 `# Git` 段又加了一句「GitHub notifies the owner of any `@name`…」（+283）；2.1.311 把
-    // 「Working directory persists between calls」那句改写成 `cd` 只在主会话里延续的说明（+160）。
-    assert_eq!(d(opus, "Bash").chars().count(), 3541);
+    // 「Working directory persists between calls」那句改写成 `cd` 只在主会话里延续的说明（+160）；2.1.327 的 `# Git` 段又加了
+    // 一句「Do not commit files that likely contain secrets…」（+177，`cap/auto-max-2.1.327-20261118-full/00044`）。
+    assert_eq!(d(opus, "Bash").chars().count(), 3718);
     // 2.1.300 的 Artifact 多了 `edits` 参数与五句说明（2.1.293 ~ 2.1.299 是 34605，2.1.291 是 34399）；
     // 2.1.301 那句「Not allowed with …」去掉了 `root`（2.1.300 是 36637）；2.1.303 加了 dashboard
     // 那几句（2.1.301 是 36629）；2.1.309 改写了 `root` 参数的说明（2.1.303 ~ 2.1.308 是 37253，+182）；
@@ -2978,7 +2979,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.326."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.327."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -5347,7 +5348,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 326)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 327)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");

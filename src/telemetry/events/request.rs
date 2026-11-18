@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// 2.1.327 起 `tengu_tether_echo_audit` 的抽样比例（官方 `mQn = 0.1`）。
+const ECHO_AUDIT_RATE_2_1_327: f64 = 0.1;
+
 impl EventBuilder<'_> {
     /// 发请求前的 git 探测、子代理选型、线程回放与工具搜索核验。
     pub(super) fn emit_pre_request(&mut self) {
@@ -553,7 +556,8 @@ impl EventBuilder<'_> {
             // 2.1.319：`changedExtraBody` 后多 `toolsHashKept`——这个来源上一份状态在、工具逐项没变（官方 `v4` 复用旧哈希，
             // `tether_decide` 单独记）。`cap/auto-2.1.319-20261106-full`：`first_request` 那条 false，续轮、`config_changed` 都是
             // true；`/clear` 之后那条（`cap/auto-2.1.319-20261106-confirm/2.1.319/00092`）上一份状态已清，false。
-            if env.f.v319 {
+            // 2.1.327 又删了这一项（`cap/auto-max-2.1.327-20261118-full` 107 条都没有）。
+            if env.f.v319 && !env.f.v327 {
                 insert_after(
                     &mut decision,
                     "changedExtraBody",
@@ -587,7 +591,12 @@ impl EventBuilder<'_> {
             self.push_dd_snake(t0, "tengu_tether_decision", decision);
             // 回声审计：客户端把上游回过来的 assistant 轮次原样带回去了没有。经代理转发的
             // 历史就是客户端自己拼的那份，按「全部原样」报。
-            if t.echo {
+            // 2.1.327 起官方先掷一次 10% 的骰子（`Math.random() >= 0.1` 不报），带回的助手轮次为 0 也不报；报的那条
+            // 打头多 `sample_rate: 0.1`（`cap/auto-max-2.1.327-20261118-full`：326 那次 78 条，这次 9 条）。
+            let echo_sampled = !env.f.v327
+                || (rand::random::<f64>() < ECHO_AUDIT_RATE_2_1_327
+                    && (t.counts_unknown || shape.assistant_messages > 0));
+            if t.echo && echo_sampled {
                 let turns = shape.assistant_messages;
                 let echo = json!({
                     "sourceCategory": kind.category(),
@@ -619,6 +628,13 @@ impl EventBuilder<'_> {
                         o.shift_remove(k);
                     }
                 }
+                if env.f.v327 {
+                    insert_before(
+                        &mut echo,
+                        "sourceCategory",
+                        vec![("sample_rate", json!(ECHO_AUDIT_RATE_2_1_327))],
+                    );
+                }
                 self.push_dd_snake(t0, "tengu_tether_echo_audit", echo);
             }
         }
@@ -646,20 +662,28 @@ impl EventBuilder<'_> {
         if env.f.v318
             && let Some(w) = env.call.chain_client_data_wait()
         {
+            // 2.1.327：`waited_ms` 后多 `is_first`（这个会话头一回等，开始等之前锁存，见
+            // [`crate::proxy::session_link::first_client_data_wait`]）与 `model`（`cap/auto-max-2.1.327-20261118-full`：一个进程头一回切到
+            // sonnet-5-5 / haiku-5-5 时各一条，都是 `is_first: true`）；等到了槽位却仍是空的（拉取没带回这个模型）另报
+            // `feature_sad{…, no_slot_after_fetch}`，326 那时不报。
+            let mut extra = json!({ "waited_ms": w.waited_ms });
+            if env.f.v327 {
+                extra["is_first"] = json!(w.is_first);
+                extra["model"] = json!(&display_model);
+            }
+            let sad = |extra: Value, code: &str| {
+                let mut sad = extra;
+                sad["feature_name"] = json!("model_client_data_wait");
+                sad["error_code"] = json!(code);
+                sad["tengu_quizzical_giraffe"] = json!("unset");
+                sad
+            };
             if w.timed_out {
-                let sad = json!({
-                    "waited_ms": w.waited_ms,
-                    "feature_name": "model_client_data_wait",
-                    "error_code": "timeout",
-                    "tengu_quizzical_giraffe": "unset"
-                });
-                self.push_dd(ms(t0, -1), "tengu_feature_sad", sad);
+                self.push_dd(ms(t0, -1), "tengu_feature_sad", sad(extra, "timeout"));
+            } else if !w.ready && env.f.v327 {
+                self.push_dd(ms(t0, -1), "tengu_feature_sad", sad(extra, "no_slot_after_fetch"));
             } else if w.ready {
-                let ok = feature_with(
-                    "model_client_data_wait",
-                    json!({ "waited_ms": w.waited_ms }),
-                    true,
-                );
+                let ok = feature_with("model_client_data_wait", extra, true);
                 self.push_dd(ms(t0, -1), "tengu_feature_ok", ok);
             }
         }

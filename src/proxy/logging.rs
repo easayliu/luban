@@ -2015,6 +2015,7 @@ impl UsageSniffer {
                     .find(|(id, _)| *id == b.id)
                     .map(|(_, v)| v.clone()),
                 input_stream_ms: b.stream_ms,
+                permission_mode: None,
             })
             .collect()
     }

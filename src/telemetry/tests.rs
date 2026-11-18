@@ -1903,6 +1903,7 @@ fn cache_heartbeat_follows_a_background_subagent() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     spawn.tool_use_lens = vec![("Agent".into(), 80)];
     t.ingest(spawn);
@@ -1928,6 +1929,7 @@ fn cache_heartbeat_follows_a_background_subagent() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(s1);
     let mut s2 = call(with_prompt(cc_body(false), PROMPT_2), "req_s2", "end_turn");
@@ -1986,6 +1988,7 @@ fn cache_heartbeat_counts_parallel_agents_by_call() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let mut spawn = call(with_prompt(cc_body(true), PROMPT_2), "req_spawn", "tool_use");
     at(&mut spawn, 30, 1_800, 6_000);
@@ -2042,6 +2045,7 @@ fn cache_heartbeat_ignores_grandchild_agents() {
         input: json!({ "prompt": prompt }),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     // 子代理首条：首条用户消息是 system-reminder + 派它的 prompt，客户端常在末尾补一个换行
     // （`cap/auto-2.1.305-20261021-full` 六个子代理里五个）。
@@ -2130,6 +2134,7 @@ fn cache_heartbeat_a_late_agent_from_an_earlier_turn_does_not_claim() {
         input: json!({ "prompt": prompt }),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let agent_body = |prompt: &str| {
         let mut v: Value = serde_json::from_slice(&with_prompt(cc_body(true), PROMPT_3)).unwrap();
@@ -2245,6 +2250,7 @@ fn cache_heartbeat_claims_even_when_a_summary_lands_first() {
         input: json!({ "prompt": "do the task" }),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     spawn.tool_use_lens = vec![("Agent".into(), 80)];
     t.ingest(spawn);
@@ -2346,6 +2352,7 @@ fn rejected_tool_events_keep_the_previous_prompt() {
         input: json!({"command": "ls"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     first.tool_use_lens = vec![("Bash".into(), 16)];
     t.ingest(first);
@@ -5126,6 +5133,7 @@ fn replay_calls(calls: &[Value], client_tools: bool) -> Telemetry {
                         input: x[2].clone(),
                         verdict: x[3].as_str().map(str::to_string),
                         input_stream_ms: None,
+                        permission_mode: None,
                     })
                     .collect()
             })
@@ -5958,6 +5966,11 @@ fn context_size_tool_tokens_follow_the_schema_per_version() {
     assert_eq!(ctx("2.1.323", opus, false), (34, 15600 - 1152 + 4));
     assert_eq!(ctx("2.1.323", h55, false), (33, 15570 - 1152 + 4));
     assert_eq!(ctx("2.1.323", h45, false), (37, 16071 - 1152 + 4));
+    // 2.1.327 ListAgents 加 `cursor` +39，交互式各族（`cap/auto-max-2.1.327-20261118-full` 对 326 同场景逐个 +39）。
+    for m in [opus, h55, h45] {
+        let (c326, t326) = ctx("2.1.326", m, false);
+        assert_eq!(ctx("2.1.327", m, false), (c326, t326 + 39), "{m}");
+    }
 
     // 关掉 Artifact（带官方工具集 Agent+Read，留着 ListAgents / SendFeedback，只少 Artifact 一组）时，
     // `artifact_schema_delta` 不加（`!off.artifact` 为假），连 Artifact 的 schema 一起减：opus 主线程
@@ -6623,6 +6636,7 @@ fn agent_tool_selected_reports_whether_the_agent_was_named() {
             input,
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
@@ -6662,6 +6676,7 @@ fn nested_agents_report_their_own_name() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
     main.ua_out = ua.into();
@@ -6713,6 +6728,7 @@ fn same_prompt_delegations_are_told_apart_by_agent_type() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |text: &str| {
         let mut v: Value =
@@ -6779,6 +6795,7 @@ fn delegation_types_match_custom_agents_and_aliases() {
             input: json!({"subagent_type": dispatched, "name": "named"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
@@ -6821,6 +6838,7 @@ fn custom_header_prefers_the_custom_named_delegation() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |text: &str| {
         let mut v: Value =
@@ -6958,6 +6976,7 @@ fn a_late_unrelated_agent_does_not_take_a_nested_delegation() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |text: &str| {
         let mut v: Value =
@@ -7031,6 +7050,7 @@ fn agent_tool_selected_reports_only_the_efforts_that_exist() {
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut sub = call(body_for(model, effort, true), "req_sub", "end_turn");
@@ -7086,6 +7106,7 @@ fn tether_thread_timing_follows_the_anchor_not_the_thread_type() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(first);
     // effort 换了：tether 另起线程。
@@ -7140,6 +7161,7 @@ fn subagent_tether_idle_is_anchored_on_its_own_branch() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(main);
     let sub = |rid: &str, at: u64, last_user_text: bool, stop: &str| {
@@ -7162,6 +7184,7 @@ fn subagent_tether_idle_is_anchored_on_its_own_branch() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(first);
     t.ingest(sub("req_sub_2", 20, false, "end_turn"));
@@ -7190,6 +7213,7 @@ fn cancelled_main_request_still_anchors_the_tether_idle() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(ok);
     let mut cancelled = call(body_for("claude-opus-5-5", Some("high"), true), "req_2", "end_turn");
@@ -7488,6 +7512,7 @@ fn tether_anchors_do_not_carry_over_a_clear() {
         input: json!({}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(with_tools);
     // 旧会话最后一条被 Esc 取消：旧会话里两个锚点都有值，新会话也不接。
@@ -8423,6 +8448,7 @@ fn user_rejected_events(ua: &str, cred: i64) -> Vec<(String, Value)> {
         input: json!({"command": "rm x"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     first.tool_use_lens = vec![("Bash".into(), 16)];
     t.ingest(first);
@@ -10446,6 +10472,7 @@ fn tool_events_of_sibling_continuations_point_at_the_parent_reply() {
         input: json!({ "command": cmd }),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let mut v: Value = serde_json::from_slice(&tool_search_body()).unwrap();
     v["thread"] = json!({"type": "create"});
@@ -10540,6 +10567,7 @@ fn rejoining_an_older_turn_restores_its_turn_stats() {
         input: json!({"command": "ls"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(a);
     t.ingest(req(
@@ -10581,6 +10609,7 @@ fn rejoining_an_older_turn_does_not_leak_into_the_newer_turn() {
         input: json!({"command": "ls"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let req = |prev: Option<&str>, msgs: Option<Value>, id: &str, stop: &str, at: u64| {
         let mut v: Value = serde_json::from_slice(&tool_search_body()).unwrap();
@@ -10704,6 +10733,7 @@ fn sdk_stats_of_a_rejoined_turn_are_its_own() {
             input: json!({"command": "ls"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(a);
         if with_x {
@@ -10905,6 +10935,7 @@ fn an_unknown_parent_does_not_move_the_session_anchors() {
             input: json!({"command": "ls"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(x);
         if with_d {
@@ -11008,6 +11039,7 @@ fn a_full_continuation_after_a_cold_start_is_not_a_new_prompt() {
                 input: json!({"command": "ls"}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
         }
         c
@@ -11071,6 +11103,7 @@ fn tool_call_ids_anchor_a_pointerless_full_continuation() {
                 input: json!({"command": "ls"}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
         }
         c
@@ -11143,6 +11176,7 @@ fn unfilled_deltas_still_anchor_their_continuations() {
                 input: json!({"command": "ls"}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
             c.tool_use_lens = vec![("Bash".into(), 16)];
         }
@@ -11255,6 +11289,7 @@ mod parent_reply_refs {
                 input: json!({"command": "ls"}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
             c.tool_use_lens = vec![("Bash".into(), 16)];
         }
@@ -11413,6 +11448,7 @@ mod parent_reply_refs {
             input,
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         };
         a.tool_calls = vec![
             tc("t1", "Read", json!({"file_path": "/p/a.md"})),
@@ -11744,6 +11780,7 @@ mod parent_reply_refs {
                 input: json!({ "file_path": p }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             })
             .collect();
         t.ingest(x);
@@ -11818,6 +11855,7 @@ mod parent_reply_refs {
                 input: json!({ "file_path": "/p/a.txt" }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
             t.ingest(s1);
             let msgs = json!([
@@ -11835,6 +11873,7 @@ mod parent_reply_refs {
                 input: json!({ "command": "cat '/p/a.txt '" }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
             t.ingest(x);
             let msgs = json!([
@@ -11879,6 +11918,7 @@ mod parent_reply_refs {
                 input: json!({ "file_path": "/p/a.txt" }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             },
             ToolCall {
                 id: "b1".into(),
@@ -11886,6 +11926,7 @@ mod parent_reply_refs {
                 input: json!({ "command": "cat '/p/a.txt '" }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             },
         ];
         let mut x = mk(req(prompt("one"), None, None), "req_x", "tool_use", 0, "", 5);
@@ -11942,6 +11983,7 @@ mod parent_reply_refs {
                 input: json!({ "file_path": "/p/a.txt" }),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
             t.ingest(x);
             let msgs = json!([
@@ -11994,6 +12036,7 @@ mod parent_reply_refs {
             input: json!({ "command": command }),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(x);
         let msgs = json!([
@@ -12058,6 +12101,7 @@ mod parent_reply_refs {
             input: json!({ "command": format!("cat {path}") }),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         };
         let turn = |id: &str, out: &str| {
             json!([
@@ -12283,6 +12327,7 @@ mod parent_reply_refs {
             input: json!({"command": format!("cat {path}")}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(x);
         let msgs = json!([
@@ -12530,6 +12575,7 @@ fn a_pointerless_continuation_of_an_unseen_reply_is_unknown() {
                 input: json!({"command": "ls"}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
         }
         c
@@ -12645,6 +12691,7 @@ fn an_unknown_parent_in_a_subagent_propagates_to_the_next_continuation() {
             input: json!({"command": "ls"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         c.tool_use_lens = vec![("Bash".into(), 16)];
         c
@@ -12756,6 +12803,7 @@ fn unknown_turn_stats_are_not_written_back() {
             input: json!({"command": "ls"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(a);
         if with_d {
@@ -12860,6 +12908,7 @@ fn rejoining_an_older_turn_keeps_its_query_chain() {
         input: json!({"command": "ls"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(a);
     let chain_of = |t: &Telemetry, name: &str| -> Vec<Value> {
@@ -12960,6 +13009,7 @@ fn rejections_on_a_sibling_continuation_point_at_the_parent_reply() {
         input: json!({"command": "ls"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(a);
     let cont = |id: &str, msgs: Value, stop: &str, at: u64| {
@@ -14075,6 +14125,7 @@ fn mcp_tool_events_use_the_scrubbed_name() {
         input: json!({"q": "x"}),
         verdict: None,
         input_stream_ms: Some(5),
+        permission_mode: None,
     }];
     t.ingest(first);
     let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -14116,6 +14167,7 @@ fn failed_bash_reports_tool_input_stream_from_2_1_319() {
             input: json!({"command": "false", "description": "fail"}),
             verdict: None,
             input_stream_ms: Some(516),
+            permission_mode: None,
         }];
         t.ingest(first);
         let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -14154,6 +14206,7 @@ fn a_failed_mcp_call_reports_tool_input_stream_from_2_1_319() {
             input: json!({"items": ["topic.index"]}),
             verdict: None,
             input_stream_ms: Some(77),
+            permission_mode: None,
         }];
         t.ingest(first);
         let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -14200,6 +14253,7 @@ fn a_failed_read_reports_its_timing_before_the_input_stream() {
         input: json!({"file_path": "/tmp/missing.txt"}),
         verdict: None,
         input_stream_ms: Some(42),
+        permission_mode: None,
     }];
     t.ingest(first);
     let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -14306,6 +14360,23 @@ fn version_2_1_325_moves_the_5xx_frame() {
     assert!(seen > 0);
 }
 
+/// 2.1.327（`cap/auto-max-2.1.327-20261118-retry`）：5xx 栈哈希与行列照旧、顶帧换块，类名压缩后是 `MHn`，**又带上
+/// `error_constructor`**。
+#[test]
+fn version_2_1_327_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.327 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert_eq!(
+            (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("MHn"), &json!("5b32b751db51"), &json!("chunk-z9xgg67q.js:5:1510")),
+            "2.1.327 {n}"
+        );
+    }
+    assert!(seen > 0);
+}
+
 /// 2.1.326（`cap/auto-max-2.1.326-20261117-retry`、`cap/auto-team-2.1.326-20261117-retry`）：5xx 栈哈希与行列照旧、顶帧换块，
 /// **又不带 `error_constructor`**。
 #[test]
@@ -14391,6 +14462,7 @@ fn version_2_1_319_reports_tool_input_stream_and_tools_hash_kept() {
             input: json!({"file_path": "/tmp/a.txt"}),
             verdict: None,
             input_stream_ms: stream_ms,
+            permission_mode: None,
         }];
         t.ingest(first);
         let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
@@ -14849,6 +14921,7 @@ fn an_accept_edits_bash_takes_the_fast_path() {
             input: input.clone(),
             verdict: Some("not_flagged".into()),
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(first);
         let mut body = with_cwd(cc_body(false));
@@ -15040,6 +15113,7 @@ fn suggestion_fork_events(cred: i64, retried: bool) -> Vec<(DateTime<Utc>, Strin
         input: json!({"command": "true"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     s1.tool_use_lens = vec![("Bash".into(), 52)];
     (s1.input_tokens, s1.output_tokens, s1.cache_read_tokens, s1.cache_creation_tokens) =
@@ -15260,6 +15334,7 @@ fn suggestion_fork_ends_on_a_background_overload() {
             input: json!({"command": "true"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(s1);
         let mut s2 = call(suggestion_body(&["toolu_s1"]), "req_s2", "end_turn");
@@ -15295,6 +15370,7 @@ fn suggestion_fork_takes_text_from_an_earlier_reply() {
         input: json!({"command": "true"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(s1);
     let mut s2 = call(suggestion_body(&["toolu_s1"]), "req_s2", "tool_use");
@@ -15307,6 +15383,7 @@ fn suggestion_fork_takes_text_from_an_earlier_reply() {
         input: json!({"command": "true"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(s2);
     let mut s3 = call(suggestion_body(&["toolu_s1", "toolu_s2"]), "req_s3", "end_turn");
@@ -15371,6 +15448,7 @@ fn suggestion_fork_replay_matches_the_2_1_307_capture() {
         input: json!({"command": "true", "description": "No-op placeholder"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     (s1.input_tokens, s1.output_tokens, s1.cache_read_tokens, s1.cache_creation_tokens) =
         (506, 74, 54_638, 60);
@@ -15594,6 +15672,131 @@ fn version_2_1_326_telemetry_shape() {
     assert!(api.get("headersMs").is_none() && ok.get("bash_places").is_none(), "{api} {ok}");
 }
 
+/// 2.1.327 的遥测（`cap/auto-max-2.1.327-20261118-full`）：Bash 执行事件不再报 `tail_input_*`，`tengu_tether_decision` 不再报
+/// `toolsHashKept`，`tengu_tether_live_outcome` 队尾多 `routingHint`（续用线程那条 `off`、另起的 `no_continue`），交互式会话首次
+/// Bash 在 `shell_snapshot_create` 前多一条 `feature_ok{shell_snapshot_head_start}`。2.1.326 都没有。
+#[test]
+fn version_2_1_327_telemetry_shape() {
+    let run = |ua: &str| {
+        let t = Telemetry::default();
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"python3 -m unittest 2>&1 | tail -5","description":"test"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        let p = &st.pending[&key()];
+        let all = |n: &str| -> Vec<Value> {
+            p.events.iter().filter(|(_, e)| ev_name(e) == n).map(|(_, e)| meta_of(e)).collect()
+        };
+        let dd: Vec<Value> = p.dd.clone();
+        (
+            all("tengu_bash_tool_command_executed"),
+            all("tengu_tether_decision"),
+            all("tengu_tether_live_outcome"),
+            dd,
+        )
+    };
+    let (bash, decision, live, dd) = run("claude-cli/2.1.327 (external, cli)");
+    assert!(!bash.is_empty() && !decision.is_empty() && !live.is_empty());
+    for b in &bash {
+        assert!(b.as_object().unwrap().keys().all(|k| !k.starts_with("tail_input_")), "{b}");
+    }
+    for d in &decision {
+        assert!(d.get("toolsHashKept").is_none(), "{d}");
+    }
+    for l in &live {
+        let keys: Vec<&str> = l.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.last(), Some(&"routingHint"), "{l}");
+        let want = if l["sentThreadType"] == "continue" { "off" } else { "no_continue" };
+        assert_eq!(l["routingHint"], want, "{l}");
+    }
+    let names: Vec<String> = dd
+        .iter()
+        .filter_map(|e| {
+            let s = e.to_string();
+            ["shell_snapshot_head_start", "shell_snapshot_create"]
+                .into_iter()
+                .find(|n| s.contains(n))
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(names, ["shell_snapshot_head_start", "shell_snapshot_create"], "交互式首次 Bash");
+
+    // plan 模式（客户端在 `safeguards` 里自报）不提前拍快照，只报 `shell_snapshot_create`。
+    let plan_dd = {
+        let t = Telemetry::default();
+        let plan = json!([{"classifier_context": {"permission_mode": "plan"}}]);
+        let mut v: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        v["safeguards"] = plan.clone();
+        let mut first = call(v.to_string().into_bytes(), "req_1", "tool_use");
+        first.ua_out = "claude-cli/2.1.327 (external, cli)".into();
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["safeguards"] = plan;
+        body["messages"][1] = json!({"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls","description":"list"}}]});
+        body["messages"][2] = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a"}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = "claude-cli/2.1.327 (external, cli)".into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()].dd.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    };
+    assert!(plan_dd.iter().any(|e| e.contains("shell_snapshot_create")), "plan 模式照样拍快照");
+    assert!(!plan_dd.iter().any(|e| e.contains("shell_snapshot_head_start")), "plan 模式不提前拍");
+
+    // 模式切换：default 下同一回复先调首次 Bash、再调 EnterPlanMode，带回结果的续轮已是 plan——快照在生成 Bash 时就提前拍了，
+    // 照报 `shell_snapshot_head_start`（按调用生成时的模式判，[`super::shape::ToolUse::origin_mode`]）。
+    let switched_dd = {
+        let t = Telemetry::default();
+        let ua = "claude-cli/2.1.327 (external, cli)";
+        let mut first = call(cc_body(true), "req_1", "tool_use");
+        first.ua_out = ua.into();
+        first.tool_calls = vec![
+            ToolCall {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: json!({"command":"ls","description":"list"}),
+                ..Default::default()
+            },
+            ToolCall {
+                id: "t2".into(),
+                name: "EnterPlanMode".into(),
+                input: json!({}),
+                ..Default::default()
+            },
+        ];
+        t.ingest(first);
+        let mut body: Value = serde_json::from_slice(&cc_body(false)).unwrap();
+        body["safeguards"] = json!([{"classifier_context": {"permission_mode": "plan"}}]);
+        body["messages"][1] = json!({"role":"assistant","content":[
+            {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls","description":"list"}},
+            {"type":"tool_use","id":"t2","name":"EnterPlanMode","input":{}}]});
+        body["messages"][2] = json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"a"},
+            {"type":"tool_result","tool_use_id":"t2","content":"Entered plan mode."}]});
+        let mut second = call(body.to_string().into_bytes(), "req_2", "end_turn");
+        second.ua_out = ua.into();
+        t.ingest(second);
+        let st = t.0.state.lock();
+        st.pending[&key()].dd.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    };
+    assert!(
+        switched_dd.iter().any(|e| e.contains("shell_snapshot_head_start")),
+        "Bash 生成时不是 plan，续轮切到 plan 也照报"
+    );
+
+    let (bash, decision, live, dd) = run("claude-cli/2.1.326 (external, cli)");
+    assert!(bash.iter().any(|b| b.get("tail_input_candidate").is_some()), "{bash:?}");
+    assert!(decision.iter().any(|d| d.get("toolsHashKept").is_some()), "{decision:?}");
+    assert!(live.iter().all(|l| l.get("routingHint").is_none()), "{live:?}");
+    assert!(!dd.iter().any(|e| e.to_string().contains("shell_snapshot_head_start")));
+}
+
 /// 2.1.303 的遥测（`cap/auto-2.1.303-20261019-full`）：`tengu_init` 在 `mcpClientCount` 之后多
 /// `repoMcpAllowList` / `repoMcpDenyList` / `mcpConfigBlockedCount`，`tengu_tool_use_success` 在
 /// `messageID` 之后多 `toolUseID`；`-p` 模板多一条 `tengu_fork_subagent_enabled`。2.1.301 都没有。
@@ -15656,6 +15859,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.327 摘要、行列、块名都换了，不再带构造名（`cap/auto-max-2.1.327-20261118-bashfail/2.1.327`）。
+        ("claude-cli/2.1.327 (external, cli)", "054b6e774401", "chunk-m14bt1pz.js:3730:9300"),
         // 2.1.326 摘要、行列、块名都换了（`cap/auto-{max,team}-2.1.326-20261117-bashfail/2.1.326`）。
         ("claude-cli/2.1.326 (external, cli)", "96e266587f52", "chunk-4h798pp0.js:3710:10163"),
         // 2.1.325 摘要、行列、块名都换了（`cap/auto-2.1.325-20261114-bashfail/2.1.325`）。
@@ -15721,7 +15926,7 @@ fn version_2_1_303_telemetry_shape() {
             assert!(err.get("error_constructor").is_none(), "{ua}");
         }
         // 2.1.326 末尾多命令词与位置类别（`cap/auto-team-2.1.326-20261117-bashfail/2.1.326` 那条 `ls`：`ls` / `none`）。
-        if ua.contains("2.1.326") {
+        if ua.contains("2.1.326") || ua.contains("2.1.327") {
             assert_eq!(keys[keys.len() - 2..], ["bash_argv0", "bash_places"], "{ua}");
             assert_eq!(
                 (&err["bash_argv0"], &err["bash_places"]),
@@ -15908,6 +16113,7 @@ fn agent_summary_stopped_2_1_316_writer_and_mode() {
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         };
         let mut main = call(body_for(session_model, Some("high"), true), "req_m", "tool_use");
         at(&mut main, 0);
@@ -16076,6 +16282,7 @@ fn agent_summary_writer_follows_the_config_and_failures() {
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         };
         let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_m", "tool_use");
         at(&mut main, 0);
@@ -16224,6 +16431,7 @@ fn short_agent_summaries_are_reported_and_counted() {
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut s1 = call(body_for(agent_model, Some("high"), true), "req_s1", "tool_use");
@@ -16235,6 +16443,7 @@ fn short_agent_summaries_are_reported_and_counted() {
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(s1);
         for (i, short) in summaries.iter().enumerate() {
@@ -16407,6 +16616,7 @@ fn summary_stopped_for(ua: &str) -> Value {
                 input: json!({}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
         } else {
             c.stop_reason = Some("end_turn".into());
@@ -16452,6 +16662,7 @@ fn agent_summary_stopped_keeps_the_model_from_spawn_time() {
                 input: json!({}),
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }];
         } else {
             c.stop_reason = Some("end_turn".into());
@@ -16630,6 +16841,7 @@ fn an_empty_result_in_a_thread_delta_follows_the_corrected_name() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     })
     .collect();
     c1.tool_use_lens = vec![("Bash".into(), 90), ("Read".into(), 30)];
@@ -16823,6 +17035,7 @@ fn sdk_turn_with(
             input: json!({}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         })
         .collect();
     let c1 = start(t, c1);
@@ -18072,24 +18285,62 @@ fn client_data_wait_is_reported_before_the_query() {
     let query =
         |ev: &[(String, Value)]| ev.iter().position(|(n, _)| n == "tengu_api_query").unwrap();
 
-    let ev = run(ua, ClientDataWait { waited_ms: 1500, timed_out: true, ready: false });
+    let ev =
+        run(ua, ClientDataWait { waited_ms: 1500, timed_out: true, ready: false, is_first: true });
     let (at, sad) = hit(&ev, "tengu_feature_sad").expect("超时报 sad");
     assert!(at < query(&ev));
     assert_eq!(
         serde_json::to_string(&sad).unwrap(),
         r#"{"waited_ms":1500,"feature_name":"model_client_data_wait","error_code":"timeout","tengu_quizzical_giraffe":"unset"}"#
     );
-    let ev = run(ua, ClientDataWait { waited_ms: 377, timed_out: false, ready: true });
+    let ev =
+        run(ua, ClientDataWait { waited_ms: 377, timed_out: false, ready: true, is_first: true });
     let (_, ok) = hit(&ev, "tengu_feature_ok").expect("等到报 ok");
     assert_eq!(
         serde_json::to_string(&ok).unwrap(),
         r#"{"waited_ms":377,"feature_name":"model_client_data_wait"}"#
     );
-    let ev = run(ua, ClientDataWait { waited_ms: 50, timed_out: false, ready: false });
+    let ev =
+        run(ua, ClientDataWait { waited_ms: 50, timed_out: false, ready: false, is_first: true });
     assert!(hit(&ev, "tengu_feature_ok").is_none() && hit(&ev, "tengu_feature_sad").is_none());
+
+    // 2.1.327：多 `is_first`（等之前锁存，随结果带来）与 `model`；拉取回来槽位仍是空的另报 `no_slot_after_fetch`。
+    let ua327 = "claude-cli/2.1.327 (external, cli)";
+    let ev = run(
+        ua327,
+        ClientDataWait { waited_ms: 887, timed_out: false, ready: true, is_first: true },
+    );
+    let (_, ok) = hit(&ev, "tengu_feature_ok").expect("等到报 ok");
+    assert_eq!(
+        serde_json::to_string(&ok).unwrap(),
+        format!(
+            r#"{{"waited_ms":887,"is_first":true,"model":{},"feature_name":"model_client_data_wait"}}"#,
+            ok["model"]
+        )
+    );
+    let ev = run(
+        ua327,
+        ClientDataWait { waited_ms: 50, timed_out: false, ready: false, is_first: false },
+    );
+    let (at, sad) = hit(&ev, "tengu_feature_sad").expect("327 拉取后仍无槽位报 sad");
+    assert!(at < query(&ev));
+    let keys: Vec<&str> = sad.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        ["waited_ms", "is_first", "model", "feature_name", "error_code", "tengu_quizzical_giraffe"]
+    );
+    assert_eq!(
+        (&sad["error_code"], &sad["is_first"]),
+        (&json!("no_slot_after_fetch"), &json!(false))
+    );
+    let ev = run(
+        ua327,
+        ClientDataWait { waited_ms: 1500, timed_out: true, ready: false, is_first: true },
+    );
+    assert_eq!(hit(&ev, "tengu_feature_sad").unwrap().1["error_code"], "timeout");
     let ev = run(
         "claude-cli/2.1.317 (external, cli)",
-        ClientDataWait { waited_ms: 1500, timed_out: true, ready: false },
+        ClientDataWait { waited_ms: 1500, timed_out: true, ready: false, is_first: true },
     );
     assert!(hit(&ev, "tengu_feature_sad").is_none(), "2.1.317 没有这一项");
 }
@@ -18435,6 +18686,7 @@ fn foreground_subagent_progress_matches_the_captures() {
             input: json!({"subagent_type": "web-fetch", "prompt": prompt, "description": "fetch"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         for (i, f) in [req, next].into_iter().enumerate() {
@@ -18472,6 +18724,7 @@ fn foreground_subagent_progress_matches_the_captures() {
                     input: json!({"url": "https://example.com", "prompt": "summarize"}),
                     verdict: None,
                     input_stream_ms: Some(168),
+                    permission_mode: None,
                 }];
                 c.tool_use_lens = vec![("WebFetch".into(), 87)];
             }
@@ -18482,6 +18735,7 @@ fn foreground_subagent_progress_matches_the_captures() {
                     input: json!({"message": "done"}),
                     verdict: None,
                     input_stream_ms: Some(352),
+                    permission_mode: None,
                 }];
             }
             t.ingest(c);
@@ -18584,6 +18838,7 @@ fn same_prompt_delegations_are_told_apart_by_model() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |model: &str| {
         let mut v: Value = serde_json::from_slice(&body_for(model, Some("high"), true)).unwrap();
@@ -18644,6 +18899,7 @@ fn foreground_subagent_progress_counts_each_tool_call() {
         input,
         verdict: None,
         input_stream_ms: Some(100),
+        permission_mode: None,
     };
     let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
     main.ua_out = ua.into();
@@ -18706,6 +18962,7 @@ fn nested_agents_report_their_depth() {
         input: json!({"subagent_type": "general-purpose", "prompt": prompt}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |text: &str| {
         let mut v: Value =
@@ -18761,6 +19018,7 @@ fn explicit_model_outranks_the_custom_name_preference() {
         input,
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     };
     let body_with = |model: &str| {
         let mut v: Value = serde_json::from_slice(&body_for(model, Some("high"), true)).unwrap();
@@ -18827,6 +19085,7 @@ fn foreground_subagent_progress_only_counts_finished_client_tool_calls() {
             input: json!({"subagent_type": "web-fetch", "prompt": "fetch"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut v: Value =
@@ -18858,6 +19117,7 @@ fn foreground_subagent_progress_only_counts_finished_client_tool_calls() {
         input: json!({"url": "https://a.example"}),
         verdict: None,
         input_stream_ms: stream_ms,
+        permission_mode: None,
     };
     assert_eq!(run(vec![fetch(None)], vec![("WebFetch".into(), 10)]), 1, "入参没收完");
     assert_eq!(run(vec![fetch(Some(120))], vec![("WebFetch".into(), 30)]), 2, "收完了");
@@ -18882,6 +19142,7 @@ fn fork_subagents_report_is_fork_and_no_prompt_chars() {
             input: json!({"subagent_type": ty, "prompt": "do it"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut sub = call(body_for("claude-opus-5-5", Some("high"), true), "req_sub", "end_turn");
@@ -18943,6 +19204,7 @@ fn forks_spawned_by_sdk_subagents_run_in_the_foreground() {
                 input,
                 verdict: None,
                 input_stream_ms: None,
+                permission_mode: None,
             }
         };
         let headers = |id: &str, ty: &str| AgentHeaders {
@@ -19030,6 +19292,7 @@ fn parallel_forks_are_claimed_by_their_tool_use_id() {
             input,
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }
     };
     let mut main = call(body_for("claude-opus-5-5", Some("high"), true), "req_main", "tool_use");
@@ -19163,6 +19426,7 @@ fn fork_subagent_lifecycle_matches_the_captures() {
             input,
             verdict: None,
             input_stream_ms: Some(120),
+            permission_mode: None,
         };
         let fork_first = body_of(fork_reqs[0]);
         let (spawn_id, spawn_input) = last_tool_use(&fork_first);
@@ -19375,6 +19639,7 @@ fn fork_prompt_chars_keep_surrounding_whitespace() {
             input: json!({"subagent_type": "fork", "prompt": raw, "name": "worker"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let mut v: Value =
@@ -19436,6 +19701,7 @@ fn cross_level_forks_with_the_same_directive_are_claimed_by_id() {
             input,
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }
     };
     let headers = |id: &str, ty: &str, parent: Option<&str>| AgentHeaders {
@@ -19520,6 +19786,7 @@ fn foreground_progress_survives_a_late_stream_error() {
         input: json!({"subagent_type": "web-fetch", "prompt": "fetch"}),
         verdict: None,
         input_stream_ms: None,
+        permission_mode: None,
     }];
     t.ingest(main);
     let mut v: Value =
@@ -19541,6 +19808,7 @@ fn foreground_progress_survives_a_late_stream_error() {
         input: json!({"url": "https://a.example"}),
         verdict: None,
         input_stream_ms: Some(140),
+        permission_mode: None,
     }];
     c.failure = Some(CallFailure {
         status: None,
@@ -19592,6 +19860,7 @@ fn a_late_fork_from_the_previous_turn_does_not_take_the_new_delegation() {
             input,
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }
     };
     let turn = |text: &str| {
@@ -19662,6 +19931,7 @@ fn a_fork_retried_before_any_output_counts_one_step() {
             input: json!({"subagent_type": "fork", "prompt": "do it"}),
             verdict: None,
             input_stream_ms: None,
+            permission_mode: None,
         }];
         t.ingest(main);
         let fork = |id: &str, at: u64, failed: bool, message_start: bool| {
@@ -19705,4 +19975,58 @@ fn a_fork_retried_before_any_output_counts_one_step() {
             events.iter().filter(|(_, e)| ev_name(e) == "tengu_agent_tool_selected").count();
         assert_eq!(launches, 1, "{message_start}");
     }
+}
+
+/// 2.1.327 的模型目录那条（`cap/auto-max-2.1.327-20261118-full`）：交互式在 `compare_failed` 后多 `skipped: false`、比对照旧；
+/// `-p` 且目录取自新鲜缓存时 `skipped: true`，后面那串比对项一项不带。
+#[test]
+fn catalog_compare_skipped_from_2_1_327() {
+    let meta = || {
+        json!({"fetch_status": "cache_fresh", "selection_source": "user_setting", "compare_failed": false,
+            "main_loop_model": "claude-opus-5-5", "picker_match": true})
+    };
+    let mut m = meta();
+    super::template::catalog_skipped_v327(&mut m, false);
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "fetch_status",
+            "selection_source",
+            "compare_failed",
+            "skipped",
+            "main_loop_model",
+            "picker_match"
+        ]
+    );
+    assert_eq!(m["skipped"], false);
+    let mut m = meta();
+    super::template::catalog_skipped_v327(&mut m, true);
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["fetch_status", "selection_source", "compare_failed", "skipped"]);
+    assert_eq!(m["skipped"], true);
+    // 现拉的目录（`-p` 模板里是 `ok`）照旧比对。
+    let mut m = meta();
+    m["fetch_status"] = json!("ok");
+    super::template::catalog_skipped_v327(&mut m, true);
+    assert_eq!((m["skipped"].clone(), m.get("picker_match").is_some()), (json!(false), true));
+}
+
+/// 2.1.327 的 `tengu_auto_mode_decision`（`cap/auto-max-2.1.327-20261118-full` 34 条）：`mcpWorkspaceShellHeld` 后多
+/// `mcpDocsWriteHeld: false`。
+#[test]
+fn auto_mode_decision_v327_adds_docs_write_held() {
+    let mut v = json!({"mcpRemoteSessionAllowOverride": false, "coworkWebAllowOverride": false});
+    crate::telemetry::tools::auto_mode_decision_v319(&mut v);
+    crate::telemetry::tools::auto_mode_decision_v327(&mut v);
+    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "mcpRemoteSessionAllowOverride",
+            "mcpWorkspaceShellHeld",
+            "mcpDocsWriteHeld",
+            "coworkWebAllowOverride"
+        ]
+    );
 }

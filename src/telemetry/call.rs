@@ -245,6 +245,9 @@ pub struct ToolCall {
     /// 流式回复里这一块从 `content_block_start` 到 `content_block_stop` 的毫秒数（至少 1），2.1.319 起
     /// `tengu_tool_use_success` 的 `tool_input_stream_ms`；非流式或没收完为 `None`。
     pub input_stream_ms: Option<u64>,
+    /// 发出这条回复的那条请求的权限模式（遥测记回复时填，代理侧建的时候为 `None`）：续轮报这次调用的事件时，按它生成时的
+    /// 模式判，不按带回结果的那条续轮的（同一回复里先调 Bash、再调 EnterPlanMode，续轮已是 plan）。
+    pub permission_mode: Option<&'static str>,
 }
 
 /// 一条失败请求客户端那头看到的东西。

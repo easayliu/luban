@@ -750,6 +750,8 @@ pub(super) struct BeginArgs<'a> {
     pub(super) v317: bool,
     /// 这个会话抽中了（[`metered`]），只在 `v317` 时看。
     pub(super) metered: bool,
+    /// 会话版本 ≥2.1.327：重复那组不再报 `earlier_tail_input_*`（官方删了「输出交给 tail」整套）。
+    pub(super) v327: bool,
     /// 调用方子代理跑在自己的 worktree 里（Agent 的 `isolation: "worktree"`）；主线程不报。
     pub(super) in_agent_worktree: bool,
 }
@@ -1005,8 +1007,8 @@ impl BashMeter {
             f.insert("earlier_call_outcome".into(), json!(e.outcome));
             f.insert("earlier_result_in_context".into(), json!(in_context));
             // 2.1.317：那次的输出另存与「交给 tail」状态（落盘的 `earlier_output_*` 代理看不到，不报；
-            // `earlier_tail_input_flag_on` 只在 Linux 上有，模拟的是 macOS）。
-            if a.v317 {
+            // `earlier_tail_input_flag_on` 只在 Linux 上有，模拟的是 macOS）。2.1.327 删了这一组。
+            if a.v317 && !a.v327 {
                 f.insert(
                     "earlier_tail_input_candidate".into(),
                     json!(e.tail.line == Some("check")),
@@ -1282,6 +1284,7 @@ mod tests {
                     prompt_seq: 1,
                     v317: false,
                     metered: false,
+                    v327: false,
                     in_agent_worktree: false,
                 },
                 |_| false,
@@ -1311,6 +1314,7 @@ mod tests {
             prompt_seq: seq,
             v317: false,
             metered: false,
+            v327: false,
             in_agent_worktree: false,
         };
         let b = m.begin(args("t1", t0, 1), ro);
@@ -1459,6 +1463,7 @@ mod tests {
             prompt_seq: 1,
             v317: true,
             metered,
+            v327: false,
             in_agent_worktree: false,
         }
     }

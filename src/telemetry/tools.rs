@@ -1292,6 +1292,12 @@ pub(super) fn auto_mode_decision_v319(v: &mut Value) {
     }
 }
 
+/// 2.1.327 的 `tengu_auto_mode_decision`（`cap/auto-max-2.1.327-20261118-full` 34 条）：每条在 `mcpWorkspaceShellHeld` 后多
+/// `mcpDocsWriteHeld: false`（MCP 文档写入判定扣住，luban 模拟的会话没有）。在 [`auto_mode_decision_v319`] 之后调。
+pub(super) fn auto_mode_decision_v327(v: &mut Value) {
+    insert_after(v, "mcpWorkspaceShellHeld", vec![("mcpDocsWriteHeld", json!(false))]);
+}
+
 /// 2.1.312 的权限两条（`tengu_tool_use_can_use_tool_allowed` / `rejected`）在 `messageID` 后多 `toolUseID`，
 /// 即这次调用的 tool_use id（`cap/auto-2.1.312-20261028-full` 的 60 条 allowed 与 B1 那条 rejected）。
 pub(super) fn can_use_tool_v312(v: &mut Value, tool_use_id: &str) {

@@ -417,6 +417,15 @@ impl<'a> EventEnv<'a> {
                 );
             }
         }
+        // 2.1.327：队尾多 `routingHint`，线程路由提示头的结果（官方 `REt.onLatestContinue`）。头名要服务端
+        // `tengu_tingly_flute` 下发，没下发时续用线程那条报 `off`、其余保持初值 `no_continue`
+        // （`cap/auto-max-2.1.327-20261118-full`：`continue` 73 条全是 `off`，`create` 34 条全是 `no_continue`）。
+        if self.f.v327
+            && let Some(o) = live.as_object_mut()
+        {
+            let hint = if sent == "continue" { "off" } else { "no_continue" };
+            o.insert("routingHint".into(), json!(hint));
+        }
         Some(live)
     }
 

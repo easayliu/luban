@@ -14,6 +14,8 @@ pub(super) struct ToolUse {
     pub(super) verdict: Option<String>,
     /// 回复流里这次调用的入参流了多久，见 [`ToolCall::input_stream_ms`]。
     pub(super) input_stream_ms: Option<u64>,
+    /// 生成这次调用的那条请求的权限模式（[`ToolCall::permission_mode`]），配不上回复里记下的调用时为 `None`。
+    pub(super) origin_mode: Option<&'static str>,
     /// `tool_result.is_error`：工具执行失败（Bash 非零退出、被用户拒绝……）。
     pub(super) is_error: bool,
     /// `tool_result` 正文的开头（至多 400 字符），认「被用户拒绝」「命令失败」用。
@@ -808,6 +810,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         media_blocks: hit.map_or(0, |r| r.media_blocks),
                         verdict: None,
                         input_stream_ms: None,
+                        origin_mode: None,
                         input,
                     })
                 })
@@ -1193,6 +1196,11 @@ pub(super) fn error_trace(
         // `tengu_api_error`，两号同值）。
         ("2.1.326", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-6ybqvknv.js:5:1510"))
+        }
+        // 2.1.327 摘要与行列照旧、顶帧换了块；5xx 类压缩后是 `MHn`，过得了构造名校验，**又带上了 `error_constructor`**
+        // （`cap/auto-max-2.1.327-20261118-retry`：R2 那次的 Datadog 批次）。
+        ("2.1.327", Some(s)) if s >= 500 => {
+            Some((Some("MHn"), "5b32b751db51", "chunk-z9xgg67q.js:5:1510"))
         }
         _ => None,
     }

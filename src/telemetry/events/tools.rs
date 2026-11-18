@@ -531,6 +531,9 @@ impl EventBuilder<'_> {
             if env.f.v319 {
                 auto_mode_decision_v319(&mut decision);
             }
+            if env.f.v327 {
+                auto_mode_decision_v327(&mut decision);
+            }
             self.push_dd_snake(td, "tengu_auto_mode_decision", decision);
         }
         // default 模式下要用户点头的：Edit / Write / NotebookEdit、非只读的 Bash（`cap/auto-2.1.285-20260930`
@@ -708,6 +711,7 @@ impl EventBuilder<'_> {
             v323,
             v325,
             v326,
+            v327,
             bash_metered,
             prompt_seq,
             ..
@@ -784,6 +788,22 @@ impl EventBuilder<'_> {
                 if let Some(snap_ms) = bash_timing.and_then(|t| t.snapshot) {
                     props["duration_ms"] = json!(snap_ms);
                 }
+                // 2.1.327：模型开始写 Bash 调用时就先拍快照（官方 `xjs` 设 `snapshotStartedAheadAt`），首次 Bash 等它落定时先报一条
+                // `shell_snapshot_head_start`，在 `shell_snapshot_create` 之前（`cap/auto-max-2.1.327-20261118-full` 九个交互式会话各一条，
+                // 八条 `wait_ms: 0`、一条 1，`too_old` 恒 false、`no_snapshot` 恒 true；`-bashfail` 那次 `-p` 没有）。提前拍的入口只有一处，
+                // 排除了子代理（`first_bash` 已只认主线程）、`-p` 与 plan 模式；它另要求没有 PreToolUse 钩子、没有命中的权限规则等，
+                // 模拟的会话都满足。
+                // 模式按生成这条 Bash 的那条请求的（[`ToolUse::origin_mode`]）：同一回复里 Bash 之后又调了 EnterPlanMode，
+                // 带回结果的续轮已是 plan，那时快照早已提前拍了。
+                let mode = tu.origin_mode.unwrap_or(shape.permission_mode);
+                if v327 && !shape.sdk && mode != "plan" {
+                    let head = feature_with(
+                        "shell_snapshot_head_start",
+                        json!({ "wait_ms": 0, "too_old": false, "no_snapshot": true }),
+                        v293,
+                    );
+                    self.push_dd(ms(t_done, -41), "tengu_feature_ok", head);
+                }
                 let snap = feature_with("shell_snapshot_create", props, v293);
                 self.push_dd(ms(t_done, -40), "tengu_feature_ok", snap);
             }
@@ -819,6 +839,7 @@ impl EventBuilder<'_> {
                         prompt_seq,
                         v317,
                         metered: bash_metered,
+                        v327,
                         // 子代理跑不跑在自己的 worktree 里代理分不清（Agent 的 `isolation` 在父线程那条调用上），按否。
                         in_agent_worktree: false,
                     },
@@ -826,8 +847,10 @@ impl EventBuilder<'_> {
                 )
             });
             // 2.1.317：这条命令算不算「输出交给 tail」的候选（模型发起的调用都看；用户 `!` 跑的在别处，恒不算）。
-            let tail_line =
-                v317.then(|| super::super::bash_kinds::tail_input_line(command)).flatten();
+            // 2.1.327 删了这一套（`tail_input_*` 与 `earlier_tail_input_*` 都不报）。
+            let tail_line = (v317 && !v327)
+                .then(|| super::super::bash_kinds::tail_input_line(command))
+                .flatten();
             // 输出落没落盘按这次结果判（客户端第一次把它发上来时就是落盘预览），记进计量器、之后判上下文时用。
             let tail = super::super::bash_repeat::Ended {
                 line: tail_line,
@@ -891,7 +914,7 @@ impl EventBuilder<'_> {
                             b.fields.clone(),
                             head,
                         );
-                        if v317 {
+                        if v317 && !v327 {
                             bash_meta_v317(&mut bash, tail_line);
                         }
                         bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
@@ -923,7 +946,7 @@ impl EventBuilder<'_> {
                             b.fields.clone(),
                             head,
                         );
-                        if v317 {
+                        if v317 && !v327 {
                             bash_meta_v317(&mut bash, tail_line);
                         }
                         bash_meta_v316_reads(&mut bash, command, &env.f.session_id);
@@ -1135,7 +1158,12 @@ impl EventBuilder<'_> {
             // 摘要、行列、块名都换了，类名压缩后是 `Sx`。2.1.324 没有发布。
             // 2.1.326（`cap/auto-max-2.1.326-20261117-bashfail` 与团队号同名目录，两号同值；同一次跑的 2.1.325 对照仍是
             // 5ae540068e38）摘要、行列、块名都换了，类名压缩后是 `UT`。
-            if v326 {
+            // 2.1.327（`cap/auto-max-2.1.327-20261118-bashfail`；同一次跑的 2.1.326 对照仍是 96e266587f52）摘要、行列、块名都换了，
+            // 类名压缩后过不了构造名校验，**又不带 `error_constructor`**。
+            if v327 {
+                err["error_stack_hash"] = json!("054b6e774401");
+                err["error_top_frame"] = json!("chunk-m14bt1pz.js:3730:9300");
+            } else if v326 {
                 err["error_constructor"] = json!("UT");
                 err["error_stack_hash"] = json!("96e266587f52");
                 err["error_top_frame"] = json!("chunk-4h798pp0.js:3710:10163");

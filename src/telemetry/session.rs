@@ -626,6 +626,7 @@ impl ThreadBase {
                         input: Value::Null,
                         verdict: None,
                         input_stream_ms: None,
+                        origin_mode: None,
                         // 线程续轮的增量体里没有那条助手消息，工具名取自回复流；Read 的原文照样从结果还原。
                         read_content: (name == "Read"
                             && !r.is_error
@@ -1234,6 +1235,11 @@ pub(super) struct TurnFacts {
     /// `deniedBy` ~ `permissionDurationMs` 挪到 `messageID` 之前；`tengu_agent_tool_selected` 在 `is_fork` 后多
     /// `is_name_given`（`cap/auto-{max,team}-2.1.326-20261117-*`）。
     pub(super) v326: bool,
+    /// 2.1.327：失败 Bash 的栈摘要、行列、块名都换了，**不再带** `error_constructor`；5xx 摘要与行列照旧、换块名，**又带上**
+    /// `error_constructor: "MHn"`。Bash 的 `tengu_bash_tool_command_executed` / `_failed` 删 `tail_input_*` 四键，
+    /// `tengu_tether_decision` 删 `toolsHashKept`，`tengu_tether_live_outcome` 末尾多 `routingHint`，`tengu_tether_echo_audit`
+    /// 改按 10% 抽样、带 `sample_rate`（`cap/auto-max-2.1.327-20261118-*`）。
+    pub(super) v327: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见

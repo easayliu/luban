@@ -1381,3 +1381,136 @@ fn suggestion_fork_keeps_its_own_chain() {
     let (_, again) = link_of(&body(&format!("{fork}]")));
     assert_eq!(again.prev_req.as_deref(), Some("req_main"));
 }
+
+/// 头一回等 `client_data` 的标记挂在模拟会话条目上（[`super::first_client_data_wait`]）：同一会话只有第一次是 `true`；
+/// 会话空闲过期、条目重建（重新握手）后重新从头算；没有条目按头一回。
+#[test]
+fn first_client_data_wait_follows_the_session_lifecycle() {
+    use super::{
+        CC_SESSION_IDLE, CC_SESSIONS, CC_SESSIONS_SWEPT, CcSessionLink, first_client_data_wait,
+    };
+    let sid = "client-data-first-wait";
+    assert!(first_client_data_wait(1, sid), "还没有会话条目");
+    assert!(CcSessionLink::load(key(sid), true, true).first_seen);
+    assert!(first_client_data_wait(1, sid));
+    assert!(!first_client_data_wait(1, sid), "同一会话第二次");
+    assert!(first_client_data_wait(2, sid), "另一张凭证是另一个进程");
+    let Some(old) =
+        std::time::Instant::now().checked_sub(CC_SESSION_IDLE + std::time::Duration::from_secs(1))
+    else {
+        return;
+    };
+    CC_SESSIONS.lock().get_mut(&(1, sid.to_string())).unwrap().last_seen = old;
+    assert!(first_client_data_wait(1, sid), "过期的会话不算等过");
+    *CC_SESSIONS_SWEPT.lock() = Some(std::time::Instant::now());
+    assert!(CcSessionLink::load(key(sid), true, true).first_seen, "重建、重新握手");
+    assert!(first_client_data_wait(1, sid), "重建后从头算");
+    assert!(!first_client_data_wait(1, sid));
+}
+
+/// `/compact` 的提示是末条用户消息的**最后**一块，前面可能并着用户排着队的话、后面还可能跟一条 system 消息
+/// （`cap/auto-2.1.308-20261022-api/00061`）：照样认成分叉——出站不补 1h、不推进主线程链、记成压缩。只按末块认：正文中间引用
+/// 了这句、最后一块才提问的普通输入仍是主线程。
+#[test]
+fn compaction_prompt_after_a_queued_message_is_a_fork() {
+    use super::CcRequestKind;
+    let body = |user: serde_json::Value| {
+        serde_json::json!({
+            "model": "claude-opus-5-5",
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.308.abc; cc_entrypoint=cli;"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": user},
+                {"role": "system", "content": [{"type": "text", "text": "<total_tokens>15000000 tokens left</total_tokens>"}]}
+            ]
+        })
+    };
+    let prompt = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
+    let text = |t: &str| serde_json::json!({"type": "text", "text": t});
+    let queued = body(serde_json::json!([
+        text("summarize the last command output in 5 words\n"),
+        text(prompt)
+    ]));
+    assert_eq!(CcRequestKind::of(&queued, &[]), CcRequestKind::Fork);
+    assert!(!CcRequestKind::Fork.wants_cache_ttl_1h());
+    let alone = body(serde_json::json!([text(prompt)]));
+    assert_eq!(CcRequestKind::of(&alone, &[]), CcRequestKind::Fork);
+    // 反例：中间那块引用了压缩提示，最后一块是正常提问——普通输入。
+    let quoted = body(serde_json::json!([
+        text("look at this log line:"),
+        text(prompt),
+        text("why did the tool print that?")
+    ]));
+    assert_eq!(CcRequestKind::of(&quoted, &[]), CcRequestKind::Main);
+    // 末条非 system 消息不是 user（助手回复收尾）的不算。
+    let mut tail_assistant = alone.clone();
+    tail_assistant["messages"][3] =
+        serde_json::json!({"role": "assistant", "content": [text("done")]});
+    assert_eq!(CcRequestKind::of(&tail_assistant, &[]), CcRequestKind::Main);
+
+    // 抓包原文：官方 API Key 模式那条压缩请求，按真实 CC 来访整条走一遍。
+    let path =
+        std::fs::read_dir(format!("{}/cap/auto-2.1.308-20261022-api", env!("CARGO_MANIFEST_DIR")))
+            .ok()
+            .and_then(|d| {
+                d.filter_map(|e| e.ok().map(|e| e.path())).find(|p| {
+                    p.file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| f.starts_with("00061_") && f.ends_with(".req.raw"))
+                })
+            });
+    let Some(path) = path else {
+        eprintln!("skipped: cap/auto-2.1.308-20261022-api not present");
+        return;
+    };
+    let raw = std::fs::read(path).unwrap();
+    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = std::str::from_utf8(&raw[..sep]).unwrap();
+    let mut headers = crate::proxy::HeaderMap::new();
+    for l in head.lines().skip(1) {
+        let Some((k, val)) = l.split_once(": ") else { continue };
+        if let (Ok(k), Ok(val)) = (
+            crate::proxy::HeaderName::from_bytes(k.to_ascii_lowercase().as_bytes()),
+            HeaderValue::from_str(val),
+        ) {
+            headers.insert(k, val);
+        }
+    }
+    let body_bytes = Bytes::copy_from_slice(&raw[sep + 4..]);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let beta = crate::proxy::inbound_beta_list(&headers);
+    let kind = CcRequestKind::of(&v, &beta);
+    assert_eq!(kind, CcRequestKind::Fork);
+    // 会话链：不推进主线程那条，记成压缩。
+    let (_, link) =
+        crate::proxy::client_session_link(Some(&v), &headers, None, all_on(), true, &test_cred())
+            .expect("压缩那条同样接会话链");
+    assert!(link.lane.is_none(), "分叉不推进主线程链");
+    assert!(link.compaction, "记成压缩");
+    // 出站：三个断点都保持客户端原样（默认 5m），一个 1h 都不补。
+    let ttl_1h = |b: &[u8]| String::from_utf8_lossy(b).matches("\"ttl\":\"1h\"").count();
+    assert_eq!(ttl_1h(&body_bytes), 0);
+    let out = crate::proxy::rewrite_body_out(
+        &body_bytes,
+        &test_cred(),
+        "fp",
+        all_on(),
+        None,
+        None,
+        None,
+        false,
+        None,
+        true,
+        true,
+        true,
+        Some(crate::proxy::body::CcClient { version: "2.1.308", entrypoint: "cli" }),
+        Some(&link),
+        kind,
+        None,
+    )
+    .0;
+    assert_eq!(ttl_1h(&out), 0, "压缩不补 1h");
+    assert!(String::from_utf8_lossy(&out).contains("\"cache_control\""), "断点还在");
+}

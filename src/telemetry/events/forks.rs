@@ -509,6 +509,9 @@ impl EventBuilder<'_> {
                 if env.f.v319 {
                     auto_mode_decision_v319(&mut decision);
                 }
+                if env.f.v327 {
+                    auto_mode_decision_v327(&mut decision);
+                }
                 self.push_dd_snake(th, "tengu_auto_mode_decision", decision);
             }
             let tg = ms(t_end, -3);

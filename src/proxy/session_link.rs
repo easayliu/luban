@@ -8,7 +8,8 @@ use crate::store;
 
 use super::{
     Simulation, has_beta, incoming_session_id, is_cc_shaped, is_quota_probe_shaped,
-    last_user_text_contains, last_user_text_starts_with, request_max_tokens, uuid_v4,
+    last_user_last_text_starts_with, last_user_text_contains, last_user_text_starts_with,
+    request_max_tokens, uuid_v4,
 };
 
 /// 一条模拟请求在会话链条上的位置：三个**指向别的请求**的字段。
@@ -345,7 +346,24 @@ pub(crate) struct CcSessionEntry {
     turn_input: TurnInput,
     /// 这一轮还没有一条主线程请求完整成功，最近那条就被客户端取消了。
     turn_aborted: bool,
+    /// 这个模拟进程已经等过一回 `client_data`（官方按进程记的 `waitedForClientData`）：会话隔了 [`CC_SESSION_IDLE`]
+    /// 再来时条目重建、重新握手，它跟着清零。见 [`first_client_data_wait`]。
+    client_data_waited: bool,
     last_seen: std::time::Instant,
+}
+
+/// 这个模拟会话（进程）这回等 `client_data` 是不是头一回，并记下已等过。**在开始等之前调**（官方在 `await` 之前锁存
+/// `waitedForClientData`）：同一会话并发的几次等，先开始的那次是 `true`，与谁先报完无关。标记挂在会话条目上，与启动握手
+/// 同一个生命周期——空闲过期后条目重建，重新从头算。没有条目（会话链没建起来）按头一回。
+pub(crate) fn first_client_data_wait(cred_id: i64, session_id: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut map = CC_SESSIONS.lock();
+    match map.get_mut(&(cred_id, session_id.to_string())) {
+        Some(e) if !expired(e.last_seen, now) => {
+            !std::mem::replace(&mut e.client_data_waited, true)
+        }
+        _ => true,
+    }
 }
 
 /// 主线程一条拒答（`stop_reason: refusal`）的回程，先挂着：官方 2.1.314 拒答时客户端若有备用模型就转过去重发
@@ -1398,6 +1416,7 @@ impl CcSessionLink {
             turn_before: (0, 0),
             turn_input: TurnInput::default(),
             turn_aborted: false,
+            client_data_waited: false,
             last_seen: now,
         });
         // 新建的那份 id 就是这一轮的，别再换一次；客户端报的还是这一轮、或与刚失败那条指纹相同，
@@ -1736,6 +1755,10 @@ impl CcSessionLink {
     }
 }
 
+/// `/compact` 那条摘要请求的提示开头。官方追加在末条用户消息**最后**一块，前面可能并着用户排着队的话，按末块认
+/// （[`super::last_user_last_text_starts_with`]）。
+const COMPACT_PROMPT: &str = "CRITICAL: Respond with TEXT ONLY";
+
 /// **真实 CC（API-key 模式）来访**在会话链条上的位置：`(会话 id, 链)`；不该补时 `None`。
 ///
 /// API-key 端的 CC 发的 billing header 是光秃秃的
@@ -1781,7 +1804,7 @@ pub(crate) enum CcRequestKind {
     /// （`cap/auto-2.1.285-20260930/00056`、`00064`），三项会话链字段一项不写；当成主线程还会
     /// 按末条那句新的用户消息换一轮 `cc_prompt_id`，把后面整条主线程链接歪。
     Auxiliary,
-    /// 主线程分叉：`/compact`（末条用户消息以「CRITICAL: Respond with TEXT ONLY」开头）、`/btw`
+    /// 主线程分叉：`/compact`（末条用户消息的最后一块以「CRITICAL: Respond with TEXT ONLY」开头，见 [`COMPACT_PROMPT`]）、`/btw`
     /// 插问（用户消息里有「This is a side question from the user」那段提醒）与离开回来时的回顾
     /// （「The user stepped away and is coming back.」，`cap/2.1.285/00097`、`00158`）。带完整
     /// system 与工具，只写 `cc_prev_req` 与 `diagnostics`、不写 `cc_prompt_id`（`00175`、`00238`），
@@ -1857,7 +1880,7 @@ impl CcRequestKind {
         {
             return Self::Suggestion;
         }
-        if last_user_text_starts_with(v, "CRITICAL: Respond with TEXT ONLY")
+        if last_user_last_text_starts_with(v, COMPACT_PROMPT)
             || last_user_text_starts_with(v, "The user stepped away and is coming back.")
             || last_user_text_contains(v, "This is a side question from the user")
         {
@@ -2124,8 +2147,8 @@ pub(crate) fn client_session_link(
         link.before_compaction = None;
         CcSessionLink::disarm_compaction(key);
     }
-    link.compaction = kind == CcRequestKind::Fork
-        && last_user_text_starts_with(v, "CRITICAL: Respond with TEXT ONLY");
+    link.compaction =
+        kind == CcRequestKind::Fork && last_user_last_text_starts_with(v, COMPACT_PROMPT);
     if !kind.wants_prev_req() {
         link.prev_req = None;
     }

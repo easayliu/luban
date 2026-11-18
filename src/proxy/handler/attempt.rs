@@ -462,7 +462,10 @@ pub(super) async fn prepare<'a>(
         };
         // `tengu_deep_shore` 关了只是不等，上面该发起的拉取照样发起（官方 `SIi` 不看它，`UWt` 才看）。
         if let Some(rx) = rx.filter(|_| waits(cred.id)) {
-            upstream.client_data_wait = Some(wait(cred.id, &model, rx).await);
+            // 头一回等的标记在开始等之前锁存（官方 `waitedForClientData`）：同一会话并发的几次等，按谁先开始定。
+            let session = upstream.sim.as_ref().map(|s| s.session_id.clone()).unwrap_or_default();
+            let first = crate::proxy::session_link::first_client_data_wait(cred.id, &session);
+            upstream.client_data_wait = Some(wait(cred.id, &model, rx, first).await);
         }
     }
     // 组装时读的是现在的下发：等过的、或 `detect` 之后下发变过的（bootstrap 赶在等之前回来那种），按新下发重拼第四块

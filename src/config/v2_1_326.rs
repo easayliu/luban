@@ -1,9 +1,9 @@
-//! 2.1.326 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.326 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.326 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.326 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.326 的 profile 表：2.1.326 来访的 beta 参照（[`cc_profile_at`]）。2.1.327 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.325（[`CC_PROFILES_2_1_325`]）完全相同**：两版的 beta 名字清单与 `/v1` 端点逐个相同。
 /// `cap/auto-team-2.1.326-20261117-full`（团队号）按场景逐条对 `cap/auto-2.1.325-20261114-full`、
@@ -15,7 +15,7 @@ use super::*;
 /// 同一天 Max 号上多出来的 `Yield` 工具（与 Agent / Bash 描述里那句 "To wait on background work, call Yield."）
 /// 与 `anthropic-usage-limit: extended` **不是这一版的改动**：两者 2.1.325 的代码里就有，分别由服务端按号下发的
 /// `tengu_dazzling_acorn`、`tengu_lantern_spool` 管，团队号同版一样都没有。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_326: &[CcProfile] = &[
     at_326(CC_PROFILES_2_1_325[0]),
     at_326(CC_PROFILES_2_1_325[1]),
     at_326(CC_PROFILES_2_1_325[2]),

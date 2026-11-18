@@ -780,6 +780,8 @@ impl Telemetry {
         let v325 = version_at_least(&version, "2.1.325");
         // 2.1.326：错误栈换块、几个事件改键，见 [`TurnFacts::v326`]。
         let v326 = version_at_least(&version, "2.1.326");
+        // 2.1.327：错误栈换块、几个事件删键加键，见 [`TurnFacts::v327`]。
+        let v327 = version_at_least(&version, "2.1.327");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -1071,7 +1073,7 @@ impl Telemetry {
             } else {
                 message_tokens
             };
-            base.reply_calls = Arc::new(call.tool_calls.clone());
+            base.reply_calls = Arc::new(with_mode(&call.tool_calls, shape.permission_mode));
             base.model = display_model.clone();
             // 这条处理完的线程配置（半截的增量没写进去，它的底本只留身份，不记）。
             // 半截的增量记一份只知道一半的（[`TetherThread::partial`]），接着它的请求按它比。
@@ -1286,6 +1288,7 @@ impl Telemetry {
             v323,
             v325,
             v326,
+            v327,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,
@@ -1657,6 +1660,7 @@ impl Session {
                 if let Some(c) = calls.iter().find(|c| c.id == tu.id) {
                     tu.apply_call(&c.name, &c.input, c.verdict.as_ref());
                     tu.input_stream_ms = c.input_stream_ms;
+                    tu.origin_mode = c.permission_mode;
                 }
             }
         }
@@ -1668,7 +1672,10 @@ impl Session {
             if call.tool_calls.is_empty() && call.stop_reason.as_deref() == Some("tool_use") {
                 self.reply_calls.remove(thread_key);
             } else {
-                self.reply_calls.insert(thread_key.to_string(), call.tool_calls.clone());
+                self.reply_calls.insert(
+                    thread_key.to_string(),
+                    with_mode(&call.tool_calls, shape.permission_mode),
+                );
             }
         }
         if shape.cwd.is_some() {
@@ -2737,4 +2744,9 @@ fn startup_wait_ms(session_id: &str, sdk: bool) -> u32 {
         // 15–24 占多，偶有 11 / 33 / 40。
         [11, 15, 15, 16, 16, 17, 17, 18, 18, 20, 22, 24, 33, 40][(h % 14) as usize]
     }
+}
+
+/// 回复里的工具调用记下来时带上发出这条回复的请求的权限模式（[`ToolCall::permission_mode`]）。
+fn with_mode(calls: &[ToolCall], mode: &'static str) -> Vec<ToolCall> {
+    calls.iter().map(|c| ToolCall { permission_mode: Some(mode), ..c.clone() }).collect()
 }

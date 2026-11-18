@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.326."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.327."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.326."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.327."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1652,8 +1652,10 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-team-2.1.326-20261117-full` 逐项核**
-/// （下面列的是历次抓包用过的编号，2.1.326 用 `00714`、`00365`、`00456`、`00615`、`00949`（团队号，配置目录 `~/.claude2`，记忆路径
+/// **对着 `cap/auto-max-2.1.327-20261118-full` 逐项核**
+/// （下面列的是历次抓包用过的编号，2.1.327 用 `00486`、`00287`、`00344`、`00440`、`00635`（个人 Max 号：服务端开着
+/// `tengu_dazzling_acorn`，官方 Agent / Bash 描述多一句「To wait on background work, call Yield.」、工具表多 `Yield`——luban 不模拟，
+/// 比之前从官方原文里去掉；也开着 `tengu_review_bughunter_config`，第四块多 ultrareview 那条，测试号同样喂开）；2.1.326 用 `00714`、`00365`、`00456`、`00615`、`00949`（团队号，配置目录 `~/.claude2`，记忆路径
 /// 归一后比；测试项目 `cal15` 同一份 calc 项目；同样没补抓 Fable 5.2 交互式）；2.1.325 用 `00683`、`00359`、`00443`、`00589`、`00898`（测试项目 `cal15`，同一份 calc 项目从
 /// 323 抓包还原；同样没补抓 Fable 5.2 交互式）；2.1.323 用 `00667`、`00353`、`00436`、`00576`、`00873`——这一版没补抓 Fable 5.2 交互式，
 /// fable-5-2 那条不比；2.1.322 用 `00687`、`00366`、`00451`、`00598`、`00906` 与 `fable52/00074`；2.1.321 用
@@ -1679,8 +1681,8 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_326_captures() {
-    let sub = "auto-team-2.1.326-20261117-full";
+fn simulated_main_threads_match_the_2_1_327_captures() {
+    let sub = "auto-max-2.1.327-20261118-full";
     let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("skipped: cap/{sub} not present");
@@ -1703,7 +1705,8 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
                 "experimentResult": {"inExperiment": true, "variationId": 1}},
             "tengu_sequential_cloud": {"value": {"enabled": true, "touchIntervalSeconds": 30,
                 "activityWindowMinutes": 60, "resumeTouches": true}, "source": "force"},
-            "tengu_snug_mitten": {"value": true, "source": "force"}}});
+            "tengu_snug_mitten": {"value": true, "source": "force"},
+            "tengu_review_bughunter_config": {"value": {"enabled": true}, "source": "force"}}});
         crate::proxy::note_eval_features(cred.id, eval.to_string().as_bytes());
         // 抓包那天 bootstrap 的 `client_data`：opus / sonnet 下发 `tengu_lapis_anchor:"off"`，haiku 与 fable 没有这一项；
         // opus 另有 `original_games_guidance: false` 与 `tengu_heron_brook`（那段原创游戏的正文改由它下发）。
@@ -1720,11 +1723,11 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         cred
     };
     for (i, (sub, n, auto_mode)) in [
-        ("-full", "00714", false),
-        ("-full", "00365", false),
-        ("-full", "00456", false),
-        ("-full", "00615", false),
-        ("-full", "00949", true),
+        ("-full", "00486", false),
+        ("-full", "00287", false),
+        ("-full", "00344", false),
+        ("-full", "00440", false),
+        ("-full", "00635", true),
     ]
     .into_iter()
     .enumerate()
@@ -1746,7 +1749,19 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         // `~/.claude`，别的字节不动。
         let body_text =
             std::str::from_utf8(&raw[sep + 4..]).unwrap().replace("/.claude2/", "/.claude/");
-        let official: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        let mut official: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        // 个人 Max 号服务端下发的 `Yield`（[`crate::proxy::body`] 不模拟）：Agent / Bash 描述里那句去掉再比。
+        if let Some(tools) = official["tools"].as_array_mut() {
+            for t in tools {
+                if let Some(d) = t["description"].as_str() {
+                    let d = d
+                        .replace("\n  - To wait on background work, call Yield.", "")
+                        .replace(" To wait on background work, call Yield.", "");
+                    t["description"] = serde_json::json!(d);
+                }
+            }
+        }
+        let official = official;
         let model = official["model"].as_str().unwrap();
         let header = |name: &str| {
             head.lines().find_map(|l| l.strip_prefix(&format!("{name}: ")[..])).unwrap()
@@ -1836,7 +1851,7 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.326."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.327."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1845,7 +1860,7 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/59e1c116-4e7d-444f-84cf-dd523e7f31cb/scratchpad/cal15",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/06ed75ba-9c3e-4bbd-ad66-61cdf2c57ed3/scratchpad/cal15",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -1854,6 +1869,11 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
             let end_to = end + official_rest[end..].find("\n\n").unwrap() + 2;
             official_rest.replace_range(end..end_to, "");
         }
+        // 抓包机装着 easel 插件（`cc-plugin-easel`），它往第四块加了一行图表工具的提示，不是官方客户端的文字，去掉。
+        official_rest = official_rest.replace(
+            "\nIf a tool named mcp__easel__chart is available, call it when numbers over time or across categories would be clearer as a chart.",
+            "",
+        );
         let ws = official_rest.find("\n\nWebSearch takes a `mode`").unwrap();
         let ws_end =
             ws + 2 + official_rest[ws + 2..].find("\n\n").unwrap_or(official_rest.len() - ws - 2);
@@ -1875,7 +1895,10 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         assert_eq!(heron.is_some(), model == "claude-opus-5-5", "{model}");
         let rest = crate::proxy::lapis_anchor::fit_system_rest(
             crate::proxy::heron_brook::fit_system_rest(
-                crate::proxy::render_system_rest(template, &cap_env),
+                crate::proxy::bughunter::fit_system_rest(
+                    crate::proxy::render_system_rest(template, &cap_env),
+                    crate::proxy::bughunter::applies(cred.id, sim.profile.version),
+                ),
                 games.then(|| crate::proxy::original_games::text_for(sim.profile.version)),
                 heron.as_deref(),
                 sim.profile.version,
@@ -1905,6 +1928,10 @@ fn simulated_main_threads_match_the_2_1_326_captures() {
         for t in tools {
             let name = t["name"].as_str().unwrap();
             if auto_mode && name == "Bash" {
+                continue;
+            }
+            // 模拟的是团队号形态，个人 Max 号的官方请求里没有 `ShareOnboardingGuide`（Team 与 Max 两号同版抓包对比，`cap/auto-max-2.1.326-20261117-full`）。
+            if name == "ShareOnboardingGuide" {
                 continue;
             }
             let o = otools.iter().find(|o| o["name"] == name).unwrap_or_else(|| panic!("{name}"));
@@ -2153,14 +2180,14 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.326 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
-/// 2.1.326 是当前模拟的版本，团队号与个人 Max 号（多 `Yield` 工具、ultrareview 那句、`anthropic-usage-limit`）两套的 `-full`、`-model`、
+/// **2.1.309 ~ 2.1.327 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
+/// 2.1.327 是当前模拟的版本，个人 Max 号的 `-full`、`-model`、`-retry`、`-bashfail` 一并过；2.1.326 团队号与个人 Max 号（多 `Yield` 工具、ultrareview 那句、`anthropic-usage-limit`）两套的 `-full`、`-model`、
 /// `-retry`、`-bashfail` 一并过，2.1.325、2.1.323 同样四份都过；2.1.322 另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍（这一版官方直连路径没改）；2.1.321 同样把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
 /// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。2.1.319 那份 WebFetch 页面处理与 kebab-case 命名多带
 /// `claude-code-side-query`，merge_beta 同样一项不多。
 #[test]
-fn every_auto_2_1_309_to_326_official_request_passes_through() {
+fn every_auto_2_1_309_to_327_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2190,7 +2217,7 @@ fn every_auto_2_1_309_to_326_official_request_passes_through() {
         ("auto-2.1.325-20261114-retry", (2, 1, 325)),
         ("auto-2.1.325-20261114-bashfail/2.1.325", (2, 1, 325)),
         ("auto-2.1.325-20261114-bashfail/2.1.323", (2, 1, 323)),
-        // 当前模拟的版本：团队号与个人 Max 号各一套，全量、`/model` 预热、重试、失败 Bash 都过一遍；失败 Bash 那份另有同一次跑的
+        // 2.1.326：团队号与个人 Max 号各一套，全量、`/model` 预热、重试、失败 Bash 都过一遍；失败 Bash 那份另有同一次跑的
         // 2.1.325 对照。
         ("auto-team-2.1.326-20261117-full", (2, 1, 326)),
         ("auto-team-2.1.326-20261117-model", (2, 1, 326)),
@@ -2202,6 +2229,12 @@ fn every_auto_2_1_309_to_326_official_request_passes_through() {
         ("auto-max-2.1.326-20261117-retry", (2, 1, 326)),
         ("auto-max-2.1.326-20261117-bashfail/2.1.326", (2, 1, 326)),
         ("auto-max-2.1.326-20261117-bashfail/2.1.325", (2, 1, 325)),
+        // 当前模拟的版本（个人 Max 号）：全量、`/model` 预热、重试、失败 Bash；失败 Bash 那份另有同一次跑的 2.1.326 对照。
+        ("auto-max-2.1.327-20261118-full", (2, 1, 327)),
+        ("auto-max-2.1.327-20261118-model", (2, 1, 327)),
+        ("auto-max-2.1.327-20261118-retry", (2, 1, 327)),
+        ("auto-max-2.1.327-20261118-bashfail/2.1.327", (2, 1, 327)),
+        ("auto-max-2.1.327-20261118-bashfail/2.1.326", (2, 1, 326)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");
