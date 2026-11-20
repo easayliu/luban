@@ -328,6 +328,14 @@ impl Telemetry {
                 n >= config::TELEMETRY_BATCH_MAX
                     || since.is_some_and(|s| now.duration_since(s) >= Duration::from_secs(secs))
             };
+            // 扣着的 clear-at 候选（[`session::Pending::held_clear_at`]）在任一路要发出去之前放进两路：归属在这一刻定死。
+            let flushing = (!p.events.is_empty()
+                && due(p.events_since, config::TELEMETRY_EVENT_FLUSH_SECS, p.events.len()))
+                || (!p.dd.is_empty()
+                    && due(p.dd_since, config::TELEMETRY_DATADOG_FLUSH_SECS, p.dd.len()))
+                || (!p.metrics.is_empty()
+                    && due(p.metrics_since, config::TELEMETRY_METRICS_FLUSH_SECS, 0));
+            p.release_held_clear_at(now, flushing);
             let mut f = Flush {
                 cred_id: *cred_id,
                 session_id: session.clone(),
@@ -400,7 +408,12 @@ impl Telemetry {
                 out.push(f);
             }
         }
-        st.pending.retain(|_, p| !p.events.is_empty() || !p.dd.is_empty() || !p.metrics.is_empty());
+        st.pending.retain(|_, p| {
+            !p.events.is_empty()
+                || !p.dd.is_empty()
+                || !p.metrics.is_empty()
+                || p.held_clear_at.is_some()
+        });
         out
     }
 
@@ -715,6 +728,7 @@ impl Telemetry {
             p.betas = s.betas;
             p.prompt_id = exit_prompt;
             p.started_wall = Some(s.started_wall);
+            p.release_held_clear_at(now, true);
             p.events.extend(events);
             p.events_since = Some(long_ago);
             p.extend_dd(dd);

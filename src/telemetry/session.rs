@@ -54,6 +54,16 @@ pub(super) struct Session {
     /// `api_per_turn_effort` / `mcp_late_tool_additions` / `api_kept_reminder_clear_at`，收尾时的
     /// `tengu_wire_shape_recorded`）。
     pub(super) first_main_done: bool,
+    /// 进程里首字节处那几条一次性能力 `feature_ok` 已经报过哪几条（[`CAP_EVENTS`] 的下标位）。官方记在进程的
+    /// `requestLatches` 上，`/clear` 不清（`cap/auto-max-2.1.328-20261119-full` B6：清空前报过一组，`00489` 之后的新会话
+    /// 不再报；`--continue` 起的新进程又报一组）。
+    pub(super) caps_emitted: u8,
+    /// 这个会话里报了 clear-at 那条的请求的首字节时刻：luban 按完成顺序处理，标题若比主线程先出首字节、却后完成，到它时
+    /// 那条已经挂在主线程上了；首字节更早的这条把它挪过来（还没发出去的话），见 `process.rs` 的 caps 那段。
+    pub(super) clear_at_claim: Option<SystemTime>,
+    /// 扣着的 clear-at 被首字节更早的标题认领了（标题还扣在 [`Self::deferred`] 里等补处理）：那条标题的首字节时刻。补处理到它时
+    /// 报 clear-at（进程锁存早已置上）。
+    pub(super) clear_at_owed: Option<SystemTime>,
     /// 这个会话的第一条标题生成已经处理过：2.1.323 的 `wait_ms` 只给会话起头那一批（第一条标题与首条主线程），见
     /// [`TurnFacts::startup_wait`]。标题多半先被扣在 [`State::presession`]、等主线程那条建好会话才补处理，补处理时
     /// `started_at` 还是它自己的（`cap/auto-2.1.323-20261113-full` 标题 `00352` 比主线程 `00353` 早 13.871 秒），所以按
@@ -617,6 +627,8 @@ impl ThreadBase {
                         persisted_from: r.persisted,
                         result_persisted: r.persisted_preview,
                         is_error: r.is_error,
+                        // 从结果反推的，结果在。
+                        no_result: false,
                         result_head: r.head.clone(),
                         result_tail: r.tail.clone(),
                         tool_error: r.tool_error.clone(),
@@ -1080,6 +1092,36 @@ pub(super) struct Pending {
     /// 退出收尾时指定的导出事件时间戳（排在 `lsp_shutdown` 之后、`cache_eviction_hint`
     /// 之前）；平时为 `None`，导出时取当下。
     pub(super) export_at: Option<DateTime<Utc>>,
+    /// 报了的 clear-at 那条（一方事件与 Datadog 两份）先扣在这里、不进两路队列，是还能换的候选：首字节更早、却后完成的
+    /// 请求到了就整条换掉（[`Session::clear_at_owed`]）。任一路要发出去之前（或 [`CLEAR_AT_HOLD`] 到期、退出收尾）才放进两路，
+    /// 归属在那一刻定死，两路拿到的是同一条。
+    pub(super) held_clear_at: Option<HeldClearAt>,
+}
+
+/// 扣着的 clear-at 那条，见 [`Pending::held_clear_at`]。
+pub(super) struct HeldClearAt {
+    pub(super) release_at: Instant,
+    pub(super) events: Vec<(DateTime<Utc>, Value)>,
+    pub(super) dd: Vec<Value>,
+}
+
+/// 扣着的 clear-at 最多扣多久：与 Datadog 那路的攒批同长。平时它在任一路要发出去之前放出来（[`Pending::release_held_clear_at`]），
+/// 这个时限只管两路都空着、一直没有到期的那种。
+pub(super) const CLEAR_AT_HOLD: Duration =
+    Duration::from_secs(crate::config::TELEMETRY_DATADOG_FLUSH_SECS);
+
+impl Pending {
+    /// 扣着的 clear-at 到期（或 `force`）就放进两路队列。
+    pub(super) fn release_held_clear_at(&mut self, now: Instant, force: bool) {
+        if self.held_clear_at.as_ref().is_some_and(|h| force || now >= h.release_at)
+            && let Some(h) = self.held_clear_at.take()
+        {
+            self.events_since.get_or_insert(now);
+            self.events.extend(h.events);
+            self.dd_since.get_or_insert(now);
+            self.extend_dd(h.dd);
+        }
+    }
 }
 
 /// `process` 前半段推出来、后半段拼事件与入队要用的那些量，与原先的局部变量一一对应。
@@ -1240,6 +1282,9 @@ pub(super) struct TurnFacts {
     /// `tengu_tether_decision` 删 `toolsHashKept`，`tengu_tether_live_outcome` 末尾多 `routingHint`，`tengu_tether_echo_audit`
     /// 改按 10% 抽样、带 `sample_rate`（`cap/auto-max-2.1.327-20261118-*`）。
     pub(super) v327: bool,
+    /// 2.1.328：失败 Bash 的栈摘要、行列、块名都换了，仍不带 `error_constructor`；5xx 摘要与行列照旧、换块名，**又不带**
+    /// `error_constructor`（`cap/auto-max-2.1.328-20261119-*`）。
+    pub(super) v328: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见
@@ -1287,6 +1332,8 @@ pub(super) struct TurnFacts {
     /// 见 [`Session::attachment_counts`]。
     pub(super) attachment_counts: Vec<(String, u32)>,
     pub(super) first_main: bool,
+    /// 这条主线程请求首字节处要报的一次性能力 `feature_ok`，按官方顺序（[`CAP_EVENTS`]）。
+    pub(super) caps_now: Vec<&'static str>,
     /// 2.1.323 起带了 sandy-plover 头的 `tengu_api_success` 报 `wait_ms`（拼头时等了多久，排在 `requestPrepareMs` 之后，
     /// `requestPrepareMs` 也把它算进去）。会话起头那一批（第一条标题与首条主线程，[`Session::first_title_done`]）是
     /// `Some(等待毫秒)`，同一会话同值；其余是 `None`，报 0（`cap/auto-2.1.323-20261113-full` 154 条里 144 条 0）。
@@ -1523,8 +1570,11 @@ impl Session {
             turn_toolsearch_calls: 0,
             turn_first_reply_end: None,
             turn_retry_status: None,
-            shell_snapshot_done: false,
+            shell_snapshot_done: cleared_prev.is_some_and(|p| p.shell_snapshot_done),
             first_main_done: false,
+            caps_emitted: cleared_prev.map_or(0, |p| p.caps_emitted),
+            clear_at_claim: None,
+            clear_at_owed: None,
             first_title_done: false,
             main_betas: String::new(),
             main_requests: 0,
@@ -1621,6 +1671,11 @@ pub(super) struct ClearedPrev {
     pub(super) background_done: usize,
     /// 进程里那条 IDE 探测已经报过。
     pub(super) ide_detect_done: bool,
+    /// 进程里的 shell 快照已经拍过（[`Session::shell_snapshot_done`]）：快照挂在进程的 shell 配置上，`/clear` 不重拍
+    /// （`cap/auto-max-2.1.328-20261119-full/00489`：旧会话拍过、同进程 `/clear` 之后新会话的 Bash 不再报 head_start / create）。
+    pub(super) shell_snapshot_done: bool,
+    /// 进程里已经报过的一次性能力事件，见 [`Session::caps_emitted`]。
+    pub(super) caps_emitted: u8,
     /// 进程里那条 `api_tools_used_header` 已经报过，见 [`Session::tools_used_header_reported`]。
     pub(super) tools_used_header_reported: bool,
     /// 进程里那条 `api_tools_used_mcp_mark` 已经报过，见 [`Session::tools_used_mcp_mark_reported`]。
@@ -1736,6 +1791,8 @@ impl State {
                 started_wall: p.started_wall,
                 background_done: p.background_done,
                 ide_detect_done: p.ide_detect_done,
+                shell_snapshot_done: p.shell_snapshot_done,
+                caps_emitted: p.caps_emitted,
                 tools_used_header_reported: p.tools_used_header_reported,
                 tools_used_mcp_mark_reported: p.tools_used_mcp_mark_reported,
                 tether_main_messages: p.tether_main.as_ref().map(|t| t.messages),
@@ -1752,3 +1809,12 @@ impl State {
         Lineage { continued_from, cleared_from, cleared_prev, parent_session_id }
     }
 }
+
+/// 首字节处的一次性能力事件，按官方触发顺序（`tVt` → `nVt` 两条 → `sVt` 里的 clear-at；`cap/auto-max-2.1.328-20261119-full/00965`
+/// 那个 `-p` 进程：late → inline → clear-at）。各项一个进程只报一次，见 [`Session::caps_emitted`]。
+pub(super) const CAP_EVENTS: [&str; 4] = [
+    "api_per_turn_effort",
+    "mcp_late_tool_additions",
+    "mcp_inline_tools",
+    "api_kept_reminder_clear_at",
+];

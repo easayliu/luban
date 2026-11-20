@@ -481,10 +481,9 @@ pub(in crate::proxy) struct ToolAlignWho<'a> {
 /// 客户端自带的同名工具与官方声明的**参数表面**是否一致：`input_schema.properties` 的键集相同、
 /// `required` 的集合相同。
 ///
-/// 只用于日志，不再决定换不换。换是一律换的（见 [`inject_cc_tools`]）；这个判据标出的是换了
-/// 之后**可能**执行不了的那几条——客户端若要一个官方 schema 里没有的必填参数，模型按官方
-/// schema 永远不会给。那种客户端的工具在换之前本来也和官方不是一回事，出了问题至少日志里
-/// 点得出名字。
+/// 只看顶层，嵌套里加的字段（2.1.328 ReportFindings `findings[].severity`）看不出来，所以换不换改由
+/// [`same_input_contract`] 判；这里只留给测试对照两种判据的差别。
+#[cfg(test)]
 pub(super) fn same_schema_surface(
     client: &serde_json::Value,
     official: &serde_json::Value,
@@ -506,6 +505,16 @@ pub(super) fn same_schema_surface(
     matches!((surface(client), surface(official)), (Some(a), Some(b)) if a == b)
 }
 
+/// 客户端同名工具的入参契约与官方是否一致：`input_schema` 整个按 JSON 值相等（嵌套属性、`required`、
+/// `additionalProperties` 都算，键序不算）。[`same_schema_surface`] 只看顶层属性与必填，漏得掉嵌套里加的字段。
+/// 不一致的同名声明 [`inject_cc_tools`] 原样保留，不换成官方的。
+pub(super) fn same_input_contract(
+    client: &serde_json::Value,
+    official: &serde_json::Value,
+) -> bool {
+    client.get("input_schema") == official.get("input_schema")
+}
+
 /// [`inject_cc_tools`] 会不会给这条补官方工具：声明了工具就补；一个都没声明（[`declares_no_tools`]）
 /// 时看开关 `fill_absent_tools`，且来访没有强制调某个工具。首轮环境说明（[`insert_env_note`]）按同一个判据
 /// 决定补不补——它列的 Agent 类型与技能离不开那两个工具。
@@ -514,15 +523,15 @@ pub(in crate::proxy) fn injects_cc_tools(v: &serde_json::Value, fill_absent: boo
 }
 
 /// 把该 profile 的 14 个官方主线程工具对齐进 `tools`：出站列表**以这 14 条按官方声明序开头**，
-/// 每一条都是资产里那个对象（客户端没声明的是补的，声明了同名的是换的），客户端其余工具
+/// 每一条都是资产里那个对象（客户端没声明的是补的，声明了同名、入参契约相同的是换的），客户端其余工具
 /// 跟在后面、相对次序不变。补哪几个由 [`cc_tools_to_inject`] 定，流水那侧对的也是这一份。
 ///
-/// **同名为什么一律换**：会走到这里的客户端本来就在模拟路径上，它用了官方名却自己写描述、
-/// 自己拼 schema，这条声明与官方的差别正是上游最容易盯的形态之一（官方客户端连
-/// `toolSchemaCharLengths` 都逐条上报）。既然整条请求已在按官方形态重建，同名工具留一份
-/// 自己写的版本只是留一处破绽。代价：参数表面与官方不一致的客户端（多要一个必填参数之类），
-/// 模型按官方 schema 拼的入参它可能不认——换之前 [`same_schema_surface`] 把这些名字打进
-/// 日志，出了事对得上是哪个客户端的哪条工具。
+/// **同名什么时候换**：会走到这里的客户端本来就在模拟路径上，它用了官方名却自己写描述，这条声明与官方的
+/// 差别正是上游最容易盯的形态之一（官方客户端连 `toolSchemaCharLengths` 都逐条上报），所以入参契约
+/// （`input_schema`）与官方相同的同名声明换成官方对象。契约不同的（多要一个必填参数、用旧版的严格 schema——
+/// 2.1.328 ReportFindings 在 `findings[]` 加了 `severity`，327 那份 `additionalProperties: false` 会拒）**整条保留客户端的**，
+/// 只按官方次序落位：回程是把模型拼的入参原样交给客户端执行，按官方 schema 拼的参数它未必认。留下的那几条
+/// 打一行 warn（[`same_input_contract`]），对得上是哪个客户端的哪条工具。
 ///
 /// **为什么不是原位换、缺的插头部**：那样客户端只缺 ListAgents 等四个时，补的四个全排在
 /// Agent 前面，14 条的相对次序就不是官方的了。官方的内建工具是一段固定次序，MCP 工具跟在
@@ -572,17 +581,18 @@ pub(super) fn inject_cc_tools(
         stubs.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str())).collect();
     let name_of = |t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()).map(str::to_owned);
 
-    // 客户端的同名声明与官方那条差在哪：只为日志与计数，落位一律用官方对象。
+    // 客户端的同名声明与官方那条差在哪。入参契约（`input_schema`，连嵌套一起）不同的那条**整条保留客户端的**，不换：
+    // 回程是把模型拼的入参原样交给客户端去执行，按官方 schema 拼的参数它未必认（2.1.328 的 ReportFindings 在
+    // `findings[]` 里加了 `severity`，327 那份 `additionalProperties: false` 会拒）。只差描述等其余字段的照旧换成官方对象。
     let mut replaced = 0usize;
-    let mut surface_differs: Vec<&str> = Vec::new();
+    let mut kept_client: Vec<&str> = Vec::new();
     for stub in stubs.iter() {
         let Some(name) = stub.get("name").and_then(|n| n.as_str()) else { continue };
         for t in tools.iter().filter(|t| t.get("name").and_then(|n| n.as_str()) == Some(name)) {
-            if serde_json::to_string(t).ok() != serde_json::to_string(stub).ok() {
+            if !same_input_contract(t, stub) {
+                kept_client.push(name);
+            } else if serde_json::to_string(t).ok() != serde_json::to_string(stub).ok() {
                 replaced += 1;
-                if !same_schema_surface(t, stub) {
-                    surface_differs.push(name);
-                }
             }
         }
     }
@@ -591,8 +601,14 @@ pub(super) fn inject_cc_tools(
     let mut aligned: Vec<serde_json::Value> = stubs
         .iter()
         .map(|stub| {
-            let mut out = stub.clone();
             let name = stub.get("name").and_then(|n| n.as_str());
+            // 入参契约不同的同名声明原样留下（见上），只按官方次序落位。
+            if let Some(client) = tools.iter().find(|t| {
+                t.get("name").and_then(|n| n.as_str()) == name && !same_input_contract(t, stub)
+            }) {
+                return client.clone();
+            }
+            let mut out = stub.clone();
             let explicit = tools
                 .iter()
                 .find(|t| t.get("name").and_then(|n| n.as_str()) == name)
@@ -615,24 +631,22 @@ pub(super) fn inject_cc_tools(
             .cloned(),
     );
     let reordered = aligned.iter().map(name_of).collect::<Vec<_>>() != before;
+    // **warn 而不是 info**：这一行标的是出站里留着非官方原文的工具——客户端同名声明的入参契约与官方不同，为了执行不出错
+    // 保留了它自己的那份。混在下面那条计数 info 里会被当成例行输出刷过去。放在「什么都没改」的提前返回之前：工具本就按官方
+    // 次序排好、旧 schema 是唯一差异时也要报。
+    if !kept_client.is_empty() {
+        tracing::warn!(
+            cred_id = who.cred_id, cred = %who.cred, session = %who.session, %model,
+            tools = %kept_client.join(","),
+            "kept same-named client tools whose input schema differs from the official one; \
+             the outbound declaration of these is the client's, not the official text"
+        );
+    }
     if missing.is_empty() && replaced == 0 && !reordered {
         return false;
     }
     *tools = aligned;
 
-    // **warn 而不是 info**：这一行标的是「这条请求换完之后可能执行不了」——模型按官方 schema
-    // 拼的入参，客户端那条声明不一定认。混在下面那条计数 info 里会被当成例行输出刷过去。
-    if !surface_differs.is_empty() {
-        // 模型名到这儿才读：`tools` 的可变借用刚随上一行结束，而这条日志本来就是少数派，
-        // 不必为它在每条模拟请求上都拷一个串。
-        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("-");
-        tracing::warn!(
-            cred_id = who.cred_id, cred = %who.cred, session = %who.session, %model,
-            tools = %surface_differs.join(","),
-            "replaced same-named client tools whose parameter surface differs from the official one; \
-             the model will fill the official schema, which this client may not accept"
-        );
-    }
     tracing::info!(
         injected = missing.len(),
         replaced,

@@ -1149,8 +1149,9 @@ fn simulated_beta_matches_official() {
 /// 2.1.325（`cap/auto-2.1.325-20261114-full` 的 `00203`、`00359`、`00589`、`00443`）同样逐字相同。
 /// 2.1.326（`cap/auto-team-2.1.326-20261117-full` 的 `00194`、`00365`、`00615`、`00456`）同样逐字相同。
 /// 2.1.327（`cap/auto-max-2.1.327-20261118-full` 的 `00044`、`00287`、`00440`、`00344`）同样逐字相同。
+/// 2.1.328（`cap/auto-max-2.1.328-20261119-full` 的 `00041`、`00279`、`00431`、`00339`）同样逐字相同。
 #[test]
-fn simulated_beta_matches_2_1_327() {
+fn simulated_beta_matches_2_1_328() {
     let opus = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
          context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
          mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
@@ -1172,17 +1173,17 @@ fn simulated_beta_matches_2_1_327() {
          thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11,\
          cache-diagnosis-2026-04-07,message-threads-2026-08-12";
     for (cap, model, official) in [
-        ("00044", "claude-opus-5-5", opus),
-        ("00287", "claude-sonnet-5-5", opus),
+        ("00041", "claude-opus-5-5", opus),
+        ("00279", "claude-sonnet-5-5", opus),
         ("同 opus", "claude-fable-5-1", opus),
         ("322 fable52/00074 同 opus", "claude-fable-5-2", opus),
-        ("00440", "claude-haiku-4-5-20251001", haiku),
-        ("00440", "claude-haiku-4-5", haiku),
-        ("00344", "claude-haiku-5-5", haiku_5_5),
-        ("00344", "haiku", haiku_5_5),
+        ("00431", "claude-haiku-4-5-20251001", haiku),
+        ("00431", "claude-haiku-4-5", haiku),
+        ("00339", "claude-haiku-5-5", haiku_5_5),
+        ("00339", "haiku", haiku_5_5),
     ] {
         let profile = crate::proxy::cc_profile_for(model);
-        assert_eq!(profile.version, "2.1.327");
+        assert_eq!(profile.version, "2.1.328");
         let beta = config::cc_model_beta(profile, model);
         let out = crate::proxy::simulated_beta(&beta, None);
         assert_eq!(out, official, "{model}（{cap}）");
@@ -1234,14 +1235,15 @@ fn profile_betas_match_the_2_1_277_captures() {
     // （`cap/auto-2.1.318-20261104-full` 同）、2.1.319（`cap/auto-2.1.319-20261106-full` 同）、2.1.321
     // （`cap/auto-2.1.321-20261110-full` 同）、2.1.322（`cap/auto-2.1.322-20261110-full` 同）、2.1.323
     // （`cap/auto-2.1.323-20261113-full` 同）、2.1.325（`cap/auto-2.1.325-20261114-full` 同）、2.1.326
-    // （`cap/auto-team-2.1.326-20261117-full` 同）、2.1.327（`cap/auto-max-2.1.327-20261118-full` 同）同串。
+    // （`cap/auto-team-2.1.326-20261117-full` 同）、2.1.327（`cap/auto-max-2.1.327-20261118-full` 同）、2.1.328
+    // （`cap/auto-max-2.1.328-20261119-full` 同）同串。
     let quota = config::cc_profile_at(QuotaProbe, Some((2, 1, 310)));
     assert_eq!((quota.version, quota.beta), ("2.1.310", cases[2].2));
     let quota = config::cc_profile(QuotaProbe);
     assert_eq!(
         (quota.version, quota.beta),
         (
-            "2.1.327",
+            "2.1.328",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05"
         )
@@ -1276,12 +1278,12 @@ fn profile_betas_match_the_2_1_277_captures() {
     // 2.1.314（`cap/auto-2.1.314-20261030-full/00069` 等）、2.1.316（`cap/auto-2.1.316-20261031-full` 全量配对无 beta 差异）、
     // 2.1.317（`cap/auto-2.1.317-20261103-full` 同）同串；2.1.318（`cap/auto-2.1.318-20261104-full/00065` 等 16 条）在
     // `mid-conversation-system-clear-at` 后多 `claude-code-side-query`，2.1.319（`cap/auto-2.1.319-20261106-full`）同串，
-    // 一直到 2.1.327（`cap/auto-max-2.1.327-20261118-full`）。
+    // 一直到 2.1.328（`cap/auto-max-2.1.328-20261119-full`）。
     let title = config::cc_profile(SessionTitleHaiku);
     assert_eq!(
         (title.version, title.beta),
         (
-            "2.1.327",
+            "2.1.328",
             "interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,\
              context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
              per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,\

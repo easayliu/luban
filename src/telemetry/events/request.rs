@@ -340,11 +340,13 @@ impl EventBuilder<'_> {
         // 没有 `ToolSearch` 的形态抓包里没见过，按字段名报 0 与 `toolSearchAbsent: true`。
         // 子代理只在工具表里有 `ToolSearch` 时才核（`cap/2.1.280` Explore 七条都有；
         // `cap/2.1.285` 的 claude-code-guide 没有 `ToolSearch`，十二条请求一条都没有）。
-        // `-p` 的第一条请求不核（`cap/auto-2.1.285-20260930` 十个 `-p` 进程的首条都没有）。
+        // `-p` 的第一条请求不核（`cap/auto-2.1.285-20260930` 十个 `-p` 进程的首条都没有）——除非这条请求体里真的按值补了
+        // 工具（`tool_addition`）：`cap/auto-max-2.1.328-20261119-full` 六个 `-p` 首请求各带三个，官方都报（`00965` 对
+        // 批次 `00969`），同版 `-retry` 那几个 `-p` 带着 beta 却没补工具，不报。
         if v280
             && shape.tools_count > 0
             && kind != Kind::WebSearchTool
-            && !(shape.sdk && new_prompt)
+            && !(shape.sdk && new_prompt && shape.inline_tool_additions == 0)
             && (!kind.is_agent() || shape.has_tool_search)
         {
             self.push(ms(t0, -1), "tengu_declared_tool_set_held", {
@@ -742,8 +744,6 @@ impl EventBuilder<'_> {
             first_text_interrupted,
             tool_calls_before,
             v277,
-            first_main,
-            ref betas_full,
             ..
         } = *env.f;
         let EventEnv { t_first, t_end, .. } = *env;
@@ -759,20 +759,10 @@ impl EventBuilder<'_> {
                 self.beat(t_first, heartbeat::Trigger::Run(Some(heartbeat::TURN_RUNNING)));
             }
             self.push_dd(t_first, "tengu_feature_ok", feature("api_request"));
-            // 会话首条主线程请求的首字节处，客户端头一回用上这几项能力各报一次，与 beta 一一
-            // 对应（`cap/2.1.285/00040` 06:34:19.500，紧跟 `api_request`；`cap/2.1.280` 两个会话
-            // 各一组）。
-            if first_main {
-                for (beta, name) in [
-                    (config::CC_BETA_PER_TURN_CONTROL, "api_per_turn_effort"),
-                    ("mid-conversation-tool-changes-", "mcp_late_tool_additions"),
-                    ("mid-conversation-system-clear-at-", "api_kept_reminder_clear_at"),
-                ] {
-                    let prefix = beta.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-');
-                    if betas_full.split(',').any(|b| b.trim().starts_with(prefix)) {
-                        self.push_dd(t_first, "tengu_feature_ok", feature(name));
-                    }
-                }
+            // 首字节处，客户端头一回用上这几项能力各报一次（`cap/2.1.285/00040` 06:34:19.500，紧跟 `api_request`）。报哪几条、
+            // 按什么顺序在处理时就定了（[`TurnFacts::caps_now`]，一个进程各一次，`/clear` 不重报）。
+            for name in &env.f.caps_now {
+                self.push_dd(t_first, "tengu_feature_ok", feature(name));
             }
         }
         if first_text_interrupted {

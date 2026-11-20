@@ -28,7 +28,7 @@ fn simulates_official_system_for_plain_request() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.327."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.328."),
         "模拟路径的 cc_version 取 profile 的版本（后缀按首句派生，是上游不校验的假值，只钉版本号）: {s}"
     );
     // 官方主线程每条新输入都带 cc_prompt_id，2.1.277 起后面跟 cc_turn_origin=human
@@ -479,7 +479,7 @@ fn simulates_fable_with_reporting_block_and_display_updates() {
         sys[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.327."),
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.328."),
         "{v}"
     );
     assert!(rest.ends_with("</total_tokens>"), "第四块是官方正文，客户端的不掺进来");
@@ -1652,8 +1652,8 @@ fn system_base_assets_are_verbatim() {
     assert!(config::CC_SYSTEM_BASE_ANCHORS.iter().any(|a| config::CC_SYSTEM_REST.starts_with(a)));
 }
 
-/// **对着 `cap/auto-max-2.1.327-20261118-full` 逐项核**
-/// （下面列的是历次抓包用过的编号，2.1.327 用 `00486`、`00287`、`00344`、`00440`、`00635`（个人 Max 号：服务端开着
+/// **对着 `cap/auto-max-2.1.328-20261119-full` 逐项核**
+/// （下面列的是历次抓包用过的编号，2.1.328 用 `00478`、`00279`、`00339`、`00431`、`00626`（同一个个人 Max 号，下发同 327）；2.1.327 用 `00486`、`00287`、`00344`、`00440`、`00635`（个人 Max 号：服务端开着
 /// `tengu_dazzling_acorn`，官方 Agent / Bash 描述多一句「To wait on background work, call Yield.」、工具表多 `Yield`——luban 不模拟，
 /// 比之前从官方原文里去掉；也开着 `tengu_review_bughunter_config`，第四块多 ultrareview 那条，测试号同样喂开）；2.1.326 用 `00714`、`00365`、`00456`、`00615`、`00949`（团队号，配置目录 `~/.claude2`，记忆路径
 /// 归一后比；测试项目 `cal15` 同一份 calc 项目；同样没补抓 Fable 5.2 交互式）；2.1.325 用 `00683`、`00359`、`00443`、`00589`、`00898`（测试项目 `cal15`，同一份 calc 项目从
@@ -1681,8 +1681,8 @@ fn system_base_assets_are_verbatim() {
 /// 刻意不比的几项（各有出处）：auto 模式才有的 `safeguards`、
 /// `max_tokens`（来访自己的）、`stream`。抓包目录不在仓库里（`.gitignore`），没有就跳过。
 #[test]
-fn simulated_main_threads_match_the_2_1_327_captures() {
-    let sub = "auto-max-2.1.327-20261118-full";
+fn simulated_main_threads_match_the_2_1_328_captures() {
+    let sub = "auto-max-2.1.328-20261119-full";
     let dir = format!("{}/cap/{sub}", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("skipped: cap/{sub} not present");
@@ -1723,11 +1723,11 @@ fn simulated_main_threads_match_the_2_1_327_captures() {
         cred
     };
     for (i, (sub, n, auto_mode)) in [
-        ("-full", "00486", false),
-        ("-full", "00287", false),
-        ("-full", "00344", false),
-        ("-full", "00440", false),
-        ("-full", "00635", true),
+        ("-full", "00478", false),
+        ("-full", "00279", false),
+        ("-full", "00339", false),
+        ("-full", "00431", false),
+        ("-full", "00626", true),
     ]
     .into_iter()
     .enumerate()
@@ -1851,7 +1851,7 @@ fn simulated_main_threads_match_the_2_1_327_captures() {
         let osys = official["system"].as_array().unwrap();
         assert_eq!(sys.len(), 5, "{model}");
         let billing = sys[0]["text"].as_str().unwrap();
-        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.327."));
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.328."));
         assert!(billing.contains("; cc_turn_origin=human; cc_prompt_index="), "{billing}");
         for i in 1..=2 {
             assert_eq!(sys[i]["text"], osys[i]["text"], "{model} system[{i}]");
@@ -1860,7 +1860,7 @@ fn simulated_main_threads_match_the_2_1_327_captures() {
         assert_eq!(sys[3]["cache_control"], osys[3]["cache_control"], "{model}");
         let cap_env = crate::proxy::SimEnv::from_cwd(
             "/Users/easayliu",
-            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/06ed75ba-9c3e-4bbd-ad66-61cdf2c57ed3/scratchpad/cal15",
+            "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/d4cbe298-5c8d-4f80-bb02-d0a542086b13/scratchpad/cal15",
         );
         // 官方原文去掉模拟路径不收的两段：EndConversation 那段（haiku 那份没有）与 WebSearch 那段。
         // Artifact `edits` 说明 2.1.303 起在基座末尾（上面 system[2] 已逐字比过），第四块不再有。
@@ -2180,14 +2180,14 @@ fn every_auto_2_1_300_to_308_official_request_passes_through() {
     }
 }
 
-/// **2.1.309 ~ 2.1.327 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
-/// 2.1.327 是当前模拟的版本，个人 Max 号的 `-full`、`-model`、`-retry`、`-bashfail` 一并过；2.1.326 团队号与个人 Max 号（多 `Yield` 工具、ultrareview 那句、`anthropic-usage-limit`）两套的 `-full`、`-model`、
+/// **2.1.309 ~ 2.1.328 的官方请求**（各版 `cap/auto-<版本>-<日期>-full`，场景同 2.1.299-full；2.1.313、2.1.324 没有发布，2.1.315、2.1.320 没抓；
+/// 2.1.328 是当前模拟的版本，个人 Max 号的 `-full`、`-model`、`-retry`、`-bashfail` 一并过，2.1.327 同样四份都过；2.1.326 团队号与个人 Max 号（多 `Yield` 工具、ultrareview 那句、`anthropic-usage-limit`）两套的 `-full`、`-model`、
 /// `-retry`、`-bashfail` 一并过，2.1.325、2.1.323 同样四份都过；2.1.322 另把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍（这一版官方直连路径没改）；2.1.321 同样把 `-model`、`-retry`、`-bashfail`、`-fable52` 几份也过一遍：第四块多隐私说明、fable-5-2 那份模板）
 /// 同样一条不进模拟、不被当探针、merge_beta 一项不多。2.1.314 那份 opus 第四块多了原创游戏那段、压缩后那条 billing 多三项，
 /// 2.1.316 那份 opus / sonnet / haiku-5-5 第四块删了开头一句，2.1.317 那份原创游戏那段换了写法，2.1.318 那份同一段改由 client_data 下发，照样认作官方。2.1.319 那份 WebFetch 页面处理与 kebab-case 命名多带
 /// `claude-code-side-query`，merge_beta 同样一项不多。
 #[test]
-fn every_auto_2_1_309_to_327_official_request_passes_through() {
+fn every_auto_2_1_309_to_328_official_request_passes_through() {
     for (sub, version) in [
         ("auto-2.1.309-20261023-full", (2, 1, 309)),
         ("auto-2.1.310-20261024-full", (2, 1, 310)),
@@ -2235,6 +2235,11 @@ fn every_auto_2_1_309_to_327_official_request_passes_through() {
         ("auto-max-2.1.327-20261118-retry", (2, 1, 327)),
         ("auto-max-2.1.327-20261118-bashfail/2.1.327", (2, 1, 327)),
         ("auto-max-2.1.327-20261118-bashfail/2.1.326", (2, 1, 326)),
+        ("auto-max-2.1.328-20261119-full", (2, 1, 328)),
+        ("auto-max-2.1.328-20261119-model", (2, 1, 328)),
+        ("auto-max-2.1.328-20261119-retry", (2, 1, 328)),
+        ("auto-max-2.1.328-20261119-bashfail/2.1.328", (2, 1, 328)),
+        ("auto-max-2.1.328-20261119-bashfail/2.1.327", (2, 1, 327)),
     ] {
         let Some((seen, bad, _)) = official_passthrough_report_at(sub, version) else {
             eprintln!("skipped: cap/{sub} not present");

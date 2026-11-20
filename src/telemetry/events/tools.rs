@@ -16,6 +16,7 @@ impl EventBuilder<'_> {
             ref prev_main_message_id,
             prev_main_depth,
             prev_end,
+            prev_main_end,
             ref chain_id,
             query_depth,
             v285,
@@ -38,8 +39,13 @@ impl EventBuilder<'_> {
             self.unknown_parent_scope = env.f.parent_unknown;
             // 这一批工具结果算一批（文件账本的修改先后，[`super::super::files::Files::begin_batch`]）。
             self.files.begin_batch();
-            let prev_end_dt: DateTime<Utc> =
-                prev_end.unwrap_or(call.started_at - Duration::from_secs(1)).into();
+            // 这串工具出自哪条回复，就以那条收完为起点：主线程是上一条主线程回复（会话里最近完成的可能是并行的标题，它比
+            // 带回结果的这条请求还晚完成，拿它作下限会把工具结果推过请求边界）；不论哪种都不晚于这条请求发出。
+            let parent_end = if is_main { prev_main_end.or(prev_end) } else { prev_end };
+            let prev_end_dt: DateTime<Utc> = parent_end
+                .unwrap_or(call.started_at - Duration::from_secs(1))
+                .min(call.started_at)
+                .into();
             // 工具是上一条主线程回复产生的：事件里的 requestId / messageID 都指上一条。回复 id 以这条请求自己声明接的那条
             // 为准（`thread.previous_message_id`，没有再看 `diagnostics.previous_message_id`）：同一条回复后面接了两条兄弟
             // 分支时，会话里「最近一条回复」是先到的那个兄弟，不是这条所接的。都没有才按会话状态。
@@ -93,12 +99,13 @@ impl EventBuilder<'_> {
             let batch_approval = if prompted > 0 && v285 {
                 // 各工具一份合理执行：首条 Bash 含快照、其余很小；剩下的算盯弹框的等待。
                 let shell_first = env.f.shell_snapshot_first;
+                let bash_at = first_bash_at(shape);
                 let exec: i64 = shape
                     .tool_uses
                     .iter()
                     .enumerate()
-                    .map(|(j, tu)| {
-                        let first_bash = tu.name == "Bash" && shell_first && is_main && j == 0;
+                    .map(|(j, _)| {
+                        let first_bash = shell_first && is_main && Some(j) == bash_at;
                         if first_bash { 700 + i64::from(env.req_hash % 600) + 60 } else { 40 }
                     })
                     .sum();
@@ -115,6 +122,7 @@ impl EventBuilder<'_> {
                 n,
                 prompted,
                 batch_approval,
+                first_bash: first_bash_at(shape),
             };
             for (i, tu) in shape.tool_uses.iter().enumerate() {
                 let i = i as i64;
@@ -137,16 +145,22 @@ impl EventBuilder<'_> {
                     continue;
                 }
                 self.emit_tool_permission(&step, i, tu);
+                // 体里没有它的 `tool_result`（[`ToolUse::no_result`]）：认不出它跑过、跑成什么样，不报执行结果。
+                if tu.no_result {
+                    continue;
+                }
                 self.emit_tool_result(&step, i, tu);
             }
             // 工具都跑完，攒附件再发下一条。这两条的深度仍是上一条的（三个版本的抓包都是
             // 「下一条 api_query 的深度 − 1」：主线程 0→1、子代理 2→3…）。
-            let ta = ms(t0, -4);
+            // 间隔极短时（不到 4ms）攒附件这段不早于上一条回复收完：与工具结果（[`Self::tool_done_at`]）同一个下限，同一毫秒的按
+            // 入队先后排（结果在前）。
+            let ta = ms(t0, -4).max(prev_end_dt);
             let results = shape.tool_uses.len();
             // 先 `query_before_attachments`、再攒附件、再 `query_after_attachments`（`cap/2.1.277`
             // 30 次、`cap/2.1.280` 5 次、`cap/2.1.285` 6 次都是这个顺序）。
             self.push(
-                ms(ta, -1),
+                ms(ta, -1).max(prev_end_dt),
                 "tengu_query_before_attachments",
                 json!({
                     "messagesForQueryCount": shape.messages_len + 3,
@@ -159,7 +173,7 @@ impl EventBuilder<'_> {
             // 攒附件：工具池变化、各附件的计算耗时、附件那条（[`Self::emit_turn_attachments`]）。
             self.emit_turn_attachments(ta, is_sub);
             self.push(
-                ms(ta, 1),
+                ms(ta, 1).min(ms(t0, -1)).max(ta),
                 "tengu_query_after_attachments",
                 json!({
                     "totalToolResultsCount": results + 1,
@@ -357,14 +371,32 @@ impl EventBuilder<'_> {
         self.push_dd_snake(t_done, "tengu_tool_use_error", err);
     }
 
-    /// 没跑起来的工具（找不到、验证不过）报错的时刻：贴着这条请求之前，与跑完的工具同一套取法。
+    /// 没跑起来的工具（找不到、验证不过）报错的时刻：贴着这条请求之前，与跑完的工具同一套取法（[`Self::tool_done_at`]）。
     fn unrun_tool_at(&self, step: &ToolStep, i: i64) -> DateTime<Utc> {
-        let ToolStep { prev_end_dt, n, .. } = *step;
+        let ToolStep { prev_end_dt, .. } = *step;
         if self.env.f.v285 {
-            ms(self.env.t0, -8 - 4 * (n - 1 - i)).max(ms(prev_end_dt, i + 1))
+            self.tool_done_at(step, i)
         } else {
-            ms(prev_end_dt, i + 1)
+            ms(prev_end_dt, i + 1).min(ms(self.env.t0, TOOL_DONE_LATEST))
         }
+    }
+
+    /// 第 `i` 个工具结果（成功或失败）的时刻。2.1.285 起工具跑完就发下一条，完成事件贴着这条请求之前（WebFetch 要先等它那条
+    /// 页面处理回来，`cap/2.1.285` 06:56:20.385 完成、.389 起下一条）；之前的版本按调用数均分间隔。不论怎么推，都不晚于
+    /// [`TOOL_DONE_LATEST`]：间隔极短、工具又多时，「上一条结束后每个错开 1ms」的下限会把排在后面的推过攒附件那一段、甚至
+    /// 请求边界（20ms 间隔、30 个工具时晚 10ms），这里以它为准。
+    fn tool_done_at(&self, step: &ToolStep, i: i64) -> DateTime<Utc> {
+        let ToolStep { prev_end_dt, n, .. } = *step;
+        let t0 = self.env.t0;
+        let raw = if self.env.f.v285 {
+            ms(t0, -8 - 4 * (n - 1 - i)).max(ms(prev_end_dt, i + 1))
+        } else {
+            let gap = (t0 - prev_end_dt).num_milliseconds().max(50);
+            ms(prev_end_dt, gap * (i + 1) / (n + 1))
+        };
+        // 下限是上一条回复收完：间隔比 [`TOOL_DONE_LATEST`] 还短时，固定的上限会把结果推到上一条回复（与它之前的权限判定）
+        // 之前，这时按实际可用的时间压缩，都落在回复收完那一刻（同一毫秒按入队先后排）。
+        raw.min(ms(t0, TOOL_DONE_LATEST)).max(prev_end_dt)
     }
 
     /// 入参没过 schema（缺必填参数、类型不对、多了参数……）或根本不是合法 JSON：客户端在验证之前就拦下，回
@@ -712,6 +744,7 @@ impl EventBuilder<'_> {
             v325,
             v326,
             v327,
+            v328,
             bash_metered,
             prompt_seq,
             ..
@@ -738,19 +771,26 @@ impl EventBuilder<'_> {
         // 2.1.285：工具跑完就发下一条，完成事件贴着这条请求之前（WebFetch 要先等它那条
         // 页面处理回来，`cap/2.1.285` 06:56:20.385 完成、.389 起下一条）；之前的版本按
         // 调用数均分。
-        let t_done = if v285 {
-            ms(t0, -8 - 4 * (n - 1 - i)).max(ms(prev_end_dt, i + 1))
-        } else {
-            ms(prev_end_dt, gap * (i + 1) / (n + 1))
-        };
+        let t_done = self.tool_done_at(step, i);
         // 每个工具跑了多久：2.1.285 起官方是一个接一个跑完就发下一条，上一条回复结束到下一条请求发出的
         // 间隔 ≈ 各工具耗时之和 + 一小段收尾（一个工具时中位 40～75ms，`cap/auto-2.1.285-20260930`、
         // `auto-2.1.293`、`auto-2.1.296`、`auto-2.1.299` 的 full 抓包逐轮核过；多一个工具多约 20ms），按调用数
         // 均分。此前按 `间隔 / (n + 1)` 分，一个工具时只报了半段间隔。更早的版本照旧。
         // `batch_approval` 是这一批盯弹框的总等待，先从间隔里扣掉再按调用数均分——同批别的工具就不会
         // 分到等待（问题 3）。它只进点头工具的 `permissionDurationMs`（见下）。
+        // 同一批里有会话首次 Bash 时，它的快照（约 0.7～1.3s）只算在那个 Bash 头上，不均分给同批别的工具：先从可分的池里
+        // 扣掉、再加回给那个 Bash（与上面估盯弹框等待时给它的那份执行同口径）。这份预算受池子约束——别的工具各留 40ms，
+        // 剩下的不够就只给剩下的，整批加起来不超过间隔。只有它一个工具时照旧整段归它。首个 Bash 的位置每批只算一次（`step`）。
+        let bash_at = step.first_bash;
+        let first_bash = shell_snapshot_first && is_main && bash_at == usize::try_from(i).ok();
+        let pool = (gap - batch_approval - 50 - 20 * (n - 1)).max(0);
+        let snap_share = if v285 && n > 1 && shell_snapshot_first && is_main && bash_at.is_some() {
+            (700 + i64::from(req_hash % 600) + 20).min((pool - 40 * (n - 1)).max(0))
+        } else {
+            0
+        };
         let duration = if v285 {
-            ((gap - batch_approval - 50 - 20 * (n - 1)) / n).max(1)
+            ((pool - snap_share) / n).max(1) + if first_bash { snap_share } else { 0 }
         } else {
             (gap / (n + 1) - 12).max(1)
         };
@@ -766,7 +806,8 @@ impl EventBuilder<'_> {
         // 会话里第一条 Bash 先建 shell 快照，这段就在这次调用里、也就在上一条回复结束到这条请求发出的
         // 那段间隔里：2.1.291 起报快照耗时，它与这次调用的计时都从间隔推出的 `duration` 里分（见
         // [`bash_timing`]），时长不会撑过间隔。失败那条同样报 2.1.299 的计时。
-        let first_bash = tu.name == "Bash" && shell_snapshot_first && is_main && i == 0;
+        // 按这一批里第一个 Bash 的实际位置（同批先 Read 后 Bash 时 Bash 在 1 号位，原先只认 0 号位就整条漏报，会话却已记成
+        // 拍过了）；`first_bash` 在上面算时长时已定。
         let bash_timing = (tu.name == "Bash").then(|| {
             let h = (i64::from(req_hash % 1_000) + i).rem_euclid(100);
             let snapshot = (first_bash && v291).then(|| 700 + i64::from(req_hash % 600));
@@ -796,13 +837,29 @@ impl EventBuilder<'_> {
                 // 模式按生成这条 Bash 的那条请求的（[`ToolUse::origin_mode`]）：同一回复里 Bash 之后又调了 EnterPlanMode，
                 // 带回结果的续轮已是 plan，那时快照早已提前拍了。
                 let mode = tu.origin_mode.unwrap_or(shape.permission_mode);
-                if v327 && !shape.sdk && mode != "plan" {
+                let head_start = v327 && !shape.sdk && mode != "plan";
+                if head_start {
                     let head = feature_with(
                         "shell_snapshot_head_start",
                         json!({ "wait_ms": 0, "too_old": false, "no_snapshot": true }),
                         v293,
                     );
                     self.push_dd(ms(t_done, -41), "tengu_feature_ok", head);
+                }
+                // 2.1.328：`duration_ms` 后多 `reason`，说快照是怎么拍的（官方 `Cco` 的 `headStartSkip`）。提前拍的那次在没有终端时
+                // 拍不出（上面 `no_snapshot: true`），执行时重拍、报 `needs_terminal`（`cap/auto-max-2.1.328-20261119-full` 九个交互式
+                // 会话都是）；`-p` 没有提前拍，判不提前的第一条理由是 `script`（`-bashfail/2.1.328`）；plan 模式是 `plan`。
+                if v328 {
+                    let reason = if head_start {
+                        "needs_terminal"
+                    } else if shape.sdk {
+                        "script"
+                    } else if mode == "plan" {
+                        "plan"
+                    } else {
+                        "other"
+                    };
+                    props["reason"] = json!(reason);
                 }
                 let snap = feature_with("shell_snapshot_create", props, v293);
                 self.push_dd(ms(t_done, -40), "tengu_feature_ok", snap);
@@ -1160,7 +1217,12 @@ impl EventBuilder<'_> {
             // 5ae540068e38）摘要、行列、块名都换了，类名压缩后是 `UT`。
             // 2.1.327（`cap/auto-max-2.1.327-20261118-bashfail`；同一次跑的 2.1.326 对照仍是 96e266587f52）摘要、行列、块名都换了，
             // 类名压缩后过不了构造名校验，**又不带 `error_constructor`**。
-            if v327 {
+            // 2.1.328（`cap/auto-max-2.1.328-20261119-bashfail`；同一次跑的 2.1.327 对照仍是 054b6e774401）摘要、行列、块名都换了，
+            // 仍不带 `error_constructor`。
+            if v328 {
+                err["error_stack_hash"] = json!("7649da726f31");
+                err["error_top_frame"] = json!("chunk-56bhcxay.js:3758:9401");
+            } else if v327 {
                 err["error_stack_hash"] = json!("054b6e774401");
                 err["error_top_frame"] = json!("chunk-m14bt1pz.js:3730:9300");
             } else if v326 {
@@ -1300,7 +1362,8 @@ impl EventBuilder<'_> {
             }
         }
         // 工具结果作为一条消息回到前台子代理这边：派它的那次 `Agent` 调用报一条进度（抓包里紧跟工具成功那条 1–2ms）。
-        self.agent_progress(ms(t_done, 2));
+        // 紧跟结果的进度事件（+2ms），间隔极短时不越过带回结果的这条请求（与结果同一毫秒时按入队先后排在它后面）。
+        self.agent_progress(ms(t_done, 2).min(ms(self.env.t0, -1)).max(t_done));
     }
 }
 
@@ -1675,3 +1738,28 @@ mod compute_duration_tests {
         }
     }
 }
+
+/// 这一批工具调用里第一个**真跑了**的 `Bash` 的位置（会话首次 Bash 的快照挂在它身上）。没跑起来的不算：工具名不认得
+/// （`No such tool available`）、入参校验没过（`InputValidationError` 与各工具自己的校验）、用户在弹框上拒了——这几种都在
+/// 执行之前就结束了，官方的 shell 快照是执行时才建的。体里没有它的 `tool_result` 的也不算（认不出它跑过）。会话标记拍过与否（`process.rs` 的 `shell_snapshot_first`）用同一个判据。
+pub(in crate::telemetry) fn first_run_bash(tool_uses: &[ToolUse]) -> Option<usize> {
+    tool_uses.iter().position(|tu| {
+        tu.name == "Bash"
+            && !tu.no_result
+            && !(tu.is_error
+                && (tu.result_head.starts_with(NO_SUCH_TOOL)
+                    || tu.result_head.trim_start().starts_with(USER_REJECTED_TOOL_USE)
+                    || tu.tool_error.as_deref().is_some_and(|m| {
+                        m.starts_with("InputValidationError: ")
+                            || validate_error_code(&tu.name, m).is_some()
+                    })))
+    })
+}
+
+fn first_bash_at(shape: &RequestShape) -> Option<usize> {
+    first_run_bash(&shape.tool_uses)
+}
+
+/// 工具结果事件最晚的时刻（相对带回结果的那条请求发出时刻）：在攒附件那一段（`query_before_attachments` 在 `t0 - 5`、附件在
+/// `t0 - 4`）之前，留出工具结果之后紧跟的进度事件（+2ms）的位置。正常情况下最后一个工具本就在 `t0 - 8`。
+const TOOL_DONE_LATEST: i64 = -8;

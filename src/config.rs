@@ -42,6 +42,7 @@ mod v2_1_323;
 mod v2_1_325;
 mod v2_1_326;
 mod v2_1_327;
+mod v2_1_328;
 
 pub use betas::*;
 pub use client::*;
@@ -82,6 +83,7 @@ pub use v2_1_323::*;
 pub use v2_1_325::*;
 pub use v2_1_326::*;
 pub use v2_1_327::*;
+pub use v2_1_328::*;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,7 +351,8 @@ mod tests {
             assert_eq!(cc_profile_at(kind, Some((2, 1, 325))).version, "2.1.325", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 326))).version, "2.1.326", "{kind:?}");
             assert_eq!(cc_profile_at(kind, Some((2, 1, 327))).version, "2.1.327", "{kind:?}");
-            assert_eq!(cc_profile(kind).version, "2.1.327", "模拟路径用 2.1.327 表: {kind:?}");
+            assert_eq!(cc_profile_at(kind, Some((2, 1, 328))).version, "2.1.328", "{kind:?}");
+            assert_eq!(cc_profile(kind).version, "2.1.328", "模拟路径用 2.1.328 表: {kind:?}");
             // 2.1.296 表除版本号外逐行同 2.1.293。
             let (old, mid) =
                 (cc_profile_at(kind, Some((2, 1, 293))), cc_profile_at(kind, Some((2, 1, 296))));
@@ -467,7 +470,7 @@ mod tests {
             ),
         ] {
             let latest = cc_profile(kind);
-            assert_eq!((latest.kind, latest.version), (kind, "2.1.327"));
+            assert_eq!((latest.kind, latest.version), (kind, "2.1.328"));
             assert_eq!(latest.beta, want, "{kind:?}");
             assert!(!cc_profile_at(kind, Some((2, 1, 318))).beta.contains(CC_BETA_SIDE_QUERY), "{kind:?}");
             assert_eq!(CC_PROFILES.iter().filter(|p| p.kind == kind).count(), 1, "{kind:?} 只有一行");
@@ -525,6 +528,7 @@ mod tests {
         assert!(cc_profile_exact(MainOpus, "2.1.325").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.326").is_some());
         assert!(cc_profile_exact(MainOpus, "2.1.327").is_some());
+        assert!(cc_profile_exact(MainOpus, "2.1.328").is_some());
         assert!(cc_profile_exact(MainHaiku55, "2.1.291").is_none(), "2.1.293 才有 haiku-5-5");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.291").is_none(), "2.1.291 没有子代理样本");
         assert!(cc_profile_exact(SdkSubagentHaiku, "2.1.280").is_none(), "2.1.280 没有子代理样本");

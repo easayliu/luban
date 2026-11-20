@@ -18,6 +18,9 @@ pub(super) struct ToolUse {
     pub(super) origin_mode: Option<&'static str>,
     /// `tool_result.is_error`：工具执行失败（Bash 非零退出、被用户拒绝……）。
     pub(super) is_error: bool,
+    /// 体里找不到这次调用对应的 `tool_result`（客户端没回它的结果）：没法认定它跑过，不拿它建会话首次的 shell 快照
+    /// （[`super::events::first_run_bash`]）。默认 false，只有从请求体配对时才判。
+    pub(super) no_result: bool,
     /// `tool_result` 正文的开头（至多 400 字符），认「被用户拒绝」「命令失败」用。
     pub(super) result_head: String,
     /// `tool_result` 正文的结尾（至多 [`RESULT_TAIL_CHARS`] 个字符），Bash 测试命令判通过 / 失败用
@@ -230,6 +233,14 @@ pub(super) struct RequestShape {
     /// 正文里声明了 `ToolSearch` 这个工具（非延迟）。它是延迟加载真正能用的前提：模型要靠它
     /// 把 `defer_loading` 的工具搜出来。只有占位声明、没有它，搜索无处发起。
     pub(super) has_tool_search: bool,
+    /// 消息里 `role: system` 那几条按值补进来的工具（`tool_addition` 带 `tool_definition`，inline-tools 那条路）的个数。
+    /// 官方 `mcp_inline_tools` 那条 `feature_ok` 看的就是请求里有没有带定义的 `api_system` 消息；`-p` 首条请求带了
+    /// 它们时也核声明的工具集（`cap/auto-max-2.1.328-20261119-full` 六个 `-p` 首请求各带三个）。
+    pub(super) inline_tool_additions: usize,
+    /// 消息里中途增减工具的块（`tool_addition` / `tool_removal`，带定义或只给名字都算）的个数。官方 `mcp_late_tool_additions`
+    /// 那条 `feature_ok` 要这条请求真用上了中途改工具（`toolChangeFallback` 非空）才报：`cap/auto-max-2.1.328-20261119-retry`
+    /// 的 `-p` 首条（`00020`）带着 beta 却没有这类块，官方批次 `00022` 只报 clear-at。
+    pub(super) tool_changes: usize,
     /// 官方用户能用环境变量关掉的那三个工具，这条请求里哪几个是关着的（模拟路径开关
     /// `sim_trim_tools`，见 `crate::proxy::cc_tools_core`）。逐项判，遥测也逐项照关掉之后的样子报，
     /// 见 [`ToolsOff`] 与 [`super::template::emit_template`]。
@@ -802,6 +813,7 @@ pub(super) fn tool_uses_of(messages: &[Value]) -> Vec<ToolUse> {
                         persisted_from: hit.and_then(|r| r.persisted),
                         result_persisted: hit.is_some_and(|r| r.persisted_preview),
                         is_error: hit.is_some_and(|r| r.is_error),
+                        no_result: hit.is_none(),
                         result_head: hit.map(|r| r.head.clone()).unwrap_or_default(),
                         result_tail: hit.map(|r| r.tail.clone()).unwrap_or_default(),
                         tool_error: hit.and_then(|r| r.tool_error.clone()),
@@ -1202,6 +1214,11 @@ pub(super) fn error_trace(
         ("2.1.327", Some(s)) if s >= 500 => {
             Some((Some("MHn"), "5b32b751db51", "chunk-z9xgg67q.js:5:1510"))
         }
+        // 2.1.328 摘要与行列照旧、顶帧换了块，**又不带 `error_constructor`**（`cap/auto-max-2.1.328-20261119-retry`：R2 那次的
+        // Datadog 批次）。
+        ("2.1.328", Some(s)) if s >= 500 => {
+            Some((None, "5b32b751db51", "chunk-rsckepzm.js:5:1510"))
+        }
         _ => None,
     }
 }
@@ -1261,6 +1278,21 @@ const DEFERRED_PLACEHOLDER: &str = "DeferredToolPlaceholder";
 /// 说明、名字的正则与六个权限模式枚举，`cap/auto-2.1.323-20261113-full` 六个 `-p` 会话首条 12 个工具据此逐个求和正好
 /// 3197，不补是 3066）。`ExitPlanMode` 删的 `launchSwarm` / `teammateCount` 在 `-p` 里不出现，`_host` 只在开了远程机器时
 /// 才有，都不补。
+/// 官方 `ReportFindings` 的 schema 按 [`recorded_schema_tokens`] 估：2.1.327 那份（紧凑 JSON 1545 字）386，2.1.328 加了
+/// `severity`（1786 字）447——两者正好差抓包里 `non_mcp_tools_tokens` 多出来的那 61。
+pub(super) const REPORT_FINDINGS_TOKENS_2_1_327: u64 = 386;
+/// 官方 `ListAgents` 的 schema 按 [`recorded_schema_tokens`] 估：2.1.326 那份（紧凑 JSON 316 字）79，2.1.327 加了 `cursor`（472 字）
+/// 118——正好是抓包里多出来的那 39。
+pub(super) const LIST_AGENTS_TOKENS_2_1_326: u64 = 79;
+/// 官方 `Read` 的 schema 估值：2.1.293 那份 185，2.1.296 加 `allow_large` 起 268（多的正是抓包里那 83）。
+pub(super) const READ_TOKENS_2_1_293: u64 = 185;
+/// 官方 `ShareOnboardingGuide` 的 schema 估值：2.1.317 改写前 195，之后 216（多的正是抓包里那 21）。
+pub(super) const SHARE_GUIDE_TOKENS_2_1_316: u64 = 195;
+#[cfg(test)]
+pub(super) const LIST_AGENTS_TOKENS_2_1_327: u64 = 118;
+#[cfg(test)]
+pub(super) const REPORT_FINDINGS_TOKENS_2_1_328: u64 = 447;
+
 pub(super) fn recorded_schema_tokens(name: &str, schema: &Value) -> u64 {
     const AGENT_TEAM_PROPS: &str = concat!(
         r#","name":{"description":"Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running.","#,
@@ -1652,6 +1684,15 @@ pub(super) struct ToolsOff {
     pub(super) list_agents: bool,
     /// 关了 `SendFeedback`（`CLAUDE_CODE_SEND_FEEDBACK=0`）。
     pub(super) send_feedback: bool,
+    /// 出站那条 `ReportFindings` 的 schema 按工具记录估的 token（[`recorded_schema_tokens`]）。模拟路径为执行不出错可能保留了
+    /// 客户端自己的版本（`proxy::body::tools::same_input_contract`），`context_size` 按实际发出的那份算它的贡献（[`super::template`]
+    /// 的 `report_findings_adjust`）。没有这条工具是 `None`。不是「关掉」，不进 [`Self::any`]。
+    pub(super) report_findings: Option<u64>,
+    /// 同上，`ListAgents` 那条（2.1.327 起多 `cursor`）。保留了客户端 326 那份（没有 `cursor`）时 `context_size` 不按 327 多算 39。
+    pub(super) list_agents_tokens: Option<u64>,
+    /// 同上，`Read`（2.1.296 起多 `allow_large`）与 `ShareOnboardingGuide`（2.1.317 改写了说明）。
+    pub(super) read_tokens: Option<u64>,
+    pub(super) share_guide_tokens: Option<u64>,
 }
 
 impl ToolsOff {
@@ -1665,6 +1706,10 @@ impl ToolsOff {
             artifact: off("Artifact") && off("ArtifactComments") && off("ArtifactData"),
             list_agents: off("ListAgents"),
             send_feedback: off("SendFeedback"),
+            report_findings: None,
+            list_agents_tokens: None,
+            read_tokens: None,
+            share_guide_tokens: None,
         }
     }
 
@@ -1830,12 +1875,52 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
             }
         }
     }
+    shape.inline_tool_additions = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_addition")
+                && b.get("tool").and_then(|t| t.get("type")).and_then(|t| t.as_str())
+                    == Some("tool_definition")
+        })
+        .count();
+    shape.tool_changes = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+        .flatten()
+        .filter(|b| {
+            matches!(b.get("type").and_then(|t| t.as_str()), Some("tool_addition" | "tool_removal"))
+        })
+        .count();
     // `toolsCharLength` 是各工具长度之和（不含数组的方括号与逗号）：`cap/2.1.260-2` 74633。
     shape.tools_chars = lens.values().filter_map(|v| v.as_u64()).sum::<u64>() as usize;
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         let names: Vec<&str> =
             tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();
         shape.tools_off = ToolsOff::of(&names);
+        // 出站那几条逐版改过 schema 的内建工具，按实际发出的 schema 估值（[`ToolsOff::report_findings`] 等）。只有缺 schema、或
+        // schema 是光秃秃的占位（只有 `type` 一项，如 `{"type":"object"}`）时照官方增量算；别的一律按实际长度——没有参数的
+        // （`properties: {}`）、把参数放进 `allOf` 之类组合里的，都是实际发出去的入参契约。
+        let schema_tokens = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+                .and_then(|t| t.get("input_schema"))
+                .filter(|schema| schema.as_object().is_some_and(|o| o.keys().any(|k| k != "type")))
+                .map(|schema| recorded_schema_tokens(name, schema))
+        };
+        shape.tools_off.report_findings = schema_tokens("ReportFindings");
+        shape.tools_off.list_agents_tokens = schema_tokens("ListAgents");
+        shape.tools_off.read_tokens = schema_tokens("Read");
+        shape.tools_off.share_guide_tokens = schema_tokens("ShareOnboardingGuide");
     }
     shape.tool_lens = Value::Object(lens).to_string();
     shape.tools_hash = sha256_hex(shape.tool_lens.as_bytes())[..12].to_string();

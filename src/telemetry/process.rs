@@ -299,6 +299,18 @@ impl Telemetry {
             if kind == Kind::Title {
                 sess.waiting_titles.push((call.logical_start(), sleepy_key(&display_model)));
             }
+            // 已经有请求报了 clear-at、归属还没定死（扣着没放出去，或让给了另一条还扣在这里的标题），这条标题首字节更早、
+            // 也带着它：候选换成这条，扣着的那条作废，补处理到这条时由它报。
+            if call.failure.is_none()
+                && call.ttft_ms.is_some()
+                && clear_at_beta(call.betas.as_deref().unwrap_or_default())
+                && sess.clear_at_claim.is_some_and(|c| first_byte(&call) < c)
+                && let Some(p) = st.pending.get_mut(&key)
+                && (p.held_clear_at.take().is_some() || sess.clear_at_owed.is_some())
+            {
+                sess.clear_at_claim = Some(first_byte(&call));
+                sess.clear_at_owed = Some(first_byte(&call));
+            }
             sess.deferred.push((call, prev_end, now));
             return;
         }
@@ -695,11 +707,15 @@ impl Telemetry {
             && !sess.turn_text_seen
             && !turn_stats_unknown;
         // 首字之前跑过的工具数 = 本轮此前的 + 这条续轮带回来的。
-        let tool_calls_before = sess.turn_tool_calls + shape.tool_uses.len() as u32;
+        // 体里没有结果的调用（[`super::shape::ToolUse::no_result`]）认不出跑过，不算（与结果事件同口径）。
+        let tool_calls_before =
+            sess.turn_tool_calls + shape.tool_uses.iter().filter(|t| !t.no_result).count() as u32;
         let user_secs = sess.user_secs(&call, &shape, new_prompt);
+        // 只有真跑起来的 Bash 才建快照（[`super::events::first_run_bash`]）：首个 Bash 没跑成（工具名不认得、校验没过、被拒），
+        // 这条不报、会话也不记成拍过，同批或下一轮跑成的那条再报。
         let shell_snapshot_first = is_main
             && !sess.shell_snapshot_done
-            && shape.tool_uses.iter().any(|t| t.name == "Bash");
+            && super::events::first_run_bash(&shape.tool_uses).is_some();
         let prompt_index = sess.prompt_index.max(1);
         let prompt_seq = sess.prompts_seen.max(1);
 
@@ -782,6 +798,8 @@ impl Telemetry {
         let v326 = version_at_least(&version, "2.1.326");
         // 2.1.327：错误栈换块、几个事件删键加键，见 [`TurnFacts::v327`]。
         let v327 = version_at_least(&version, "2.1.327");
+        // 2.1.328：错误栈换块，见 [`TurnFacts::v328`]。
+        let v328 = version_at_least(&version, "2.1.328");
         // 这个会话的 Bash 调用记不记重复命令统计（2.1.317 起按会话 id 抽样，比例跟号的 `tengu_vivid_peach`）。
         let bash_metered = v317
             && super::bash_repeat::metered(
@@ -856,6 +874,65 @@ impl Telemetry {
         if first_main {
             sess.first_main_done = true;
         }
+        // 首字节处的一次性能力事件（[`super::session::CAP_EVENTS`]）：请求成功收到首字节才报，每项按这条请求用没用上那项能力
+        // 判，一个进程各报一次。per-turn、中途改工具、inline 只有主线程会用上：per-turn 只看 beta，中途改工具要体里真有工具
+        // 增减块，inline 要体里真有带定义的 system 消息。clear-at 谁先用上算谁的（官方的锁存在进程上、每次查询都过一遍）：
+        // `cap/auto-max-2.1.328-20261119-full/00436` 那个 haiku-4.5 会话只有标题请求带这个 beta，官方照报；`00480` 那次标题先于
+        // 主线程出首字节，官方挂在标题上。标题常被扣着、等主线程处理完才补处理（[`State::presession`]），所以主线程判 clear-at
+        // 时先看扣着的标题里有没有更早出首字节、也带着它的，有就留给那条。
+        let clear_at = clear_at_beta;
+        let mut hold_clear_at = false;
+        let caps_now: Vec<&'static str> =
+            if v280 && !failed && !(call.aborted && call.ttft_ms.is_none()) {
+                let betas = call.betas.as_deref().unwrap_or_default();
+                let has = |prefix: &str| betas.split(',').any(|b| b.trim().starts_with(prefix));
+                let title_first = is_main
+                    && sess.deferred.iter().any(|(c, ..)| {
+                        c.failure.is_none()
+                            && c.ttft_ms.is_some()
+                            && clear_at(c.betas.as_deref().unwrap_or_default())
+                            && first_byte(c) < first_byte(&call)
+                    });
+                let wanted = [
+                    is_main && has(config::CC_BETA_PER_TURN_CONTROL),
+                    is_main && has("mid-conversation-tool-changes-") && shape.tool_changes > 0,
+                    is_main
+                        && betas.split(',').any(|b| b.trim() == config::CC_BETA_INLINE_TOOLS)
+                        && shape.inline_tool_additions > 0,
+                    clear_at(betas) && !title_first,
+                ];
+                let mut out = Vec::new();
+                for (bit, (name, want)) in super::session::CAP_EVENTS.iter().zip(wanted).enumerate()
+                {
+                    if want && sess.caps_emitted & (1 << bit) == 0 {
+                        sess.caps_emitted |= 1 << bit;
+                        out.push(*name);
+                        if *name == CLEAR_AT {
+                            sess.clear_at_claim = Some(first_byte(&call));
+                            // 先扣着，等首字节可能更早、却后完成的请求（[`Pending::held_clear_at`]）。
+                            hold_clear_at = true;
+                        }
+                    } else if want
+                        && *name == CLEAR_AT
+                        && (sess.clear_at_owed == Some(first_byte(&call))
+                            || (sess.clear_at_claim.is_some_and(|c| first_byte(&call) < c)
+                                && st
+                                    .pending
+                                    .get_mut(&key)
+                                    .is_some_and(|p| p.held_clear_at.take().is_some())
+                                    | sess.clear_at_owed.is_some()))
+                    {
+                        // 归属让给了这条（补处理的标题），或者这条比当前候选更早出首字节、候选还没放出去：换成这条，照样先扣着。
+                        sess.clear_at_owed = None;
+                        sess.clear_at_claim = Some(first_byte(&call));
+                        hold_clear_at = true;
+                        out.push(*name);
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            };
         // 快照一条线一份：主线程（含猜下一句）一份，每个子代理（含它的摘要请求）各一份
         // （`cap/2.1.280` 主线程 `b06e…`/`d6bc…`、Explore 子代理 `7d8050a24c2c`，子代理首条
         // 同样报 `live_recorded`）。
@@ -1289,6 +1366,7 @@ impl Telemetry {
             v325,
             v326,
             v327,
+            v328,
             bash_metered,
             tools_used_header_first,
             tools_used_connector_fields_first,
@@ -1313,6 +1391,7 @@ impl Telemetry {
             ide_detect,
             attachment_counts,
             first_main,
+            caps_now,
             startup_wait,
             snapshot,
             sleepy,
@@ -1442,6 +1521,19 @@ impl Telemetry {
             pending.prompt_id = prompt_id.clone();
         }
         pending.started_wall = Some(started_wall);
+        let (mut events, mut dd) = (events, dd);
+        if hold_clear_at {
+            let (held_ev, rest): (Vec<_>, Vec<_>) =
+                events.into_iter().partition(|(_, e)| is_clear_at(e));
+            events = rest;
+            let (held_dd, rest): (Vec<_>, Vec<_>) = dd.into_iter().partition(is_clear_at);
+            dd = rest;
+            pending.held_clear_at = Some(super::session::HeldClearAt {
+                release_at: now + super::session::CLEAR_AT_HOLD,
+                events: held_ev,
+                dd: held_dd,
+            });
+        }
         pending.push_batch((events, dd), now);
         // OTel 指标只有 team / enterprise 号导出（官方 `st()`）；个人号不攒，也就没有那条 `internal_metrics_export`。
         if !is_prosumer(&pending.subscription_type) {
@@ -2491,8 +2583,11 @@ impl Session {
             }
             self.last_model = Some(display_model.to_string());
             self.note_main_model(call.started_at, display_model);
-            self.turn_tool_calls += shape.tool_uses.len() as u32;
-            for tu in &shape.tool_uses {
+            // 跑过的工具数与 `tool_use` 结果事件同口径：体里没有结果的调用不算（`-p` 收尾的 `tool_use_count` /
+            // `builtin_tool_calls`）。
+            let ran = || shape.tool_uses.iter().filter(|t| !t.no_result);
+            self.turn_tool_calls += ran().count() as u32;
+            for tu in ran() {
                 if tu.name.starts_with("mcp__") {
                     self.turn_mcp_calls += 1;
                 } else if tu.name == "ToolSearch" {
@@ -2749,4 +2844,31 @@ fn startup_wait_ms(session_id: &str, sdk: bool) -> u32 {
 /// 回复里的工具调用记下来时带上发出这条回复的请求的权限模式（[`ToolCall::permission_mode`]）。
 fn with_mode(calls: &[ToolCall], mode: &'static str) -> Vec<ToolCall> {
     calls.iter().map(|c| ToolCall { permission_mode: Some(mode), ..c.clone() }).collect()
+}
+
+/// 请求带了 clear-at 那个 beta（`mid-conversation-system-clear-at-*`）。
+fn clear_at_beta(betas: &str) -> bool {
+    betas.split(',').any(|b| b.trim().starts_with("mid-conversation-system-clear-at-"))
+}
+
+/// 一条请求收到首字节的时刻（没有首字节按发出时刻）。
+fn first_byte(c: &ApiCall) -> SystemTime {
+    c.started_at + Duration::from_millis(c.ttft_ms.unwrap_or(0))
+}
+
+/// 首字节处那几条能力事件里 clear-at 那条的 feature 名（[`super::session::CAP_EVENTS`] 的末项）。
+const CLEAR_AT: &str = "api_kept_reminder_clear_at";
+
+/// 队里这条事件是不是 clear-at 那条 `feature_ok`（一方事件的 `additional_metadata` 是 base64 的 JSON，Datadog 那份是平铺的字段）。
+fn is_clear_at(e: &Value) -> bool {
+    if e.get("message").and_then(|m| m.as_str()) == Some("tengu_feature_ok") {
+        return e.get("feature_name").and_then(|f| f.as_str()) == Some(CLEAR_AT);
+    }
+    let Some(d) = e.get("event_data") else { return false };
+    d.get("event_name").and_then(|n| n.as_str()) == Some("tengu_feature_ok")
+        && d.get("additional_metadata")
+            .and_then(|m| m.as_str())
+            .and_then(|m| STANDARD.decode(m).ok())
+            .and_then(|m| serde_json::from_slice::<Value>(&m).ok())
+            .is_some_and(|m| m.get("feature_name").and_then(|f| f.as_str()) == Some(CLEAR_AT))
 }

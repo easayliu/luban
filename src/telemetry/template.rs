@@ -852,6 +852,30 @@ const SHARE_GUIDE_TOKENS_2_1_317: u64 = 21;
 /// 实际发出的 schema 现算（`sent_schema`），资产里那份已是 327 的，不再另加。
 const LIST_AGENTS_CURSOR_TOKENS_2_1_327: u64 = 39;
 
+/// 2.1.328 起 `ReportFindings` 的入参 `summary` 描述改短、多一个 `severity` 枚举（schema 紧凑 JSON 1545→1786 字），`non_mcp_tools_tokens`
+/// 各族（含 `-p`）一律多 61，工具数不变（`cap/auto-max-2.1.328-20261119-full` 对 `cap/auto-max-2.1.327-20261118-full` 同场景逐个：opus 等
+/// 15564→15625、haiku-5-5 15534→15595、haiku-4.5 16035→16096、`-p` 3129→3190）。同版 ListAgents 只改了描述（不计入），不另加。
+const REPORT_FINDINGS_SEVERITY_TOKENS_2_1_328: u64 = 61;
+
+/// 2.1.328 起 `ReportFindings` 对 `non_mcp_tools_tokens` 的修正（模板里那份是 327 的）：按出站那条实际的 schema 估值
+/// （[`super::shape::recorded_schema_tokens`]）减去 327 那份的。328 官方那份正好 +61（与抓包同），模拟路径保留下来的 327 原样
+/// 那份 0，在它上面加长 800 字的描述 +200，与 `-p` 那条按记录估的同口径。认不出这条工具（没有 `tools`）照 328 官方算。
+fn report_findings_adjust(rf: Option<u64>) -> i64 {
+    schema_adjust(
+        rf,
+        super::shape::REPORT_FINDINGS_TOKENS_2_1_327,
+        REPORT_FINDINGS_SEVERITY_TOKENS_2_1_328,
+    )
+}
+
+/// 一条 schema 逐版变过的内建工具对模板值的修正：出站那条的实际估值减去模板那版的；认不出（没有 `tools`）按新版官方的增量算。
+fn schema_adjust(actual: Option<u64>, template_tokens: u64, official_delta: u64) -> i64 {
+    match actual {
+        None => official_delta as i64,
+        Some(tokens) => tokens as i64 - template_tokens as i64,
+    }
+}
+
 /// 2.1.300 起 `Artifact` 的 schema 按版本变，交互式各族（`-p` 没有 Artifact）的 token 跟着变、工具数不变；
 /// 关掉 Artifact 时连这部分一起减。逐版对抓包里 `Artifact.input_schema` 的 `round(长度 / 4)` 差：
 /// 2.1.300 加 `edits` 参数 +274（`cap/auto-2.1.300-20261015-full`：opus 等 14299、haiku-5-5 14269、
@@ -1340,14 +1364,32 @@ where
                 let v293 = version_at_least(subst.version, "2.1.293");
                 let (count, mut tokens) =
                     context_tool_counts(v293, subst.sdk, subst.tool_family, off);
+                // 下面几项都按出站那条实际的 schema 算（模拟路径可能保留了客户端旧版的入参契约），认不出时按官方增量。
                 if version_at_least(subst.version, "2.1.296") {
-                    tokens += READ_ALLOW_LARGE_TOKENS;
+                    tokens = tokens.saturating_add_signed(schema_adjust(
+                        off.read_tokens,
+                        super::shape::READ_TOKENS_2_1_293,
+                        READ_ALLOW_LARGE_TOKENS,
+                    ));
                 }
                 if version_at_least(subst.version, "2.1.317") {
-                    tokens += SHARE_GUIDE_TOKENS_2_1_317;
+                    tokens = tokens.saturating_add_signed(schema_adjust(
+                        off.share_guide_tokens,
+                        super::shape::SHARE_GUIDE_TOKENS_2_1_316,
+                        SHARE_GUIDE_TOKENS_2_1_317,
+                    ));
                 }
+                // ListAgents 同 ReportFindings：按出站那条实际的 schema 算（模拟路径可能保留了客户端 326 那份，没有 `cursor`）。
                 if version_at_least(subst.version, "2.1.327") && !off.list_agents {
-                    tokens += LIST_AGENTS_CURSOR_TOKENS_2_1_327;
+                    tokens = tokens.saturating_add_signed(schema_adjust(
+                        off.list_agents_tokens,
+                        super::shape::LIST_AGENTS_TOKENS_2_1_326,
+                        LIST_AGENTS_CURSOR_TOKENS_2_1_327,
+                    ));
+                }
+                if version_at_least(subst.version, "2.1.328") {
+                    tokens =
+                        tokens.saturating_add_signed(report_findings_adjust(off.report_findings));
                 }
                 if subst.sdk {
                     if version_at_least(subst.version, "2.1.303") {

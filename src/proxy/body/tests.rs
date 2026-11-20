@@ -1104,7 +1104,7 @@ fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
     assert!(build_tool_name_map(Some(&legacy_only)).is_none());
 }
 
-/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 ~ 2.1.327 各份抓包（团队号、个人 Max 号、Ultra）的每条
+/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 ~ 2.1.328 各份抓包（团队号、个人 Max 号、Ultra）的每条
 /// `/v1/messages`，按白名单建映射应当为空，整条出站改写（真实 CC 透传那条路、工具名混淆开着）之后 `tools` 的名字与
 /// 先后逐个不变。Max 号延迟池里的 `SendToProject` / `SendToProjectContext` 与按号下发的 `Yield` 此前漏在白名单外，
 /// 会被改成 `mcp__luban__*`。抓包不在就跳过。
@@ -1119,7 +1119,11 @@ fn official_tool_names_survive_the_outbound_rewrite() {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for d in dirs.flatten() {
         let name = d.file_name().to_string_lossy().to_string();
-        if !(name.contains("2.1.325-") || name.contains("2.1.326-") || name.contains("2.1.327-")) {
+        if !(name.contains("2.1.325-")
+            || name.contains("2.1.326-")
+            || name.contains("2.1.327-")
+            || name.contains("2.1.328-"))
+        {
             continue;
         }
         let mut stack = vec![d.path()];
@@ -2979,7 +2983,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.327."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.328."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -3864,7 +3868,7 @@ fn tool_less_requests_get_the_official_tools_only_when_the_switch_is_on() {
 /// 同名替换保留客户端显式写的 `eager_input_streaming`：opus 资产带 true，客户端 Read 写了
 /// false → 出站 Read 是官方对象但 eager 为 false；fable 资产没有这个键，客户端 Read 写了
 /// true → 出站 Read 带 true；没写的一律等于资产。整条模拟路径走完（注入 → 补 eager → 混淆）
-/// 结论不变——补 eager 那步对已有键不动。
+/// 结论不变——补 eager 那步对已有键不动。客户端的入参契约照抄官方（只改描述），才会被换。
 #[test]
 fn same_named_client_tools_keep_their_explicit_eager_setting() {
     for (kind, model, client_value) in [
@@ -3875,11 +3879,13 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
         let asset = crate::proxy::cc_tools_core(profile, false);
         let asset_read = asset.iter().find(|t| t["name"] == "Read").unwrap();
         let asset_bash = asset.iter().find(|t| t["name"] == "Bash").unwrap();
+        let (read_schema, bash_schema) =
+            (asset_read["input_schema"].clone(), asset_bash["input_schema"].clone());
         let mut v = serde_json::json!({
             "model": model, "messages": [],
             "tools": [
-                {"name": "Read", "description": "mine", "input_schema": {"type": "object"}, "eager_input_streaming": client_value},
-                {"name": "Bash", "description": "mine", "input_schema": {"type": "object"}}
+                {"name": "Read", "description": "mine", "input_schema": read_schema, "eager_input_streaming": client_value},
+                {"name": "Bash", "description": "mine", "input_schema": bash_schema}
             ]
         });
         assert!(super::inject_cc_tools(&mut v, profile, false, false, who()));
@@ -3903,7 +3909,7 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
         let body: Bytes = serde_json::json!({
                 "model": model, "max_tokens": 1024,
                 "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"name": "Read", "description": "mine", "input_schema": {"type": "object"}, "eager_input_streaming": client_value}],
+                "tools": [{"name": "Read", "description": "mine", "input_schema": asset_read["input_schema"], "eager_input_streaming": client_value}],
                 "stream": true
             })
             .to_string()
@@ -3916,8 +3922,8 @@ fn same_named_client_tools_keep_their_explicit_eager_setting() {
     }
 }
 
-/// 客户端已带部分官方名的「半抄」克隆：缺的补到头部，同名的一律整条换成官方声明（参数
-/// 表面一致与否都换，不一致的只多一行日志），老版本多出来的不删。依据是现网一条
+/// 客户端已带部分官方名的「半抄」克隆：缺的补到头部，同名且入参契约（`input_schema`）与官方相同的整条换成官方
+/// 声明，契约不同的整条保留客户端自己的（按官方次序落位，多一行日志），老版本多出来的不删。依据是现网一条
 /// Go-http-client：15 个官方名（含 2.1.258 才有的 TaskCreate 等）、缺 2.1.260 恒带的四个，
 /// 原先一个都不补。
 #[test]
@@ -3930,7 +3936,7 @@ fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
     let mut client_read = official_read.clone();
     client_read["description"] = serde_json::json!("reads a file, my own wording");
     client_read.as_object_mut().unwrap().remove("eager_input_streaming");
-    // Bash：多要一个必填 `cwd`，参数表面与官方不一致 → 照样换，只是多一行日志。
+    // Bash：多要一个必填 `cwd`，入参契约与官方不一致 → 保留客户端的，模型按它的 schema 拼参数。
     let client_bash = serde_json::json!({
         "name": "Bash", "description": "run",
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}}, "required": ["command", "cwd"]}
@@ -3953,9 +3959,43 @@ fn partial_cc_clones_get_the_missing_tools_and_official_replacements() {
     let read = tools.iter().find(|t| t["name"] == "Read").unwrap();
     assert_eq!(read, official_read, "参数表面一致的 Read 整条换成官方声明");
     let bash = tools.iter().find(|t| t["name"] == "Bash").unwrap();
-    assert_eq!(bash, official_bash, "参数表面不一致的 Bash 同样换成官方声明");
-    assert!(!super::same_schema_surface(&client_bash, official_bash), "日志判据认得出它不一致");
+    assert_eq!(bash, &client_bash, "入参契约不一致的 Bash 保留客户端的声明");
+    assert!(!super::same_input_contract(&client_bash, official_bash));
     assert!(names.contains(&"TaskCreate"), "老版本多出来的不删");
+}
+
+/// 2.1.328 的 ReportFindings 在 `findings[]` 里加了 `severity`：用 327 那份严格 schema（`additionalProperties: false`）的客户端，
+/// 同名声明整条保留，出站不带 `severity`，模型拼的参数它认得；顶层属性相同、嵌套不同也算契约不同
+/// （[`super::same_schema_surface`] 看不出来）。与官方逐字相同的照旧是官方那份。
+#[test]
+fn same_named_tool_with_an_older_nested_schema_keeps_its_contract() {
+    let profile = config::cc_profile(config::CcProfileKind::MainOpus);
+    let official = crate::proxy::cc_tools_core(profile, false);
+    let official_rf = official.iter().find(|t| t["name"] == "ReportFindings").unwrap().clone();
+    assert!(
+        official_rf["input_schema"]["properties"]["findings"]["items"]["properties"]
+            .get("severity")
+            .is_some(),
+        "328 资产带 severity"
+    );
+    let mut old_rf = official_rf.clone();
+    let items = &mut old_rf["input_schema"]["properties"]["findings"]["items"];
+    items["properties"].as_object_mut().unwrap().remove("severity");
+    items["additionalProperties"] = serde_json::json!(false);
+    assert!(super::same_schema_surface(&old_rf, &official_rf), "顶层表面一样");
+    assert!(!super::same_input_contract(&old_rf, &official_rf), "嵌套不一样");
+    let mut v =
+        serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": [old_rf.clone()]});
+    super::inject_cc_tools(&mut v, profile, false, false, who());
+    let out =
+        v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "ReportFindings").unwrap();
+    assert_eq!(out, &old_rf, "保留客户端那份");
+    assert!(!out.to_string().contains("severity"));
+    let mut v = serde_json::json!({"model": "claude-opus-5", "messages": [], "tools": [official_rf.clone()]});
+    super::inject_cc_tools(&mut v, profile, false, false, who());
+    let out =
+        v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "ReportFindings").unwrap();
+    assert_eq!(serde_json::to_string(out).unwrap(), serde_json::to_string(&official_rf).unwrap());
 }
 
 /// `tengu_lucky_cerf` 清单里的模型注的是换了 `Agent` 说明的那份：只有 `Agent.description` 不同，
@@ -5348,7 +5388,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 327)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 328)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6739,21 +6779,24 @@ fn env_note_model_line_follows_the_captured_table() {
 
 /// opus 那族：首条用户消息之后一条 `role: system`，各段次序同 `00340`；精简工具时没有
 /// scratchpad 一行与 artifact 三个技能（`cap/auto-2.1.291-20261006/00066`）；同一条再补一遍不重复。
-/// **对着 `cap/auto-2.1.293-20261008-full` 逐段核首轮环境说明**：opus / sonnet / haiku-5-5 三个
-/// 带 `mid-conversation-system` 的主线程（`00419`、`00256`、`00344`），按抓包机的 cwd 补一份，与官方
-/// 那条 `role: system` 消息去掉模拟路径不注的几段后逐字节相同。不比的：MCP 那几段（2.1.293 新增的
-/// 「tools just became available」、MCP 说明）、延迟工具那段、插件技能（名字带 `:` 的那几行）；
-/// scratchpad 那行里的会话 id 与日期换成模拟这边的。抓包目录不在仓库里就跳过。
+/// **对着 `cap/auto-max-2.1.328-20261119-full` 逐段核首轮环境说明**：opus / sonnet / haiku-5-5 三个
+/// 带 `mid-conversation-system` 的主线程（`00478`、`00279`、`00339`，各自首轮），按抓包机的 cwd 补一份，与官方
+/// 那条 `role: system` 消息去掉模拟路径不注的几段后逐字节相同。不比的：MCP 那几段（「tools just became available」、
+/// 连不上的 MCP 与其后那句、MCP 说明）、延迟工具那段、插件技能（名字带 `:` 的那几行）与抓包机用户级的
+/// `reverse-engineer-anything`、Agent 清单里的 `web-fetch`（服务端 `tengu_clever_orbit` 按号下发，2.1.326 起这个号开着）；
+/// 抓包号开着 bughunter，技能清单 code-review 那行是 ultra 长版，换回短版再比（长版见 [`crate::proxy::bughunter`]）；
+/// scratchpad 那行里的会话 id 换成模拟这边的。2.1.328 起环境段末尾无条件多 curl `--form-string` 那句；scratchpad 那行
+/// 2.1.325 起多两句（重启会清、提文件要写完整绝对路径）。抓包目录不在仓库里就跳过。
 #[test]
-fn env_note_matches_the_2_1_293_captures() {
-    let dir = format!("{}/cap/auto-2.1.293-20261008-full", env!("CARGO_MANIFEST_DIR"));
+fn env_note_matches_the_2_1_328_captures() {
+    let dir = format!("{}/cap/auto-max-2.1.328-20261119-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-2.1.293-20261008-full not present");
+        eprintln!("skipped: cap/auto-max-2.1.328-20261119-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
-    let cwd = "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/32e92005-bbe2-45cf-9aac-d4f538716b03/scratchpad/calc";
-    for (cred, n) in [(5301, "00419"), (5302, "00256"), (5303, "00344")] {
+    let cwd = "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/d4cbe298-5c8d-4f80-bb02-d0a542086b13/scratchpad/cal15";
+    for (cred, n) in [(5311, "00478"), (5312, "00279"), (5313, "00339")] {
         let path = files
             .iter()
             .find(|p| {
@@ -6783,7 +6826,7 @@ fn env_note_matches_the_2_1_293_captures() {
         assert_eq!(v["messages"][1]["role"], "system", "{model}");
         let text = v["messages"][1]["content"][0]["text"].as_str().unwrap();
 
-        // 官方那份去掉模拟不注的段落：MCP 两种、延迟工具；技能清单只留内建的（不带 `:` 的）。
+        // 官方那份去掉模拟不注的段落：MCP 几种、延迟工具；技能清单只留内建的；Agent 清单去掉 web-fetch。
         let mut keep = Vec::new();
         let mut in_mcp = false;
         for para in otext.split("\n\n") {
@@ -6796,38 +6839,46 @@ fn env_note_matches_the_2_1_293_captures() {
             if in_mcp
                 || para.starts_with("The following tools just became available")
                 || para.starts_with("The following deferred tools are now available")
+                || para
+                    .starts_with("The following MCP servers are configured but failed to connect")
+                || para.starts_with("Treat this as a connection failure")
             {
                 continue;
             }
-            // 插件技能形如 `- commit-commands:commit: …`，名字里带 `:`。
-            let plugin = |l: &str| {
-                l.strip_prefix("- ")
-                    .and_then(|s| s.split_once(": "))
-                    .is_some_and(|(name, _)| name.contains(':'))
+            // 插件技能形如 `- commit-commands:commit: …`，名字里带 `:`；抓包机用户级技能另列。
+            let dropped = |l: &str| {
+                l.strip_prefix("- ").and_then(|s| s.split_once(": ")).is_some_and(|(name, _)| {
+                    name.contains(':')
+                        || name == "reverse-engineer-anything"
+                        || (para.starts_with("Available agent types") && name == "web-fetch")
+                })
             };
-            let para: Vec<&str> = para.lines().filter(|l| !plugin(l)).collect();
+            let para: Vec<&str> = para.lines().filter(|l| !dropped(l)).collect();
             keep.push(para.join("\n"));
         }
-        // 2.1.311 改写了技能清单里 code-review 那行（描述改了措辞、行尾多一句 whenToUse），其余段落与 2.1.293
-        // 逐字相同：官方那行换成当前资产里的再比。
+        let want = keep.join("\n\n").replace(session, &sim.session_id);
         let review =
             |s: &str| s.lines().find(|l| l.starts_with("- code-review: ")).map(str::to_owned);
-        let mut want = keep.join("\n\n").replace(session, &sim.session_id);
+        let mut want = want;
         if let (Some(old), Some(new)) = (review(&want), review(config::CC_ENV_SKILLS)) {
+            assert_eq!(
+                crate::proxy::bughunter::fit_skills(&new, true),
+                old,
+                "{model}: 抓包号开着 bughunter，code-review 是长版"
+            );
             want = want.replace(&old, &new);
         }
-        // 2.1.321 又改写了 claude-api 那一条（`read FIRST, before you answer…`、末尾多 `; if nothing hits, load this skill`，
-        // `cap/auto-2.1.321-20261110-full/00068`）：那一条跨三行，从它起到下一条之前整段换成当前资产里的。
-        let api = |s: &str| {
-            let at = s.find("- claude-api: ")?;
-            let end = s[at..].find("\n- ").map_or(s.len(), |n| at + n);
-            Some(s[at..end].to_owned())
-        };
-        if let (Some(old), Some(new)) = (api(&want), api(config::CC_ENV_SKILLS)) {
-            want = want.replace(&old, &new);
+        // 抓包机 OS 版本是 27.2.0，模拟固定写 [`config::CC_OS_RELEASE`]。
+        let want = want.replace("Today's date is 2026-11-19.", "").replace(
+            "OS Version: Darwin 27.2.0",
+            &format!("OS Version: Darwin {}", config::CC_OS_RELEASE),
+        );
+        let mut got = text.split("Today's date is ").next().unwrap().to_string();
+        // `<total_tokens>` 跟号的下发走（[`crate::proxy::lapis_anchor`]）：抓包那天 opus / sonnet 下发 off、官方没有这一段，
+        // 测试号没喂；官方有这一段时两边都有，按官方那份决定比不比。
+        if !want.contains("<total_tokens>") {
+            got = got.replace("<total_tokens>15000000 tokens left</total_tokens>\n\n", "");
         }
-        let want = want.replace("Today's date is 2026-10-08.", "");
-        let got = text.split("Today's date is ").next().unwrap().to_string();
         assert_eq!(got, want, "{model}（{n}）");
         let line = config::CC_MODEL_IDENTITIES.iter().find(|(id, ..)| *id == model).unwrap().1;
         assert!(got.contains(&format!("You are powered by the model named {line}.")), "{model}");

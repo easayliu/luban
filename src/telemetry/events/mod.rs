@@ -11,6 +11,7 @@ mod request;
 mod tools;
 #[cfg(test)]
 pub(super) use tools::bash_timing;
+pub(super) use tools::first_run_bash;
 
 /// 拼这条调用的事件链：只读 [`TurnFacts`]，不碰会话状态。
 pub(crate) fn build_events(
@@ -494,6 +495,8 @@ pub(super) struct ToolStep {
     /// 这一批盯弹框的总等待（死时间）的估值：间隔减去各工具一份合理执行后剩下的。只在
     /// `prompted > 0` 时非零；它只进点头那些工具的 `permissionDurationMs`，不摊到别的工具的时长上。
     pub(super) batch_approval: i64,
+    /// 这一批里第一个真跑了的 `Bash` 的位置（[`tools::first_run_bash`]），每批算一次。
+    pub(super) first_bash: Option<usize>,
 }
 
 /// 攒这条调用的几路事件。各段 `emit_*` 照官方的先后依次往里写，[`Self::finish`] 再按原来的

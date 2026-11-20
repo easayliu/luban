@@ -1,9 +1,9 @@
-//! 2.1.327 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.327 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.327 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.327 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.327 的 profile 表：2.1.327 来访的 beta 参照（[`cc_profile_at`]）。2.1.328 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.326（[`CC_PROFILES_2_1_326`]）完全相同**：`cap/auto-max-2.1.327-20261118-full`（个人 Max 号）
 /// 按场景逐条对 `cap/auto-max-2.1.326-20261117-full`，主线程 system 各块（测试项目路径归一后）、beta、body 键、端点都没变，
@@ -13,7 +13,7 @@ use super::*;
 ///
 /// 代码里新出现、但要服务端按号下发才发的两样，这个号都没有：WebSearch 侧查询的 `web-search-results-only-2026-11-15`
 /// beta（`tengu_nifty_quasar`）与线程路由提示头（头名由 `tengu_tingly_flute` 下发）。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_327: &[CcProfile] = &[
     at_327(CC_PROFILES_2_1_326[0]),
     at_327(CC_PROFILES_2_1_326[1]),
     at_327(CC_PROFILES_2_1_326[2]),
