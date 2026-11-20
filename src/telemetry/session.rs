@@ -453,6 +453,8 @@ pub(super) struct AgentState {
 pub(super) struct ThreadBase {
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
+    /// [`RequestShape::mcp_tools_chars`]：没带 `tools` 的续轮同样沿用（2.1.329 `mcpToolsCharLength`）。
+    pub(super) mcp_tools_chars: usize,
     pub(super) tools_hash: String,
     pub(super) tools_content_hash: String,
     pub(super) tool_lens: String,
@@ -545,6 +547,7 @@ impl ThreadBase {
             tools_known: true,
             tools_count: s.tools_count,
             tools_chars: s.tools_chars,
+            mcp_tools_chars: s.mcp_tools_chars,
             tools_hash: s.tools_hash.clone(),
             tools_content_hash: s.tools_content_hash.clone(),
             tool_lens: s.tool_lens.clone(),
@@ -664,6 +667,7 @@ impl ThreadBase {
         }
         s.tools_count = self.tools_count;
         s.tools_chars = self.tools_chars;
+        s.mcp_tools_chars = self.mcp_tools_chars;
         s.tools_hash = self.tools_hash.clone();
         s.tools_content_hash = self.tools_content_hash.clone();
         s.tool_lens = self.tool_lens.clone();
@@ -1285,6 +1289,9 @@ pub(super) struct TurnFacts {
     /// 2.1.328：失败 Bash 的栈摘要、行列、块名都换了，仍不带 `error_constructor`；5xx 摘要与行列照旧、换块名，**又不带**
     /// `error_constructor`（`cap/auto-max-2.1.328-20261119-*`）。
     pub(super) v328: bool,
+    /// 2.1.329：失败 Bash 的栈摘要、行列、块名都换了，**又带上** `error_constructor: "TT"`；5xx 摘要与行列照旧、换块名，**又带上**
+    /// `error_constructor: "Wzn"`；`tengu_api_success` 在 `toolsCharLength` 后多 `mcpToolsCharLength`（`cap/auto-max-2.1.329-20261120-*`）。
+    pub(super) v329: bool,
     /// 2.1.317 起这个会话抽中了重复命令统计（[`super::bash_repeat::metered`]），更早的版本恒假（那时不抽样，看 `v316`）。
     pub(super) bash_metered: bool,
     /// 这条出站带了 `x-claude-code-sandy-plover`（重发过的看整串，这个会话的额度探测带过也算，见

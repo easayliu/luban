@@ -16,7 +16,7 @@ pub const KEEPALIVE_HOURLY_TICKS: u64 = 2;
 
 /// 保活请求的 User-Agent。抓包显示保活类端点都用 `claude-code/<版本>`，
 /// 而非转发时的 `claude-cli/<版本>`。
-pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.328";
+pub const KEEPALIVE_USER_AGENT: &str = "claude-code/2.1.329";
 
 /// 事件日志里的 `betas` 字段：会话级 beta 集合，不含每请求才带的模型级 beta
 /// （`advanced-tool-use`/`effort`/`extended-cache-ttl` 等）。原取自 `cap/2.1.258/00032`
@@ -43,6 +43,9 @@ pub const KEEPALIVE_EVENT_LOGGING: &str = "/api/event_logging/v2/batch";
 pub const KEEPALIVE_METRICS: &str = "/api/claude_code/metrics";
 
 pub const KEEPALIVE_POLICY_LIMITS: &str = "/api/claude_code/policy_limits";
+
+/// 2.1.329 起 `policy_limits` 恒带的 `anthropic-client-capabilities` 取值（官方常量 `vi`，静态核对）。
+pub const POLICY_LIMITS_CLIENT_CAPABILITIES: &str = "computer_use_apps_v1";
 
 pub const KEEPALIVE_SETTINGS: &str = "/api/claude_code/settings";
 
@@ -207,6 +210,26 @@ pub const AXIOS_SHAPES: &[AxiosShape] = &[
             "Cache-Control",
             "Pragma",
             "If-None-Match",
+            "Authorization",
+            "anthropic-beta",
+            "Accept-Encoding",
+            "Host",
+            "Connection",
+        ],
+    },
+    // 2.1.329 起多 `anthropic-client-capabilities: computer_use_apps_v1`（[`POLICY_LIMITS_CLIENT_CAPABILITIES`]），
+    // 紧跟 `If-None-Match`、排在鉴权两项之前（官方 `Myr`：`{User-Agent, ...no-cache 两项, If-None-Match,
+    // anthropic-client-capabilities, ...鉴权头}`，静态核对；个人 Max 号不拉 policy，`cap/auto-max-2.1.329-20261120-*` 里没有样本）。
+    AxiosShape {
+        name: "policy_limits",
+        since: (2, 1, 329),
+        order: &[
+            "Accept",
+            "User-Agent",
+            "Cache-Control",
+            "Pragma",
+            "If-None-Match",
+            "anthropic-client-capabilities",
             "Authorization",
             "anthropic-beta",
             "Accept-Encoding",

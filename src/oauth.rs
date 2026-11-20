@@ -1329,6 +1329,11 @@ fn policy_limits_request(
     if let Some(etag) = etag_of(ctx.cred_id, "policy_limits") {
         req = req.header("If-None-Match", etag);
     }
+    // 2.1.329 起恒带（条件请求与否都带），见 [`config::POLICY_LIMITS_CLIENT_CAPABILITIES`]。
+    if ctx.at_least((2, 1, 329)) {
+        req =
+            req.header("anthropic-client-capabilities", config::POLICY_LIMITS_CLIENT_CAPABILITIES);
+    }
     axios_at(req, "policy_limits", ctx.client_version())
 }
 

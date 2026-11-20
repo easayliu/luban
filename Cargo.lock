@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "luban"
-version = "0.3.304"
+version = "0.3.305"
 dependencies = [
  "aes-gcm",
  "anyhow",

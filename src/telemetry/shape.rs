@@ -181,6 +181,9 @@ pub(super) struct RequestShape {
     pub(super) total_tokens_max: Option<u64>,
     pub(super) tools_count: usize,
     pub(super) tools_chars: usize,
+    /// [`Self::tools_chars`] 里**非延迟** `mcp__*` 工具（官方 `Kf`：名字带 `mcp__` 前缀或标了 MCP）那部分：2.1.329 起
+    /// `tengu_api_success.mcpToolsCharLength`（官方 `krr`，`cap/auto-max-2.1.329-20261120-full` 165 条全 0——MCP 工具都在延迟池）。
+    pub(super) mcp_tools_chars: usize,
     /// 这条实际发出了 schema 的内建工具（非延迟、非 MCP）按官方工具记录估的 token 和（[`recorded_schema_tokens`]）：
     /// 2.1.323 起 `-p` 的 `tengu_context_size.non_mcp_tools_tokens` 只算这些。
     pub(super) sent_schema_tokens: u64,
@@ -1219,6 +1222,11 @@ pub(super) fn error_trace(
         ("2.1.328", Some(s)) if s >= 500 => {
             Some((None, "5b32b751db51", "chunk-rsckepzm.js:5:1510"))
         }
+        // 2.1.329 摘要与行列照旧、顶帧换了块；5xx 类压缩后是 `Wzn`，过得了构造名校验，**又带上了 `error_constructor`**
+        // （`cap/auto-max-2.1.329-20261120-retry`：两条 `tengu_api_retry` 与收尾的 `tengu_api_error` 都带）。
+        ("2.1.329", Some(s)) if s >= 500 => {
+            Some((Some("Wzn"), "5b32b751db51", "chunk-avbzeyf3.js:5:1510"))
+        }
         _ => None,
     }
 }
@@ -1902,6 +1910,12 @@ pub(super) fn shape_of(v: &Value, body: &[u8]) -> Option<RequestShape> {
         .count();
     // `toolsCharLength` 是各工具长度之和（不含数组的方括号与逗号）：`cap/2.1.260-2` 74633。
     shape.tools_chars = lens.values().filter_map(|v| v.as_u64()).sum::<u64>() as usize;
+    // 与 `toolsCharLength` 同一张长度表取 `mcp__*` 那几项，同名重复声明两边一样只算一次。
+    shape.mcp_tools_chars = lens
+        .iter()
+        .filter(|(k, _)| k.starts_with("mcp__"))
+        .filter_map(|(_, v)| v.as_u64())
+        .sum::<u64>() as usize;
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
         let names: Vec<&str> =
             tools.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str())).collect();

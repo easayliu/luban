@@ -1,9 +1,9 @@
-//! 2.1.328 的 profile 表（模拟路径用的就是它），及这一版还缺的抓包。
+//! 2.1.328 的 profile 表，及这一版还缺的抓包。
 
 use super::*;
 
-/// 2.1.328 的 profile 表——**模拟路径用的就是它**（[`cc_profile`]），也是 ≥2.1.328 来访的
-/// beta 参照（[`cc_profile_at`]）。
+/// 2.1.328 的 profile 表：2.1.328 来访的 beta 参照（[`cc_profile_at`]）。2.1.329 的表（[`CC_PROFILES`]）各行
+/// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.327（[`CC_PROFILES_2_1_327`]）完全相同**：`cap/auto-max-2.1.328-20261119-full`（个人 Max 号）
 /// 按场景逐条对 `cap/auto-max-2.1.327-20261118-full`，主线程 system 各块（测试项目路径归一后）、beta、body 键、端点都没变，
@@ -14,7 +14,7 @@ use super::*;
 /// 代码里新出现、但要服务端按号下发才发的：`resumption-2026-10-08` beta（`tengu_peaceful_wigderson`，替代
 /// thinking-resumption），这个号没有。web-fetch 内置子代理跑 haiku 时首条 `max_tokens` 8192、WebSearch 侧查询的
 /// `web_search` 带 `search_profile`，都在模拟路径不发的子代理 / 侧查询上。
-pub const CC_PROFILES: &[CcProfile] = &[
+pub const CC_PROFILES_2_1_328: &[CcProfile] = &[
     at_328(CC_PROFILES_2_1_327[0]),
     at_328(CC_PROFILES_2_1_327[1]),
     at_328(CC_PROFILES_2_1_327[2]),

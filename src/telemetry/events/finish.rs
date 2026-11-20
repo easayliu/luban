@@ -287,6 +287,10 @@ impl EventBuilder<'_> {
             // 工具表不知道（[`TurnFacts::tools_unknown`]）：不报成空表。
             if !env.f.tools_unknown {
                 put("toolsCharLength", json!(shape.tools_chars));
+                // 2.1.329 起紧跟其后（官方 `krr` 的 `mcpToolsCharLength`，`cap/auto-max-2.1.329-20261120-full` 165 条都在这个位置）。
+                if env.f.v329 {
+                    put("mcpToolsCharLength", json!(shape.mcp_tools_chars));
+                }
                 put("toolsCount", json!(shape.tools_count));
                 put("deferredToolsCount", json!(shape.deferred_tools));
                 put("toolSchemasHash", json!(&shape.tools_hash));

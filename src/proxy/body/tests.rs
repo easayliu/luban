@@ -1104,7 +1104,7 @@ fn tool_map_keeps_legacy_official_names_but_still_mimics_lookalikes() {
     assert!(build_tool_name_map(Some(&legacy_only)).is_none());
 }
 
-/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 ~ 2.1.328 各份抓包（团队号、个人 Max 号、Ultra）的每条
+/// 官方请求里声明的工具一个都不该被混淆：本机 2.1.325 ~ 2.1.329 各份抓包（团队号、个人 Max 号、Ultra）的每条
 /// `/v1/messages`，按白名单建映射应当为空，整条出站改写（真实 CC 透传那条路、工具名混淆开着）之后 `tools` 的名字与
 /// 先后逐个不变。Max 号延迟池里的 `SendToProject` / `SendToProjectContext` 与按号下发的 `Yield` 此前漏在白名单外，
 /// 会被改成 `mcp__luban__*`。抓包不在就跳过。
@@ -1122,7 +1122,8 @@ fn official_tool_names_survive_the_outbound_rewrite() {
         if !(name.contains("2.1.325-")
             || name.contains("2.1.326-")
             || name.contains("2.1.327-")
-            || name.contains("2.1.328-"))
+            || name.contains("2.1.328-")
+            || name.contains("2.1.329-"))
         {
             continue;
         }
@@ -2983,7 +2984,7 @@ mod billing_only {
         );
         let pid = h["x-claude-code-prompt-id"].to_str().unwrap().to_string();
         let first = billing(&sim);
-        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.328."), "{first}");
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.329."), "{first}");
         assert!(first.contains(&format!(" cc_prompt_id={pid}; cc_turn_origin=human;")), "{first}");
         assert!(first.contains(" cc_prompt_index="), "{first}");
         assert!(!first.contains("cc_prev_req"), "首条没有上一环: {first}");
@@ -5388,7 +5389,7 @@ fn api_key_cc_billing_carries_the_reply_before_compaction() {
 #[test]
 fn reads_the_cc_version_from_the_user_agent() {
     let v = crate::proxy::cc_cli_version;
-    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 328)), "官方那串");
+    assert_eq!(v(config::CC_USER_AGENT), Some((2, 1, 329)), "官方那串");
     assert_eq!(v("claude-cli/2.1.251"), Some((2, 1, 251)), "光秃秃一串也认");
     assert_eq!(v("claude-cli/1.0 (external, cli)"), Some((1, 0, 0)));
     assert_eq!(v("python-httpx/0.27.0"), None, "非 CC 客户端没有版本可比");
@@ -6779,8 +6780,8 @@ fn env_note_model_line_follows_the_captured_table() {
 
 /// opus 那族：首条用户消息之后一条 `role: system`，各段次序同 `00340`；精简工具时没有
 /// scratchpad 一行与 artifact 三个技能（`cap/auto-2.1.291-20261006/00066`）；同一条再补一遍不重复。
-/// **对着 `cap/auto-max-2.1.328-20261119-full` 逐段核首轮环境说明**：opus / sonnet / haiku-5-5 三个
-/// 带 `mid-conversation-system` 的主线程（`00478`、`00279`、`00339`，各自首轮），按抓包机的 cwd 补一份，与官方
+/// **对着 `cap/auto-max-2.1.329-20261120-full` 逐段核首轮环境说明**：opus / sonnet / haiku-5-5 三个
+/// 带 `mid-conversation-system` 的主线程（`00481`、`00287`、`00344`，各自首轮；2.1.328 用的是 `00478`、`00279`、`00339`），抓包机路径（从抓包里读出）两边都换成合成路径后补一份，与官方
 /// 那条 `role: system` 消息去掉模拟路径不注的几段后逐字节相同。不比的：MCP 那几段（「tools just became available」、
 /// 连不上的 MCP 与其后那句、MCP 说明）、延迟工具那段、插件技能（名字带 `:` 的那几行）与抓包机用户级的
 /// `reverse-engineer-anything`、Agent 清单里的 `web-fetch`（服务端 `tengu_clever_orbit` 按号下发，2.1.326 起这个号开着）；
@@ -6788,15 +6789,14 @@ fn env_note_model_line_follows_the_captured_table() {
 /// scratchpad 那行里的会话 id 换成模拟这边的。2.1.328 起环境段末尾无条件多 curl `--form-string` 那句；scratchpad 那行
 /// 2.1.325 起多两句（重启会清、提文件要写完整绝对路径）。抓包目录不在仓库里就跳过。
 #[test]
-fn env_note_matches_the_2_1_328_captures() {
-    let dir = format!("{}/cap/auto-max-2.1.328-20261119-full", env!("CARGO_MANIFEST_DIR"));
+fn env_note_matches_the_2_1_329_captures() {
+    let dir = format!("{}/cap/auto-max-2.1.329-20261120-full", env!("CARGO_MANIFEST_DIR"));
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        eprintln!("skipped: cap/auto-max-2.1.328-20261119-full not present");
+        eprintln!("skipped: cap/auto-max-2.1.329-20261120-full not present");
         return;
     };
     let files: Vec<std::path::PathBuf> = entries.filter_map(|e| Some(e.ok()?.path())).collect();
-    let cwd = "/private/tmp/claude-501/-Users-easayliu-Works-easay-luban/d4cbe298-5c8d-4f80-bb02-d0a542086b13/scratchpad/cal15";
-    for (cred, n) in [(5311, "00478"), (5312, "00279"), (5313, "00339")] {
+    for (cred, n) in [(5311, "00481"), (5312, "00287"), (5313, "00344")] {
         let path = files
             .iter()
             .find(|p| {
@@ -6812,13 +6812,24 @@ fn env_note_matches_the_2_1_328_captures() {
         let session = official["metadata"]["user_id"].as_str().unwrap();
         let session: serde_json::Value = serde_json::from_str(session).unwrap();
         let session = session["session_id"].as_str().unwrap();
-        let otext = official["messages"][1]["content"][0]["text"].as_str().unwrap();
+        // 抓包机的路径从抓包里读，官方原文换成合成路径，模拟这边也按合成路径生成。
+        let (cap_home, cap_cwd) = crate::proxy::test_support::capture_paths(&official);
+        let otext = crate::proxy::test_support::synth_capture_paths(
+            official["messages"][1]["content"][0]["text"].as_str().unwrap(),
+            &cap_home,
+            &cap_cwd,
+        );
+        let otext = otext.as_str();
+        crate::proxy::test_support::assert_synth_paths(otext, &cap_home, &cap_cwd, n);
 
         let body = format!(
             r#"{{"model":"{model}","max_tokens":16,"messages":[{{"role":"user","content":"环境说明·{n}"}}]}}"#
         );
         let mut sim = crate::proxy::test_support::sim_for(&body);
-        sim.env = Some(crate::proxy::SimEnv::from_cwd("/Users/easayliu", cwd));
+        sim.env = Some(crate::proxy::SimEnv::from_cwd(
+            crate::proxy::test_support::SYN_HOME,
+            crate::proxy::test_support::SYN_CWD,
+        ));
         sim.trim_tools = false;
         let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let root = super::env_note::env_root_of(&v);
@@ -6869,11 +6880,13 @@ fn env_note_matches_the_2_1_328_captures() {
             want = want.replace(&old, &new);
         }
         // 抓包机 OS 版本是 27.2.0，模拟固定写 [`config::CC_OS_RELEASE`]。
-        let want = want.replace("Today's date is 2026-11-19.", "").replace(
+        // 日期那行只归一化日期值（随抓包当天变），这一行的写法与其后的内容照比。
+        let want = crate::proxy::test_support::mask_date(&want).replace(
             "OS Version: Darwin 27.2.0",
             &format!("OS Version: Darwin {}", config::CC_OS_RELEASE),
         );
-        let mut got = text.split("Today's date is ").next().unwrap().to_string();
+        let mut got = crate::proxy::test_support::mask_date(text);
+        assert!(want.contains("Today's date is <DATE>."), "{n}: 官方那份带日期行，归一化后照比");
         // `<total_tokens>` 跟号的下发走（[`crate::proxy::lapis_anchor`]）：抓包那天 opus / sonnet 下发 off、官方没有这一段，
         // 测试号没喂；官方有这一段时两边都有，按官方那份决定比不比。
         if !want.contains("<total_tokens>") {

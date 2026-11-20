@@ -322,16 +322,17 @@ fn prewarm_probe_matches_the_capture() {
     use crate::proxy::body::{CcClient, apply_cch};
     use crate::proxy::session_link::CcRequestKind;
 
-    // `cap/auto-max-2.1.328-20261119-model/00041` 原文（与 2.1.327 的 `00039`、2.1.326 团队号的 `00072`、2.1.325 的 `00066`、2.1.323 的
-    // `00064` 只差版本、cch 与身份会话）。cch 算法在这个形态上同样成立：几条体只差模型名，cch 却都是同一个值，一并钉住（同场各模型那几条
-    // 同为 `3e521`）。
+    // `cap/auto-max-2.1.329-20261120-model/00038` 的形态（与 2.1.328 的 `00041`、2.1.327 的 `00039`、2.1.326 团队号的 `00072`、
+    // 2.1.325 的 `00066`、2.1.323 的 `00064` 只差版本、cch 与身份会话），设备、账号、会话三项换成合成值、不进仓库——下面比对时整段
+    // 换成本凭证的身份。cch 盖着 metadata，合成身份后是 `dcb40`（抓包原值 `3d354`，原文对得上由全量 cch 回归
+    // `cch_matches_all_captures` 管）；几条体只差模型名，cch 同一个值，一并钉住。
     const CAPTURED: &str = concat!(
         r#"{"model":"claude-opus-5-5","max_tokens":1,"system":[{"type":"text","text":"#,
-        r#""x-anthropic-billing-header: cc_version=2.1.328.ce7; cc_entrypoint=cli; cch=3e521;"},"#,
+        r#""x-anthropic-billing-header: cc_version=2.1.329.3c4; cc_entrypoint=cli; cch=dcb40;"},"#,
         r#"{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"#,
         r#""messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral"}}]}],"#,
-        r#""metadata":{"user_id":"{\"device_id\":\"b982b4cdcb0479c11bfa7d89fcc8536b51e4356e043dc0104b3a05b1f356395d\","#,
-        r#"\"account_uuid\":\"3369b17e-e1db-4207-b262-ad651110b0cb\",\"session_id\":\"4ca23070-87f3-4f5a-b213-4f305275aaf4\"}"}}"#,
+        r#""metadata":{"user_id":"{\"device_id\":\"5e1d0c0ffee0000000000000000000000000000000000000000000000000d1ce\","#,
+        r#"\"account_uuid\":\"00000000-0000-4000-8000-00000000a11c\",\"session_id\":\"00000000-0000-4000-8000-0000000005e5\"}"}}"#,
     );
     for model in [
         "claude-opus-5-5",
@@ -343,7 +344,7 @@ fn prewarm_probe_matches_the_capture() {
         let captured = CAPTURED.replace("claude-opus-5-5", model);
         assert_eq!(
             apply_cch(&mut captured.clone().into_bytes()).as_deref(),
-            Some("3e521"),
+            Some("dcb40"),
             "{model}"
         );
     }
@@ -412,7 +413,7 @@ fn prewarm_probe_matches_the_capture() {
         // 抓包那条换上本凭证的身份与这份体自己的 cch，其余逐字节相同。
         let want = CAPTURED
             .replace("claude-opus-5-5", model)
-            .replace("cch=3e521", &format!("cch={cch}"))
+            .replace("cch=dcb40", &format!("cch={cch}"))
             .replace(
                 &CAPTURED[CAPTURED.find(r#""metadata""#).unwrap()..],
                 &format!(r#""metadata":{{"user_id":{}}}}}"#, serde_json::json!(user_id)),

@@ -745,6 +745,7 @@ impl EventBuilder<'_> {
             v326,
             v327,
             v328,
+            v329,
             bash_metered,
             prompt_seq,
             ..
@@ -1219,7 +1220,13 @@ impl EventBuilder<'_> {
             // 类名压缩后过不了构造名校验，**又不带 `error_constructor`**。
             // 2.1.328（`cap/auto-max-2.1.328-20261119-bashfail`；同一次跑的 2.1.327 对照仍是 054b6e774401）摘要、行列、块名都换了，
             // 仍不带 `error_constructor`。
-            if v328 {
+            // 2.1.329（`cap/auto-max-2.1.329-20261120-bashfail`；同一次跑的 2.1.328 对照仍是 7649da726f31）摘要、行列、块名都换了，
+            // 类名压缩后是 `TT`，**又带上了 `error_constructor`**（夹在消息摘要与栈摘要之间）。
+            if v329 {
+                err["error_constructor"] = json!("TT");
+                err["error_stack_hash"] = json!("1ecd03fb2d31");
+                err["error_top_frame"] = json!("chunk-hg1yqkjk.js:3767:9506");
+            } else if v328 {
                 err["error_stack_hash"] = json!("7649da726f31");
                 err["error_top_frame"] = json!("chunk-56bhcxay.js:3758:9401");
             } else if v327 {

@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// 2.1.327 的 profile 表：2.1.327 来访的 beta 参照（[`cc_profile_at`]）。2.1.328 的表（[`CC_PROFILES`]）各行
+/// 2.1.327 的 profile 表：2.1.327 来访的 beta 参照（[`cc_profile_at`]）。2.1.328 的表（[`CC_PROFILES_2_1_328`]）各行
 /// 除版本号外与这张相同。
 ///
 /// **各行除版本号外与 2.1.326（[`CC_PROFILES_2_1_326`]）完全相同**：`cap/auto-max-2.1.327-20261118-full`（个人 Max 号）

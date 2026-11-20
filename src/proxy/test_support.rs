@@ -240,3 +240,90 @@ pub(super) fn rl_headers(pairs: &[(&str, &str)]) -> super::RateLimitInfo {
     }
     super::RateLimitInfo::from_headers(&h)
 }
+
+/// 抓包回放比对用的合成家目录与工作目录：官方原文里抓包机的真实路径（家目录、cwd、由 cwd 派生的项目段）先经
+/// [`synth_capture_paths`] 换成它们，模拟这边也用它们生成，源码里不写抓包机的路径。
+pub(super) const SYN_HOME: &str = "/Users/tester";
+pub(super) const SYN_CWD: &str = "/Users/tester/work/cal";
+
+/// 从一条官方请求体里读出抓包机的家目录与工作目录：工作目录取环境段 `Primary working directory: ` 那行，家目录取记忆
+/// 路径里 `/.claude/projects/` 之前那截。读不出来即抓包形态变了，直接失败。
+pub(super) fn capture_paths(official: &serde_json::Value) -> (String, String) {
+    fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+    let mut all = Vec::new();
+    strings(official, &mut all);
+    let cwd = all
+        .iter()
+        .find_map(|s| s.split("Primary working directory: ").nth(1))
+        .and_then(|t| t.lines().next())
+        .expect("抓包里没有 Primary working directory")
+        .trim()
+        .to_owned();
+    let home = all
+        .iter()
+        .find_map(|s| {
+            let at = s.find("/.claude/projects/")?;
+            let start = s[..at].rfind(|c: char| c.is_whitespace() || c == '`' || c == '"')? + 1;
+            Some(s[start..at].to_owned())
+        })
+        .expect("抓包里没有记忆路径");
+    (home, cwd)
+}
+
+/// 把文本里抓包机的路径换成 [`SYN_HOME`] / [`SYN_CWD`]：先换项目段（记忆目录、scratchpad 用的是它），再换 cwd，最后换家目录。
+pub(super) fn synth_capture_paths(s: &str, home: &str, cwd: &str) -> String {
+    let real = super::SimEnv::from_cwd(home, cwd);
+    let syn = super::SimEnv::from_cwd(SYN_HOME, SYN_CWD);
+    s.replace(&real.slug, &syn.slug).replace(cwd, SYN_CWD).replace(home, SYN_HOME)
+}
+
+/// [`synth_capture_paths`] 之后的文本确实落在合成路径上：带着 [`SYN_CWD`] 或它的项目段（system 第四块只有记忆路径），且抓包机的
+/// 工作目录、项目段、家目录不再出现。夹具若已是合成路径（`cwd == SYN_CWD`），替换前后不变，后一条自然成立，不会误报。
+pub(super) fn assert_synth_paths(s: &str, home: &str, cwd: &str, ctx: &str) {
+    let syn_slug = super::SimEnv::from_cwd(SYN_HOME, SYN_CWD).slug;
+    assert!(s.contains(SYN_CWD) || s.contains(&syn_slug), "{ctx}: 归一化后应落在合成路径");
+    if cwd != SYN_CWD {
+        let slug = super::SimEnv::from_cwd(home, cwd).slug;
+        assert!(!s.contains(cwd) && !s.contains(&slug), "{ctx}: 抓包机工作目录没换干净");
+    }
+    if home != SYN_HOME {
+        assert!(!s.contains(&format!("{home}/")), "{ctx}: 抓包机家目录没换干净");
+    }
+}
+
+/// 把 `Today's date is YYYY-MM-DD.` 里的日期值换成占位：只归一化日期本身，这一行的写法与其后的内容照比。
+pub(super) fn mask_date(s: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"Today's date is \d{4}-\d{2}-\d{2}\.").unwrap()
+    });
+    RE.replace_all(s, "Today's date is <DATE>.").into_owned()
+}
+
+/// 已经脱敏成合成路径的夹具交给归一化：前后不变，断言照过；真实路径的那份换完同样落到合成路径上。
+#[test]
+fn synth_paths_accept_an_already_synthetic_fixture() {
+    let syn_slug = super::SimEnv::from_cwd(SYN_HOME, SYN_CWD).slug;
+    let text = format!(
+        "Primary working directory: {SYN_CWD}\nmemory at `{SYN_HOME}/.claude/projects/{syn_slug}/memory/`"
+    );
+    let official = serde_json::json!({ "system": [{ "text": text }] });
+    let (home, cwd) = capture_paths(&official);
+    assert_eq!((home.as_str(), cwd.as_str()), (SYN_HOME, SYN_CWD));
+    let out = synth_capture_paths(&text, &home, &cwd);
+    assert_eq!(out, text);
+    assert_synth_paths(&out, &home, &cwd, "synthetic");
+
+    let (real_home, real_cwd) = ("/Users/someone", "/Users/someone/src/app_x");
+    let real_slug = super::SimEnv::from_cwd(real_home, real_cwd).slug;
+    let real = format!(
+        "Primary working directory: {real_cwd}\nmemory at `{real_home}/.claude/projects/{real_slug}/memory/`"
+    );
+    assert_eq!(synth_capture_paths(&real, real_home, real_cwd), text);
+}

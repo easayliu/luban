@@ -11607,6 +11607,37 @@ mod parent_reply_refs {
         assert_eq!(run(true), without);
     }
 
+    /// 2.1.329 的 `mcpToolsCharLength` 跟 `toolsCharLength` 一样随线程底本走：首轮带着非延迟的 `mcp__*` 工具，续轮省掉
+    /// `tools` 时沿用首轮那份，不报成 0。
+    #[test]
+    fn a_tools_less_delta_keeps_the_mcp_tools_char_length() {
+        let t = Telemetry::default();
+        let mcp = json!({"name":"mcp__ide__getDiagnostics","description":"diag","input_schema":{"type":"object"}});
+        let v329 = |mut c: ApiCall| {
+            c.ua_out = "claude-cli/2.1.329 (external, cli)".into();
+            c
+        };
+        let first = thread_req_with(json!({"type": "create"}), prompt("a"), |v| {
+            v["tools"].as_array_mut().unwrap().push(mcp.clone());
+        });
+        t.ingest(v329(mk(first, "req_a", "end_turn", 0, "", 5)));
+        let delta = thread_req(
+            json!({"type": "continue", "previous_message_id": "msg_req_a"}),
+            prompt("b"),
+        );
+        assert!(serde_json::from_slice::<Value>(&delta).unwrap().get("tools").is_none());
+        t.ingest(v329(mk(delta, "req_b", "end_turn", 10, "", 5)));
+        let evs = events(&t);
+        let ok: Vec<&Value> =
+            evs.iter().filter(|(n, _)| n == "tengu_api_success").map(|(_, m)| m).collect();
+        assert_eq!(ok.len(), 2);
+        let want = json!(super::shape::js_len(&mcp.to_string()));
+        assert_ne!(want, json!(0));
+        for m in ok {
+            assert_eq!(m["mcpToolsCharLength"], want, "{m}");
+        }
+    }
+
     /// 线程续轮回传 Read、Bash、Read 三条结果：按调用 id 配名字，两条 Read 都报正文哈希（按顺序暂配会把第三条配成 Bash）。
     #[test]
     fn a_mixed_batch_delta_hashes_every_read() {
@@ -14531,6 +14562,54 @@ fn version_2_1_325_moves_the_5xx_frame() {
     assert!(seen > 0);
 }
 
+/// 2.1.329（`cap/auto-max-2.1.329-20261120-retry`）：5xx 栈哈希与行列照旧、顶帧换块，类名压缩后是 `Wzn`，**又带上
+/// `error_constructor`**。
+#[test]
+fn version_2_1_329_moves_the_5xx_frame() {
+    let ev = retried_sdk_turn(4, false, "claude-cli/2.1.329 (external, sdk-cli)");
+    let mut seen = 0;
+    for (n, m) in ev.iter().filter(|(n, _)| n == "tengu_api_retry" || n == "tengu_api_error") {
+        seen += 1;
+        assert_eq!(
+            (&m["error_constructor"], &m["error_stack_hash"], &m["error_top_frame"]),
+            (&json!("Wzn"), &json!("5b32b751db51"), &json!("chunk-avbzeyf3.js:5:1510")),
+            "2.1.329 {n}"
+        );
+    }
+    assert!(seen > 0);
+}
+
+/// 2.1.329 起 `tengu_api_success` 在 `toolsCharLength` 后紧跟 `mcpToolsCharLength`（`cap/auto-max-2.1.329-20261120-full` 165 条），
+/// 值是**非延迟** `mcp__*` 工具的长度和（官方 `krr`，延迟的不算）；2.1.328 没有这一项。
+#[test]
+fn version_2_1_329_reports_mcp_tools_char_length() {
+    let success = |ua: &str| {
+        let t = Telemetry::default();
+        let mut body: Value = serde_json::from_slice(&cc_body(true)).unwrap();
+        let mcp = json!({"name":"mcp__ide__getDiagnostics","description":"diag","input_schema":{"type":"object"}});
+        let mcp_deferred = json!({"name":"mcp__ide__executeCode","description":"run","input_schema":{"type":"object"},"defer_loading":true});
+        body["tools"].as_array_mut().unwrap().extend([mcp.clone(), mcp_deferred]);
+        let mut c = call(body.to_string().into_bytes(), "req_1", "end_turn");
+        c.ua_out = ua.into();
+        t.ingest(c);
+        let st = t.0.state.lock();
+        let m = st.pending[&key()]
+            .events
+            .iter()
+            .find(|(_, e)| ev_name(e) == "tengu_api_success")
+            .map(|(_, e)| meta_of(e))
+            .unwrap();
+        (m, super::shape::js_len(&mcp.to_string()))
+    };
+    let (m, want) = success("claude-cli/2.1.329 (external, cli)");
+    assert_eq!(m["mcpToolsCharLength"], json!(want), "{m}");
+    let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+    let at = keys.iter().position(|k| *k == "toolsCharLength").unwrap();
+    assert_eq!(keys[at + 1], "mcpToolsCharLength");
+    let (m, _) = success("claude-cli/2.1.328 (external, cli)");
+    assert!(m.get("mcpToolsCharLength").is_none(), "{m}");
+}
+
 /// 2.1.328（`cap/auto-max-2.1.328-20261119-retry`）：5xx 栈哈希与行列照旧、顶帧换块，**又不带 `error_constructor`**。
 #[test]
 fn version_2_1_328_moves_the_5xx_frame() {
@@ -16787,6 +16866,8 @@ fn version_2_1_303_telemetry_shape() {
             .unwrap()
     };
     for (ua, hash, frame) in [
+        // 2.1.329 摘要、行列、块名都换了，类名压缩后是 `TT`、又带上构造名（`cap/auto-max-2.1.329-20261120-bashfail/2.1.329`）。
+        ("claude-cli/2.1.329 (external, cli)", "1ecd03fb2d31", "chunk-hg1yqkjk.js:3767:9506"),
         // 2.1.328 摘要、行列、块名都换了，仍不带构造名（`cap/auto-max-2.1.328-20261119-bashfail/2.1.328`）。
         ("claude-cli/2.1.328 (external, cli)", "7649da726f31", "chunk-56bhcxay.js:3758:9401"),
         // 2.1.327 摘要、行列、块名都换了，不再带构造名（`cap/auto-max-2.1.327-20261118-bashfail/2.1.327`）。
@@ -16828,7 +16909,8 @@ fn version_2_1_303_telemetry_shape() {
         // 2.1.321 的 `ShellError` 压缩后是 `Rx`，带构造名、夹在消息摘要与栈摘要之间
         // （`cap/auto-2.1.321-20261110-bashfail/2.1.321`），2.1.322 同；2.1.293 ~ 2.1.319 不带。
         let keys: Vec<&str> = err.as_object().unwrap().keys().map(String::as_str).collect();
-        if ua.contains("2.1.326")
+        if ua.contains("2.1.329")
+            || ua.contains("2.1.326")
             || ua.contains("2.1.325")
             || ua.contains("2.1.323")
             || ua.contains("2.1.322")
@@ -16836,7 +16918,9 @@ fn version_2_1_303_telemetry_shape() {
             || ua.contains("2.1.320")
         {
             // 2.1.323 类名压缩后换成 `JR`、2.1.325 换成 `Sx`、2.1.326 换成 `UT`，位置不变。
-            let want = if ua.contains("2.1.326") {
+            let want = if ua.contains("2.1.329") {
+                "TT"
+            } else if ua.contains("2.1.326") {
                 "UT"
             } else if ua.contains("2.1.325") {
                 "Sx"
@@ -16856,7 +16940,11 @@ fn version_2_1_303_telemetry_shape() {
             assert!(err.get("error_constructor").is_none(), "{ua}");
         }
         // 2.1.326 末尾多命令词与位置类别（`cap/auto-team-2.1.326-20261117-bashfail/2.1.326` 那条 `ls`：`ls` / `none`）。
-        if ua.contains("2.1.326") || ua.contains("2.1.327") || ua.contains("2.1.328") {
+        if ua.contains("2.1.326")
+            || ua.contains("2.1.327")
+            || ua.contains("2.1.328")
+            || ua.contains("2.1.329")
+        {
             assert_eq!(keys[keys.len() - 2..], ["bash_argv0", "bash_places"], "{ua}");
             assert_eq!(
                 (&err["bash_argv0"], &err["bash_places"]),

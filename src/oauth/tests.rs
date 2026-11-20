@@ -320,10 +320,22 @@ fn header_orders_follow_the_client_version() {
         "Authorization",
         "anthropic-beta",
     ];
-    for v in [(2, 1, 277), (2, 1, 285), (2, 1, 312)] {
+    for v in [(2, 1, 277), (2, 1, 285), (2, 1, 312), (2, 1, 328)] {
         assert_eq!(at("policy_limits", v)[..7], v277, "{v:?}");
     }
-    assert_eq!(config::axios_shape_at("policy_limits", None)[..7], v277, "读不出版本取最新那份");
+    // 2.1.329 起 `anthropic-client-capabilities` 紧跟 `If-None-Match`、排在鉴权两项之前（官方 `Myr`）。
+    let v329 = [
+        "Accept",
+        "User-Agent",
+        "Cache-Control",
+        "Pragma",
+        "If-None-Match",
+        "anthropic-client-capabilities",
+        "Authorization",
+        "anthropic-beta",
+    ];
+    assert_eq!(at("policy_limits", (2, 1, 329))[..8], v329);
+    assert_eq!(config::axios_shape_at("policy_limits", None)[..8], v329, "读不出版本取最新那份");
 
     let ua_first = |name: &str, v| at(name, v).iter().position(|h| *h == "User-Agent").unwrap();
     let auth = |name: &str, v| at(name, v).iter().position(|h| *h == "Authorization").unwrap();
@@ -1065,6 +1077,19 @@ async fn handshake_wire_shapes_follow_the_session_version(pool: sqlx::PgPool) {
             ]
             .concat(),
         ),
+        // 2.1.329 起多 `anthropic-client-capabilities`，夹在 `If-None-Match` 与鉴权两项之间（官方 `Myr`）。
+        (
+            "2.1.329",
+            "policy_limits",
+            super::policy_limits_request,
+            "claude-code/2.1.329",
+            [
+                &["Accept", "User-Agent", "Cache-Control", "Pragma", "If-None-Match"][..],
+                &["anthropic-client-capabilities", "Authorization", "anthropic-beta"],
+                &TAIL,
+            ]
+            .concat(),
+        ),
         (
             "2.1.270",
             "policy_limits",
@@ -1087,6 +1112,13 @@ async fn handshake_wire_shapes_follow_the_session_version(pool: sqlx::PgPool) {
                 ("no-cache", "no-cache")
             );
         }
+        if name == "policy_limits" {
+            assert_eq!(
+                values.get("anthropic-client-capabilities").map(String::as_str),
+                (version == "2.1.329").then_some(config::POLICY_LIMITS_CLIENT_CAPABILITIES),
+                "{version}"
+            );
+        }
         // 号的 `tengu_glowing_lark` 开着（下面那段之前没喂，这一圈都是关）：MCP 客户端声明不带 tasks 扩展。
         if name == "mcp_servers" {
             assert_eq!(
@@ -1096,6 +1128,43 @@ async fn handshake_wire_shapes_follow_the_session_version(pool: sqlx::PgPool) {
             );
         }
     }
+
+    // 首次拉取（这张凭证还没有 ETag）：2.1.329 照样带 `anthropic-client-capabilities`，只是没有 `If-None-Match`，
+    // 新头紧跟 `Pragma`、仍在鉴权两项之前（官方 `Myr` 的条件头与能力头各自独立）。
+    let fresh = store.insert("t2", None, "a2", "r2", 0, None, None, 1).await.unwrap();
+    let snapshot = crate::telemetry::SessionSnapshot {
+        session_id: "4dc73702-d904-4887-809d-17b93cc5357c".into(),
+        device_id: "b9".repeat(32),
+        account_uuid: "9922ef8e-7945-4f5a-ab4f-cf5f521531df".into(),
+        version: "2.1.329".into(),
+        model: "claude-opus-5-5".into(),
+        betas: String::new(),
+        prompt_id: "6c079143-0c53-4c48-817d-105460b3f622".into(),
+        started_wall: std::time::SystemTime::now(),
+    };
+    let (addr, server) = serve_once("{}");
+    super::policy_limits_request(
+        &client,
+        &format!("http://{addr}"),
+        "AT",
+        &KeepaliveCtx::new(&fresh, 1.0, None, Some(snapshot)),
+    )
+    .send()
+    .await
+    .unwrap();
+    let raw = server.join().unwrap();
+    let (_, names, values, _) = split_raw(&raw);
+    assert_eq!(
+        names,
+        [
+            &["Accept", "User-Agent", "Cache-Control", "Pragma"][..],
+            &["anthropic-client-capabilities", "Authorization", "anthropic-beta"],
+            &TAIL,
+        ]
+        .concat(),
+        "无 ETag 的 2.1.329 policy_limits\n{raw}"
+    );
+    assert_eq!(values["anthropic-client-capabilities"], config::POLICY_LIMITS_CLIENT_CAPABILITIES);
 
     // `tengu_glowing_lark` 下发了开：2.1.309 起的会话带 tasks 扩展，与 `cap/auto-2.1.312-20261028-full` 25 条逐字同；
     // 更早的会话照旧。
